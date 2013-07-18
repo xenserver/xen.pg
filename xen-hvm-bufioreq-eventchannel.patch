@@ -7,10 +7,10 @@ slow xenstore performances.
 This patch allocate it when Qemu read the value so after machine and xenstore
 has been initialized giving same numbers for event channel ports.
 
-diff -r 2cc384c70e24 xen/arch/x86/hvm/hvm.c
+diff -r f76d527e9fef xen/arch/x86/hvm/hvm.c
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
-@@ -530,6 +530,7 @@ int hvm_domain_initialise(struct domain 
+@@ -539,6 +539,7 @@ int hvm_domain_initialise(struct domain 
  
      hvm_init_guest_time(d);
  
@@ -18,43 +18,46 @@ diff -r 2cc384c70e24 xen/arch/x86/hvm/hvm.c
      d->arch.hvm_domain.params[HVM_PARAM_HPET_ENABLED] = 1;
      d->arch.hvm_domain.params[HVM_PARAM_TIMER_MODE]
          = HVMPTM_no_delay_for_missed_ticks;
-@@ -1047,15 +1048,6 @@ int hvm_vcpu_initialise(struct vcpu *v)
+@@ -1094,15 +1095,6 @@ int hvm_vcpu_initialise(struct vcpu *v)
      /* Register ioreq event channel. */
      v->arch.hvm_vcpu.xen_port = rc;
  
 -    if ( v->vcpu_id == 0 )
 -    {
 -        /* Create bufioreq event channel. */
--        rc = alloc_unbound_xen_event_channel(v, 0, NULL);
+-        rc = alloc_unbound_xen_event_channel(v, dm_domid, NULL);
 -        if ( rc < 0 )
 -            goto fail2;
--        v->domain->arch.hvm_domain.params[HVM_PARAM_BUFIOREQ_EVTCHN] = rc;
+-        d->arch.hvm_domain.params[HVM_PARAM_BUFIOREQ_EVTCHN] = rc;
 -    }
 -
-     spin_lock(&v->domain->arch.hvm_domain.ioreq.lock);
-     if ( v->domain->arch.hvm_domain.ioreq.va != NULL )
+     spin_lock(&d->arch.hvm_domain.ioreq.lock);
+     if ( d->arch.hvm_domain.ioreq.va != NULL )
          get_ioreq(v)->vp_eport = v->arch.hvm_vcpu.xen_port;
-@@ -3988,6 +3980,19 @@ long do_hvm_op(unsigned long op, XEN_GUE
+@@ -4018,6 +4010,22 @@ long do_hvm_op(unsigned long op, XEN_GUE
              case HVM_PARAM_ACPI_S_STATE:
                  a.value = d->arch.hvm_domain.is_s3_suspended ? 3 : 0;
                  break;
 +            case HVM_PARAM_BUFIOREQ_EVTCHN:
++            {
 +                /* Create bufioreq event channel if missing */
++                domid_t dm_domid = d->arch.hvm_domain.params[HVM_PARAM_DM_DOMAIN];
 +                rc = (int) d->arch.hvm_domain.params[a.index];
 +                if ( rc < 0 ) {
 +                    rc = -EINVAL;
 +                    if ( !d->vcpu || !d->vcpu[0] )
 +                        goto param_fail;
-+                    rc = alloc_unbound_xen_event_channel(d->vcpu[0], 0, NULL);
++                    rc = alloc_unbound_xen_event_channel(d->vcpu[0], dm_domid, NULL);
 +                    if ( rc < 0 )
 +                        goto param_fail;
 +                    d->arch.hvm_domain.params[a.index] = rc;
 +                }
 +                /* fall through */
++            }
              default:
                  a.value = d->arch.hvm_domain.params[a.index];
                  break;
-diff -r 2cc384c70e24 xen/arch/x86/hvm/io.c
+diff -r f76d527e9fef xen/arch/x86/hvm/io.c
 --- a/xen/arch/x86/hvm/io.c
 +++ b/xen/arch/x86/hvm/io.c
 @@ -54,6 +54,7 @@ int hvm_buffered_io_send(ioreq_t *p)
