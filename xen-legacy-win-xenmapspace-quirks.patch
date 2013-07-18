@@ -1,12 +1,12 @@
 # HG changeset patch
-# Parent 6afb3996537dc982454d427724722c0e9ebc221b
+# Parent a3692ccd493f2791a034d5db4a9f22b517b6a9e5
 Oh dear.  What a mess.
 My deepest apologies to anyone maintaining this in the future.
 
 
 The XENMAPSPACE_* spaces have been abused over and over again in older
-drivers, and with upstream changes in Xen-4.2, the differences have
-finally become incompatible.
+drivers, and with upstream changes in Xen-4.2, the differences finally become
+incompatible, and in Xen-4.3 become worse.
 
 XENMAPSPACE_shared_info:
 
@@ -20,8 +20,10 @@ Rio through Orlando assume that shared info is available at number 4 and
 Xen version; if it's greater than 3.3, they map 0 only, otherwise, they
 map 4 and then 0.
 
-Very luckily for us, index 4 is currently unused upstream, so we can get
-away with a direct alias.
+index 4 is used upstream as of Xen 4.3, but is specified as only for use with
+the XENMEM_add_to_physmap_range hypercall, rather than the
+XENMEM_add_to_physmap hypercall used by the windows PV drivers.  Therefore we
+can get away with a direct alias, by the skin of our teeth.
 
 
 
@@ -78,10 +80,10 @@ take as many opportunities to latch quirks mode as possible, and it is
 likely that we can latch quirks mode based on space 4, which will likely be
 attempted before space 3).
 
-diff -r 6afb3996537d xen/arch/x86/mm.c
+diff -r a3692ccd493f xen/arch/x86/mm.c
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -4844,6 +4844,11 @@ static int xenmem_add_to_physmap_once(
+@@ -4581,6 +4581,11 @@ static int xenmem_add_to_physmap_once(
              page = mfn_to_page(mfn);
              break;
          }
@@ -93,7 +95,7 @@ diff -r 6afb3996537d xen/arch/x86/mm.c
          default:
              break;
      }
-@@ -4950,6 +4955,76 @@ static int xenmem_add_to_physmap(struct 
+@@ -4687,6 +4692,81 @@ static int xenmem_add_to_physmap(struct 
      return xenmem_add_to_physmap_once(d, xatp);
  }
  
@@ -137,8 +139,13 @@ diff -r 6afb3996537d xen/arch/x86/mm.c
 +            return XENMAPSPACE_gmfn_range;
 +
 +
-+        /* Space 4, unaliased upstream currently.  As soon as upstream
-+         * aliases this, pre MNR drivers will break.
++        /* Space 4 - Shared between XENMAPSPACE_shared_info_old_xs and
++         * XENMAPSPACE_gmfn_foreign, although XENMAPSPACE_gmfn_foreign is
++         * currently defined as "XENMEM_add_to_physmap_range only".  This is
++         * because a foreign domid cannot be inserted into basic
++         * XENMEM_add_to_physmap structure.  Therefore, we will not see the
++         * binary incompatibility here from anything other than the legacy
++         * drivers.
 +         */
 +    case XENMAPSPACE_shared_info_old_xs:
 +        _set_quirks_mode(d);
@@ -167,10 +174,10 @@ diff -r 6afb3996537d xen/arch/x86/mm.c
 +    }
 +}
 +
- long arch_memory_op(int op, XEN_GUEST_HANDLE(void) arg)
+ long arch_memory_op(int op, XEN_GUEST_HANDLE_PARAM(void) arg)
  {
      int rc;
-@@ -4974,6 +5049,7 @@ long arch_memory_op(int op, XEN_GUEST_HA
+@@ -4711,6 +4791,7 @@ long arch_memory_op(int op, XEN_GUEST_HA
              return -EPERM;
          }
  
@@ -178,12 +185,12 @@ diff -r 6afb3996537d xen/arch/x86/mm.c
          rc = xenmem_add_to_physmap(d, &xatp);
  
          rcu_unlock_domain(d);
-diff -r 6afb3996537d xen/include/public/memory.h
+diff -r a3692ccd493f xen/include/public/memory.h
 --- a/xen/include/public/memory.h
 +++ b/xen/include/public/memory.h
-@@ -218,6 +218,13 @@ struct xen_add_to_physmap {
- #define XENMAPSPACE_gmfn_range  3 /* GMFN range */
-     unsigned int space;
+@@ -226,6 +226,13 @@ struct xen_add_to_physmap {
+ 
+     unsigned int space; /* => enum phys_map_space */
  
 +    /* Legacy Windows compat spaces. Read patch comment for info. */
 +#define XENMAPSPAEC_vlapic_compat        3 /* Compat per-vcpu vlapic regs page */
@@ -194,4 +201,4 @@ diff -r 6afb3996537d xen/include/public/memory.h
 +
  #define XENMAPIDX_grant_table_status 0x80000000
  
-     /* Index into source mapping space. */
+     /* Index into space being mapped. */
