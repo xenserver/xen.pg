@@ -1,7 +1,7 @@
-From 0edb823e998b5dcbb8d237deffab6f61c3ba3cb1 Mon Sep 17 00:00:00 2001
+From a9f628a9a22bca81e67f22f0401b9833e984978a Mon Sep 17 00:00:00 2001
 From: David Vrabel <david.vrabel@citrix.com>
 Date: Fri, 11 Jan 2013 11:31:29 +0000
-Subject: [PATCH 5/9] kexec: extend hypercall with improved load/unload ops
+Subject: [PATCH 05/10] kexec: extend hypercall with improved load/unload ops
 
 In the existing kexec hypercall, the load and unload ops depend on
 internals of the Linux kernel (the page list and code page provided by
@@ -33,23 +33,26 @@ KEXEC_CMD_load_v1 and KEXEC_CMD_unload_v1) and are implemented on top
 of the new infrastructure.
 
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Daniel Kiper <daniel.kiper@oracle.com>
+Tested-by: Daniel Kiper <daniel.kiper@oracle.com>
 ---
- xen/arch/x86/machine_kexec.c        |  282 +++++++++++++++++++------
+ xen/arch/x86/machine_kexec.c        |  282 ++++++++++++++++++-------
  xen/arch/x86/x86_64/Makefile        |    2 +-
- xen/arch/x86/x86_64/compat_kexec.S  |  187 ----------------
- xen/arch/x86/x86_64/kexec_reloc.S   |  208 ++++++++++++++++++
- xen/common/kexec.c                  |  397 +++++++++++++++++++++++++++++------
+ xen/arch/x86/x86_64/compat_kexec.S  |  187 -----------------
+ xen/arch/x86/x86_64/kexec_reloc.S   |  211 +++++++++++++++++++
+ xen/common/kexec.c                  |  393 +++++++++++++++++++++++++++++------
  xen/common/kimage.c                 |  103 +++++++++
  xen/include/asm-x86/fixmap.h        |    3 -
- xen/include/asm-x86/machine_kexec.h |   14 ++
+ xen/include/asm-x86/machine_kexec.h |   16 ++
  xen/include/xen/kexec.h             |   14 +-
  xen/include/xen/kimage.h            |    6 +
- 10 files changed, 884 insertions(+), 332 deletions(-)
+ 10 files changed, 885 insertions(+), 332 deletions(-)
  delete mode 100644 xen/arch/x86/x86_64/compat_kexec.S
  create mode 100644 xen/arch/x86/x86_64/kexec_reloc.S
  create mode 100644 xen/include/asm-x86/machine_kexec.h
 
-diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
+diff --git a/xen/arch/x86/machine_kexec.c b/xen/arch/x86/machine_kexec.c
+index 68b9705..d6a1082 100644
 --- a/xen/arch/x86/machine_kexec.c
 +++ b/xen/arch/x86/machine_kexec.c
 @@ -1,9 +1,18 @@
@@ -71,33 +74,30 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
   */
  
  #include <xen/types.h>
-@@ -11,66 +20,216 @@
+@@ -11,63 +20,216 @@
  #include <xen/guest_access.h>
  #include <asm/fixmap.h>
  #include <asm/hpet.h>
 +#include <asm/page.h>
 +#include <asm/machine_kexec.h>
++
++static void init_level2_page(l2_pgentry_t *l2, unsigned long addr)
++{
++    unsigned long end_addr;
++
++    addr &= PAGE_MASK;
++    end_addr = addr + L2_PAGETABLE_ENTRIES * (1ul << L2_PAGETABLE_SHIFT);
  
 -typedef void (*relocate_new_kernel_t)(
 -                unsigned long indirection_page,
 -                unsigned long *page_list,
 -                unsigned long start_address,
--#ifdef __i386__
--                unsigned int cpu_has_pae,
--#endif
 -                unsigned int preserve_context);
-+static void init_level2_page(l2_pgentry_t *l2, unsigned long addr)
-+{
-+    unsigned long end_addr;
- 
--int machine_kexec_load(int type, int slot, xen_kexec_image_t *image)
-+    addr &= PAGE_MASK;
-+    end_addr = addr + L2_PAGETABLE_ENTRIES * (1ul << L2_PAGETABLE_SHIFT);
-+
 +    while ( addr < end_addr )
 +    {
 +        l2e_write(l2++, l2e_from_paddr(addr, __PAGE_HYPERVISOR | _PAGE_PSE));
-+
+ 
+-int machine_kexec_load(int type, int slot, xen_kexec_image_t *image)
 +        addr += 1ul << L2_PAGETABLE_SHIFT;
 +    }
 +}
@@ -115,38 +115,9 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
 -     */
 +    addr &= PAGE_MASK;
 +    end_addr = addr + L3_PAGETABLE_ENTRIES * (1ul << L3_PAGETABLE_SHIFT);
- 
--    for ( k = 0; k < KEXEC_XEN_NO_PAGES; k++ )
++
 +    while( (addr < last_addr) && (addr < end_addr) )
-     {
--        if ( (k & 1) == 0 )
--        {
--            /* Even pages: machine address. */
--            prev_ma = image->page_list[k];
--        }
--        else
--        {
--            /* Odd pages: va for previous ma. */
--            if ( is_pv_32on64_domain(dom0) )
--            {
--                /*
--                 * The compatability bounce code sets up a page table
--                 * with a 1-1 mapping of the first 1G of memory so
--                 * VA==PA here.
--                 *
--                 * This Linux purgatory code still sets up separate
--                 * high and low mappings on the control page (entries
--                 * 0 and 1) but it is harmless if they are equal since
--                 * that PT is not live at the time.
--                 */
--                image->page_list[k] = prev_ma;
--            }
--            else
--            {
--                set_fixmap(fix_base + (k >> 1), prev_ma);
--                image->page_list[k] = fix_to_virt(fix_base + (k >> 1));
--            }
--        }
++    {
 +        struct page_info *l2_page;
 +        l2_pgentry_t *l2;
 +
@@ -160,12 +131,11 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
 +        l3e_write(l3++, l3e_from_page(l2_page, __PAGE_HYPERVISOR));
 +
 +        addr += 1ul << L3_PAGETABLE_SHIFT;
-     }
- 
-     return 0;
- }
- 
--void machine_kexec_unload(int type, int slot, xen_kexec_image_t *image)
++    }
++
++    return 0;
++}
++
 +/*
 + * Build a complete page table to identity map [addr, last_addr).
 + *
@@ -174,7 +144,7 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
 + */
 +static int init_level4_page(struct kexec_image *image, l4_pgentry_t *l4,
 +                            unsigned long addr, unsigned long last_addr)
- {
++{
 +    unsigned long end_addr;
 +    int result;
 +
@@ -201,9 +171,8 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
 +    }
 +
 +    return 0;
- }
- 
--void machine_reboot_kexec(xen_kexec_image_t *image)
++}
++
 +/*
 + * Add a mapping for the control code page to the same virtual address
 + * as kexec_reloc.  This allows us to keep running after these page
@@ -276,7 +245,8 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
 +        unmap_domain_page(l3);
 +    return ret;
 +}
-+
+ 
+-    for ( k = 0; k < KEXEC_XEN_NO_PAGES; k++ )
 +
 +static int build_reloc_page_table(struct kexec_image *image)
 +{
@@ -306,35 +276,65 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
 +    int ret;
 +
 +    switch ( image->arch )
-+    {
+     {
+-        if ( (k & 1) == 0 )
+-        {
+-            /* Even pages: machine address. */
+-            prev_ma = image->page_list[k];
+-        }
+-        else
+-        {
+-            /* Odd pages: va for previous ma. */
+-            if ( is_pv_32on64_domain(dom0) )
+-            {
+-                /*
+-                 * The compatability bounce code sets up a page table
+-                 * with a 1-1 mapping of the first 1G of memory so
+-                 * VA==PA here.
+-                 *
+-                 * This Linux purgatory code still sets up separate
+-                 * high and low mappings on the control page (entries
+-                 * 0 and 1) but it is harmless if they are equal since
+-                 * that PT is not live at the time.
+-                 */
+-                image->page_list[k] = prev_ma;
+-            }
+-            else
+-            {
+-                set_fixmap(fix_base + (k >> 1), prev_ma);
+-                image->page_list[k] = fix_to_virt(fix_base + (k >> 1));
+-            }
+-        }
 +    case EM_386:
 +    case EM_X86_64:
 +        break;
 +    default:
 +        return -EINVAL;
-+    }
-+
+     }
+ 
 +    code_page = __map_domain_page(image->control_code_page);
-+    memcpy(code_page, kexec_reloc, PAGE_SIZE);
++    memcpy(code_page, kexec_reloc, kexec_reloc_size);
 +    unmap_domain_page(code_page);
 +
 +    ret = build_reloc_page_table(image);
 +    if ( ret < 0 )
 +        return ret;
 +
-+    return 0;
-+}
-+
+     return 0;
+ }
+ 
+-void machine_kexec_unload(int type, int slot, xen_kexec_image_t *image)
 +void machine_kexec_unload(struct kexec_image *image)
-+{
+ {
 +    /* no-op. kimage_free() frees all control pages. */
-+}
-+
+ }
+ 
+-void machine_reboot_kexec(xen_kexec_image_t *image)
 +void machine_reboot_kexec(struct kexec_image *image)
  {
      BUG_ON(smp_processor_id() != 0);
      smp_send_stop();
-@@ -78,13 +237,10 @@ void machine_reboot_kexec(xen_kexec_imag
+@@ -75,13 +237,10 @@ void machine_reboot_kexec(xen_kexec_image_t *image)
      BUG();
  }
  
@@ -350,7 +350,7 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
  
      /* We are about to permenantly jump out of the Xen context into the kexec
       * purgatory code.  We really dont want to be still servicing interupts.
-@@ -112,34 +268,12 @@ void machine_kexec(xen_kexec_image_t *im
+@@ -109,29 +268,12 @@ void machine_kexec(xen_kexec_image_t *image)
       * not like running with NMIs disabled. */
      enable_nmis();
  
@@ -363,7 +363,6 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
 +    if ( image->arch == EM_386 )
 +        reloc_flags |= KEXEC_RELOC_FLAG_COMPAT;
  
--#ifdef CONFIG_COMPAT
 -    if ( is_pv_32on64_domain(dom0) )
 -    {
 -        compat_machine_kexec(image->page_list[1],
@@ -372,16 +371,12 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
 -                             image->start_address);
 -    }
 -    else
--#endif
 -    {
 -        relocate_new_kernel_t rnk;
 -
 -        rnk = (relocate_new_kernel_t) image->page_list[1];
 -        (*rnk)(image->indirection_page, image->page_list,
 -               image->start_address,
--#ifdef __i386__
--               1 /* cpu_has_pae */,
--#endif
 -               0 /* preserve_context */);
 -    }
 +    kexec_reloc(page_to_maddr(image->control_code_page),
@@ -390,7 +385,8 @@ diff -r c1fa19be4faf xen/arch/x86/machine_kexec.c
  }
  
  int machine_kexec_get(xen_kexec_range_t *range)
-diff -r c1fa19be4faf xen/arch/x86/x86_64/Makefile
+diff --git a/xen/arch/x86/x86_64/Makefile b/xen/arch/x86/x86_64/Makefile
+index d56e12d..7f8fb3d 100644
 --- a/xen/arch/x86/x86_64/Makefile
 +++ b/xen/arch/x86/x86_64/Makefile
 @@ -11,11 +11,11 @@ obj-y += mmconf-fam10h.o
@@ -406,7 +402,9 @@ diff -r c1fa19be4faf xen/arch/x86/x86_64/Makefile
 +obj-bin-y += kexec_reloc.o
  
  obj-$(crash_debug)   += gdbstub.o
-diff -r c1fa19be4faf xen/arch/x86/x86_64/compat_kexec.S
+diff --git a/xen/arch/x86/x86_64/compat_kexec.S b/xen/arch/x86/x86_64/compat_kexec.S
+deleted file mode 100644
+index fc92af9..0000000
 --- a/xen/arch/x86/x86_64/compat_kexec.S
 +++ /dev/null
 @@ -1,187 +0,0 @@
@@ -597,10 +595,12 @@ diff -r c1fa19be4faf xen/arch/x86/x86_64/compat_kexec.S
 -        identmap 0x40000000
 -        identmap 0x80000000
 -        identmap 0xc0000000
-diff -r c1fa19be4faf xen/arch/x86/x86_64/kexec_reloc.S
+diff --git a/xen/arch/x86/x86_64/kexec_reloc.S b/xen/arch/x86/x86_64/kexec_reloc.S
+new file mode 100644
+index 0000000..135cbcd
 --- /dev/null
 +++ b/xen/arch/x86/x86_64/kexec_reloc.S
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,211 @@
 +/*
 + * Relocate a kexec_image to its destination and call it.
 + *
@@ -807,12 +807,16 @@ diff -r c1fa19be4faf xen/arch/x86/x86_64/kexec_reloc.S
 +        .fill 16,8,0
 +reloc_stack:
 +
++        .globl __kexec_reloc_size
++        .set __kexec_reloc_size, . - kexec_reloc
 +        .globl kexec_reloc_size
-+        .set kexec_reloc_size, . - kexec_reloc
-diff -r c1fa19be4faf xen/common/kexec.c
++kexec_reloc_size:
++        .quad __kexec_reloc_size
+diff --git a/xen/common/kexec.c b/xen/common/kexec.c
+index 2d34524..b180e0c 100644
 --- a/xen/common/kexec.c
 +++ b/xen/common/kexec.c
-@@ -23,6 +23,7 @@
+@@ -25,6 +25,7 @@
  #include <xen/version.h>
  #include <xen/console.h>
  #include <xen/kexec.h>
@@ -820,7 +824,7 @@ diff -r c1fa19be4faf xen/common/kexec.c
  #include <public/elfnote.h>
  #include <xsm/xsm.h>
  #include <xen/cpu.h>
-@@ -45,7 +46,7 @@ static Elf_Note *xen_crash_note;
+@@ -47,7 +48,7 @@ static Elf_Note *xen_crash_note;
  
  static cpumask_t crash_saved_cpus;
  
@@ -829,7 +833,7 @@ diff -r c1fa19be4faf xen/common/kexec.c
  
  #define KEXEC_FLAG_DEFAULT_POS   (KEXEC_IMAGE_NR + 0)
  #define KEXEC_FLAG_CRASH_POS     (KEXEC_IMAGE_NR + 1)
-@@ -309,14 +310,14 @@ void kexec_crash(void)
+@@ -311,14 +312,14 @@ void kexec_crash(void)
      kexec_common_shutdown();
      kexec_crash_save_cpu();
      machine_crash_shutdown();
@@ -846,25 +850,21 @@ diff -r c1fa19be4faf xen/common/kexec.c
  
      kexecing = TRUE;
  
-@@ -732,63 +733,265 @@ static void crash_save_vmcoreinfo(void)
+@@ -734,63 +735,261 @@ static void crash_save_vmcoreinfo(void)
  #endif
  }
  
 -static int kexec_load_unload_internal(unsigned long op, xen_kexec_load_v1_t *load)
 +static void kexec_unload_image(struct kexec_image *image)
- {
--    xen_kexec_image_t *image;
--    int base, bit, pos;
--    int ret = 0;
++{
 +    if ( !image )
 +        return;
- 
--    if ( kexec_load_get_bits(load->type, &base, &bit) )
++
 +    machine_kexec_unload(image);
 +    kimage_free(image);
 +}
 +
-+static int kexec_exec(XEN_GUEST_HANDLE(void) uarg)
++static int kexec_exec(XEN_GUEST_HANDLE_PARAM(void) uarg)
 +{
 +    xen_kexec_exec_t exec;
 +    struct kexec_image *image;
@@ -874,34 +874,16 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +        return -EFAULT;
 +
 +    if ( kexec_load_get_bits(exec.type, &base, &bit) )
-         return -EINVAL;
- 
-     pos = (test_bit(bit, &kexec_flags) != 0);
- 
--    /* Load the user data into an unused image */
--    if ( op == KEXEC_CMD_kexec_load )
++        return -EINVAL;
++
++    pos = (test_bit(bit, &kexec_flags) != 0);
++
 +    /* Only allow kexec/kdump into loaded images */
 +    if ( !test_bit(base + pos, &kexec_flags) )
 +        return -ENOENT;
 +
 +    switch (exec.type)
-     {
--        image = &kexec_image[base + !pos];
--
--        BUG_ON(test_bit((base + !pos), &kexec_flags)); /* must be free */
--
--        memcpy(image, &load->image, sizeof(*image));
--
--        if ( !(ret = machine_kexec_load(load->type, base + !pos, image)) )
--        {
--            /* Set image present bit */
--            set_bit((base + !pos), &kexec_flags);
--
--            /* Make new image the active one */
--            change_bit(bit, &kexec_flags);
--        }
--
--        crash_save_vmcoreinfo();
++    {
 +    case KEXEC_TYPE_DEFAULT:
 +        image = kexec_image[base + pos];
 +        ret = continue_hypercall_on_cpu(0, kexec_reboot, image);
@@ -909,17 +891,17 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +    case KEXEC_TYPE_CRASH:
 +        kexec_crash(); /* Does not return */
 +        break;
-     }
- 
--    /* Unload the old image if present and load successful */
--    if ( ret == 0 && !test_bit(KEXEC_FLAG_IN_PROGRESS, &kexec_flags) )
++    }
++
 +    return -EINVAL; /* never reached */
 +}
 +
 +static int kexec_swap_images(int type, struct kexec_image *new,
 +                             struct kexec_image **old)
-+{
-+    int base, bit, pos;
+ {
+-    xen_kexec_image_t *image;
+     int base, bit, pos;
+-    int ret = 0;
 +    int new_slot, old_slot;
 +
 +    *old = NULL;
@@ -927,38 +909,46 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +    spin_lock(&kexec_lock);
 +
 +    if ( test_bit(KEXEC_FLAG_IN_PROGRESS, &kexec_flags) )
-     {
--        if ( test_and_clear_bit((base + pos), &kexec_flags) )
--        {
--            image = &kexec_image[base + pos];
--            machine_kexec_unload(load->type, base + pos, image);
--        }
++    {
 +        spin_unlock(&kexec_lock);
 +        return -EBUSY;
-     }
++    }
  
+-    if ( kexec_load_get_bits(load->type, &base, &bit) )
 +    if ( kexec_load_get_bits(type, &base, &bit) )
-+        return -EINVAL;
-+
-+    pos = (test_bit(bit, &kexec_flags) != 0);
+         return -EINVAL;
+ 
+     pos = (test_bit(bit, &kexec_flags) != 0);
 +    old_slot = base + pos;
 +    new_slot = base + !pos;
-+
+ 
+-    /* Load the user data into an unused image */
+-    if ( op == KEXEC_CMD_kexec_load )
 +    if ( new )
-+    {
+     {
+-        image = &kexec_image[base + !pos];
 +        kexec_image[new_slot] = new;
 +        set_bit(new_slot, &kexec_flags);
 +    }
 +    change_bit(bit, &kexec_flags);
-+
+ 
+-        BUG_ON(test_bit((base + !pos), &kexec_flags)); /* must be free */
 +    clear_bit(old_slot, &kexec_flags);
 +    *old = kexec_image[old_slot];
-+
+ 
+-        memcpy(image, &load->image, sizeof(*image));
 +    spin_unlock(&kexec_lock);
-+
+ 
+-        if ( !(ret = machine_kexec_load(load->type, base + !pos, image)) )
+-        {
+-            /* Set image present bit */
+-            set_bit((base + !pos), &kexec_flags);
 +    return 0;
 +}
-+
+ 
+-            /* Make new image the active one */
+-            change_bit(bit, &kexec_flags);
+-        }
 +static int kexec_load_slot(struct kexec_image *kimage)
 +{
 +    struct kexec_image *old_kimage;
@@ -966,24 +956,19 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +
 +    ret = machine_kexec_load(kimage);
 +    if ( ret < 0 )
-+        goto error;
++        return ret;
 +
 +    crash_save_vmcoreinfo();
 +
 +    ret = kexec_swap_images(kimage->type, kimage, &old_kimage);
 +    if ( ret < 0 )
-+        goto error;
++        return ret;
 +
 +    kexec_unload_image(old_kimage);
 +
 +    return 0;
++}
 +
-+error:
-+    kimage_free(kimage);
-     return ret;
- }
- 
--static int kexec_load_unload(unsigned long op, XEN_GUEST_HANDLE(void) uarg)
 +static uint16_t kexec_load_v1_arch(void)
 +{
 +#ifdef CONFIG_X86
@@ -999,7 +984,8 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +{
 +    paddr_t maddr = (paddr_t)mfn << PAGE_SHIFT;
 +    int n = *nr_segments;
-+
+ 
+-        crash_save_vmcoreinfo();
 +    /* Need a new segment? */
 +    if ( n == 0
 +         || segments[n-1].dest_maddr + segments[n-1].dest_size != maddr )
@@ -1013,8 +999,10 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +        segments[n-1].buf_size = 0;
 +        segments[n-1].dest_maddr = maddr;
 +        segments[n-1].dest_size = 0;
-+    }
-+
+     }
+ 
+-    /* Unload the old image if present and load successful */
+-    if ( ret == 0 && !test_bit(KEXEC_FLAG_IN_PROGRESS, &kexec_flags) )
 +    return 0;
 +}
 +
@@ -1034,14 +1022,17 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +     * segments.
 +     */
 +    for ( entry = page; ; )
-+    {
+     {
+-        if ( test_and_clear_bit((base + pos), &kexec_flags) )
 +        unsigned long ind;
 +
 +        ind = kimage_entry_ind(entry, compat);
 +        mfn = kimage_entry_mfn(entry, compat);
 +
 +        switch ( ind )
-+        {
+         {
+-            image = &kexec_image[base + pos];
+-            machine_kexec_unload(load->type, base + pos, image);
 +        case IND_DESTINATION:
 +            ret = kexec_segments_add_segment(nr_segments, segments, mfn);
 +            if ( ret < 0 )
@@ -1062,9 +1053,9 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +        default:
 +            ret = -EINVAL;
 +            goto done;
-+        }
+         }
 +        entry = kimage_entry_next(entry, compat);
-+    }
+     }
 +done:
 +    unmap_domain_page(page);
 +    return ret;
@@ -1119,17 +1110,18 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +    ret = kexec_load_slot(kimage);
 +    if ( ret < 0 )
 +        goto error;
-+
+ 
 +    return 0;
 +
 +error:
 +    if ( !kimage )
 +        xfree(segments);
 +    kimage_free(kimage);
-+    return ret;
-+}
-+
-+static int kexec_load_v1(XEN_GUEST_HANDLE(void) uarg)
+     return ret;
+ }
+ 
+-static int kexec_load_unload(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) uarg)
++static int kexec_load_v1(XEN_GUEST_HANDLE_PARAM(void) uarg)
  {
      xen_kexec_load_v1_t load;
  
@@ -1141,12 +1133,12 @@ diff -r c1fa19be4faf xen/common/kexec.c
  }
  
 -static int kexec_load_unload_compat(unsigned long op,
--                                    XEN_GUEST_HANDLE(void) uarg)
-+static int kexec_load_v1_compat(XEN_GUEST_HANDLE(void) uarg)
+-                                    XEN_GUEST_HANDLE_PARAM(void) uarg)
++static int kexec_load_v1_compat(XEN_GUEST_HANDLE_PARAM(void) uarg)
  {
  #ifdef CONFIG_COMPAT
      compat_kexec_load_v1_t compat_load;
-@@ -807,48 +1010,112 @@ static int kexec_load_unload_compat(unsi
+@@ -809,49 +1008,113 @@ static int kexec_load_unload_compat(unsigned long op,
      load.type = compat_load.type;
      XLAT_kexec_image(&load.image, &compat_load.image);
  
@@ -1159,8 +1151,8 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +#endif
  }
  
--static int kexec_exec(XEN_GUEST_HANDLE(void) uarg)
-+static int kexec_load(XEN_GUEST_HANDLE(void) uarg)
+-static int kexec_exec(XEN_GUEST_HANDLE_PARAM(void) uarg)
++static int kexec_load(XEN_GUEST_HANDLE_PARAM(void) uarg)
  {
 -    xen_kexec_exec_t exec;
 -    xen_kexec_image_t *image;
@@ -1179,14 +1171,14 @@ diff -r c1fa19be4faf xen/common/kexec.c
          return -EINVAL;
  
 -    pos = (test_bit(bit, &kexec_flags) != 0);
+-
+-    /* Only allow kexec/kdump into loaded images */
+-    if ( !test_bit(base + pos, &kexec_flags) )
+-        return -ENOENT;
 +    segments = xmalloc_array(xen_kexec_segment_t, load.nr_segments);
 +    if ( segments == NULL )
 +        return -ENOMEM;
  
--    /* Only allow kexec/kdump into loaded images */
--    if ( !test_bit(base + pos, &kexec_flags) )
--        return -ENOENT;
--
 -    switch (exec.type)
 +    if ( copy_from_guest(segments, load.segments, load.nr_segments) )
      {
@@ -1238,7 +1230,7 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +    return 0;
 +}
 +
-+static int kexec_unload_v1(XEN_GUEST_HANDLE(void) uarg)
++static int kexec_unload_v1(XEN_GUEST_HANDLE_PARAM(void) uarg)
 +{
 +    xen_kexec_load_v1_t load;
 +    xen_kexec_unload_t unload;
@@ -1250,7 +1242,7 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +    return kexec_do_unload(&unload);
 +}
 +
-+static int kexec_unload_v1_compat(XEN_GUEST_HANDLE(void) uarg)
++static int kexec_unload_v1_compat(XEN_GUEST_HANDLE_PARAM(void) uarg)
 +{
 +#ifdef CONFIG_COMPAT
 +    compat_kexec_load_v1_t compat_load;
@@ -1266,7 +1258,7 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +#endif
 +}
 +
-+static int kexec_unload(XEN_GUEST_HANDLE(void) uarg)
++static int kexec_unload(XEN_GUEST_HANDLE_PARAM(void) uarg)
 +{
 +    xen_kexec_unload_t unload;
 +
@@ -1276,14 +1268,15 @@ diff -r c1fa19be4faf xen/common/kexec.c
 +    return kexec_do_unload(&unload);
  }
  
- static int do_kexec_op_internal(unsigned long op, XEN_GUEST_HANDLE(void) uarg,
+ static int do_kexec_op_internal(unsigned long op,
+                                 XEN_GUEST_HANDLE_PARAM(void) uarg,
                                  bool_t compat)
  {
 -    unsigned long flags;
      int ret = -EINVAL;
  
-     if ( !IS_PRIV(current->domain) )
-@@ -867,20 +1134,26 @@ static int do_kexec_op_internal(unsigned
+     ret = xsm_kexec(XSM_PRIV);
+@@ -867,20 +1130,26 @@ static int do_kexec_op_internal(unsigned long op,
                  ret = kexec_get_range(uarg);
          break;
      case KEXEC_CMD_kexec_load_v1:
@@ -1319,10 +1312,11 @@ diff -r c1fa19be4faf xen/common/kexec.c
      }
  
      return ret;
-diff -r c1fa19be4faf xen/common/kimage.c
+diff --git a/xen/common/kimage.c b/xen/common/kimage.c
+index 995ce36..1cc0ef7 100644
 --- a/xen/common/kimage.c
 +++ b/xen/common/kimage.c
-@@ -812,6 +812,109 @@ int kimage_load_segments(struct kexec_im
+@@ -812,6 +812,109 @@ int kimage_load_segments(struct kexec_image *image)
      return 0;
  }
  
@@ -1432,10 +1426,11 @@ diff -r c1fa19be4faf xen/common/kimage.c
  /*
   * Local variables:
   * mode: C
-diff -r c1fa19be4faf xen/include/asm-x86/fixmap.h
+diff --git a/xen/include/asm-x86/fixmap.h b/xen/include/asm-x86/fixmap.h
+index 2eefcf4..1695228 100644
 --- a/xen/include/asm-x86/fixmap.h
 +++ b/xen/include/asm-x86/fixmap.h
-@@ -51,9 +51,6 @@ enum fixed_addresses {
+@@ -57,9 +57,6 @@ enum fixed_addresses {
      FIX_ACPI_END = FIX_ACPI_BEGIN + FIX_ACPI_PAGES - 1,
      FIX_HPET_BASE,
      FIX_CYCLONE_TIMER,
@@ -1445,10 +1440,12 @@ diff -r c1fa19be4faf xen/include/asm-x86/fixmap.h
      FIX_IOMMU_REGS_BASE_0,
      FIX_IOMMU_REGS_END = FIX_IOMMU_REGS_BASE_0 + MAX_IOMMUS-1,
      FIX_IOMMU_MMIO_BASE_0,
-diff -r c1fa19be4faf xen/include/asm-x86/machine_kexec.h
+diff --git a/xen/include/asm-x86/machine_kexec.h b/xen/include/asm-x86/machine_kexec.h
+new file mode 100644
+index 0000000..9f7c29e
 --- /dev/null
 +++ b/xen/include/asm-x86/machine_kexec.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,16 @@
 +#ifndef __X86_MACHINE_KEXEC_H__
 +#define __X86_MACHINE_KEXEC_H__
 +
@@ -1460,10 +1457,13 @@ diff -r c1fa19be4faf xen/include/asm-x86/machine_kexec.h
 +                        unsigned long ind_maddr, unsigned long entry_maddr,
 +                        unsigned long flags);
 +
++extern unsigned long kexec_reloc_size;
++
 +#endif
 +
 +#endif /* __X86_MACHINE_KEXEC_H__ */
-diff -r c1fa19be4faf xen/include/xen/kexec.h
+diff --git a/xen/include/xen/kexec.h b/xen/include/xen/kexec.h
+index 1a5dda1..7bb9213 100644
 --- a/xen/include/xen/kexec.h
 +++ b/xen/include/xen/kexec.h
 @@ -6,6 +6,7 @@
@@ -1474,7 +1474,7 @@ diff -r c1fa19be4faf xen/include/xen/kexec.h
  
  typedef struct xen_kexec_reserve {
      unsigned long size;
-@@ -40,11 +41,11 @@ extern enum low_crashinfo low_crashinfo_
+@@ -40,11 +41,11 @@ extern enum low_crashinfo low_crashinfo_mode;
  extern paddr_t crashinfo_maxaddr_bits;
  void kexec_early_calculations(void);
  
@@ -1502,10 +1502,11 @@ diff -r c1fa19be4faf xen/include/xen/kexec.h
  /* vmcoreinfo stuff */
  #define VMCOREINFO_BYTES           (4096)
  #define VMCOREINFO_NOTE_NAME       "VMCOREINFO_XEN"
-diff -r c1fa19be4faf xen/include/xen/kimage.h
+diff --git a/xen/include/xen/kimage.h b/xen/include/xen/kimage.h
+index 9555688..fb62c6f 100644
 --- a/xen/include/xen/kimage.h
 +++ b/xen/include/xen/kimage.h
-@@ -46,6 +46,12 @@ int kimage_load_segments(struct kexec_im
+@@ -46,6 +46,12 @@ int kimage_load_segments(struct kexec_image *image);
  struct page_info *kimage_alloc_control_page(struct kexec_image *image,
                                              unsigned memflags);
  
@@ -1518,3 +1519,6 @@ diff -r c1fa19be4faf xen/include/xen/kimage.h
  #endif /* __XEN_KIMAGE_H__ */
  
  /*
+-- 
+1.7.10.4
+
