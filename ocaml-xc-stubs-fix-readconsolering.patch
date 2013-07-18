@@ -1,0 +1,87 @@
+# HG changeset patch
+# Parent e39342e6ec39711157c7fa8c85d1035cadab345e
+tools/ocaml: libxc bindings: Fix stub_xc_readconsolering().
+
+There are two problems with this function:
+  * The caml_{enter,leave}_blocking_section() calls mean that two threads can
+    compete for use of the static ring[] buffer.
+  * It fails to retrieve the entire buffer if the hypervisor has used 32K or
+    more of its console ring.
+
+Rewrite the function using the new xc_consoleringsize() and
+xc_readconsolering_buffer() functions to efficiently grab the entire console
+ring.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+--
+Changes since v3:
+ * Use caml_alloc_string/memcpy in preference to caml_copy_string to allow
+   for the possibility of NULL characters in the middle of the conring
+Changes since v2:
+ * Tweak style and remove redundant variables
+Changes since v1:
+ * Convert conring_size to being static to avoid needless hypercalls
+ * Fix memory due to ordering of failwith_xc() and xc_hypercall_buffer_free()
+ * Remove useless CAMLreturns()
+
+diff -r e39342e6ec39 tools/ocaml/libs/xc/xenctrl_stubs.c
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -523,27 +523,47 @@ CAMLprim value stub_xc_evtchn_reset(valu
+ 	CAMLreturn(Val_unit);
+ }
+ 
+-
+-#define RING_SIZE 32768
+-static char ring[RING_SIZE];
+-
+ CAMLprim value stub_xc_readconsolering(value xch)
+ {
+-	unsigned int size = RING_SIZE - 1;
+-	char *ring_ptr = ring;
++	static uint64_t conring_size = 0;
++	unsigned int nr_chars;
++	DECLARE_HYPERCALL_BUFFER(char, ring);
+ 	int retval;
+ 
+ 	CAMLparam1(xch);
++	CAMLlocal1(conring);
++
++	if (!conring_size)
++	{
++		if (xc_consoleringsize(_H(xch), &conring_size))
++			failwith_xc(_H(xch));
++
++		/* Round conring_size up to the next page, for NULL terminator
++		   and slop from a race with printk() in the hypervisor. */
++		conring_size = (conring_size + XC_PAGE_SIZE) & XC_PAGE_MASK;
++	}
++
++	nr_chars = conring_size - 1;
++	ring = xc_hypercall_buffer_alloc(_H(xch), ring, conring_size);
++
++	if (!ring)
++		caml_raise_out_of_memory();
+ 
+ 	caml_enter_blocking_section();
+-	retval = xc_readconsolering(_H(xch), ring_ptr, &size, 0, 0, NULL);
++	retval = xc_readconsolering_buffer(_H(xch), HYPERCALL_BUFFER(ring),
++					   &nr_chars, 0, 0, NULL);
+ 	caml_leave_blocking_section();
+ 
+ 	if (retval)
++	{
++		xc_hypercall_buffer_free(_H(xch), ring);
+ 		failwith_xc(_H(xch));
++	}
+ 
+-	ring[size] = '\0';
+-	CAMLreturn(caml_copy_string(ring));
++	conring = caml_alloc_string(nr_chars);
++	memcpy(String_val(conring), ring, nr_chars);
++	xc_hypercall_buffer_free(_H(xch), ring);
++	CAMLreturn(conring);
+ }
+ 
+ CAMLprim value stub_xc_send_debug_keys(value xch, value keys)

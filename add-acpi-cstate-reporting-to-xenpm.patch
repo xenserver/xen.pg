@@ -1,0 +1,168 @@
+# HG changeset patch
+# Parent c537c8e4d750d8116f013658469cbd58c8b3660c
+xenpm: Add reporting of ACPI C-state level to xenpm get-cpuidle-state output
+
+diff -r c537c8e4d750 tools/libxc/xc_pm.c
+--- a/tools/libxc/xc_pm.c
++++ b/tools/libxc/xc_pm.c
+@@ -126,9 +126,10 @@ int xc_pm_get_cxstat(xc_interface *xch, 
+     DECLARE_SYSCTL;
+     DECLARE_NAMED_HYPERCALL_BOUNCE(triggers, cxpt->triggers, 0, XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
+     DECLARE_NAMED_HYPERCALL_BOUNCE(residencies, cxpt->residencies, 0, XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
++    DECLARE_NAMED_HYPERCALL_BOUNCE(types, cxpt->types, 0, XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
+     int max_cx, ret;
+ 
+-    if( !cxpt || !(cxpt->triggers) || !(cxpt->residencies) )
++    if( !cxpt || !(cxpt->triggers) || !(cxpt->residencies) || !(cxpt->types))
+         return -EINVAL;
+ 
+     if ( (ret = xc_pm_get_max_cx(xch, cpuid, &max_cx)) )
+@@ -136,21 +137,25 @@ int xc_pm_get_cxstat(xc_interface *xch, 
+ 
+     HYPERCALL_BOUNCE_SET_SIZE(triggers, max_cx * sizeof(uint64_t));
+     HYPERCALL_BOUNCE_SET_SIZE(residencies, max_cx * sizeof(uint64_t));
++    HYPERCALL_BOUNCE_SET_SIZE(types, max_cx * sizeof(uint32_t));
+ 
+     ret = -1;
+     if ( xc_hypercall_bounce_pre(xch, triggers) )
+         goto unlock_0;
+     if ( xc_hypercall_bounce_pre(xch, residencies) )
+         goto unlock_1;
++    if ( xc_hypercall_bounce_pre(xch, types) )
++        goto unlock_2;
+ 
+     sysctl.cmd = XEN_SYSCTL_get_pmstat;
+     sysctl.u.get_pmstat.type = PMSTAT_get_cxstat;
+     sysctl.u.get_pmstat.cpuid = cpuid;
+     set_xen_guest_handle(sysctl.u.get_pmstat.u.getcx.triggers, triggers);
+     set_xen_guest_handle(sysctl.u.get_pmstat.u.getcx.residencies, residencies);
++    set_xen_guest_handle(sysctl.u.get_pmstat.u.getcx.types, types);
+ 
+     if ( (ret = xc_sysctl(xch, &sysctl)) )
+-        goto unlock_2;
++        goto unlock_3;
+ 
+     cxpt->nr = sysctl.u.get_pmstat.u.getcx.nr;
+     cxpt->last = sysctl.u.get_pmstat.u.getcx.last;
+@@ -163,6 +168,8 @@ int xc_pm_get_cxstat(xc_interface *xch, 
+     cxpt->cc6 = sysctl.u.get_pmstat.u.getcx.cc6;
+     cxpt->cc7 = sysctl.u.get_pmstat.u.getcx.cc7;
+ 
++unlock_3:
++    xc_hypercall_bounce_post(xch, types);
+ unlock_2:
+     xc_hypercall_bounce_post(xch, residencies);
+ unlock_1:
+diff -r c537c8e4d750 tools/libxc/xenctrl.h
+--- a/tools/libxc/xenctrl.h
++++ b/tools/libxc/xenctrl.h
+@@ -1708,6 +1708,7 @@ struct xc_cx_stat {
+     uint64_t idle_time;    /* idle time from boot */
+     uint64_t *triggers;    /* Cx trigger counts */
+     uint64_t *residencies; /* Cx residencies */
++    uint32_t *types;       /* Cx types */
+     uint64_t pc2;
+     uint64_t pc3;
+     uint64_t pc6;
+diff -r c537c8e4d750 tools/misc/xenpm.c
+--- a/tools/misc/xenpm.c
++++ b/tools/misc/xenpm.c
+@@ -87,8 +87,8 @@ static void print_cxstat(int cpuid, stru
+            cxstat->idle_time/1000000UL);
+     for ( i = 0; i < cxstat->nr; i++ )
+     {
+-        printf("C%d                   : transition [%020"PRIu64"]\n",
+-               i, cxstat->triggers[i]);
++        printf("C%d [ACPI C%d]         : transition [%020"PRIu64"]\n",
++               i, cxstat->types[i], cxstat->triggers[i]);
+         printf("                       residency  [%020"PRIu64" ms]\n",
+                cxstat->residencies[i]/1000000UL);
+     }
+@@ -128,6 +128,13 @@ static int get_cxstat_by_cpuid(xc_interf
+         free(cxstat->triggers);
+         return -ENOMEM;
+     }
++    cxstat->types = malloc(max_cx_num * sizeof(uint32_t));
++    if ( !cxstat->types )
++    {
++        free(cxstat->residencies);
++        free(cxstat->triggers);
++        return -ENOMEM;
++    }
+ 
+     ret = xc_pm_get_cxstat(xc_handle, cpuid, cxstat);
+     if( ret )
+@@ -135,8 +142,10 @@ static int get_cxstat_by_cpuid(xc_interf
+         int temp = errno;
+         free(cxstat->triggers);
+         free(cxstat->residencies);
++        free(cxstat->types);
+         cxstat->triggers = NULL;
+         cxstat->residencies = NULL;
++        cxstat->types = NULL;
+         return temp;
+     }
+ 
+@@ -168,6 +177,7 @@ static int show_cxstat_by_cpuid(xc_inter
+ 
+     free(cxstatinfo.triggers);
+     free(cxstatinfo.residencies);
++    free(cxstatinfo.types);
+     return 0;
+ }
+ 
+diff -r c537c8e4d750 xen/arch/x86/acpi/cpu_idle.c
+--- a/xen/arch/x86/acpi/cpu_idle.c
++++ b/xen/arch/x86/acpi/cpu_idle.c
+@@ -1089,6 +1089,7 @@ int pmstat_get_cx_stat(uint32_t cpuid, s
+ {
+     struct acpi_processor_power *power = processor_powers[cpuid];
+     uint64_t usage, res, idle_usage = 0, idle_res = 0;
++    uint32_t type;
+     int i;
+     struct hw_residencies hw_res;
+ 
+@@ -1110,14 +1111,18 @@ int pmstat_get_cx_stat(uint32_t cpuid, s
+         /* C1 */
+         usage = 1;
+         res = stat->idle_time;
++        type = ACPI_STATE_C1;
+         if ( copy_to_guest_offset(stat->triggers, 1, &usage, 1) ||
+-             copy_to_guest_offset(stat->residencies, 1, &res, 1) )
++             copy_to_guest_offset(stat->residencies, 1, &res, 1) ||
++             copy_to_guest_offset(stat->types, 1, &type, 1) )
+             return -EFAULT;
+ 
+         /* C0 */
+         res = NOW() - res;
++        type = ACPI_STATE_C0;
+         if ( copy_to_guest_offset(stat->triggers, 0, &usage, 1) ||
+-             copy_to_guest_offset(stat->residencies, 0, &res, 1) )
++             copy_to_guest_offset(stat->residencies, 0, &res, 1) ||
++             copy_to_guest_offset(stat->types, 0, &type, 1) )
+             return -EFAULT;
+ 
+         stat->pc2 = 0;
+@@ -1144,8 +1149,10 @@ int pmstat_get_cx_stat(uint32_t cpuid, s
+             usage = idle_usage;
+             res = NOW() - idle_res;
+         }
++        type = power->states[i].type;
+         if ( copy_to_guest_offset(stat->triggers, i, &usage, 1) ||
+-             copy_to_guest_offset(stat->residencies, i, &res, 1) )
++             copy_to_guest_offset(stat->residencies, i, &res, 1) ||
++             copy_to_guest_offset(stat->types, i, &type, 1) )
+             return -EFAULT;
+     }
+ 
+diff -r c537c8e4d750 xen/include/public/sysctl.h
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -225,6 +225,7 @@ struct pm_cx_stat {
+     uint64_aligned_t idle_time;                 /* idle time from boot */
+     XEN_GUEST_HANDLE_64(uint64) triggers;    /* Cx trigger counts */
+     XEN_GUEST_HANDLE_64(uint64) residencies; /* Cx residencies */
++    XEN_GUEST_HANDLE_64(uint32) types;       /* Cx types */
+     uint64_aligned_t pc2;
+     uint64_aligned_t pc3;
+     uint64_aligned_t pc6;

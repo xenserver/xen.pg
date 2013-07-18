@@ -1,0 +1,156 @@
+# HG changeset patch
+# User Ian Campbell <ian.campbell@citrix.com>
+# Date 1347613370 -3600
+# Node ID 6ba5dd84143983ffca1d30894e32f84d0cb1e474
+# Parent  ff6d9494403908d43bf61ce11bc1a5daa21133c7
+xl: do not leak cpupool names.
+
+Valgrind reports:
+==3076== 7 bytes in 1 blocks are definitely lost in loss record 1 of 1
+==3076==    at 0x402458C: malloc (vg_replace_malloc.c:270)
+==3076==    by 0x406F86D: libxl_cpupoolid_to_name (libxl_utils.c:102)
+==3076==    by 0x8058742: parse_config_data (xl_cmdimpl.c:639)
+==3076==    by 0x805BD56: create_domain (xl_cmdimpl.c:1838)
+==3076==    by 0x805DAED: main_create (xl_cmdimpl.c:3903)
+==3076==    by 0x804D39D: main (xl.c:285)
+
+And indeed there are several places where xl uses
+libxl_cpupoolid_to_name as a boolean to test if the pool name is
+valid and leaks the name if it is. Introduce an is_valid helper and
+use that instead.
+
+Signed-off-by: Ian Campbell <ian.campbell@citrix.com>
+Acked-by: Juergen Gross<juergen.gross@ts.fujitsu.com>
+Committed-by: Ian Campbell <ian.campbell@citrix.com>
+
+diff -r ff6d94944039 -r 6ba5dd841439 tools/libxl/libxl_utils.c
+--- a/tools/libxl/libxl_utils.c
++++ b/tools/libxl/libxl_utils.c
+@@ -103,6 +103,17 @@ char *libxl_cpupoolid_to_name(libxl_ctx 
+     return s;
+ }
+ 
++/* This is a bit horrid but without xs_exists it seems like the only way. */
++int libxl_cpupoolid_is_valid(libxl_ctx *ctx, uint32_t poolid)
++{
++    int ret;
++    char *s = libxl_cpupoolid_to_name(ctx, poolid);
++
++    ret = (s != NULL);
++    free(s);
++    return ret;
++}
++
+ char *libxl__cpupoolid_to_name(libxl__gc *gc, uint32_t poolid)
+ {
+     char *s = libxl_cpupoolid_to_name(libxl__gc_owner(gc), poolid);
+diff -r ff6d94944039 -r 6ba5dd841439 tools/libxl/libxl_utils.h
+--- a/tools/libxl/libxl_utils.h
++++ b/tools/libxl/libxl_utils.h
+@@ -24,6 +24,7 @@ int libxl_name_to_domid(libxl_ctx *ctx, 
+ char *libxl_domid_to_name(libxl_ctx *ctx, uint32_t domid);
+ int libxl_name_to_cpupoolid(libxl_ctx *ctx, const char *name, uint32_t *poolid);
+ char *libxl_cpupoolid_to_name(libxl_ctx *ctx, uint32_t poolid);
++int libxl_cpupoolid_is_valid(libxl_ctx *ctx, uint32_t poolid);
+ int libxl_get_stubdom_id(libxl_ctx *ctx, int guest_domid);
+ int libxl_is_stubdom(libxl_ctx *ctx, uint32_t domid, uint32_t *target_domid);
+ int libxl_create_logfile(libxl_ctx *ctx, const char *name, char **full_name);
+diff -r ff6d94944039 -r 6ba5dd841439 tools/libxl/xl_cmdimpl.c
+--- a/tools/libxl/xl_cmdimpl.c
++++ b/tools/libxl/xl_cmdimpl.c
+@@ -636,7 +636,7 @@ static void parse_config_data(const char
+         c_info->poolid = -1;
+         cpupool_qualifier_to_cpupoolid(buf, &c_info->poolid, NULL);
+     }
+-    if (!libxl_cpupoolid_to_name(ctx, c_info->poolid)) {
++    if (!libxl_cpupoolid_is_valid(ctx, c_info->poolid)) {
+         fprintf(stderr, "Illegal pool specified\n");
+         exit(1);
+     }
+@@ -4740,7 +4740,7 @@ static int sched_domain_output(libxl_sch
+ 
+     if (cpupool) {
+         if (cpupool_qualifier_to_cpupoolid(cpupool, &poolid, NULL) ||
+-            !libxl_cpupoolid_to_name(ctx, poolid)) {
++            !libxl_cpupoolid_is_valid(ctx, poolid)) {
+             fprintf(stderr, "unknown cpupool \'%s\'\n", cpupool);
+             return -ERROR_FAIL;
+         }
+@@ -4870,7 +4870,7 @@ int main_sched_credit(int argc, char **a
+ 
+         if (cpupool) {
+             if (cpupool_qualifier_to_cpupoolid(cpupool, &poolid, NULL) ||
+-                !libxl_cpupoolid_to_name(ctx, poolid)) {
++                !libxl_cpupoolid_is_valid(ctx, poolid)) {
+                 fprintf(stderr, "unknown cpupool \'%s\'\n", cpupool);
+                 return -ERROR_FAIL;
+             }
+@@ -6297,7 +6297,7 @@ int main_cpupooldestroy(int argc, char *
+     pool = argv[optind];
+ 
+     if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+-        !libxl_cpupoolid_to_name(ctx, poolid)) {
++        !libxl_cpupoolid_is_valid(ctx, poolid)) {
+         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
+         return -ERROR_FAIL;
+     }
+@@ -6318,7 +6318,7 @@ int main_cpupoolrename(int argc, char **
+     pool = argv[optind++];
+ 
+     if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+-        !libxl_cpupoolid_to_name(ctx, poolid)) {
++        !libxl_cpupoolid_is_valid(ctx, poolid)) {
+         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
+         return -ERROR_FAIL;
+     }
+@@ -6355,7 +6355,7 @@ int main_cpupoolcpuadd(int argc, char **
+     }
+ 
+     if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+-        !libxl_cpupoolid_to_name(ctx, poolid)) {
++        !libxl_cpupoolid_is_valid(ctx, poolid)) {
+         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
+         return -ERROR_FAIL;
+     }
+@@ -6399,7 +6399,7 @@ int main_cpupoolcpuremove(int argc, char
+     }
+ 
+     if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+-        !libxl_cpupoolid_to_name(ctx, poolid)) {
++        !libxl_cpupoolid_is_valid(ctx, poolid)) {
+         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
+         return -ERROR_FAIL;
+     }
+@@ -6442,7 +6442,7 @@ int main_cpupoolmigrate(int argc, char *
+     }
+ 
+     if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+-        !libxl_cpupoolid_to_name(ctx, poolid)) {
++        !libxl_cpupoolid_is_valid(ctx, poolid)) {
+         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
+         return -ERROR_FAIL;
+     }
+diff -r ff6d94944039 -r 6ba5dd841439 tools/libxl/xl_sxp.c
+--- a/tools/libxl/xl_sxp.c
++++ b/tools/libxl/xl_sxp.c
+@@ -37,6 +37,7 @@ void printf_info_sexp(int domid, libxl_d
+ 
+     libxl_domain_create_info *c_info = &d_config->c_info;
+     libxl_domain_build_info *b_info = &d_config->b_info;
++    char *pool;
+ 
+     printf("(domain\n\t(domid %d)\n", domid);
+     printf("\t(create_info)\n");
+@@ -54,8 +55,10 @@ void printf_info_sexp(int domid, libxl_d
+     } else {
+         printf("\t(uuid <unknown>)\n");
+     }
+-
+-    printf("\t(cpupool %s)\n", libxl_cpupoolid_to_name(ctx, c_info->poolid));
++    pool = libxl_cpupoolid_to_name(ctx, c_info->poolid);
++    if (pool)
++        printf("\t(cpupool %s)\n", pool);
++    free(pool);
+     if (c_info->xsdata)
+         printf("\t(xsdata contains data)\n");
+     else

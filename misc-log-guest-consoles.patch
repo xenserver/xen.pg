@@ -1,0 +1,180 @@
+Log guest's serial consoles.
+Logging is enable by writing the filename of the logfile to the
+node /local/logconsole/<domid> in xenstore.
+Writing the empty string or removing the node stops logging.
+Writing the same path to the node causes the daemon to close and
+reopen the file -- this can be used to logrotate the file.
+The /local/logconsole directory should not be removed as otherwise
+all console logging will not work until xenconsoled is restarted.
+
+Logging can also be enabled by writing a filename containing %d
+to the node /local/logconsole/@ in xenstore.  This enables logging
+for domains for which no /local/logconsole/<domid> node exists.
+The filename is expanded by replacing %d with the domain id.
+
+diff -r 478fd4140d1d tools/console/daemon/io.c
+--- a/tools/console/daemon/io.c	Tue Jun 07 17:21:37 2011 +0100
++++ b/tools/console/daemon/io.c	Tue Jun 07 17:22:03 2011 +0100
+@@ -94,8 +94,12 @@
+ 	struct xencons_interface *interface;
+ 	int event_count;
+ 	long long next_period;
++	FILE *logfile;
+ };
+ 
++static void update_logconsole(struct domain *);
++static char *wildcard_logfile = NULL;
++
+ static struct domain *dom_head;
+ 
+ static int write_all(int fd, const char* buf, size_t len)
+@@ -149,6 +153,7 @@
+ 	struct buffer *buffer = &dom->buffer;
+ 	XENCONS_RING_IDX cons, prod, size;
+ 	struct xencons_interface *intf = dom->interface;
++	size_t begin;
+ 
+ 	cons = intf->out_cons;
+ 	prod = intf->out_prod;
+@@ -167,9 +172,15 @@
+ 		}
+ 	}
+ 
++	begin = buffer->size;
+ 	while (cons != prod)
+ 		buffer->data[buffer->size++] = intf->out[
+ 			MASK_XENCONS_IDX(cons++, intf->out)];
++	if (dom->logfile && buffer->size != begin) {
++		fwrite(&buffer->data[begin], buffer->size - begin, 1,
++		       dom->logfile);
++		fflush(dom->logfile);
++	}
+ 
+ 	xen_mb();
+ 	intf->out_cons = cons;
+@@ -660,6 +671,9 @@
+ 	if (!watch_domain(dom, true))
+ 		goto out;
+ 
++	dom->logfile = NULL;
++	update_logconsole(dom);
++
+ 	dom->next = dom_head;
+ 	dom_head = dom;
+ 
+@@ -685,12 +699,17 @@
+ static void remove_domain(struct domain *dom)
+ {
+ 	struct domain **pp;
++	FILE *oldfile;
+ 
+ 	dolog(LOG_DEBUG, "Removing domain-%d", dom->domid);
+ 
+ 	for (pp = &dom_head; *pp; pp = &(*pp)->next) {
+ 		if (dom == *pp) {
+ 			*pp = dom->next;
++			oldfile = dom->logfile;
++			dom->logfile = NULL;
++			if (oldfile)
++				fclose(oldfile);
+ 			free(dom);
+ 			break;
+ 		}
+@@ -746,6 +765,37 @@
+ 	}
+ }
+ 
++static void update_logconsole(struct domain *dom)
++{
++	char *fname = NULL, *path = NULL;
++	FILE *oldfile;
++
++	oldfile = dom->logfile;
++
++	if (asprintf(&path, "/local/logconsole/%d", dom->domid) == -1)
++		goto out;
++
++	fname = xs_read(xs, XBT_NULL, path, NULL);
++	if (!fname && wildcard_logfile)
++		if (asprintf(&fname, wildcard_logfile, dom->domid) == -1)
++			goto out;
++	if (!fname || !fname[0])
++		goto out;
++
++	dom->logfile = fopen(fname, "a");
++	if (!dom->logfile)
++		dolog(LOG_ERR, "fopen %s failed", fname);
++
++ out:
++	if (oldfile && dom->logfile == oldfile) {
++		dom->logfile = NULL;
++		fclose(oldfile);
++	}
++	free(fname);
++	free(path);
++	return;
++}
++
+ static int ring_free_bytes(struct domain *dom)
+ {
+ 	struct xencons_interface *intf = dom->interface;
+@@ -871,6 +921,19 @@
+ 		   been removed, so dom may be NULL here. */
+ 		if (dom && dom->is_dead == false)
+ 			domain_create_ring(dom);
++	} else if (!strcmp(vec[XS_WATCH_TOKEN], "logconsole")) {
++		if (sscanf(vec[XS_WATCH_PATH], "/local/logconsole/%u",
++			   &domid) == 1) {
++			dom = lookup_domain(domid);
++			if (dom && dom->is_dead == false)
++				update_logconsole(dom);
++		} else if (!strcmp(vec[XS_WATCH_PATH],
++				   "/local/logconsole/@")) {
++			free(wildcard_logfile);
++			wildcard_logfile = xs_read(xs, XBT_NULL,
++						   "/local/logconsole/@",
++						   NULL);
++		}
+ 	}
+ 
+ 	free(vec);
+@@ -1090,6 +1153,17 @@
+ 	log_hv_evtchn = -1;
+ }
+ 
++void watch_logconsole(void)
++{
++      bool success;
++
++      success = xs_watch(xs, "/local/logconsole", "logconsole");
++      if (!success)
++              dolog(LOG_ERR, "logconsole watch failed");
++      wildcard_logfile = xs_read(xs, XBT_NULL, "/local/logconsole/@", NULL);
++}
++
++
+ /*
+  * Local variables:
+  *  c-file-style: "linux"
+diff -r 478fd4140d1d tools/console/daemon/io.h
+--- a/tools/console/daemon/io.h	Tue Jun 07 17:21:37 2011 +0100
++++ b/tools/console/daemon/io.h	Tue Jun 07 17:22:03 2011 +0100
+@@ -23,5 +23,6 @@
+ 
+ void enum_domains(void);
+ void handle_io(void);
++void watch_logconsole(void);
+ 
+ #endif
+diff -r 478fd4140d1d tools/console/daemon/main.c
+--- a/tools/console/daemon/main.c	Tue Jun 07 17:21:37 2011 +0100
++++ b/tools/console/daemon/main.c	Tue Jun 07 17:22:03 2011 +0100
+@@ -161,6 +161,8 @@
+ 	if (!xen_setup())
+ 		exit(1);
+ 
++	watch_logconsole();
++
+ 	enum_domains();
+ 
+ 	handle_io();

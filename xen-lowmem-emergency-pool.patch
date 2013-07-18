@@ -1,0 +1,54 @@
+Reintroduce the low-memory emergency pool, since we need low pages
+to create domains, and can't guarantee to get them back by ballooning.
+
+diff -r 18513473b052 xen/common/page_alloc.c
+--- a/xen/common/page_alloc.c	Fri Nov 12 16:04:20 2010 +0000
++++ b/xen/common/page_alloc.c	Fri Nov 12 16:05:29 2010 +0000
+@@ -61,6 +61,16 @@ boolean_param("bootscrub", opt_bootscrub
+ static unsigned int dma_bitsize;
+ integer_param("dma_bits", dma_bitsize);
+ 
++static unsigned long dma_emergency_pool_pages;
++static void __init parse_dma_emergency_pool(char *s)
++{
++    unsigned long long bytes;
++    bytes = parse_size_and_unit(s, NULL);
++    dma_emergency_pool_pages = bytes >> PAGE_SHIFT;
++}
++custom_param("lowmem_emergency_pool", parse_dma_emergency_pool);
++
++
+ #define round_pgdown(_p)  ((_p)&PAGE_MASK)
+ #define round_pgup(_p)    (((_p)+(PAGE_SIZE-1))&PAGE_MASK)
+ 
+@@ -942,6 +952,9 @@ void __init end_boot_allocator(void)
+ #endif
+     }
+ 
++    if ( !dma_bitsize )
++        dma_bitsize = 32;
++
+     printk("Domain heap initialised");
+     if ( dma_bitsize )
+         printk(" DMA width %u bits", dma_bitsize);
+@@ -1177,9 +1190,19 @@ struct page_info *alloc_domheap_pages(
+     if ( (zone_hi = min_t(unsigned int, bits_to_zone(bits), zone_hi)) == 0 )
+         return NULL;
+ 
+-    if ( dma_bitsize && ((dma_zone = bits_to_zone(dma_bitsize)) < zone_hi) )
++    if ( dma_bitsize && ((dma_zone = bits_to_zone(dma_bitsize)) < zone_hi) ) {
+         pg = alloc_heap_pages(dma_zone + 1, zone_hi, order, memflags, d);
+ 
++        /* Lowmem emergency pool is only for them as asks for it */
++        if ( unlikely(pg == NULL) &&
++             ((order > MAX_ORDER) ||
++              avail_heap_pages(MEMZONE_XEN + 1,
++                               dma_bitsize - PAGE_SHIFT - 1,
++                               -1) <
++              (dma_emergency_pool_pages + (1UL << order))) )
++            return NULL;
++    }
++
+     if ( (pg == NULL) &&
+          ((memflags & MEMF_no_dma) ||
+           ((pg = alloc_heap_pages(MEMZONE_XEN + 1, zone_hi, order,

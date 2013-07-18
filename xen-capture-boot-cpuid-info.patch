@@ -1,0 +1,49 @@
+# HG changeset patch
+# Parent f9255d9e83641f074787d9a7a1a195764c756c54
+capture CPUID boot parameters when Intel CPUID faulting is used.
+
+The CPUID boot parameters used for the non upstream XENPF_get_cpu_features hypervcall where only captured in the Intel CPUID masking code path. Intel Ivy Bridge CPU's use CPUID faulting instead of CPUID masking and this resulted in the XENPF_get_cpu_features hypercall returning all zero's for CPUID fields.
+
+This patch has been implemented in a way to result in minimal change to other code due to the proximity to Tampa release. The capturing of pre masking CPUID field should be performed in a common location and the functionality should be upstreamed.
+
+diff -r f9255d9e8364 xen/arch/x86/cpu/intel.c
+--- a/xen/arch/x86/cpu/intel.c
++++ b/xen/arch/x86/cpu/intel.c
+@@ -27,10 +27,22 @@ extern int trap_init_f00f_bug(void);
+ struct movsl_mask movsl_mask __read_mostly;
+ #endif
+ 
+-static unsigned int probe_intel_cpuid_faulting(void)
++static unsigned int probe_intel_cpuid_faulting(struct cpuinfo_x86 *c)
+ {
+ 	uint64_t x;
+-	return !rdmsr_safe(MSR_INTEL_PLATFORM_INFO, x) && (x & (1u<<31));
++	unsigned int result;
++	u32 eax, ebx;
++	result = !rdmsr_safe(MSR_INTEL_PLATFORM_INFO, x) && (x & (1u<<31));
++	if (result) {
++		cpuid(0x1, &eax, &ebx, &c->boot_base_ecx, &c->boot_base_edx);
++		cpuid(0x80000001, &eax, &ebx, &c->boot_ext_ecx, &c->boot_ext_edx);
++		c->masked_base_ecx = c->boot_base_ecx & opt_cpuid_mask_ecx;
++		c->masked_base_edx = c->boot_base_edx & opt_cpuid_mask_edx;
++		c->masked_ext_ecx = c->boot_ext_ecx & opt_cpuid_mask_ext_ecx;
++		c->masked_ext_edx = c->boot_ext_edx & opt_cpuid_mask_ext_edx;
++	}
++
++	return result;
+ }
+ 
+ static DEFINE_PER_CPU(bool_t, cpuid_faulting_enabled);
+@@ -269,10 +281,10 @@ static void __devinit init_intel(struct 
+ 	}
+ 
+ 	if (smp_processor_id() == 0) {
+-		if (probe_intel_cpuid_faulting())
++		if (probe_intel_cpuid_faulting(c))
+ 			set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
+ 	} else if (boot_cpu_has(X86_FEATURE_CPUID_FAULTING)) {
+-		BUG_ON(!probe_intel_cpuid_faulting());
++		BUG_ON(!probe_intel_cpuid_faulting(c));
+ 		set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
+ 	}
+ 

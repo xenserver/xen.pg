@@ -1,0 +1,932 @@
+[LIBXC] Add support for the new restricted evtchn and privcmd ioctls.
+
+diff -r 3ea52ebdddb8 tools/include/xen-sys/Linux/evtchn.h
+--- a/tools/include/xen-sys/Linux/evtchn.h
++++ b/tools/include/xen-sys/Linux/evtchn.h
+@@ -85,4 +85,17 @@ struct ioctl_evtchn_notify {
+ #define IOCTL_EVTCHN_RESET				\
+ 	_IOC(_IOC_NONE, 'E', 5, 0)
+ 
++/* Restruct this file descriptor so that it can only be applied to a
++ * nominated domain.  Once a file descriptor has been restricted it
++ * cannot be de-restricted, and must be closed and re-openned.  Event
++ * channels which were bound before restricting remain bound
++ * afterwards, and can be notified as usual.
++ */
++#define IOCTL_EVTCHN_RESTRICT_DOMID                    \
++       _IOC(_IOC_NONE, 'E', 100, sizeof(struct ioctl_evtchn_restrict_domid))
++struct ioctl_evtchn_restrict_domid {
++       uint16_t domid;
++};
++
++
+ #endif /* __LINUX_PUBLIC_EVTCHN_H__ */
+diff -r 3ea52ebdddb8 tools/include/xen-sys/Linux/privcmd.h
+--- a/tools/include/xen-sys/Linux/privcmd.h
++++ b/tools/include/xen-sys/Linux/privcmd.h
+@@ -35,6 +35,14 @@
+ 
+ #include <linux/types.h>
+ 
++#ifdef __KERNEL__
++#include <xen/interface/hvm/hvm_op.h>
++#include <xen/interface/memory.h>
++#else
++#include <xen/hvm/hvm_op.h>
++#include <xen/memory.h>
++#endif
++
+ #ifndef __user
+ #define __user
+ #endif
+@@ -72,6 +80,38 @@ typedef struct privcmd_mmapbatch_v2 {
+ 	int __user *err;  /* array of error codes */
+ } privcmd_mmapbatch_v2_t;
+ 
++typedef struct privcmd_restrict_domid {
++       domid_t domid;
++} privcmd_restrict_domid_t;
++
++typedef struct privcmd_memop {
++        unsigned cmd;
++        union {
++                xen_memory_reservation_t reservation;
++                xen_memory_exchange_t exchange;
++                domid_t domid;
++                xen_add_to_physmap_t add_to_physmap;
++                xen_foreign_memory_map_t foreign_memory_map;
++                xen_machphys_mfn_list_t machphys_mfn_list;
++                xen_machphys_mapping_t machphys_mapping;
++                xen_memory_map_t memory_map;
++                xen_remove_from_physmap_t remove_from_physmap;
++        } u;
++} privcmd_memop_t;
++
++typedef struct privcmd_hvmop {
++        unsigned cmd;
++        union {
++                xen_hvm_param_t param;
++                xen_hvm_set_pci_intx_level_t set_pci_intx_level;
++                xen_hvm_set_isa_irq_level_t set_isa_irq_level;
++                xen_hvm_set_pci_link_route_t set_pci_link_route;
++                xen_hvm_modified_memory_t modified_memory;
++                xen_hvm_set_mem_type_t set_mem_type;
++                xen_hvm_track_dirty_vram_t track_dirty_vram;
++        } u;
++} privcmd_hvmop_t;
++
+ /*
+  * @cmd: IOCTL_PRIVCMD_HYPERCALL
+  * @arg: &privcmd_hypercall_t
+@@ -85,5 +125,17 @@ typedef struct privcmd_mmapbatch_v2 {
+ 	_IOC(_IOC_NONE, 'P', 3, sizeof(privcmd_mmapbatch_t))
+ #define IOCTL_PRIVCMD_MMAPBATCH_V2				\
+ 	_IOC(_IOC_NONE, 'P', 4, sizeof(privcmd_mmapbatch_v2_t))
++#define IOCTL_PRIVCMD_RESTRICT_DOMID                           \
++       _IOC(_IOC_NONE, 'P', 100, sizeof(privcmd_restrict_domid_t))
++#define IOCTL_PRIVCMD_DOMCTL                           \
++       _IOC(_IOC_NONE, 'P', 101, sizeof(xen_domctl_t))
++#define IOCTL_PRIVCMD_HVMOP                                    \
++       _IOC(_IOC_NONE, 'P', 102, sizeof(privcmd_hvmop_t))
++#define IOCTL_PRIVCMD_SHUTDOWN                                 \
++       _IOC(_IOC_NONE, 'P', 103, sizeof(sched_remote_shutdown_t))
++#define IOCTL_PRIVCMD_MEMOP                                    \
++       _IOC(_IOC_NONE, 'P', 104, sizeof(privcmd_memop_t))
++
++#define ARCH_IOCTL(d, r, a) ioctl(d, r, a)
+ 
+ #endif /* __LINUX_PUBLIC_PRIVCMD_H__ */
+diff -r 3ea52ebdddb8 tools/include/xen-sys/MiniOS/privcmd.h
+--- a/tools/include/xen-sys/MiniOS/privcmd.h
++++ b/tools/include/xen-sys/MiniOS/privcmd.h
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include <sys/types.h>
++#include <errno.h>
+ 
+ typedef struct privcmd_hypercall
+ {
+@@ -33,4 +34,6 @@ typedef struct privcmd_mmap_entry {
+ 	uint64_t mfn;
+ } privcmd_mmap_entry_t; 
+ 
++#define ARCH_IOCTL(d, r, a) (errno=EINVAL, -1)
++
+ #endif /* __MINIOS_PUBLIC_PRIVCMD_H__ */
+diff -r 3ea52ebdddb8 tools/include/xen-sys/NetBSD/privcmd.h
+--- a/tools/include/xen-sys/NetBSD/privcmd.h
++++ b/tools/include/xen-sys/NetBSD/privcmd.h
+@@ -86,6 +86,8 @@ typedef struct privcmd_blkmsg
+ #define IOCTL_PRIVCMD_GET_MACH2PHYS_START_MFN \
+     _IOR('P', 4, unsigned long)
+ 
++#define ARCH_IOCTL(d, r, a) ioctl(d, r, a)
++
+ /*
+  * @cmd: IOCTL_PRIVCMD_INITDOMAIN_EVTCHN
+  * @arg: n/a
+diff -r 3ea52ebdddb8 tools/include/xen-sys/SunOS/privcmd.h
+--- a/tools/include/xen-sys/SunOS/privcmd.h
++++ b/tools/include/xen-sys/SunOS/privcmd.h
+@@ -53,6 +53,7 @@ extern "C" {
+ #define	IOCTL_PRIVCMD_HYPERCALL		(__PRIVCMD_IOC|0)
+ #define	IOCTL_PRIVCMD_MMAP		(__PRIVCMD_IOC|1)
+ #define	IOCTL_PRIVCMD_MMAPBATCH		(__PRIVCMD_IOC|2)
++#define ARCH_IOCTL(d, r, a) ioctl(d, r, a)
+ 
+ typedef struct __privcmd_hypercall {
+ 	unsigned long op;
+diff -r 3ea52ebdddb8 tools/libxc/xc_domain.c
+--- a/tools/libxc/xc_domain.c
++++ b/tools/libxc/xc_domain.c
+@@ -25,6 +25,11 @@
+ #include <xen/memory.h>
+ #include <xen/hvm/hvm_op.h>
+ 
++int xc_interface_restrict(xc_interface *xch, domid_t dom)
++{
++    return xch->ops->u.privcmd.restrict_to(xch, xch->ops_handle, dom);
++}
++
+ int xc_domain_create(xc_interface *xch,
+                      uint32_t ssidref,
+                      xen_domain_handle_t handle,
+@@ -84,32 +89,31 @@ int xc_domain_shutdown(xc_interface *xch
+                        uint32_t domid,
+                        int reason)
+ {
+-    int ret = -1;
+     DECLARE_HYPERCALL;
+     DECLARE_HYPERCALL_BUFFER(sched_remote_shutdown_t, arg);
++    int rc;
+ 
+     arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+     if ( arg == NULL )
+-    {
+-        PERROR("Could not allocate memory for xc_domain_shutdown hypercall");
+-        goto out1;
+-    }
++        return -1;
+ 
+-    hypercall.op     = __HYPERVISOR_sched_op;
+-    hypercall.arg[0] = (unsigned long)SCHEDOP_remote_shutdown;
+-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+     arg->domain_id = domid;
+     arg->reason = reason;
+ 
+-    ret = do_xen_hypercall(xch, &hypercall);
++    rc = do_xen_arch_ioctl(xch, IOCTL_PRIVCMD_SHUTDOWN,
++                           HYPERCALL_BUFFER_AS_ARG(arg));
++    if (rc < 0 && errno == EINVAL) {
++        hypercall.op     = __HYPERVISOR_sched_op;
++        hypercall.arg[0] = (unsigned long)SCHEDOP_remote_shutdown;
++        hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
++
++        rc = do_xen_hypercall(xch, &hypercall);
++    }
+ 
+     xc_hypercall_buffer_free(xch, arg);
+-
+- out1:
+-    return ret;
++    return rc;
+ }
+ 
+-
+ int xc_vcpu_setaffinity(xc_interface *xch,
+                         uint32_t domid,
+                         int vcpu,
+@@ -1080,44 +1084,30 @@ int xc_domain_send_trigger(xc_interface 
+ 
+ int xc_set_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long value)
+ {
+-    DECLARE_HYPERCALL;
+-    DECLARE_HYPERCALL_BUFFER(xen_hvm_param_t, arg);
+-    int rc;
++    xen_hvm_param_t arg;
+ 
+-    arg = xc_hypercall_buffer_alloc(handle, arg, sizeof(*arg));
+-    if ( arg == NULL )
+-        return -1;
+-
+-    hypercall.op     = __HYPERVISOR_hvm_op;
+-    hypercall.arg[0] = HVMOP_set_param;
+-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+-    arg->domid = dom;
+-    arg->index = param;
+-    arg->value = value;
+-    rc = do_xen_hypercall(handle, &hypercall);
+-    xc_hypercall_buffer_free(handle, arg);
+-    return rc;
++    arg.domid = dom;
++    arg.index = param;
++    arg.value = value;
++    
++    return do_hvm_op(handle, HVMOP_set_param, &arg);
+ }
+ 
+ int xc_get_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long *value)
+ {
+-    DECLARE_HYPERCALL;
+-    DECLARE_HYPERCALL_BUFFER(xen_hvm_param_t, arg);
++    xen_hvm_param_t arg;
+     int rc;
+ 
+-    arg = xc_hypercall_buffer_alloc(handle, arg, sizeof(*arg));
+-    if ( arg == NULL )
+-        return -1;
++    arg.domid = dom;
++    arg.index = param;
++    arg.value = 0;
++    
++    rc = do_hvm_op(handle, HVMOP_get_param, &arg);
++    if (rc)
++        return rc;
+ 
+-    hypercall.op     = __HYPERVISOR_hvm_op;
+-    hypercall.arg[0] = HVMOP_get_param;
+-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+-    arg->domid = dom;
+-    arg->index = param;
+-    rc = do_xen_hypercall(handle, &hypercall);
+-    *value = arg->value;
+-    xc_hypercall_buffer_free(handle, arg);
+-    return rc;
++    *value = arg.value;
++    return 0;
+ }
+ 
+ int xc_domain_setdebugging(xc_interface *xch,
+diff -r 3ea52ebdddb8 tools/libxc/xc_evtchn.c
+--- a/tools/libxc/xc_evtchn.c
++++ b/tools/libxc/xc_evtchn.c
+@@ -65,6 +65,11 @@ xc_evtchn_alloc_unbound(xc_interface *xc
+     return rc;
+ }
+ 
++int xc_evtchn_restrict(xc_evtchn *xce, domid_t dom)
++{
++    return xce->ops->u.evtchn.restrict_to(xce, xce->ops_handle, dom);
++}
++
+ int xc_evtchn_reset(xc_interface *xch,
+                     uint32_t dom)
+ {
+diff -r 3ea52ebdddb8 tools/libxc/xc_linux_osdep.c
+--- a/tools/libxc/xc_linux_osdep.c
++++ b/tools/libxc/xc_linux_osdep.c
+@@ -44,6 +44,15 @@
+ #define PERROR(_m, _a...) xc_osdep_log(xch,XTL_ERROR,XC_INTERNAL_ERROR,_m \
+                   " (%d = %s)", ## _a , errno, xc_strerror(xch, errno))
+ 
++static int intf_restrict(xc_interface *xch, xc_osdep_handle h, domid_t domid)
++{
++    privcmd_restrict_domid_t prd;
++    int fd = (int)h;
++
++    prd.domid = domid;
++    return ioctl(fd, IOCTL_PRIVCMD_RESTRICT_DOMID, &prd);
++}
++
+ static xc_osdep_handle linux_privcmd_open(xc_interface *xch)
+ {
+     int flags, saved_errno;
+@@ -116,6 +125,12 @@ static int linux_privcmd_hypercall(xc_in
+     return ioctl(fd, IOCTL_PRIVCMD_HYPERCALL, hypercall);
+ }
+ 
++static int linux_arch_ioctl(xc_interface *xch, xc_osdep_handle h, int cmd, long int arg)
++{
++    int fd = (int)h;
++    return ioctl(fd, cmd, arg);
++}
++
+ static int xc_map_foreign_batch_single(int fd, uint32_t dom,
+                                        xen_pfn_t *mfn, unsigned long addr)
+ {
+@@ -425,16 +440,27 @@ static struct xc_osdep_ops linux_privcmd
+         .free_hypercall_buffer = &linux_privcmd_free_hypercall_buffer,
+ 
+         .hypercall = &linux_privcmd_hypercall,
++        .arch_ioctl = &linux_arch_ioctl,
+ 
+         .map_foreign_batch = &linux_privcmd_map_foreign_batch,
+         .map_foreign_bulk = &linux_privcmd_map_foreign_bulk,
+         .map_foreign_range = &linux_privcmd_map_foreign_range,
+         .map_foreign_ranges = &linux_privcmd_map_foreign_ranges,
++        .restrict_to = &intf_restrict,
+     },
+ };
+ 
+ #define DEVXEN "/dev/xen/"
+ 
++static int evtchn_restrict(xc_evtchn *xce, xc_osdep_handle h, domid_t domid)
++{
++    struct ioctl_evtchn_restrict_domid ierd;
++    int fd = (int)h;
++
++    ierd.domid = domid;
++    return ioctl(fd, IOCTL_EVTCHN_RESTRICT_DOMID, &ierd);
++}
++
+ static xc_osdep_handle linux_evtchn_open(xc_evtchn *xce)
+ {
+     int fd = open(DEVXEN "evtchn", O_RDWR);
+@@ -543,6 +569,7 @@ static struct xc_osdep_ops linux_evtchn_
+         .unbind = &linux_evtchn_unbind,
+         .pending = &linux_evtchn_pending,
+         .unmask = &linux_evtchn_unmask,
++        .restrict_to = &evtchn_restrict,
+     },
+ };
+ 
+diff -r 3ea52ebdddb8 tools/libxc/xc_minios.c
+--- a/tools/libxc/xc_minios.c
++++ b/tools/libxc/xc_minios.c
+@@ -104,6 +104,56 @@ static int minios_privcmd_hypercall(xc_i
+     return call.result;
+ }
+ 
++int xc_memory_op_new(int xc_handle, int cmd, void *arg)
++{
++    errno = EINVAL;
++    return -1;
++}
++
++int do_hvm_op(int xc_handle, unsigned cmd, void *arg)
++{
++    int rc;
++    size_t arg_size;
++    DECLARE_HYPERCALL;
++
++    switch (cmd) {
++    case HVMOP_set_param:
++    case HVMOP_get_param:
++        arg_size = sizeof(xen_hvm_param_t);
++        break;
++    case HVMOP_set_pci_intx_level:
++        arg_size = sizeof(xen_hvm_set_pci_intx_level_t);
++        break;
++    case HVMOP_set_isa_irq_level:
++        arg_size = sizeof(xen_hvm_set_isa_irq_level_t);
++        break;
++    case HVMOP_set_pci_link_route:
++        arg_size = sizeof(xen_hvm_set_pci_link_route_t);
++        break;
++    case HVMOP_modified_memory:
++        arg_size = sizeof(xen_hvm_modified_memory_t);
++        break;
++    case HVMOP_set_mem_type:
++        arg_size = sizeof(xen_hvm_set_mem_type_t);
++        break;
++    case HVMOP_track_dirty_vram:
++        arg_size = sizeof(xen_hvm_track_dirty_vram_t);
++        break;
++    default:
++        errno = EINVAL;
++        return -1;
++    }
++
++    hypercall.op     = __HYPERVISOR_hvm_op;
++    hypercall.arg[0] = cmd;
++    hypercall.arg[1] = (unsigned long)arg;
++    if ( lock_pages(arg, arg_size) != 0 )
++	    return -1;
++    rc = do_xen_hypercall(xc_handle, &hypercall);
++    unlock_pages(&arg, arg_size);
++    return rc;
++}
++
+ static void *minios_privcmd_map_foreign_bulk(xc_interface *xch, xc_osdep_handle h,
+                                              uint32_t dom, int prot,
+                                              const xen_pfn_t *arr, int *err, unsigned int num)
+diff -r 3ea52ebdddb8 tools/libxc/xc_misc.c
+--- a/tools/libxc/xc_misc.c
++++ b/tools/libxc/xc_misc.c
+@@ -376,33 +376,16 @@ int xc_hvm_set_pci_intx_level(
+     uint8_t domain, uint8_t bus, uint8_t device, uint8_t intx,
+     unsigned int level)
+ {
+-    DECLARE_HYPERCALL;
+-    DECLARE_HYPERCALL_BUFFER(struct xen_hvm_set_pci_intx_level, arg);
+-    int rc;
++    struct xen_hvm_set_pci_intx_level arg;
+ 
+-    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+-    if ( arg == NULL )
+-    {
+-        PERROR("Could not allocate memory for xc_hvm_set_pci_intx_level hypercall");
+-        return -1;
+-    }
++    arg.domid  = dom;
++    arg.domain = domain;
++    arg.bus    = bus;
++    arg.device = device;
++    arg.intx   = intx;
++    arg.level  = level;
+ 
+-    hypercall.op     = __HYPERVISOR_hvm_op;
+-    hypercall.arg[0] = HVMOP_set_pci_intx_level;
+-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+-
+-    arg->domid  = dom;
+-    arg->domain = domain;
+-    arg->bus    = bus;
+-    arg->device = device;
+-    arg->intx   = intx;
+-    arg->level  = level;
+-
+-    rc = do_xen_hypercall(xch, &hypercall);
+-
+-    xc_hypercall_buffer_free(xch, arg);
+-
+-    return rc;
++    return do_hvm_op(xch, HVMOP_set_pci_intx_level, &arg);
+ }
+ 
+ int xc_hvm_set_isa_irq_level(
+@@ -410,59 +393,25 @@ int xc_hvm_set_isa_irq_level(
+     uint8_t isa_irq,
+     unsigned int level)
+ {
+-    DECLARE_HYPERCALL;
+-    DECLARE_HYPERCALL_BUFFER(struct xen_hvm_set_isa_irq_level, arg);
+-    int rc;
++    struct xen_hvm_set_isa_irq_level arg;
+ 
+-    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+-    if ( arg == NULL )
+-    {
+-        PERROR("Could not allocate memory for xc_hvm_set_isa_irq_level hypercall");
+-        return -1;
+-    }
++    arg.domid   = dom;
++    arg.isa_irq = isa_irq;
++    arg.level   = level;
+ 
+-    hypercall.op     = __HYPERVISOR_hvm_op;
+-    hypercall.arg[0] = HVMOP_set_isa_irq_level;
+-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+-
+-    arg->domid   = dom;
+-    arg->isa_irq = isa_irq;
+-    arg->level   = level;
+-
+-    rc = do_xen_hypercall(xch, &hypercall);
+-
+-    xc_hypercall_buffer_free(xch, arg);
+-
+-    return rc;
++    return do_hvm_op(xch, HVMOP_set_isa_irq_level, &arg);
+ }
+ 
+ int xc_hvm_set_pci_link_route(
+     xc_interface *xch, domid_t dom, uint8_t link, uint8_t isa_irq)
+ {
+-    DECLARE_HYPERCALL;
+-    DECLARE_HYPERCALL_BUFFER(struct xen_hvm_set_pci_link_route, arg);
+-    int rc;
++    struct xen_hvm_set_pci_link_route arg;
+ 
+-    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+-    if ( arg == NULL )
+-    {
+-        PERROR("Could not allocate memory for xc_hvm_set_pci_link_route hypercall");
+-        return -1;
+-    }
++    arg.domid   = dom;
++    arg.link    = link;
++    arg.isa_irq = isa_irq;
+ 
+-    hypercall.op     = __HYPERVISOR_hvm_op;
+-    hypercall.arg[0] = HVMOP_set_pci_link_route;
+-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+-
+-    arg->domid   = dom;
+-    arg->link    = link;
+-    arg->isa_irq = isa_irq;
+-
+-    rc = do_xen_hypercall(xch, &hypercall);
+-
+-    xc_hypercall_buffer_free(xch, arg);
+-
+-    return rc;
++    return do_hvm_op(xch, HVMOP_set_pci_link_route, &arg);
+ }
+ 
+ int xc_hvm_inject_msi(
+@@ -499,32 +448,22 @@ int xc_hvm_track_dirty_vram(
+     uint64_t first_pfn, uint64_t nr,
+     unsigned long *dirty_bitmap)
+ {
+-    DECLARE_HYPERCALL;
++    struct xen_hvm_track_dirty_vram arg;
+     DECLARE_HYPERCALL_BOUNCE(dirty_bitmap, (nr+7) / 8, XC_HYPERCALL_BUFFER_BOUNCE_OUT);
+-    DECLARE_HYPERCALL_BUFFER(struct xen_hvm_track_dirty_vram, arg);
+     int rc;
+ 
+-    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+-    if ( arg == NULL || xc_hypercall_bounce_pre(xch, dirty_bitmap) )
++    if ( xc_hypercall_bounce_pre(xch, dirty_bitmap) )
+     {
+         PERROR("Could not bounce memory for xc_hvm_track_dirty_vram hypercall");
+-        rc = -1;
+-        goto out;
++        return -1;
+     }
+ 
+-    hypercall.op     = __HYPERVISOR_hvm_op;
+-    hypercall.arg[0] = HVMOP_track_dirty_vram;
+-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
++    arg.domid     = dom;
++    arg.first_pfn = first_pfn;
++    arg.nr        = nr;
++    set_xen_guest_handle(arg.dirty_bitmap, dirty_bitmap);
+ 
+-    arg->domid     = dom;
+-    arg->first_pfn = first_pfn;
+-    arg->nr        = nr;
+-    set_xen_guest_handle(arg->dirty_bitmap, dirty_bitmap);
+-
+-    rc = do_xen_hypercall(xch, &hypercall);
+-
+-out:
+-    xc_hypercall_buffer_free(xch, arg);
++    rc = do_hvm_op(xch, HVMOP_track_dirty_vram, &arg);
+     xc_hypercall_bounce_post(xch, dirty_bitmap);
+     return rc;
+ }
+@@ -532,60 +471,26 @@ out:
+ int xc_hvm_modified_memory(
+     xc_interface *xch, domid_t dom, uint64_t first_pfn, uint64_t nr)
+ {
+-    DECLARE_HYPERCALL;
+-    DECLARE_HYPERCALL_BUFFER(struct xen_hvm_modified_memory, arg);
+-    int rc;
++    struct xen_hvm_modified_memory arg;
+ 
+-    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+-    if ( arg == NULL )
+-    {
+-        PERROR("Could not allocate memory for xc_hvm_modified_memory hypercall");
+-        return -1;
+-    }
++    arg.domid     = dom;
++    arg.first_pfn = first_pfn;
++    arg.nr        = nr;
+ 
+-    hypercall.op     = __HYPERVISOR_hvm_op;
+-    hypercall.arg[0] = HVMOP_modified_memory;
+-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+-
+-    arg->domid     = dom;
+-    arg->first_pfn = first_pfn;
+-    arg->nr        = nr;
+-
+-    rc = do_xen_hypercall(xch, &hypercall);
+-
+-    xc_hypercall_buffer_free(xch, arg);
+-
+-    return rc;
++    return do_hvm_op(xch, HVMOP_modified_memory, &arg);
+ }
+ 
+ int xc_hvm_set_mem_type(
+     xc_interface *xch, domid_t dom, hvmmem_type_t mem_type, uint64_t first_pfn, uint64_t nr)
+ {
+-    DECLARE_HYPERCALL;
+-    DECLARE_HYPERCALL_BUFFER(struct xen_hvm_set_mem_type, arg);
+-    int rc;
++    struct xen_hvm_set_mem_type arg;
+ 
+-    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+-    if ( arg == NULL )
+-    {
+-        PERROR("Could not allocate memory for xc_hvm_set_mem_type hypercall");
+-        return -1;
+-    }
++    arg.domid        = dom;
++    arg.hvmmem_type  = mem_type;
++    arg.first_pfn    = first_pfn;
++    arg.nr           = nr;
+ 
+-    arg->domid        = dom;
+-    arg->hvmmem_type  = mem_type;
+-    arg->first_pfn    = first_pfn;
+-    arg->nr           = nr;
+-
+-    hypercall.op     = __HYPERVISOR_hvm_op;
+-    hypercall.arg[0] = HVMOP_set_mem_type;
+-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+-
+-    rc = do_xen_hypercall(xch, &hypercall);
+-
+-    xc_hypercall_buffer_free(xch, arg);
+-
+-    return rc;
++    return do_hvm_op(xch, HVMOP_set_mem_type, &arg);
+ }
+ 
+ int xc_hvm_set_mem_access(
+diff -r 3ea52ebdddb8 tools/libxc/xc_private.c
+--- a/tools/libxc/xc_private.c
++++ b/tools/libxc/xc_private.c
+@@ -244,6 +244,10 @@ int do_xen_hypercall(xc_interface *xch, 
+ {
+     return xch->ops->u.privcmd.hypercall(xch, xch->ops_handle, hypercall);
+ }
++int do_xen_arch_ioctl(xc_interface *xch, int req, long int arg)
++{
++    return xch->ops->u.privcmd.arch_ioctl(xch, xch->ops_handle, req, arg);
++}
+ 
+ xc_evtchn *xc_evtchn_open(xentoollog_logger *logger,
+                              unsigned open_flags)
+@@ -513,6 +517,74 @@ int xc_flush_mmu_updates(xc_interface *x
+     return flush_mmu_updates(xch, mmu);
+ }
+ 
++int do_hvm_op(xc_interface *xch, unsigned cmd, void *arg)
++{
++    privcmd_hvmop_t pht;
++    size_t arg_size;
++    int rc;
++
++    errno = 0;
++
++    switch (cmd) {
++    case HVMOP_set_param:
++    case HVMOP_get_param:
++        arg_size = sizeof(pht.u.param);
++        break;
++    case HVMOP_set_pci_intx_level:
++        arg_size = sizeof(pht.u.set_pci_intx_level);
++        break;
++    case HVMOP_set_isa_irq_level:
++        arg_size = sizeof(pht.u.set_isa_irq_level);
++        break;
++    case HVMOP_set_pci_link_route:
++        arg_size = sizeof(pht.u.set_pci_link_route);
++        break;
++    case HVMOP_modified_memory:
++        arg_size = sizeof(pht.u.modified_memory);
++        break;
++    case HVMOP_set_mem_type:
++        arg_size = sizeof(pht.u.set_mem_type);
++        break;
++    case HVMOP_track_dirty_vram:
++        arg_size = sizeof(pht.u.track_dirty_vram);
++        break;
++    default:
++        /* No implemention for this subop - fall back to direct hypercall */
++        return -1;
++    }
++
++    if (errno == 0) {
++        pht.cmd = cmd;
++        memcpy(&pht.u, arg, arg_size);
++        rc = do_xen_arch_ioctl(xch, IOCTL_PRIVCMD_HVMOP, (long int)&pht);
++        if (rc >= 0) {
++            memcpy(arg, &pht.u, arg_size);
++            return rc;
++        }
++    }
++
++    if (errno == EINVAL) {
++        DECLARE_HYPERCALL;
++        DECLARE_HYPERCALL_BOUNCE(arg, arg_size, XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
++
++        if ( xc_hypercall_bounce_pre(xch, arg) )
++        {
++            PERROR("Could not bounce memory for HVMOP hypercall");
++            return -1;
++        }
++
++        hypercall.op     = __HYPERVISOR_hvm_op;
++        hypercall.arg[0] = cmd;
++        hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
++
++        rc = do_xen_hypercall(xch, &hypercall);
++        xc_hypercall_bounce_post(xch, arg);
++    }
++
++    return rc;
++}
++
++/*
+ int do_memory_op(xc_interface *xch, int cmd, void *arg, size_t len)
+ {
+     DECLARE_HYPERCALL;
+@@ -535,6 +607,90 @@ int do_memory_op(xc_interface *xch, int 
+  out1:
+     return ret;
+ }
++*/
++
++int do_memory_op(xc_interface *xch, int cmd, void *arg, size_t len)
++{
++    privcmd_memop_t pmt;
++    long ret = -EINVAL;
++    size_t arg_size;
++
++    errno = 0;
++
++    switch (cmd) {
++    case XENMEM_increase_reservation:
++    case XENMEM_decrease_reservation:
++    case XENMEM_populate_physmap:
++        arg_size = sizeof(pmt.u.reservation);
++        break;
++    case XENMEM_exchange:
++        arg_size = sizeof(pmt.u.exchange);
++        break;
++    case XENMEM_maximum_ram_page:
++        arg_size = 0;
++        break;
++    case XENMEM_current_reservation:
++    case XENMEM_maximum_reservation:
++    case XENMEM_maximum_gpfn:
++        arg_size = sizeof(pmt.u.domid);
++        break;
++    case XENMEM_machphys_mfn_list:
++        arg_size = sizeof(pmt.u.machphys_mfn_list);
++        break;
++    case XENMEM_machphys_mapping:
++        arg_size = sizeof(pmt.u.machphys_mapping);
++        break;
++    case XENMEM_add_to_physmap:
++        arg_size = sizeof(pmt.u.add_to_physmap);
++        break;
++    case XENMEM_remove_from_physmap:
++        arg_size = sizeof(pmt.u.remove_from_physmap);
++        break;
++    case XENMEM_memory_map:
++    case XENMEM_machine_memory_map:
++        arg_size = sizeof(pmt.u.memory_map);
++        break;
++    case XENMEM_set_memory_map:
++        arg_size = sizeof(pmt.u.foreign_memory_map);
++        break;
++    default:
++        /* No implemention for this subop - fall back to direct hypercall */
++        errno = EINVAL;
++        arg_size = len;
++        break;
++    }
++
++    if (errno == 0) {
++        pmt.cmd = cmd;
++        memcpy(&pmt.u, arg, arg_size);
++
++        ret = do_xen_arch_ioctl(xch, IOCTL_PRIVCMD_MEMOP, (long int)&pmt);
++        if (ret >= 0) {
++            memcpy(arg, &pmt.u, arg_size);
++            return ret;
++        }
++    }
++
++    if (errno == EINVAL) {
++        DECLARE_HYPERCALL;
++        DECLARE_HYPERCALL_BOUNCE(arg, len, XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
++
++        if ( xc_hypercall_bounce_pre(xch, arg) )
++        {
++            PERROR("Could not bounce memory for XENMEM hypercall");
++            return -1;
++        }
++
++        hypercall.op     = __HYPERVISOR_memory_op;
++        hypercall.arg[0] = (unsigned long) cmd;
++        hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
++
++        ret = do_xen_hypercall(xch, &hypercall);
++        xc_hypercall_bounce_post(xch, arg);
++    }
++
++    return ret;
++}
+ 
+ long xc_maximum_ram_page(xc_interface *xch)
+ {
+@@ -574,9 +730,10 @@ int xc_machphys_mfn_list(xc_interface *x
+ 
+     set_xen_guest_handle(xmml.extent_start, extent_start);
+     rc = do_memory_op(xch, XENMEM_machphys_mfn_list, &xmml, sizeof(xmml));
+-    if (rc || xmml.nr_extents != max_extents)
++    if (rc || xmml.nr_extents != max_extents) {
++        ERROR("xc_machphys_mfn_list: %ld != %ld", xmml.nr_extents, max_extents);
+         rc = -1;
+-    else
++    }else
+         rc = 0;
+ 
+     xc_hypercall_bounce_post(xch, extent_start);
+diff -r 3ea52ebdddb8 tools/libxc/xc_private.h
+--- a/tools/libxc/xc_private.h
++++ b/tools/libxc/xc_private.h
+@@ -32,6 +32,7 @@
+ #include "xenctrl.h"
+ #include "xenctrlosdep.h"
+ 
++#include <xen/hvm/hvm_op.h>
+ #include <xen/sys/privcmd.h>
+ 
+ /* valgrind cannot see when a hypercall has filled in some values.  For this
+@@ -191,6 +192,8 @@ void xc__hypercall_buffer_cache_release(
+  */
+ 
+ int do_xen_hypercall(xc_interface *xch, privcmd_hypercall_t *hypercall);
++int do_xen_arch_ioctl(xc_interface *xch, int req, long int arg);
++int do_hvm_op(xc_interface *xch, unsigned cmd, void *arg);
+ 
+ static inline int do_xen_version(xc_interface *xch, int cmd, xc_hypercall_buffer_t *dest)
+ {
+@@ -246,14 +249,21 @@ static inline int do_domctl(xc_interface
+         goto out1;
+     }
+ 
+-    hypercall.op     = __HYPERVISOR_domctl;
+-    hypercall.arg[0] = HYPERCALL_BUFFER_AS_ARG(domctl);
++    /* Try the new interface first, then fall back to the old one. */
++    ret = do_xen_arch_ioctl(xch, IOCTL_PRIVCMD_DOMCTL,
++                     HYPERCALL_BUFFER_AS_ARG(domctl));
++    if (ret < 0 && errno == EINVAL) {
++        /* The new interface failed, and it's likely to be because
++           it's not available.  Try the old one. */
++        hypercall.op     = __HYPERVISOR_domctl;
++        hypercall.arg[0] = HYPERCALL_BUFFER_AS_ARG(domctl);
+ 
+-    if ( (ret = do_xen_hypercall(xch, &hypercall)) < 0 )
+-    {
+-        if ( errno == EACCES )
+-            DPRINTF("domctl operation failed -- need to"
+-                    " rebuild the user-space tool set?\n");
++        if ( (ret = do_xen_hypercall(xch, &hypercall)) < 0 )
++        {
++            if ( errno == EACCES )
++                DPRINTF("domctl operation failed -- need to"
++                        " rebuild the user-space tool set?\n");
++        }
+     }
+ 
+     xc_hypercall_bounce_post(xch, domctl);
+diff -r 3ea52ebdddb8 tools/libxc/xenctrl.h
+--- a/tools/libxc/xenctrl.h
++++ b/tools/libxc/xenctrl.h
+@@ -189,6 +189,14 @@ int xc_interface_close(xc_interface *xch
+  */
+ int xc_interface_is_fake(void);
+ 
++ /**
++  * Restrict a handle to the event channel driver so that it only works
++  * for one domain.
++  *
++  * @return zero on success
++  */
++int xc_evtchn_restrict(xc_evtchn *xce, domid_t domid);
++
+ /*
+  * HYPERCALL SAFE MEMORY BUFFER
+  *
+@@ -368,6 +376,18 @@ xc_cpumap_t xc_cpumap_alloc(xc_interface
+ /* return maximum number of NUMA nodes the hypervisor supports */
+ int xc_get_max_nodes(xc_interface *xch);
+ 
++/**
++ * This function restricts an open hypervisor interface so that it can
++ * only be applied to a particular domain.  It cannot subsequently be
++ * unrestricted.
++ *
++ *
++ * @parm xc_handle a handle to an open hypervisor interface
++ * @parm domid the domain to restrict to
++ * @return 0 on success, -1 otherwise.
++ */
++int xc_interface_restrict(xc_interface *xch, domid_t domid);
++
+ /*
+  * DOMAIN DEBUGGING FUNCTIONS
+  */
+diff -r 3ea52ebdddb8 tools/libxc/xenctrlosdep.h
+--- a/tools/libxc/xenctrlosdep.h
++++ b/tools/libxc/xenctrlosdep.h
+@@ -89,6 +89,10 @@ struct xc_osdep_ops
+             void *(*map_foreign_ranges)(xc_interface *xch, xc_osdep_handle h, uint32_t dom, size_t size, int prot,
+                                         size_t chunksize, privcmd_mmap_entry_t entries[],
+                                         int nentries);
++#define XENCTRL_HAS_ARCH_IOCTL 1
++            int (*arch_ioctl)(xc_interface *xch, xc_osdep_handle h, int cmd, long int arg);
++#define XENCTRL_HAS_RESTRICT_TO 1
++            int (*restrict_to)(xc_interface *xch, xc_osdep_handle h, domid_t domid);
+         } privcmd;
+         struct {
+             int (*fd)(xc_evtchn *xce, xc_osdep_handle h);
+@@ -104,6 +108,7 @@ struct xc_osdep_ops
+ 
+             evtchn_port_or_error_t (*pending)(xc_evtchn *xce, xc_osdep_handle h);
+             int (*unmask)(xc_evtchn *xce, xc_osdep_handle h, evtchn_port_t port);
++            int (*restrict_to)(xc_interface *xch, xc_osdep_handle h, domid_t domid);
+         } evtchn;
+         struct {
+ #define XC_GRANT_MAP_SINGLE_DOMAIN 0x1

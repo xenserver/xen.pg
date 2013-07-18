@@ -1,0 +1,90 @@
+# HG changeset patch
+# Parent 0bd32c19873e4ff55c07cb4147b62ce7085bc935
+tools/libxc: Implement xc_readconsolering_buffer().
+
+Functions identically to xc_readconsolering(), but uses a user-provided
+xc_hypercall_buffer_t to save using a bounce buffer.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+--
+Changes since v2:
+ * Document xc_readconsolering() and xc_readconsolering_buffer() functions
+Changes since v1:
+ * Reduce xc_readconsolering() to use xc_readconsolering_buffer()
+
+diff -r 0bd32c19873e tools/libxc/xc_misc.c
+--- a/tools/libxc/xc_misc.c
++++ b/tools/libxc/xc_misc.c
+@@ -70,13 +70,29 @@ int xc_readconsolering(xc_interface *xch
+                        int clear, int incremental, uint32_t *pindex)
+ {
+     int ret;
+-    unsigned int nr_chars = *pnr_chars;
+-    DECLARE_SYSCTL;
+-    DECLARE_HYPERCALL_BOUNCE(buffer, nr_chars, XC_HYPERCALL_BUFFER_BOUNCE_OUT);
++    DECLARE_HYPERCALL_BOUNCE(buffer, *pnr_chars, XC_HYPERCALL_BUFFER_BOUNCE_OUT);
+ 
+     if ( xc_hypercall_bounce_pre(xch, buffer) )
+         return -1;
+ 
++    ret = xc_readconsolering_buffer(xch, HYPERCALL_BUFFER(buffer),
++                                    pnr_chars, clear, incremental, pindex);
++
++    xc_hypercall_bounce_post(xch, buffer);
++
++    return ret;
++}
++
++int xc_readconsolering_buffer(xc_interface *xch,
++                              xc_hypercall_buffer_t *buffer,
++                              unsigned int *pnr_chars,
++                              int clear, int incremental, uint32_t *pindex)
++{
++    int ret;
++    unsigned int nr_chars = *pnr_chars;
++    DECLARE_SYSCTL;
++    DECLARE_HYPERCALL_BUFFER_ARGUMENT(buffer);
++
+     sysctl.cmd = XEN_SYSCTL_readconsole;
+     set_xen_guest_handle(sysctl.u.readconsole.buffer, buffer);
+     sysctl.u.readconsole.count = nr_chars;
+@@ -95,8 +111,6 @@ int xc_readconsolering(xc_interface *xch
+             *pindex = sysctl.u.readconsole.index;
+     }
+ 
+-    xc_hypercall_bounce_post(xch, buffer);
+-
+     return ret;
+ }
+ 
+diff -r 0bd32c19873e tools/libxc/xenctrl.h
+--- a/tools/libxc/xenctrl.h
++++ b/tools/libxc/xenctrl.h
+@@ -994,10 +994,26 @@ int xc_physdev_pci_access_modify(xc_inte
+                                  int func,
+                                  int enable);
+ 
++/*
++ * For both readconsolering functions, *pnr_chars is both an input and
++ * output.  As an input, it specifies the size of *buffer, and as an output
++ * indicates now many character Xen wrote into *buffer.
++ *
++ * The 'clear' parameter indicates whether Xen should clear the buffer or not.
++ * If incremental is set, *pindex is an input and output parameter to aid with
++ * sequential small reads of the console ring.
++ *
++ * xc_readconsolering_buffer is preferred to avoid an extra copy of the console
++ * ring buffer.
++ */
+ int xc_readconsolering(xc_interface *xch,
+                        char *buffer,
+                        unsigned int *pnr_chars,
+                        int clear, int incremental, uint32_t *pindex);
++int xc_readconsolering_buffer(xc_interface *xch,
++                              xc_hypercall_buffer_t *buffer,
++                              unsigned int *pnr_chars,
++                              int clear, int incremental, uint32_t *pindex);
+ int xc_consoleringsize(xc_interface *xch, uint64_t *psize);
+ 
+ int xc_send_debug_keys(xc_interface *xch, char *keys);

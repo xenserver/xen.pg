@@ -1,0 +1,115 @@
+# HG changeset patch
+# User Jan Beulich <jbeulich@suse.com>
+# Date 1348125775 -7200
+# Node ID 06a0774df47cad34ad889767bd65bdf1722dd76a
+# Parent  14980591956954584f3cd87bf4e8d306360e7f27
+ACPI: move tables.c fully into .init.*
+
+The only non-init item was the space reserved for the initial tables,
+but we can as well dynamically allocate that array.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 149805919569 -r 06a0774df47c xen/drivers/acpi/Makefile
+--- a/xen/drivers/acpi/Makefile
++++ b/xen/drivers/acpi/Makefile
+@@ -2,7 +2,7 @@ subdir-y += tables
+ subdir-y += utilities
+ subdir-$(x86) += apei
+ 
+-obj-y += tables.o
++obj-bin-y += tables.init.o
+ obj-y += numa.o
+ obj-y += osl.o
+ obj-y += pmstat.o
+diff -r 149805919569 -r 06a0774df47c xen/drivers/acpi/osl.c
+--- a/xen/drivers/acpi/osl.c
++++ b/xen/drivers/acpi/osl.c
+@@ -27,6 +27,7 @@
+ #include <asm/io.h>
+ #include <xen/config.h>
+ #include <xen/init.h>
++#include <xen/pfn.h>
+ #include <xen/types.h>
+ #include <xen/errno.h>
+ #include <xen/acpi.h>
+@@ -182,3 +183,38 @@ acpi_os_write_memory(acpi_physical_addre
+ 
+ 	return AE_OK;
+ }
++
++#define is_xmalloc_memory(ptr) ((unsigned long)(ptr) & (PAGE_SIZE - 1))
++
++void *__init acpi_os_alloc_memory(size_t sz)
++{
++	void *ptr;
++
++	if (system_state == SYS_STATE_early_boot)
++		return mfn_to_virt(alloc_boot_pages(PFN_UP(sz), 1));
++
++	ptr = xmalloc_bytes(sz);
++	ASSERT(!ptr || is_xmalloc_memory(ptr));
++	return ptr;
++}
++
++void *__init acpi_os_zalloc_memory(size_t sz)
++{
++	void *ptr;
++
++	if (system_state != SYS_STATE_early_boot) {
++		ptr = xzalloc_bytes(sz);
++		ASSERT(!ptr || is_xmalloc_memory(ptr));
++		return ptr;
++	}
++	ptr = acpi_os_alloc_memory(sz);
++	return ptr ? memset(ptr, 0, sz) : NULL;
++}
++
++void __init acpi_os_free_memory(void *ptr)
++{
++	if (is_xmalloc_memory(ptr))
++		xfree(ptr);
++	else if (ptr && system_state == SYS_STATE_early_boot)
++		init_boot_pages(__pa(ptr), __pa(ptr) + PAGE_SIZE);
++}
+diff -r 149805919569 -r 06a0774df47c xen/drivers/acpi/tables.c
+--- a/xen/drivers/acpi/tables.c
++++ b/xen/drivers/acpi/tables.c
+@@ -41,8 +41,6 @@ mps_inti_flags_polarity[] = { "dfl", "hi
+ static const char *__initdata
+ mps_inti_flags_trigger[] = { "dfl", "edge", "res", "level" };
+ 
+-static struct acpi_table_desc initial_tables[ACPI_MAX_TABLES];
+-
+ static int acpi_apic_instance __initdata;
+ 
+ void __init acpi_table_print_madt_entry(struct acpi_subtable_header *header)
+@@ -324,7 +322,7 @@ static void __init check_multiple_madt(v
+ 
+ int __init acpi_table_init(void)
+ {
+-	acpi_initialize_tables(initial_tables, ACPI_MAX_TABLES, 0);
++	acpi_initialize_tables(NULL, ACPI_MAX_TABLES, 0);
+ 	check_multiple_madt();
+ 	return 0;
+ }
+diff -r 149805919569 -r 06a0774df47c xen/include/acpi/platform/aclinux.h
+--- a/xen/include/acpi/platform/aclinux.h
++++ b/xen/include/acpi/platform/aclinux.h
+@@ -76,8 +76,12 @@
+ 
+ #define acpi_thread_id struct vcpu *
+ 
+-#define ACPI_ALLOCATE(a)	xmalloc_bytes(a)
+-#define ACPI_ALLOCATE_ZEROED(a)	xzalloc_bytes(a)
+-#define ACPI_FREE(a)		xfree(a)
++void *acpi_os_alloc_memory(size_t);
++void *acpi_os_zalloc_memory(size_t);
++void acpi_os_free_memory(void *);
++
++#define ACPI_ALLOCATE(a)	acpi_os_alloc_memory(a)
++#define ACPI_ALLOCATE_ZEROED(a)	acpi_os_zalloc_memory(a)
++#define ACPI_FREE(a)		acpi_os_free_memory(a)
+ 
+ #endif				/* __ACLINUX_H__ */

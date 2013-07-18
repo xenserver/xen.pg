@@ -1,0 +1,201 @@
+Some cosmetic tweaks to the BIOS that are all that's left of the
+original OEM customization (including SMBIOS passthrough via Xen).
+
+diff -r 64da5f1296b5 tools/firmware/rombios/rombios.c
+--- a/tools/firmware/rombios/rombios.c	Thu Jul 08 12:34:35 2010 +0100
++++ b/tools/firmware/rombios/rombios.c	Thu Jul 08 12:35:44 2010 +0100
+@@ -2023,28 +2023,9 @@
+ void
+ print_bios_banner()
+ {
+-  printf(BX_APPNAME" BIOS - build: %s\n%s\nOptions: ",
+-    BIOS_BUILD_DATE, bios_cvs_version_string);
+-  printf(
+-#if BX_APM
+-  "apmbios "
+-#endif
+-#if BX_PCIBIOS
+-  "pcibios "
+-#endif
+-#if BX_ELTORITO_BOOT
+-  "eltorito "
+-#endif
+-#if BX_ROMBIOS32
+-  "rombios32 "
+-#endif
+-#if BX_TCGBIOS
+-  "TCG-enabled "
+-#endif
+-#if BX_PMM
+-  "PMM "
+-#endif
+-  "\n\n");
++  int i = 0;
++  for (; i < BX_SMP_PROCESSORS; i++)
++    printf("Processor %d: Xen(R) Virtual CPU\n", i+1);
+ }
+ 
+ //--------------------------------------------------------------------------
+@@ -2062,7 +2043,7 @@
+ // http://www.phoenix.com/en/Customer+Services/White+Papers-Specs/pc+industry+specifications.htm
+ //--------------------------------------------------------------------------
+ 
+-static char drivetypes[][10]={"", "Floppy","Hard Disk","CD-Rom", "Network"};
++static char drivetypes[][11]={"", "Floppy","Hard Drive","CD-Rom", "Network"};
+ 
+ static void
+ init_boot_vectors()
+@@ -2203,7 +2184,7 @@
+   /* NIC appears as type 0x80 */
+   if (type == IPL_TYPE_BEV) type = 0x4;
+   if (type == 0 || type > 0x4) BX_PANIC("Bad drive type\n");
+-  printf("Booting from %s", drivetypes[type]);
++  printf("Boot device: %s", drivetypes[type]);
+   /* print product string if BEV */
+   if (type == 4 && desc != 0) {
+     /* first 32 bytes are significant */
+@@ -2212,7 +2193,6 @@
+     description[32] = 0;
+     printf(" [%S]", ss, description);
+   }
+-  printf("...\n");
+ }
+ 
+ //--------------------------------------------------------------------------
+@@ -2225,13 +2205,13 @@
+ {
+   if (type == 0 || type > 0x3) BX_PANIC("Bad drive type\n");
+ 
+-  printf("Boot from %s failed", drivetypes[type]);
++  printf(" - failure", drivetypes[type]);
+   if (type < 4) {
+     /* Report the reason too */
+     if (reason==0)
+-      printf(": not a bootable disk");
++      printf(": disk not bootable");
+     else
+-      printf(": could not read the boot disk");
++      printf(": could not read boot disk");
+   }
+   printf("\n\n");
+ }
+@@ -2244,7 +2224,7 @@
+ print_cdromboot_failure( code )
+   Bit16u code;
+ {
+-  bios_printf(BIOS_PRINTF_SCREEN | BIOS_PRINTF_INFO, "CDROM boot failure code : %04x\n",code);
++  //bios_printf(BIOS_PRINTF_SCREEN | BIOS_PRINTF_INFO, "CDROM boot failure code : %04x\n",code);
+ 
+   return;
+ }
+@@ -2853,23 +2833,21 @@
+ 
+       switch (type) {
+         case ATA_TYPE_ATA:
+-          printf("ata%d %s: ",channel,slave?" slave":"master");
+-          i=0; while(c=read_byte(get_SS(),model+i++)) printf("%c",c);
++          printf("XS Virtual IDE Controller      Hard Drive");
+ 	  if (sizeinmb < (1UL<<16))
+-            printf(" ATA-%d Hard-Disk (%4u MBytes)\n", version, (Bit16u)sizeinmb);
++            printf(" (%uMB)\n", sizeinmb);
+ 	  else
+-            printf(" ATA-%d Hard-Disk (%4u GBytes)\n", version, (Bit16u)(sizeinmb>>10));
++            printf(" (%uGB)\n", sizeinmb>>10);
+           break;
+         case ATA_TYPE_ATAPI:
+-          printf("ata%d %s: ",channel,slave?" slave":"master");
+-          i=0; while(c=read_byte(get_SS(),model+i++)) printf("%c",c);
++          printf("XS Virtual ATAPI-");
+           if(read_byte(ebda_seg,&EbdaData->ata.devices[device].device)==ATA_DEVICE_CDROM)
+-            printf(" ATAPI-%d CD-Rom/DVD-Rom\n",version);
++            printf("%d             CD-Rom/DVD-Rom\n",version);
+           else
+-            printf(" ATAPI-%d Device\n",version);
++            printf("%d             Device\n",version);
+           break;
+         case ATA_TYPE_UNKNOWN:
+-          printf("ata%d %s: Unknown device\n",channel,slave?" slave":"master");
++          printf("Unknown device\n");
+           break;
+         }
+       }
+@@ -8364,6 +8342,8 @@
+ 
+   default: return;
+   }
++
++  printf(" - success.\n");
+ 
+   /* Debugging info */
+   BX_INFO("Booting from %x:%x\n", bootseg, bootip);
+diff -r 64da5f1296b5 tools/firmware/vgabios/vgabios.c
+--- a/tools/firmware/vgabios/vgabios.c	Thu Jul 08 12:34:35 2010 +0100
++++ b/tools/firmware/vgabios/vgabios.c	Thu Jul 08 12:35:44 2010 +0100
+@@ -223,6 +223,14 @@
+ .byte 0x80 // last image
+ .word 0 // reserved
+ #endif
++
++
++oem_splash:
++.ascii	"Citrix XenServer"
++.byte	0x0a,0x0d
++.ascii	"www.citrix.com"
++.byte	0x0a,0x0d
++.byte	0x00
+ 
+ 
+ ;; ============================================================================================
+@@ -524,7 +532,7 @@
+ 
+ // --------------------------------------------------------------------------------------------
+ /*
+- *  Tell who we are
++ *  Splash the BIOS start display
+  */
+ 
+ static void display_info()
+@@ -532,19 +540,22 @@
+ ASM_START
+  mov ax,#0xc000
+  mov ds,ax
+- mov si,#vgabios_name
+- call _display_string
+- mov si,#vgabios_version
+- call _display_string
++ ;;mov si,#vgabios_name
++ ;;call _display_string
++ ;;mov si,#vgabios_version
++ ;;call _display_string
+  
+  ;;mov si,#vgabios_copyright
+  ;;call _display_string
+  ;;mov si,#crlf
+  ;;call _display_string
+ 
+- mov si,#vgabios_license
+- call _display_string
+- mov si,#vgabios_website
++ ;;mov si,#vgabios_license
++ ;;call _display_string
++ ;;mov si,#vgabios_website
++ ;;call _display_string
++
++ mov si,#oem_splash
+  call _display_string
+ ASM_END
+ }
+@@ -572,7 +583,12 @@
+  
+  pop cx
+  mov ax,#0x1301
+- mov bx,#0x000b
++ ;;mov bx,#0x000b
++ // Set the colour of the display string.
++ // 0007 : light gray
++ // 000b : cyan (yuck)
++ // 000f : white
++ mov bx,#0x0007
+  mov bp,si
+  int #0x10
+ ASM_END

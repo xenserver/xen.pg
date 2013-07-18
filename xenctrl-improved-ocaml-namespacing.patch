@@ -1,0 +1,495 @@
+# HG changeset patch
+# Parent 2c317cbeca7a171a096d12c89e25c4d65db5a454
+Encapsulate several OCaml types within xenctrl.
+
+This is done mainly because OCaml record type fields share the same namespace.
+Due to this, several fields of the modified types were hidden, and therefore
+inaccessible. Encapsulating the types within their own modules (in a standard
+way), puts the field names within sub-namespaces, and so makes all fields
+accessible.
+
+Note that this is not a backward-compatible change. For example, code in xcp's
+xen-api component needs to be modified accordingly.
+
+Signed-off-by: Rok Strnisa <rok.strnisa@citrix.com>
+
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -19,87 +19,94 @@ type domid = int
+ 
+ (* ** xenctrl.h ** *)
+ 
+-type vcpuinfo =
+-{
+-	online: bool;
+-	blocked: bool;
+-	running: bool;
+-	cputime: int64;
+-	cpumap: int32;
+-}
++module Vcpu_info = struct
++	type t = {
++		online : bool;
++		blocked : bool;
++		running : bool;
++		cputime : int64;
++		cpumap : int32;
++	}
++end
+ 
+-type runstateinfo = {
+-  state : int32;
+-  missed_changes: int32;
+-  state_entry_time : int64;
+-  time0 : int64;
+-  time1 : int64;
+-  time2 : int64;
+-  time3 : int64;
+-  time4 : int64;
+-  time5 : int64;
+-}
++module Runstate_info = struct
++	type t = {
++		state : int32;
++		missed_changes : int32;
++		state_entry_time : int64;
++		time0 : int64;
++		time1 : int64;
++		time2 : int64;
++		time3 : int64;
++		time4 : int64;
++		time5 : int64;
++	}
++end
+ 
+-type domaininfo =
+-{
+-	domid             : domid;
+-	dying             : bool;
+-	shutdown          : bool;
+-	paused            : bool;
+-	blocked           : bool;
+-	running           : bool;
+-	hvm_guest         : bool;
+-	shutdown_code     : int;
+-	total_memory_pages: nativeint;
+-	max_memory_pages  : nativeint;
+-	shared_info_frame : int64;
+-	cpu_time          : int64;
+-	nr_online_vcpus   : int;
+-	max_vcpu_id       : int;
+-	ssidref           : int32;
+-	handle            : int array;
+-}
++module Domain_info = struct
++	type t = {
++		domid : domid;
++		dying : bool;
++		shutdown : bool;
++		paused : bool;
++		blocked : bool;
++		running : bool;
++		hvm_guest : bool;
++		shutdown_code : int;
++		total_memory_pages : nativeint;
++		max_memory_pages : nativeint;
++		shared_info_frame : int64;
++		cpu_time : int64;
++		nr_online_vcpus : int;
++		max_vcpu_id : int;
++		ssidref : int32;
++		handle : int array;
++	}
++end
+ 
+-type sched_control =
+-{
+-	weight : int;
+-	cap    : int;
+-}
++module Sched_control = struct
++	type t = {
++		weight : int;
++		cap : int;
++	}
++end
+ 
+-type physinfo_cap_flag =
+-	| CAP_HVM
+-	| CAP_DirectIO
++module Phys_info = struct
++	type cap_flag =
++		| CAP_HVM
++		| CAP_DirectIO
+ 
+-type physinfo =
+-{
+-	threads_per_core : int;
+-	cores_per_socket : int;
+-	nr_cpus          : int;
+-	max_node_id      : int;
+-	cpu_khz          : int;
+-	total_pages      : nativeint;
+-	free_pages       : nativeint;
+-	scrub_pages      : nativeint;
+-	(* XXX hw_cap *)
+-	capabilities     : physinfo_cap_flag list;
+-	max_nr_cpus      : int;
+-}
++	type t = {
++		threads_per_core : int;
++		cores_per_socket : int;
++		nr_cpus : int;
++		max_node_id : int;
++		cpu_khz : int;
++		total_pages : nativeint;
++		free_pages : nativeint;
++		scrub_pages : nativeint;
++		(* XXX hw_cap *)
++		capabilities : cap_flag list;
++		max_nr_cpus : int;
++	}
++end
+ 
+-type version =
+-{
+-	major : int;
+-	minor : int;
+-	extra : string;
+-}
++module Version = struct
++	type t = {
++		major : int;
++		minor : int;
++		extra : string;
++	}
++end
+ 
+-
+-type compile_info =
+-{
+-	compiler : string;
+-	compile_by : string;
+-	compile_domain : string;
+-	compile_date : string;
+-}
++module Compile_info = struct
++	type t = {
++		compiler : string;
++		compile_by : string;
++		compile_domain : string;
++		compile_date : string;
++	}
++end
+ 
+ type shutdown_reason = Poweroff | Reboot | Suspend | Crash | Halt
+ 
+@@ -160,23 +167,23 @@ external domain_destroy: handle -> domid
+ external domain_shutdown: handle -> domid -> shutdown_reason -> unit
+        = "stub_xc_domain_shutdown"
+ 
+-external _domain_getinfolist: handle -> domid -> int -> domaininfo list
++external _domain_getinfolist: handle -> domid -> int -> Domain_info.t list
+        = "stub_xc_domain_getinfolist"
+ 
+ let domain_getinfolist handle first_domain =
+ 	let nb = 2 in
+-	let last_domid l = (List.hd l).domid + 1 in
++	let last_domid l = (List.hd l).Domain_info.domid + 1 in
+ 	let rec __getlist from =
+ 		let l = _domain_getinfolist handle from nb in
+ 		(if List.length l = nb then __getlist (last_domid l) else []) @ l
+ 		in
+ 	List.rev (__getlist first_domain)
+ 
+-external domain_getinfo: handle -> domid -> domaininfo= "stub_xc_domain_getinfo"
++external domain_getinfo: handle -> domid -> Domain_info.t = "stub_xc_domain_getinfo"
+ 
+-external domain_get_vcpuinfo: handle -> int -> int -> vcpuinfo
++external domain_get_vcpuinfo: handle -> int -> int -> Vcpu_info.t
+        = "stub_xc_vcpu_getinfo"
+-external domain_get_runstate_info : handle -> int -> runstateinfo
++external domain_get_runstate_info : handle -> int -> Runstate_info.t
+   = "stub_xc_get_runstate_info"
+ 
+ external domain_ioport_permission: handle -> domid -> int -> int -> bool -> unit
+@@ -196,9 +203,9 @@ external vcpu_context_get: handle -> dom
+ 
+ external sched_id: handle -> int = "stub_xc_sched_id"
+ 
+-external sched_credit_domain_set: handle -> domid -> sched_control -> unit
++external sched_credit_domain_set: handle -> domid -> Sched_control.t -> unit
+        = "stub_sched_credit_domain_set"
+-external sched_credit_domain_get: handle -> domid -> sched_control
++external sched_credit_domain_get: handle -> domid -> Sched_control.t
+        = "stub_sched_credit_domain_get"
+ 
+ external shadow_allocation_set: handle -> domid -> int -> unit
+@@ -213,7 +220,7 @@ external evtchn_reset: handle -> domid -
+ external readconsolering: handle -> string = "stub_xc_readconsolering"
+ 
+ external send_debug_keys: handle -> string -> unit = "stub_xc_send_debug_keys"
+-external physinfo: handle -> physinfo = "stub_xc_physinfo"
++external physinfo: handle -> Phys_info.t = "stub_xc_physinfo"
+ external pcpu_info: handle -> int -> int64 array = "stub_xc_pcpu_info"
+ 
+ external domain_setmaxmem: handle -> domid -> int64 -> unit
+@@ -268,8 +275,8 @@ external domain_trigger_sleep: handle ->
+ external hvm_check_pvdriver: handle -> domid -> bool
+        = "stub_xc_hvm_check_pvdriver"
+ 
+-external version: handle -> version = "stub_xc_version_version"
+-external version_compile_info: handle -> compile_info
++external version: handle -> Version.t = "stub_xc_version_version"
++external version_compile_info: handle -> Compile_info.t
+        = "stub_xc_version_compile_info"
+ external version_changeset: handle -> string = "stub_xc_version_changeset"
+ external version_capabilities: handle -> string =
+@@ -305,10 +312,10 @@ let coredump xch domid fd =
+ 
+ 	let info = domain_getinfo xch domid in
+ 
+-	let nrpages = info.total_memory_pages in
+-	let ctxt = Array.make info.max_vcpu_id None in
++	let nrpages = info.Domain_info.total_memory_pages in
++	let ctxt = Array.make info.Domain_info.max_vcpu_id None in
+ 	let nr_vcpus = ref 0 in
+-	for i = 0 to info.max_vcpu_id - 1
++	for i = 0 to info.Domain_info.max_vcpu_id - 1
+ 	do
+ 		ctxt.(i) <- try
+ 			let v = vcpu_context_get xch domid i in
+@@ -330,7 +337,7 @@ let coredump xch domid fd =
+ 		in
+ 
+ 	let header = {
+-		xch_magic = if info.hvm_guest then Magic_hvm else Magic_pv;
++		xch_magic = if info.Domain_info.hvm_guest then Magic_hvm else Magic_pv;
+ 		xch_nr_vcpus = !nr_vcpus;
+ 		xch_nr_pages = nrpages;
+ 		xch_ctxt_offset = Int64.of_int (sizeof_core_header ());
+@@ -340,7 +347,7 @@ let coredump xch domid fd =
+ 	} in
+ 
+ 	dump (marshall_core_header header);
+-	for i = 0 to info.max_vcpu_id - 1
++	for i = 0 to info.Domain_info.max_vcpu_id - 1
+ 	do
+ 		match ctxt.(i) with
+ 		| None -> ()
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -15,63 +15,84 @@
+  *)
+ 
+ type domid = int
+-type vcpuinfo = {
+-  online : bool;
+-  blocked : bool;
+-  running : bool;
+-  cputime : int64;
+-  cpumap : int32;
+-}
+-type runstateinfo = {
+-  state : int32;
+-  missed_changes: int32;
+-  state_entry_time : int64;
+-  time0 : int64;
+-  time1 : int64;
+-  time2 : int64;
+-  time3 : int64;
+-  time4 : int64;
+-  time5 : int64;
+-}
+-type domaininfo = {
+-  domid : domid;
+-  dying : bool;
+-  shutdown : bool;
+-  paused : bool;
+-  blocked : bool;
+-  running : bool;
+-  hvm_guest : bool;
+-  shutdown_code : int;
+-  total_memory_pages : nativeint;
+-  max_memory_pages : nativeint;
+-  shared_info_frame : int64;
+-  cpu_time : int64;
+-  nr_online_vcpus : int;
+-  max_vcpu_id : int;
+-  ssidref : int32;
+-  handle : int array;
+-}
+-type sched_control = { weight : int; cap : int; }
+-type physinfo_cap_flag = CAP_HVM | CAP_DirectIO
+-type physinfo = {
+-  threads_per_core : int;
+-  cores_per_socket : int;
+-  nr_cpus          : int;
+-  max_node_id      : int;
+-  cpu_khz          : int;
+-  total_pages      : nativeint;
+-  free_pages       : nativeint;
+-  scrub_pages      : nativeint;
+-  capabilities     : physinfo_cap_flag list;
+-  max_nr_cpus      : int; (** compile-time max possible number of nr_cpus *)
+-}
+-type version = { major : int; minor : int; extra : string; }
+-type compile_info = {
+-  compiler : string;
+-  compile_by : string;
+-  compile_domain : string;
+-  compile_date : string;
+-}
++module Vcpu_info : sig
++	type t = {
++		online : bool;
++		blocked : bool;
++		running : bool;
++		cputime : int64;
++		cpumap : int32;
++	}
++end
++module Runstate_info : sig
++	type t = {
++		state : int32;
++		missed_changes: int32;
++		state_entry_time : int64;
++		time0 : int64;
++		time1 : int64;
++		time2 : int64;
++		time3 : int64;
++		time4 : int64;
++		time5 : int64;
++	}
++end
++module Domain_info : sig
++	type t = {
++		domid : domid;
++		dying : bool;
++		shutdown : bool;
++		paused : bool;
++		blocked : bool;
++		running : bool;
++		hvm_guest : bool;
++		shutdown_code : int;
++		total_memory_pages : nativeint;
++		max_memory_pages : nativeint;
++		shared_info_frame : int64;
++		cpu_time : int64;
++		nr_online_vcpus : int;
++		max_vcpu_id : int;
++		ssidref : int32;
++		handle : int array;
++	}
++end
++module Sched_control : sig
++	type t = {
++		weight : int;
++		cap : int;
++	}
++end
++module Phys_info : sig
++	type cap_flag = CAP_HVM | CAP_DirectIO
++	type t = {
++		threads_per_core : int;
++		cores_per_socket : int;
++		nr_cpus : int;
++		max_node_id : int;
++		cpu_khz : int;
++		total_pages : nativeint;
++		free_pages : nativeint;
++		scrub_pages : nativeint;
++		capabilities : cap_flag list;
++		max_nr_cpus : int; (** compile-time max possible number of nr_cpus *)
++	}
++end
++module Version : sig
++	type t = {
++		major : int;
++		minor : int;
++		extra : string;
++	}
++end
++module Compile_info : sig
++	type t = {
++		compiler : string;
++		compile_by : string;
++		compile_domain : string;
++		compile_date : string;
++	}
++end
+ type shutdown_reason = Poweroff | Reboot | Suspend | Crash | Halt
+ 
+ type domain_create_flag = CDF_HVM | CDF_HAP
+@@ -97,14 +118,14 @@ external domain_resume_fast : handle -> 
+ external domain_destroy : handle -> domid -> unit = "stub_xc_domain_destroy"
+ external domain_shutdown : handle -> domid -> shutdown_reason -> unit
+   = "stub_xc_domain_shutdown"
+-external _domain_getinfolist : handle -> domid -> int -> domaininfo list
++external _domain_getinfolist : handle -> domid -> int -> Domain_info.t list
+   = "stub_xc_domain_getinfolist"
+-val domain_getinfolist : handle -> domid -> domaininfo list
+-external domain_getinfo : handle -> domid -> domaininfo
++val domain_getinfolist : handle -> domid -> Domain_info.t list
++external domain_getinfo : handle -> domid -> Domain_info.t
+   = "stub_xc_domain_getinfo"
+-external domain_get_vcpuinfo : handle -> int -> int -> vcpuinfo
++external domain_get_vcpuinfo : handle -> int -> int -> Vcpu_info.t
+   = "stub_xc_vcpu_getinfo"
+-external domain_get_runstate_info : handle -> int -> runstateinfo
++external domain_get_runstate_info : handle -> int -> Runstate_info.t
+   = "stub_xc_get_runstate_info"
+ external domain_ioport_permission: handle -> domid -> int -> int -> bool -> unit
+        = "stub_xc_domain_ioport_permission"
+@@ -119,9 +140,9 @@ external vcpu_affinity_get : handle -> d
+ external vcpu_context_get : handle -> domid -> int -> string
+   = "stub_xc_vcpu_context_get"
+ external sched_id : handle -> int = "stub_xc_sched_id"
+-external sched_credit_domain_set : handle -> domid -> sched_control -> unit
++external sched_credit_domain_set : handle -> domid -> Sched_control.t -> unit
+   = "stub_sched_credit_domain_set"
+-external sched_credit_domain_get : handle -> domid -> sched_control
++external sched_credit_domain_get : handle -> domid -> Sched_control.t
+   = "stub_sched_credit_domain_get"
+ external shadow_allocation_set : handle -> domid -> int -> unit
+   = "stub_shadow_allocation_set"
+@@ -132,7 +153,7 @@ external evtchn_alloc_unbound : handle -
+ external evtchn_reset : handle -> domid -> unit = "stub_xc_evtchn_reset"
+ external readconsolering : handle -> string = "stub_xc_readconsolering"
+ external send_debug_keys : handle -> string -> unit = "stub_xc_send_debug_keys"
+-external physinfo : handle -> physinfo = "stub_xc_physinfo"
++external physinfo : handle -> Phys_info.t = "stub_xc_physinfo"
+ external pcpu_info: handle -> int -> int64 array = "stub_xc_pcpu_info"
+ external domain_setmaxmem : handle -> domid -> int64 -> unit
+   = "stub_xc_domain_setmaxmem"
+@@ -170,8 +191,8 @@ external domain_trigger_sleep: handle ->
+ 
+ external hvm_check_pvdriver : handle -> domid -> bool
+   = "stub_xc_hvm_check_pvdriver"
+-external version : handle -> version = "stub_xc_version_version"
+-external version_compile_info : handle -> compile_info
++external version : handle -> Version.t = "stub_xc_version_version"
++external version_compile_info : handle -> Compile_info.t
+   = "stub_xc_version_compile_info"
+ external version_changeset : handle -> string = "stub_xc_version_changeset"
+ external version_capabilities : handle -> string
+diff --git a/tools/ocaml/xenstored/domains.ml b/tools/ocaml/xenstored/domains.ml
+--- a/tools/ocaml/xenstored/domains.ml
++++ b/tools/ocaml/xenstored/domains.ml
+@@ -36,10 +36,11 @@ let cleanup xc doms =
+ 	Hashtbl.iter (fun id _ -> if id <> 0 then
+ 		try
+ 			let info = Xenctrl.domain_getinfo xc id in
+-			if info.Xenctrl.shutdown || info.Xenctrl.dying then (
++			if info.Xenctrl.Domain_info.shutdown || info.Xenctrl.Domain_info.dying then (
+ 				debug "Domain %u died (dying=%b, shutdown %b -- code %d)"
+-				                    id info.Xenctrl.dying info.Xenctrl.shutdown info.Xenctrl.shutdown_code;
+-				if info.Xenctrl.dying then
++					id info.Xenctrl.Domain_info.dying info.Xenctrl.Domain_info.shutdown
++					info.Xenctrl.Domain_info.shutdown_code;
++				if info.Xenctrl.Domain_info.dying then
+ 					dead_dom := id :: !dead_dom
+ 				else
+ 					notify := true;

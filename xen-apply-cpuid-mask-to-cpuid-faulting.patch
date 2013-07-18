@@ -1,0 +1,44 @@
+# HG changeset patch
+# Parent b0cbce39f070417934bb29e2a630fedfc57ca061
+Use the boot CPUID mask parameters in the PV CPUID GP fault handler.
+
+Intel Ivy Bridge and newer processors use CPUID faulting instead of masking, this results in guest trapping to the PV GP fault handler. The fault handler was returning the bare metal CPUID and hypervisor specific masks but was not applying the boot CPUID mask parameters.
+
+This patch always applies the boot CPUID mask parameters, this feature could be upstreamed and maybe a compile/runtime option.
+
+diff -r b0cbce39f070 xen/arch/x86/traps.c
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -74,6 +74,8 @@
+ #include <public/arch-x86/cpuid.h>
+ #include <xsm/xsm.h>
+ 
++#include "cpu/cpu.h"
++
+ /*
+  * opt_nmi: one of 'ignore', 'dom0', or 'fatal'.
+  *  fatal:  Xen prints diagnostic message and then hangs.
+@@ -808,6 +810,23 @@ static void pv_cpuid(struct cpu_user_reg
+         : "=a" (a), "=b" (b), "=c" (c), "=d" (d)
+         : "0" (a), "1" (b), "2" (c), "3" (d) );
+ 
++	/* Apply boot masks to CPUID instruction if CPU faulting is enabled */
++	if ( cpu_has_cpuid_faulting )
++	{
++		if ( regs->eax == 1 )
++		{
++			c &= opt_cpuid_mask_ecx;
++			d &= opt_cpuid_mask_edx;
++		}
++		else if ( regs->eax == 0x80000001 )
++		{
++			c &= opt_cpuid_mask_ext_ecx;
++			d &= opt_cpuid_mask_ext_edx;
++		}
++		else if ( regs->eax == 0xd && regs->ecx == 0x1 )
++			a &= opt_cpuid_mask_xsave_eax;
++	}
++
+     if ( (regs->eax & 0x7fffffff) == 0x00000001 )
+     {
+         /* Modify Feature Information. */

@@ -1,0 +1,172 @@
+Add xenbus-only communication option to xenstore clients/API
+
+Currently, xenstore clients default to socket communication mode and only fallback to xenbus if the former is not present. This is a sensible choice for both normal hosts (Dom0) and normal VMs (DomU), but it would cause troubles for SDK/DDK VMs which are playing both host and VM roles. In such VMs, xenstore clients will sometimes talk to the xenstored running inside the VM as a Dom0 client via socket, and sometimes the xenstored running on the real host as a DomU client via xenbus. With current design, the xenstore clients in a SDK/DDK VM will always talk to its own xenstored running inside the VM, and there is no option for us to enforce xenbus communication when necessary (e.g. as part of xenguest agent to report information back to the real host).
+
+In this patch, we add an extra flag XS_OPEN_XENBUSONLY (and also a command line option "-b") corresponding to the current XS_OPEN_SOCKETONLY flag (and the "-s" option). The algorithm of choosing communication method becomes:
+
+* As before, XENSTORED_PATH environment variable still has the highest prioirty over any other options
+* If XS_OPEN_SOCKETONLY flag is set, xenstore clients will always use socket communication and will not try xenbus communication even if socket communication is not fesible
+* If XS_OPEN_XENBUSONLY flag is set, xenstore clients will always use xenbus communication and will not try socket communication even if xenbus communication is not fesible
+* If both options are unset or both options are set, socket communication will have the higher priority, and xenbus communication will take place only when the socket communication is not fesible.
+
+Moreoever, to avoid the practice of having to monkey patch scripts which make use of xenstore clients/API with these flags/options all over the places, three environment variables of the same name i.e. "XS_OPEN_XXXONLY" are added and will have the same effect (in addition to) as passing explicit flags/options to the xs_open primitive if not empty. 
+
+
+Signed-off-by: Zheng Li <zheng.li@eu.citrix.com>
+
+
+
+diff --git a/tools/python/xen/lowlevel/xs/xs.c b/tools/python/xen/lowlevel/xs/xs.c
+--- a/tools/python/xen/lowlevel/xs/xs.c
++++ b/tools/python/xen/lowlevel/xs/xs.c
+@@ -899,15 +899,21 @@ fail:
+ static int
+ xshandle_init(XsHandle *self, PyObject *args, PyObject *kwds)
+ {
+-    static char *kwd_spec[] = { "readonly", NULL };
+-    static char *arg_spec = "|i";
+-    int readonly = 0;
++    static char *kwd_spec[] = { "readonly", "socket", "xenbus", NULL };
++    static char *arg_spec = "|iii";
++    int readonly = 0, socket = 0, xenbus = 0;
++    unsigned long flags = 0;
+ 
+     if (!PyArg_ParseTupleAndKeywords(args, kwds, arg_spec, kwd_spec,
+-                                     &readonly))
++            &readonly, &socket, &xenbus))
+         goto fail;
+ 
+-    self->xh = (readonly ? xs_daemon_open_readonly() : xs_daemon_open());
++    flags |= (readonly ? XS_OPEN_READONLY : 0);
++    flags |= (socket ? XS_OPEN_SOCKETONLY : 0);
++    flags |= (xenbus ? XS_OPEN_XENBUSONLY : 0);
++
++    self->xh = xs_open(flags);
++
+     if (!self->xh)
+         goto fail;
+ 
+diff --git a/tools/xenstore/xenstore_client.c b/tools/xenstore/xenstore_client.c
+--- a/tools/xenstore/xenstore_client.c
++++ b/tools/xenstore/xenstore_client.c
+@@ -78,24 +78,24 @@ usage(enum mode mode, int incl_mode, con
+ 	errx(1, "Usage: %s <mode> [-h] [...]", progname);
+     case MODE_read:
+ 	mstr = incl_mode ? "read " : "";
+-	errx(1, "Usage: %s %s[-h] [-p] [-s] key [...]", progname, mstr);
++	errx(1, "Usage: %s %s[-h] [-p] [-s|-b] key [...]", progname, mstr);
+     case MODE_write:
+ 	mstr = incl_mode ? "write " : "";
+-	errx(1, "Usage: %s %s[-h] [-s] key value [...]", progname, mstr);
++	errx(1, "Usage: %s %s[-h] [-s|-b] key value [...]", progname, mstr);
+     case MODE_rm:
+ 	mstr = incl_mode ? "rm " : "";
+-	errx(1, "Usage: %s %s[-h] [-s] [-t] key [...]", progname, mstr);
++	errx(1, "Usage: %s %s[-h] [-s|-b] [-t] key [...]", progname, mstr);
+     case MODE_exists:
+ 	mstr = incl_mode ? "exists " : "";
+     case MODE_list:
+ 	mstr = mstr ? : incl_mode ? "list " : "";
+-	errx(1, "Usage: %s %s[-h] [-p] [-s] key [...]", progname, mstr);
++	errx(1, "Usage: %s %s[-h] [-p] [-s|-b] key [...]", progname, mstr);
+     case MODE_ls:
+ 	mstr = mstr ? : incl_mode ? "ls " : "";
+-	errx(1, "Usage: %s %s[-h] [-f] [-p] [-s] [path]", progname, mstr);
++	errx(1, "Usage: %s %s[-h] [-f] [-p] [-s|-b] [path]", progname, mstr);
+     case MODE_chmod:
+ 	mstr = incl_mode ? "chmod " : "";
+-	errx(1, "Usage: %s %s[-h] [-u] [-r] [-s] key <mode [modes...]>", progname, mstr);
++	errx(1, "Usage: %s %s[-h] [-u] [-r] [-s|-b] key <mode [modes...]>", progname, mstr);
+     case MODE_watch:
+ 	mstr = incl_mode ? "watch " : "";
+ 	errx(1, "Usage: %s %s[-h] [-n NR] key", progname, mstr);
+@@ -496,7 +496,8 @@ main(int argc, char **argv)
+ {
+     struct xs_handle *xsh;
+     xs_transaction_t xth = XBT_NULL;
+-    int ret = 0, socket = 0;
++    int ret = 0;
++    unsigned long flags = 0;
+     int prefix = 0;
+     int tidy = 0;
+     int upto = 0;
+@@ -531,6 +532,7 @@ main(int argc, char **argv)
+ 	    {"help",    0, 0, 'h'},
+ 	    {"flat",    0, 0, 'f'}, /* MODE_ls */
+ 	    {"socket",  0, 0, 's'},
++      {"xenbus",  0, 0, 'b'},
+ 	    {"prefix",  0, 0, 'p'}, /* MODE_read || MODE_list || MODE_ls */
+ 	    {"tidy",    0, 0, 't'}, /* MODE_rm */
+ 	    {"upto",    0, 0, 'u'}, /* MODE_chmod */
+@@ -539,7 +541,7 @@ main(int argc, char **argv)
+ 	    {0, 0, 0, 0}
+ 	};
+ 
+-	c = getopt_long(argc - switch_argv, argv + switch_argv, "hfspturn:",
++	c = getopt_long(argc - switch_argv, argv + switch_argv, "hfsbpturn:",
+ 			long_options, &index);
+ 	if (c == -1)
+ 	    break;
+@@ -557,9 +559,12 @@ main(int argc, char **argv)
+ 		usage(mode, switch_argv, argv[0]);
+ 	    }
+             break;
+-        case 's':
+-            socket = 1;
+-            break;
++  case 's':
++    flags |= XS_OPEN_SOCKETONLY;
++    break;
++  case 'b':
++    flags |= XS_OPEN_XENBUSONLY;
++    break;
+ 	case 'p':
+ 	    if ( mode == MODE_read || mode == MODE_list || mode == MODE_ls )
+ 		prefix = 1;
+@@ -633,7 +638,7 @@ main(int argc, char **argv)
+ 	    max_width = ws.ws_col - 2;
+     }
+ 
+-    xsh = xs_open(socket ? XS_OPEN_SOCKETONLY : 0);
++    xsh = xs_open(flags);
+     if (xsh == NULL) err(1, "xs_open");
+ 
+ again:
+diff --git a/tools/xenstore/xs.c b/tools/xenstore/xs.c
+--- a/tools/xenstore/xs.c
++++ b/tools/xenstore/xs.c
+@@ -257,12 +257,18 @@ struct xs_handle *xs_open(unsigned long 
+ {
+ 	struct xs_handle *xsh = NULL;
+ 
+-	if (flags & XS_OPEN_READONLY)
+-		xsh = get_handle(xs_daemon_socket_ro(), flags);
+-	else
+-		xsh = get_handle(xs_daemon_socket(), flags);
++	flags |= (getenv("XS_OPEN_READONLY") ? XS_OPEN_READONLY : 0);
++	flags |= (getenv("XS_OPEN_SOCKETONLY") ? XS_OPEN_SOCKETONLY : 0);
++	flags |= (getenv("XS_OPEN_XENBUSONLY") ? XS_OPEN_XENBUSONLY : 0);
++       
++	if ((flags & XS_OPEN_SOCKETONLY) || !(flags & XS_OPEN_XENBUSONLY)) {
++		if (flags & XS_OPEN_READONLY)
++			xsh = get_handle(xs_daemon_socket_ro(), flags);
++		else
++			xsh = get_handle(xs_daemon_socket(), flags);
++	}
+ 
+-	if (!xsh && !(flags & XS_OPEN_SOCKETONLY))
++	if (!xsh && ((flags & XS_OPEN_XENBUSONLY) || !(flags & XS_OPEN_SOCKETONLY)))
+ 		xsh = get_handle(xs_domain_dev(), flags);
+ 
+ 	return xsh;
+diff --git a/tools/xenstore/xs.h b/tools/xenstore/xs.h
+--- a/tools/xenstore/xs.h
++++ b/tools/xenstore/xs.h
+@@ -26,6 +26,7 @@
+ 
+ #define XS_OPEN_READONLY	1UL<<0
+ #define XS_OPEN_SOCKETONLY      1UL<<1
++#define XS_OPEN_XENBUSONLY      1UL<<2
+ 
+ struct xs_handle;
+ typedef uint32_t xs_transaction_t;

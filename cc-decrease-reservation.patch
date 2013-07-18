@@ -1,0 +1,37 @@
+# HG changeset patch
+# Parent 5c9a7680f6e60392b1fbdfba15496c28627193c0
+
+Modify the prior cc-restrictions patch to allow a decrease_reservation memory
+operation but clear the memory such that no guest data leaks. This is only
+done for non-privileged guests as it is assumed that privileged guests will
+be more careful.
+This modificaton is necessary to be able to use unmodified Windows PV drivers
+which use the decrease_reservation operation to create memory 'holes' to use
+for shared_info, grant tables, and the like.
+
+diff -r 5c9a7680f6e6 xen/common/memory.c
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -223,6 +223,13 @@ int guest_remove_page(struct domain *d, 
+ 
+     guest_physmap_remove_page(d, gmfn, mfn, 0);
+ 
++    if ( unlikely(opt_cc_restrictions) && !IS_PRIV(d) )
++    {
++        char *b = map_domain_page(page_to_mfn(page));
++        clear_page(b);
++        unmap_domain_page(b);
++    }
++
+     put_page(page);
+     put_gfn(d, gmfn);
+ 
+@@ -546,7 +553,7 @@ long do_memory_op(unsigned long cmd, XEN
+      * return memory to Xen. */
+     if ( unlikely(opt_cc_restrictions) &&
+          !IS_PRIV(current->domain) &&
+-         (op == XENMEM_decrease_reservation || op == XENMEM_exchange) )
++         ( op == XENMEM_exchange) )
+         return -EPERM;
+ 
+     switch ( op )

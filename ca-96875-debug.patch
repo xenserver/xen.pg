@@ -1,0 +1,59 @@
+# HG changeset patch
+# Parent c23d830466f5363546f7f026e559558da6fa6dda
+
+diff -r c23d830466f5 xen/arch/x86/hvm/vmx/vmx.c
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -2294,6 +2294,9 @@ static void vmx_idtv_reinject(unsigned l
+     }
+ }
+ 
++DEFINE_PER_CPU(unsigned int, _lvr[8]) = {0};
++DEFINE_PER_CPU(unsigned int, _lvr_idx) = 0;
++
+ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+ {
+     unsigned int exit_reason, idtv_info, intr_info = 0, vector = 0;
+@@ -2304,7 +2307,8 @@ void vmx_vmexit_handler(struct cpu_user_
+         v->arch.hvm_vcpu.guest_cr[3] = v->arch.hvm_vcpu.hw_cr[3] =
+             __vmread(GUEST_CR3);
+ 
+-    exit_reason = __vmread(VM_EXIT_REASON);
++    this_cpu(_lvr)[ (this_cpu(_lvr_idx)++) & 7 ] =
++        exit_reason = __vmread(VM_EXIT_REASON);
+ 
+     if ( hvm_long_mode_enabled(v) )
+         HVMTRACE_ND(VMEXIT64, 0, 1/*cycles*/, 3, exit_reason,
+diff -r c23d830466f5 xen/drivers/char/console.c
+--- a/xen/drivers/char/console.c
++++ b/xen/drivers/char/console.c
+@@ -933,12 +933,17 @@ __initcall(debugtrace_init);
+  * **************************************************************
+  */
+ 
++DECLARE_PER_CPU(unsigned int, _lvr[8]);
++DECLARE_PER_CPU(unsigned int, _lvr_idx);
++
++
+ void panic(const char *fmt, ...)
+ {
+     va_list args;
+     unsigned long flags;
+     static DEFINE_SPINLOCK(lock);
+     static char buf[128];
++    unsigned int i;
+     
+     debugtrace_dump();
+ 
+@@ -950,6 +955,11 @@ void panic(const char *fmt, ...)
+     va_end(args);
+ 
+     console_start_sync();
++
++    printk("\nLast VMEXIT reasons:\n");
++    for ( i = 0; i < 8; ++i )
++        printk("  0x%016"PRIx32"\n", this_cpu(_lvr)[ (this_cpu(_lvr_idx)-i) & 7 ] );
++
+     printk("\n****************************************\n");
+     printk("Panic on CPU %d:\n", smp_processor_id());
+     printk("%s", buf);

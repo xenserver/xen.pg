@@ -1,0 +1,101 @@
+CA-31487: Reinstate the CR3 switch and TLB-flush Viridian calls.
+They were dropped (because they're pretty well useless) when the
+viridian interface was sent upstream, but VMs that are live-migrated
+from older versions will still try to use them.  This puts the
+implementation back in, but doesn't advertise it to the guest.
+
+diff -r 5d0b41a3da0d xen/arch/x86/hvm/viridian.c
+--- a/xen/arch/x86/hvm/viridian.c	Mon Nov 23 16:12:52 2009 +0000
++++ b/xen/arch/x86/hvm/viridian.c	Mon Nov 23 16:30:27 2009 +0000
+@@ -27,9 +27,14 @@
+ /* Viridian Hypercall Status Codes. */
+ #define HV_STATUS_SUCCESS                       0x0000
+ #define HV_STATUS_INVALID_HYPERCALL_CODE        0x0002
++#define HV_STATUS_INVALID_ALIGNMENT             0x0004
++#define HV_STATUS_INVALID_PARAMETER             0x0005
+ 
+-/* Viridian Hypercall Codes and Parameters. */
+-#define HvNotifyLongSpinWait    8
++/* Viridian Hypercall Codes. */
++#define HvSwitchVirtualAddressSpace   1
++#define HvFlushVirtualAddressSpace    2
++#define HvFlushVirtualAddressList     3
++#define HvNotifyLongSpinWait          8
+ 
+ /* Viridian CPUID 4000003, Viridian MSR availability. */
+ #define CPUID3A_MSR_APIC_ACCESS (1 << 4)
+@@ -274,12 +279,15 @@
+     int mode = hvm_guest_x86_mode(current);
+     unsigned long input_params_gpa, output_params_gpa;
+     uint16_t status = HV_STATUS_SUCCESS;
++    XEN_GUEST_HANDLE(void) handle;
++    long rc;
+ 
+     union hypercall_input {
+         uint64_t raw;
+         struct {
+             uint16_t call_code;
+-            uint16_t rsvd1;
++            uint16_t flag_fast:1;
++            uint16_t rsvd1:15;
+             unsigned rep_count:12;
+             unsigned rsvd2:4;
+             unsigned rep_start:12;
+@@ -319,6 +327,57 @@
+ 
+     switch ( input.call_code )
+     {
++        /*
++         * We don't advertise the address-space-switch or TLB flush
++         * hypercalls because they give no advantage over just
++         * intercepting CR3 writes and INVLPG.  We still need to keep
++         * the implementations, though, for VMs that booted on an older
++         * hypervisor that _did_ advertise them.
++         */
++    case HvSwitchVirtualAddressSpace:
++        perfc_incr(mshv_call_sw_addr_space);
++        /*
++         * If the fast flag is not set, the input parameter points to the
++         * guest physical address where the input data can be found.  For
++         * simple inputs which can be contained wholly in a register the
++         * fast flag indicates that's how it is.  This was not the case for
++         * Vista SP0.
++         */
++        if ( !input.flag_fast )
++        {
++            if ( input_params_gpa & ((sizeof input_params_gpa) - 1) )
++            {
++                status = HV_STATUS_INVALID_ALIGNMENT;
++                break;
++            }
++            if ( hvm_copy_from_guest_phys(&input_params_gpa,
++                                          input_params_gpa,
++                                          sizeof input_params_gpa) )
++            {
++                status = HV_STATUS_INVALID_PARAMETER;
++                break;
++            }
++        }
++        hvm_set_cr3(input_params_gpa);
++        status = HV_STATUS_SUCCESS;
++        break;
++    case HvFlushVirtualAddressList:
++        perfc_incr(mshv_call_flush_tlb_list);
++        output.rep_complete = input.rep_count;
++        set_xen_guest_handle(handle, NULL);
++        rc = do_hvm_op(HVMOP_flush_tlbs, handle);
++        if (rc == -EAGAIN)
++            return HVM_HCALL_preempted;
++        status = HV_STATUS_SUCCESS;
++        break;
++    case HvFlushVirtualAddressSpace:
++        perfc_incr(mshv_call_flush_tlb_all);
++        set_xen_guest_handle(handle, NULL);
++        rc = do_hvm_op(HVMOP_flush_tlbs, handle);
++        if (rc == -EAGAIN)
++            return HVM_HCALL_preempted;
++        status = HV_STATUS_SUCCESS;
++        break;
+     case HvNotifyLongSpinWait:
+         perfc_incr(mshv_call_long_wait);
+         do_sched_op_compat(SCHEDOP_yield, 0);

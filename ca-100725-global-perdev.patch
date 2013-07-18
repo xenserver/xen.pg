@@ -1,0 +1,52 @@
+# HG changeset patch
+# Parent 5eef3973b15163810d25821828659e6524b1cf2c
+
+diff -r 5eef3973b151 xen/arch/x86/irq.c
+--- a/xen/arch/x86/irq.c
++++ b/xen/arch/x86/irq.c
+@@ -396,7 +396,8 @@ static vmask_t *irq_get_used_vector_mask
+ {
+     vmask_t *ret = NULL;
+ 
+-    if ( opt_irq_vector_map == OPT_IRQ_VECTOR_MAP_GLOBAL )
++    if ( opt_irq_vector_map == OPT_IRQ_VECTOR_MAP_GLOBAL ||
++         opt_irq_vector_map == OPT_IRQ_VECTOR_MAP_PERDEV_GLOBAL )
+     {
+         struct irq_desc *desc = irq_to_desc(irq);
+ 
+diff -r 5eef3973b151 xen/drivers/passthrough/amd/pci_amd_iommu.c
+--- a/xen/drivers/passthrough/amd/pci_amd_iommu.c
++++ b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+@@ -207,6 +207,21 @@ int __init amd_iov_detect(void)
+     }
+     if ( !amd_iommu_perdev_intremap )
+         printk(XENLOG_WARNING "AMD-Vi: Using global interrupt remap table is not recommended (see XSA-36)!\n");
++
++    /* Per-device vector map logic is broken for devices with multiple MSI-X
++     * interrupts (and would also be for multiple MSI, if Xen supported it).
++     *
++     * Until this is fixed, use per-device-global vector tables to avoid the
++     * security vulnerability of global devices, and the buggy behaviour of
++     * per-device.
++     */
++    if ( opt_irq_vector_map == OPT_IRQ_VECTOR_MAP_PERDEV )
++    {
++        printk(XENLOG_WARNING "AMD-Vi BUG: per-device vector map logic is broken.  "
++               "Using per-device-global maps instead until a fix is found\n");
++        opt_irq_vector_map = OPT_IRQ_VECTOR_MAP_PERDEV_GLOBAL;
++    }
++
+     return scan_pci_devices();
+ }
+ 
+diff -r 5eef3973b151 xen/include/asm-x86/irq.h
+--- a/xen/include/asm-x86/irq.h
++++ b/xen/include/asm-x86/irq.h
+@@ -53,6 +53,7 @@ extern bool_t opt_noirqbalance;
+ #define OPT_IRQ_VECTOR_MAP_NONE    1 /* None */ 
+ #define OPT_IRQ_VECTOR_MAP_GLOBAL  2 /* One global vector map (no vector sharing) */ 
+ #define OPT_IRQ_VECTOR_MAP_PERDEV  3 /* Per-device vetor map (no vector sharing w/in a device) */
++#define OPT_IRQ_VECTOR_MAP_PERDEV_GLOBAL 4
+ 
+ extern int opt_irq_vector_map;
+ 

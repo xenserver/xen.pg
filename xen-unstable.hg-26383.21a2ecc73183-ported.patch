@@ -1,0 +1,89 @@
+# HG changeset patch
+# User Keir Fraser <keir@xen.org>
+# Date 1358182042 0
+# Node ID 21a2ecc7318344ffe6e73018c6230292496bb6b7
+# Parent f470c18ce5cc57abd21a9b6b6af4c33888eeb1a4
+xen: Introduce ASSERT_NOT_IN_ATOMIC() to give more info on in_atomic() crash.
+
+Signed-off-by: Keir Fraser <keir@xen.org>
+
+diff -r f470c18ce5cc xen/common/preempt.c
+--- a/xen/common/preempt.c
++++ b/xen/common/preempt.c
+@@ -31,8 +31,11 @@ bool_t in_atomic(void)
+     return preempt_count() || in_irq() || !local_irq_is_enabled();
+ }
+ 
+-/* asm helper */
+-void bug_if_in_atomic(void)
++#ifndef NDEBUG
++void ASSERT_NOT_IN_ATOMIC(void)
+ {
+-    BUG_ON(in_atomic());
++    ASSERT(!preempt_count());
++    ASSERT(!in_irq());
++    ASSERT(local_irq_is_enabled());
+ }
++#endif
+diff -r f470c18ce5cc xen/common/schedule.c
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -1082,7 +1082,7 @@ static void schedule(void)
+     struct task_slice     next_slice;
+     int cpu = smp_processor_id();
+ 
+-    ASSERT(!in_atomic());
++    ASSERT_NOT_IN_ATOMIC();
+ 
+     perfc_incr(sched_run);
+ 
+diff -r f470c18ce5cc xen/common/softirq.c
+--- a/xen/common/softirq.c
++++ b/xen/common/softirq.c
+@@ -58,7 +58,7 @@ void process_pending_softirqs(void)
+ 
+ asmlinkage void do_softirq(void)
+ {
+-    ASSERT(!in_atomic());
++    ASSERT_NOT_IN_ATOMIC();
+     __do_softirq(0);
+ }
+ 
+diff -r f470c18ce5cc xen/common/wait.c
+--- a/xen/common/wait.c
++++ b/xen/common/wait.c
+@@ -219,7 +219,7 @@ void prepare_to_wait(struct waitqueue_he
+     struct vcpu *curr = current;
+     struct waitqueue_vcpu *wqv = curr->waitqueue_vcpu;
+ 
+-    ASSERT(!in_atomic());
++    ASSERT_NOT_IN_ATOMIC();
+     __prepare_to_wait(wqv);
+ 
+     ASSERT(list_empty(&wqv->list));
+diff -r f470c18ce5cc xen/include/asm-x86/asm_defns.h
+--- a/xen/include/asm-x86/asm_defns.h
++++ b/xen/include/asm-x86/asm_defns.h
+@@ -51,7 +51,7 @@ void ret_from_intr(void);
+ #ifndef NDEBUG
+ #define ASSERT_NOT_IN_ATOMIC                                             \
+     sti; /* sometimes called with interrupts disabled: safe to enable */ \
+-    call bug_if_in_atomic
++    call ASSERT_NOT_IN_ATOMIC
+ #else
+ #define ASSERT_NOT_IN_ATOMIC
+ #endif
+diff -r f470c18ce5cc xen/include/xen/preempt.h
+--- a/xen/include/xen/preempt.h
++++ b/xen/include/xen/preempt.h
+@@ -28,4 +28,10 @@ DECLARE_PER_CPU(unsigned int, __preempt_
+ 
+ bool_t in_atomic(void);
+ 
++#ifndef NDEBUG
++void ASSERT_NOT_IN_ATOMIC(void);
++#else
++#define ASSERT_NOT_IN_ATOMIC() ((void)0)
++#endif
++
+ #endif /* __XEN_PREEMPT_H__ */

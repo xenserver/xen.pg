@@ -1,0 +1,191 @@
+# HG changeset patch
+# Parent 27d25b3e37afdfec9df882f277770ec23ebcd41e
+
+diff -r 27d25b3e37af tools/firmware/hvmloader/acpi/dsdt.asl
+--- a/tools/firmware/hvmloader/acpi/dsdt.asl
++++ b/tools/firmware/hvmloader/acpi/dsdt.asl
+@@ -30,8 +30,8 @@ DefinitionBlock ("DSDT.aml", "DSDT", 2, 
+     /* _S3 and _S4 are in separate SSDTs */
+     Name (\_S5, Package (0x04)
+     {
+-        0x00,  /* PM1a_CNT.SLP_TYP */
+-        0x00,  /* PM1b_CNT.SLP_TYP */
++        0x07,  /* PM1a_CNT.SLP_TYP */
++        0x07,  /* PM1b_CNT.SLP_TYP */
+         0x00,  /* reserved */
+         0x00   /* reserved */
+     })
+diff -r 27d25b3e37af tools/firmware/hvmloader/acpi/ssdt_s3.asl
+--- a/tools/firmware/hvmloader/acpi/ssdt_s3.asl
++++ b/tools/firmware/hvmloader/acpi/ssdt_s3.asl
+@@ -23,8 +23,8 @@ DefinitionBlock ("SSDT_S3.aml", "SSDT", 
+     /* Must match piix emulation */
+     Name (\_S3, Package (0x04)
+     {
+-        0x01,  /* PM1a_CNT.SLP_TYP */
+-        0x01,  /* PM1b_CNT.SLP_TYP */
++        0x05,  /* PM1a_CNT.SLP_TYP */
++        0x05,  /* PM1b_CNT.SLP_TYP */
+         0x0,   /* reserved */
+         0x0    /* reserved */
+     })
+diff -r 27d25b3e37af tools/firmware/hvmloader/acpi/ssdt_s4.asl
+--- a/tools/firmware/hvmloader/acpi/ssdt_s4.asl
++++ b/tools/firmware/hvmloader/acpi/ssdt_s4.asl
+@@ -23,8 +23,8 @@ DefinitionBlock ("SSDT_S4.aml", "SSDT", 
+     /* Must match piix emulation */
+     Name (\_S4, Package (0x04)
+     {
+-        0x00,  /* PM1a_CNT.SLP_TYP */
+-        0x00,  /* PM1b_CNT.SLP_TYP */
++        0x06,  /* PM1a_CNT.SLP_TYP */
++        0x06,  /* PM1b_CNT.SLP_TYP */
+         0x00,  /* reserved */
+         0x00   /* reserved */
+     })
+diff -r 27d25b3e37af tools/firmware/hvmloader/hvmloader.c
+--- a/tools/firmware/hvmloader/hvmloader.c
++++ b/tools/firmware/hvmloader/hvmloader.c
+@@ -325,7 +325,7 @@ int main(void)
+         struct xen_hvm_param p = {
+             .domid = DOMID_SELF,
+             .index = HVM_PARAM_ACPI_IOPORTS_LOCATION,
+-            .value = 1,
++            .value = 0,
+         };
+ 
+         if ( bios->acpi_build_tables )
+diff -r 27d25b3e37af xen/arch/x86/hvm/hvm.c
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -3876,7 +3876,7 @@ long do_hvm_op(unsigned long op, XEN_GUE
+ 
+                 break;
+             case HVM_PARAM_ACPI_IOPORTS_LOCATION:
+-                rc = pmtimer_change_ioport(d, a.value);
++                rc = pmtimer_change_ioport(d, 0);
+                 break;
+             case HVM_PARAM_MEMORY_EVENT_CR0:
+             case HVM_PARAM_MEMORY_EVENT_CR3:
+diff -r 27d25b3e37af xen/arch/x86/hvm/pmtimer.c
+--- a/xen/arch/x86/hvm/pmtimer.c
++++ b/xen/arch/x86/hvm/pmtimer.c
+@@ -140,6 +140,8 @@ static void pmt_timer_callback(void *opa
+     spin_unlock(&s->lock);
+ }
+ 
++extern long debug_info_count;
++
+ /* Handle port I/O to the PM1a_STS and PM1a_EN registers */
+ static int handle_evt_io(
+     int dir, uint32_t port, uint32_t bytes, uint32_t *val)
+@@ -154,6 +156,12 @@ static int handle_evt_io(
+             HVM_PARAM_ACPI_IOPORTS_LOCATION] == 0) ?
+          PM1a_STS_ADDR_V0 : PM1a_STS_ADDR_V1);
+ 
++    if ( debug_info_count )
++    {
++        printk("Handle_evt_io(%d, %"PRIx32", %"PRIx32", %"PRIx32")\n",
++               dir, port, bytes, *val);
++    }
++
+     spin_lock(&s->lock);
+ 
+     if ( dir == IOREQ_WRITE )
+diff -r 27d25b3e37af xen/arch/x86/hvm/svm/svm.c
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -62,6 +62,7 @@
+ #include <asm/apic.h>
+ #include <asm/debugger.h>
+ #include <asm/xstate.h>
++#include <xen/keyhandler.h>
+ 
+ void svm_asm_do_resume(void);
+ 
+@@ -2050,6 +2051,32 @@ static struct hvm_function_table __read_
+     .nhvm_intr_blocked = nsvm_intr_blocked,
+ };
+ 
++long debug_info_count = 0;
++
++static void debug_svm(unsigned char key)
++{
++    if ( debug_info_count == 0 )
++    {
++        printk("Enabling VMEXIT logging\n");
++        debug_info_count = 12;
++    }
++}
++
++static struct keyhandler debug_keyhandler = {
++    .diagnostic = 1,
++    .u.fn = debug_svm,
++    .desc = "debug_svm"
++};
++
++static int __init debug_key_init(void)
++{
++    printk("Registering debug key for SVM VMEXITS\n");
++    register_keyhandler('1', &debug_keyhandler);
++    return 0;
++}
++__initcall(debug_key_init);
++
++
+ void svm_vmexit_handler(struct cpu_user_regs *regs)
+ {
+     uint64_t exit_reason;
+@@ -2083,6 +2110,12 @@ void svm_vmexit_handler(struct cpu_user_
+ 
+     exit_reason = vmcb->exitcode;
+ 
++    if ( debug_info_count )
++    {
++        printk("Dom%d VMEXIT: %016"PRIx64"\n", v->domain->domain_id, exit_reason);
++        debug_info_count--;
++    }
++
+     if ( hvm_long_mode_enabled(v) )
+         HVMTRACE_ND(VMEXIT64, vcpu_guestmode ? TRC_HVM_NESTEDFLAG : 0,
+                     1/*cycles*/, 3, exit_reason,
+@@ -2301,11 +2334,19 @@ void svm_vmexit_handler(struct cpu_user_
+         break;
+ 
+     case VMEXIT_IOIO:
++
+         if ( (vmcb->exitinfo1 & (1u<<2)) == 0 )
+         {
+             uint16_t port = (vmcb->exitinfo1 >> 16) & 0xFFFF;
+             int bytes = ((vmcb->exitinfo1 >> 4) & 0x07);
+             int dir = (vmcb->exitinfo1 & 1) ? IOREQ_READ : IOREQ_WRITE;
++
++            if ( debug_info_count )
++            {
++                printk("Dom%d EXITINFO1: %016"PRIx64"\n", v->domain->domain_id, vmcb->exitinfo1);
++                printk("Dom%d EXITINFO2: %016"PRIx64"\n", v->domain->domain_id, vmcb->exitinfo2);
++            }
++
+             if ( handle_pio(port, bytes, dir) )
+                 __update_guest_eip(regs, vmcb->exitinfo2 - vmcb->rip);
+         }
+diff -r 27d25b3e37af xen/include/public/hvm/ioreq.h
+--- a/xen/include/public/hvm/ioreq.h
++++ b/xen/include/public/hvm/ioreq.h
+@@ -113,11 +113,11 @@ struct buffered_piopage {
+ #define ACPI_GPE0_BLK_LEN_V0         0x08
+ 
+ /* Version 1: Locations preferred by modern Qemu. */
+-#define ACPI_PM1A_EVT_BLK_ADDRESS_V1 0xb000
+-#define ACPI_PM1A_CNT_BLK_ADDRESS_V1 (ACPI_PM1A_EVT_BLK_ADDRESS_V1 + 0x04)
+-#define ACPI_PM_TMR_BLK_ADDRESS_V1   (ACPI_PM1A_EVT_BLK_ADDRESS_V1 + 0x08)
+-#define ACPI_GPE0_BLK_ADDRESS_V1     0xafe0
+-#define ACPI_GPE0_BLK_LEN_V1         0x04
++#define ACPI_PM1A_EVT_BLK_ADDRESS_V1 0x1f40
++#define ACPI_PM1A_CNT_BLK_ADDRESS_V1 (ACPI_PM1A_EVT_BLK_ADDRESS_V0 + 0x04)
++#define ACPI_PM_TMR_BLK_ADDRESS_V1   (ACPI_PM1A_EVT_BLK_ADDRESS_V0 + 0x08)
++#define ACPI_GPE0_BLK_ADDRESS_V1     (ACPI_PM_TMR_BLK_ADDRESS_V0 + 0x20)
++#define ACPI_GPE0_BLK_LEN_V1         0x08
+ 
+ /* Compatibility definitions for the default location (version 0). */
+ #define ACPI_PM1A_EVT_BLK_ADDRESS    ACPI_PM1A_EVT_BLK_ADDRESS_V0

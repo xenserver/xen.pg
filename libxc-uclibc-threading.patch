@@ -1,0 +1,120 @@
+We need to be able to build non-thread-safe libxc for uClibc environments.
+
+diff -r c4d80da7e35e tools/libxc/Makefile
+--- a/tools/libxc/Makefile
++++ b/tools/libxc/Makefile
+@@ -85,6 +85,14 @@ CFLAGS	+= $(PTHREAD_CFLAGS)
+ # libraries.
+ #CFLAGS   += -DVALGRIND -O0 -ggdb3
+ 
++# Support libxc used from threaded application
++LIBXC_SUPPORT_THREADING ?= yes
++
++ifeq ($(LIBXC_SUPPORT_THREADING),yes)
++LIBXC_LIBS := $(PTHREAD_LIBS)
++CFLAGS     += -DLIBXC_SUPPORT_THREADING=1
++endif
++
+ CTRL_LIB_OBJS := $(patsubst %.c,%.o,$(CTRL_SRCS-y))
+ CTRL_PIC_OBJS := $(patsubst %.c,%.opic,$(CTRL_SRCS-y))
+ 
+@@ -165,7 +173,7 @@ libxenctrl.so.$(MAJOR): libxenctrl.so.$(
+ 	ln -sf $< $@
+ 
+ libxenctrl.so.$(MAJOR).$(MINOR): $(CTRL_PIC_OBJS)
+-	$(CC) $(LDFLAGS) $(PTHREAD_LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxenctrl.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(DLOPEN_LIBS) $(PTHREAD_LIBS) $(APPEND_LDFLAGS)
++	$(CC) $(LDFLAGS) $(PTHREAD_LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxenctrl.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(DLOPEN_LIBS) $(LIBXC_LIBS) $(APPEND_LDFLAGS)
+ 
+ # libxenguest
+ 
+diff -r c4d80da7e35e tools/libxc/xc_hcall_buf.c
+--- a/tools/libxc/xc_hcall_buf.c
++++ b/tools/libxc/xc_hcall_buf.c
+@@ -18,7 +18,9 @@
+ 
+ #include <stdlib.h>
+ #include <string.h>
++#ifdef LIBXC_SUPPORT_THREADING
+ #include <pthread.h>
++#endif
+ 
+ #include "xc_private.h"
+ #include "xg_private.h"
+@@ -29,20 +31,26 @@ xc_hypercall_buffer_t XC__HYPERCALL_BUFF
+     HYPERCALL_BUFFER_INIT_NO_BOUNCE
+ };
+ 
++#ifdef LIBXC_SUPPORT_THREADING
+ pthread_mutex_t hypercall_buffer_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
++#endif
+ 
+ static void hypercall_buffer_cache_lock(xc_interface *xch)
+ {
+     if ( xch->flags & XC_OPENFLAG_NON_REENTRANT )
+         return;
++#ifdef LIBXC_SUPPORT_THREADING
+     pthread_mutex_lock(&hypercall_buffer_cache_mutex);
++#endif
+ }
+ 
+ static void hypercall_buffer_cache_unlock(xc_interface *xch)
+ {
+     if ( xch->flags & XC_OPENFLAG_NON_REENTRANT )
+         return;
++#ifdef LIBXC_SUPPORT_THREADING
+     pthread_mutex_unlock(&hypercall_buffer_cache_mutex);
++#endif
+ }
+ 
+ static void *hypercall_buffer_cache_alloc(xc_interface *xch, int nr_pages)
+diff -r c4d80da7e35e tools/libxc/xc_private.c
+--- a/tools/libxc/xc_private.c
++++ b/tools/libxc/xc_private.c
+@@ -24,7 +24,6 @@
+ #include <stdarg.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+-#include <pthread.h>
+ #include <assert.h>
+ 
+ #ifndef __MINIOS__
+@@ -287,9 +286,18 @@ int xc_gntshr_close(xc_gntshr *xcg)
+ }
+ 
+ 
++#ifdef LIBXC_SUPPORT_THREADING
++#include <pthread.h>
++
+ static pthread_key_t errbuf_pkey;
+ static pthread_once_t errbuf_pkey_once = PTHREAD_ONCE_INIT;
+ 
++#else
++
++/* wtf? */
++
++#endif
++
+ const xc_error *xc_get_last_error(xc_interface *xch)
+ {
+     return &xch->last_error;
+@@ -740,6 +748,7 @@ unsigned long xc_make_page_below_4G(
+     return new_mfn;
+ }
+ 
++#ifdef LIBXC_SUPPORT_THREADING
+ static void
+ _xc_clean_errbuf(void * m)
+ {
+@@ -787,6 +796,12 @@ const char *xc_strerror(xc_interface *xc
+         return errbuf;
+     }
+ }
++#else
++const char *xc_strerror(xc_interface *xch, int errcode)
++{
++    return strerror(errcode);
++}
++#endif
+ 
+ void bitmap_64_to_byte(uint8_t *bp, const uint64_t *lp, int nbits)
+ {

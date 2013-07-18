@@ -1,0 +1,84 @@
+# HG changeset patch
+# User Keir Fraser <keir@xen.org>
+# Date 1358171745 0
+# Node ID e6f74afc78d26e0201c64d08b8a3ed089c2120ff
+# Parent 25616aecff398d705d155dba9b0dd4c7efcad7c5
+x86: Assert !in_atomic() before exiting to guest context.
+
+Signed-off-by: Keir Fraser <keir@xen.org>
+
+diff -r 25616aecff39 xen/arch/x86/hvm/svm/entry.S
+--- a/xen/arch/x86/hvm/svm/entry.S
++++ b/xen/arch/x86/hvm/svm/entry.S
+@@ -55,6 +55,7 @@
+ ENTRY(svm_asm_do_resume)
+         call svm_intr_assist
+         call_with_regs(nsvm_vcpu_switch)
++        ASSERT_NOT_IN_ATOMIC
+ 
+         get_current(bx)
+         CLGI
+diff -r 25616aecff39 xen/arch/x86/hvm/vmx/entry.S
+--- a/xen/arch/x86/hvm/vmx/entry.S
++++ b/xen/arch/x86/hvm/vmx/entry.S
+@@ -120,6 +120,7 @@ vmx_asm_vmexit_handler:
+ vmx_asm_do_vmentry:
+         call vmx_intr_assist
+         call nvmx_switch_guest
++        ASSERT_NOT_IN_ATOMIC
+ 
+         get_current(bx)
+         cli
+diff -r 25616aecff39 xen/arch/x86/x86_64/compat/entry.S
+--- a/xen/arch/x86/x86_64/compat/entry.S
++++ b/xen/arch/x86/x86_64/compat/entry.S
+@@ -94,6 +94,7 @@ compat_skip_clobber:
+ 
+ /* %rbx: struct vcpu */
+ ENTRY(compat_test_all_events)
++        ASSERT_NOT_IN_ATOMIC
+         cli                             # tests must not race interrupts
+ /*compat_test_softirqs:*/
+         movl  VCPU_processor(%rbx),%eax
+diff -r 25616aecff39 xen/arch/x86/x86_64/entry.S
+--- a/xen/arch/x86/x86_64/entry.S
++++ b/xen/arch/x86/x86_64/entry.S
+@@ -194,6 +194,7 @@ skip_clobber:
+ 
+ /* %rbx: struct vcpu */
+ test_all_events:
++        ASSERT_NOT_IN_ATOMIC
+         cli                             # tests must not race interrupts
+ /*test_softirqs:*/  
+         movl  VCPU_processor(%rbx),%eax
+diff -r 25616aecff39 xen/common/preempt.c
+--- a/xen/common/preempt.c
++++ b/xen/common/preempt.c
+@@ -30,3 +30,9 @@ bool_t in_atomic(void)
+ {
+     return preempt_count() || in_irq() || !local_irq_is_enabled();
+ }
++
++/* asm helper */
++void bug_if_in_atomic(void)
++{
++    BUG_ON(in_atomic());
++}
+diff -r 25616aecff39 xen/include/asm-x86/asm_defns.h
+--- a/xen/include/asm-x86/asm_defns.h
++++ b/xen/include/asm-x86/asm_defns.h
+@@ -48,6 +48,14 @@ void ret_from_intr(void);
+         .subsection 0;            \
+         .Llikely.tag:
+ 
++#ifndef NDEBUG
++#define ASSERT_NOT_IN_ATOMIC                                             \
++    sti; /* sometimes called with interrupts disabled: safe to enable */ \
++    call bug_if_in_atomic
++#else
++#define ASSERT_NOT_IN_ATOMIC
++#endif
++
+ #endif
+ 
+ #endif /* __X86_ASM_DEFNS_H__ */

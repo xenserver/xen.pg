@@ -1,0 +1,58 @@
+Allow NX support to be hidden from HVM guests as a domain creation
+parameter.
+
+diff -r fc4b1dd7ccf7 xen/arch/x86/hvm/hvm.c
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -1510,6 +1510,14 @@ int hvm_set_efer(uint64_t value)
+         return X86EMUL_EXCEPTION;
+     }
+ 
++    if ( (value & EFER_NX) &&
++         !(v->domain->arch.hvm_domain.params[HVM_PARAM_NX_ENABLED]) ) 
++    {
++        gdprintk(XENLOG_WARNING, "Trying to set NXE when it was disabled\n");
++        hvm_inject_page_fault(0, 0);
++        return X86EMUL_EXCEPTION;
++    }
++
+     if ( ((value ^ v->arch.hvm_vcpu.guest_efer) & EFER_LME) &&
+          hvm_paging_enabled(v) )
+     {
+@@ -2785,6 +2793,12 @@ void hvm_cpuid(unsigned int input, unsig
+         /* Only provide PSE36 when guest runs in 32bit PAE or in long mode */
+         if ( !(hvm_pae_enabled(v) || hvm_long_mode_enabled(v)) )
+             *edx &= ~cpufeat_mask(X86_FEATURE_PSE36);
++        /* Fix up NX-disabling HVM param */
++#if CONFIG_PAGING_LEVELS >= 3
++        if ( !v->domain->arch.hvm_domain.params[HVM_PARAM_PAE_ENABLED] ||
++             !v->domain->arch.hvm_domain.params[HVM_PARAM_NX_ENABLED] )
++#endif
++            __clear_bit(X86_FEATURE_NX & 31, edx);
+         break;
+     }
+ }
+@@ -3778,6 +3792,10 @@ long do_hvm_op(unsigned long op, XEN_GUE
+                 iorp = &d->arch.hvm_domain.buf_ioreq;
+                 rc = hvm_set_ioreq_page(d, iorp, a.value);
+                 break;
++            case HVM_PARAM_NX_ENABLED:
++                if ( !cpu_has_nx )
++                    goto param_fail;
++                break;
+             case HVM_PARAM_CALLBACK_IRQ:
+                 hvm_set_callback_via(d, a.value);
+                 hvm_latch_shinfo_size(d);
+diff -r fc4b1dd7ccf7 xen/include/public/hvm/params.h
+--- a/xen/include/public/hvm/params.h
++++ b/xen/include/public/hvm/params.h
+@@ -62,6 +62,9 @@
+ 
+ #elif defined(__i386__) || defined(__x86_64__)
+ 
++/* Should the guest be allowed to use NX bits in page tables? */
++#define HVM_PARAM_NX_ENABLED   7
++
+ /* The guest is using 32 bit PV drivers.  Apply suitable translations
+    to shared info and hypercall arguments. */
+ #define HVM_PARAM_32BIT        8

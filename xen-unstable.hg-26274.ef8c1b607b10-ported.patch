@@ -1,0 +1,87 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1355244559 -3600
+# Node ID ef8c1b607b1046b69036bd16d27e08413d47ed11
+# Parent 5b1e89afccb342cd80f68a84300ad51b72c9587d
+x86/IST: Create set_ist() helper function
+
+... to save using open-coded bitwise operations, and update all IST
+manipulation sites to use the function.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Committed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 5b1e89afccb3 xen/arch/x86/hvm/svm/svm.c
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -682,9 +682,9 @@ static void svm_ctxt_switch_from(struct 
+ 
+ #ifdef __x86_64__
+     /* Resume use of ISTs now that the host TR is reinstated. */
+-    idt_tables[cpu][TRAP_double_fault].a  |= IST_DF << 32;
+-    idt_tables[cpu][TRAP_nmi].a           |= IST_NMI << 32;
+-    idt_tables[cpu][TRAP_machine_check].a |= IST_MCE << 32;
++    set_ist(&idt_tables[cpu][TRAP_double_fault],  IST_DF);
++    set_ist(&idt_tables[cpu][TRAP_nmi],           IST_NMI);
++    set_ist(&idt_tables[cpu][TRAP_machine_check], IST_MCE);
+ #endif
+ }
+ 
+@@ -708,9 +708,9 @@ static void svm_ctxt_switch_to(struct vc
+      * Cannot use ISTs for NMI/#MC/#DF while we are running with the guest TR.
+      * But this doesn't matter: the IST is only req'd to handle SYSCALL/SYSRET.
+      */
+-    idt_tables[cpu][TRAP_double_fault].a  &= ~(7UL << 32);
+-    idt_tables[cpu][TRAP_nmi].a           &= ~(7UL << 32);
+-    idt_tables[cpu][TRAP_machine_check].a &= ~(7UL << 32);
++    set_ist(&idt_tables[cpu][TRAP_double_fault],  IST_NONE);
++    set_ist(&idt_tables[cpu][TRAP_nmi],           IST_NONE);
++    set_ist(&idt_tables[cpu][TRAP_machine_check], IST_NONE);
+ #endif
+ 
+     svm_restore_dr(v);
+diff -r 5b1e89afccb3 xen/arch/x86/x86_64/traps.c
+--- a/xen/arch/x86/x86_64/traps.c
++++ b/xen/arch/x86/x86_64/traps.c
+@@ -364,9 +364,9 @@ void __devinit subarch_percpu_traps_init
+     {
+         /* Specify dedicated interrupt stacks for NMI, #DF, and #MC. */
+         set_intr_gate(TRAP_double_fault, &double_fault);
+-        idt_table[TRAP_double_fault].a  |= IST_DF << 32;
+-        idt_table[TRAP_nmi].a           |= IST_NMI << 32;
+-        idt_table[TRAP_machine_check].a |= IST_MCE << 32;
++        set_ist(&idt_table[TRAP_double_fault],  IST_DF);
++        set_ist(&idt_table[TRAP_nmi],           IST_NMI);
++        set_ist(&idt_table[TRAP_machine_check], IST_MCE);
+ 
+         /*
+          * The 32-on-64 hypercall entry vector is only accessible from ring 1.
+diff -r 5b1e89afccb3 xen/include/asm-x86/processor.h
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -462,10 +462,21 @@ struct tss_struct {
+ } __cacheline_aligned __attribute__((packed));
+ 
+ #ifdef __x86_64__
+-# define IST_DF  1UL
+-# define IST_NMI 2UL
+-# define IST_MCE 3UL
+-# define IST_MAX 3UL
++#define IST_NONE 0UL
++#define IST_DF   1UL
++#define IST_NMI  2UL
++#define IST_MCE  3UL
++#define IST_MAX  3UL
++
++/* Set the interrupt stack table used by a particular interrupt
++ * descriptor table entry. */
++static always_inline void set_ist(idt_entry_t *idt, unsigned long ist)
++{
++    /* IST is a 3 bit field, 32 bits into the IDT entry. */
++    ASSERT(ist <= IST_MAX);
++    idt->a = (idt->a & ~(7UL << 32)) | (ist << 32);
++}
++
+ #endif
+ 
+ #define IDT_ENTRIES 256

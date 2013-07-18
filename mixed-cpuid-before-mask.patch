@@ -1,0 +1,400 @@
+Add a new hypercall and libxc wrapper to get the CPUID feature leaves
+as they were before and after the FlexMigrate/Extended Migration masks.
+
+This is not the ideal way to do it - in particular I think probably
+platform_ops is the wrong hypercall, and it definitely needs to
+allocate a better cmd number before going upstream.
+
+diff -r 172007b9e9f8 tools/libxc/xc_misc.c
+--- a/tools/libxc/xc_misc.c
++++ b/tools/libxc/xc_misc.c
+@@ -371,6 +371,31 @@ int xc_getcpuinfo(xc_interface *xch, int
+ }
+ 
+ 
++int xc_get_boot_cpufeatures(xc_interface *xch,
++                            uint32_t *base_ecx, uint32_t *base_edx,
++                            uint32_t *ext_ecx, uint32_t *ext_edx,
++                            uint32_t *masked_base_ecx, 
++                            uint32_t *masked_base_edx,
++                            uint32_t *masked_ext_ecx, 
++                            uint32_t *masked_ext_edx)
++{
++    xen_platform_op_t pm = {0};
++    int rc;
++
++    pm.cmd = XENPF_get_cpu_features;
++    rc = do_platform(xch, &pm);
++
++    *base_ecx = pm.u.cpu_features.base_ecx;
++    *base_edx = pm.u.cpu_features.base_edx;
++    *ext_ecx = pm.u.cpu_features.ext_ecx;
++    *ext_edx = pm.u.cpu_features.ext_edx;
++    *masked_base_ecx = pm.u.cpu_features.masked_base_ecx;
++    *masked_base_edx = pm.u.cpu_features.masked_base_edx;
++    *masked_ext_ecx = pm.u.cpu_features.masked_ext_ecx;
++    *masked_ext_edx = pm.u.cpu_features.masked_ext_edx;
++    return rc;
++}
++
+ int xc_hvm_set_pci_intx_level(
+     xc_interface *xch, domid_t dom,
+     uint8_t domain, uint8_t bus, uint8_t device, uint8_t intx,
+diff -r 172007b9e9f8 tools/libxc/xc_private.c
+--- a/tools/libxc/xc_private.c
++++ b/tools/libxc/xc_private.c
+@@ -609,6 +609,32 @@ int do_memory_op(xc_interface *xch, int 
+ }
+ */
+ 
++int do_platform(xc_interface *xch, struct xen_platform_op *pm)
++{
++    int ret = -1;
++    DECLARE_HYPERCALL;
++    DECLARE_HYPERCALL_BOUNCE(pm, sizeof(*pm), XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
++
++    pm->interface_version = XENPF_INTERFACE_VERSION;
++    if ( xc_hypercall_bounce_pre(xch, pm) )
++    {
++        PERROR("Could not bounce memory for platform op hypercall");
++        return -1;
++    }
++
++    hypercall.op     = __HYPERVISOR_platform_op;
++    hypercall.arg[0] = HYPERCALL_BUFFER_AS_ARG(pm);
++    if ( (ret = do_xen_hypercall(xch, &hypercall)) < 0 )
++    {
++        if ( errno == EACCES )
++            DPRINTF("platform operation failed -- need to"
++                    " rebuild the user-space tool set?\n");
++    }
++
++    xc_hypercall_bounce_post(xch, pm);
++    return ret;
++}
++
+ int do_memory_op(xc_interface *xch, int cmd, void *arg, size_t len)
+ {
+     privcmd_memop_t pmt;
+diff -r 172007b9e9f8 tools/libxc/xc_private.h
+--- a/tools/libxc/xc_private.h
++++ b/tools/libxc/xc_private.h
+@@ -194,6 +194,7 @@ void xc__hypercall_buffer_cache_release(
+ int do_xen_hypercall(xc_interface *xch, privcmd_hypercall_t *hypercall);
+ int do_xen_arch_ioctl(xc_interface *xch, int req, long int arg);
+ int do_hvm_op(xc_interface *xch, unsigned cmd, void *arg);
++int do_platform(xc_interface *xch, struct xen_platform_op *pm);
+ 
+ static inline int do_xen_version(xc_interface *xch, int cmd, xc_hypercall_buffer_t *dest)
+ {
+diff -r 172007b9e9f8 tools/libxc/xenctrl.h
+--- a/tools/libxc/xenctrl.h
++++ b/tools/libxc/xenctrl.h
+@@ -38,6 +38,7 @@
+ #include <xen/domctl.h>
+ #include <xen/physdev.h>
+ #include <xen/sysctl.h>
++#include <xen/platform.h>
+ #include <xen/version.h>
+ #include <xen/event_channel.h>
+ #include <xen/sched.h>
+@@ -102,6 +103,10 @@
+  * between, and be compatible with, both versions.
+  */
+ 
++#define XENCTRL_HAS_GET_CPUFEATURES 1
++/* xc_get_boot_cpufeatures is not upstream, so we use this to allow
++ * the ocaml bindings to conditionally-compile.
++ */
+ 
+ /*
+  *  GENERAL
+@@ -2379,4 +2384,15 @@ int xc_kexec_load(xc_interface *xch, uin
+  */
+ int xc_kexec_unload(xc_interface *xch, int type);
+ 
++
++/* Get the CPUID feature lists before and after any hardware masks 
++ * were applied.  Returns the ANDed aggregate of all online CPUs. */
++int xc_get_boot_cpufeatures(xc_interface *xc_handle, 
++                            uint32_t *base_ecx, uint32_t *base_edx,
++                            uint32_t *ext_ecx, uint32_t *ext_edx,
++                            uint32_t *masked_base_ecx, 
++                            uint32_t *masked_base_edx,
++                            uint32_t *masked_ext_ecx, 
++                            uint32_t *masked_ext_edx);
++
+ #endif /* XENCTRL_H */
+diff -r 172007b9e9f8 tools/ocaml/libs/xc/xenctrl.ml
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -278,6 +278,9 @@ external version_capabilities: handle ->
+ external watchdog : handle -> int -> int32 -> int
+   = "stub_xc_watchdog"
+ 
++external get_boot_cpufeatures: handle ->
++        (int32 * int32 * int32 * int32 * int32 * int32 * int32 * int32) = "stub_xc_get_boot_cpufeatures"
++
+ (* core dump structure *)
+ type core_magic = Magic_hvm | Magic_pv
+ 
+diff -r 172007b9e9f8 tools/ocaml/libs/xc/xenctrl.mli
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -210,3 +210,5 @@ external domain_cpuid_apply_policy: hand
+ external cpuid_check: handle -> (int64 * (int64 option)) -> string option array -> (bool * string option array)
+        = "stub_xc_cpuid_check"
+ 
++external get_boot_cpufeatures: handle ->
++        (int32 * int32 * int32 * int32 * int32 * int32 * int32 * int32) = "stub_xc_get_boot_cpufeatures"
+diff -r 172007b9e9f8 tools/ocaml/libs/xc/xenctrl_stubs.c
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -1303,6 +1303,30 @@ CAMLprim value stub_xc_domain_trigger_sl
+ 	CAMLreturn(Val_unit);
+ }
+ 
++CAMLprim value stub_xc_get_boot_cpufeatures(value xch)
++{
++	CAMLparam1(xch);
++	CAMLlocal1(v);
++	uint32_t a, b, c, d, e, f, g, h;
++	int ret;
++
++	ret = xc_get_boot_cpufeatures(_H(xch), &a, &b, &c, &d, &e, &f, &g, &h);
++	if (ret < 0)
++		failwith_xc(_H(xch));
++
++	v = caml_alloc_tuple(8);
++	Store_field(v, 0, caml_copy_int32(a));
++	Store_field(v, 1, caml_copy_int32(b));
++	Store_field(v, 2, caml_copy_int32(c));
++	Store_field(v, 3, caml_copy_int32(d));
++	Store_field(v, 4, caml_copy_int32(e));
++	Store_field(v, 5, caml_copy_int32(f));
++	Store_field(v, 6, caml_copy_int32(g));
++	Store_field(v, 7, caml_copy_int32(h));
++
++	CAMLreturn(v);
++}
++
+ /*
+  * Local variables:
+  *  indent-tabs-mode: t
+diff -r 172007b9e9f8 xen/arch/x86/cpu/amd.c
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -96,12 +96,16 @@ static inline int wrmsr_amd_safe(unsigne
+  */
+ static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
+ {
++	unsigned int eax, ebx;
+ 	static unsigned int feat_ecx, feat_edx;
+ 	static unsigned int extfeat_ecx, extfeat_edx;
+ 	static enum { not_parsed, no_mask, set_mask } status;
+ 
++	cpuid(0x1, &eax, &ebx, &c->boot_base_ecx, &c->boot_base_edx);
++	cpuid(0x80000001, &eax, &ebx, &c->boot_ext_ecx, &c->boot_ext_edx);
++
+ 	if (status == no_mask)
+-		return;
++		goto out;
+ 
+ 	if (status == set_mask)
+ 		goto setmask;
+@@ -116,7 +120,7 @@ static void __devinit set_cpuidmask(cons
+ 		extfeat_ecx = opt_cpuid_mask_ext_ecx;
+ 		extfeat_edx = opt_cpuid_mask_ext_edx;
+ 	} else if (*opt_famrev == '\0') {
+-		return;
++		goto out;
+ 	} else if (!strcmp(opt_famrev, "fam_0f_rev_c")) {
+ 		feat_ecx = AMD_FEATURES_K8_REV_C_ECX;
+ 		feat_edx = AMD_FEATURES_K8_REV_C_EDX;
+@@ -160,7 +164,7 @@ static void __devinit set_cpuidmask(cons
+ 	} else {
+ 		printk("Invalid processor string: %s\n", opt_famrev);
+ 		printk("CPUID will not be masked\n");
+-		return;
++		goto out;
+ 	}
+ 
+         /* Setting bits in the CPUID mask MSR that are not set in the
+@@ -187,6 +191,10 @@ static void __devinit set_cpuidmask(cons
+ 		wrmsr_amd(MSR_K8_FEATURE_MASK, feat_edx, feat_ecx);
+ 		wrmsr_amd(MSR_K8_EXT_FEATURE_MASK, extfeat_edx, extfeat_ecx);
+ 	}
++
++out:
++	cpuid(0x1, &eax, &ebx, &c->masked_base_ecx, &c->masked_base_edx);
++	cpuid(0x80000001, &eax, &ebx, &c->masked_ext_ecx, &c->masked_ext_edx);
+ }
+ 
+ /*
+diff -r 172007b9e9f8 xen/arch/x86/cpu/intel.c
+--- a/xen/arch/x86/cpu/intel.c
++++ b/xen/arch/x86/cpu/intel.c
+@@ -69,19 +69,22 @@ void set_cpuid_faulting(bool_t enable)
+  */
+ static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
+ {
+-	u32 eax, edx;
++	u32 eax, ebx, edx;
+ 	const char *extra = "";
+ 
++	cpuid(0x1, &eax, &ebx, &c->boot_base_ecx, &c->boot_base_edx);
++	cpuid(0x80000001, &eax, &ebx, &c->boot_ext_ecx, &c->boot_ext_edx);
++
+ 	if (!~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx &
+ 	       opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx &
+                opt_cpuid_mask_xsave_eax))
+-		return;
++		goto out;
+ 
+ 	/* Only family 6 supports this feature  */
+ 	switch ((c->x86 == 6) * c->x86_model) {
+ 	case 0x17:
+ 		if ((c->x86_mask & 0x0f) < 4)
+-			break;
++			goto error;
+ 		/* fall through */
+ 	case 0x1d:
+ 		wrmsr(MSR_INTEL_CPUID_FEATURE_MASK,
+@@ -92,8 +95,8 @@ static void __devinit set_cpuidmask(cons
+ 		else if (~opt_cpuid_mask_xsave_eax)
+ 			extra = "xsave ";
+ 		else
+-			return;
+-		break;
++			goto out;
++		goto error;
+ /* 
+  * CPU supports this feature if the processor signature meets the following:
+  * (CPUID.(EAX=01h):EAX) > 000106A2h, or
+@@ -101,8 +104,8 @@ static void __devinit set_cpuidmask(cons
+  *
+  */
+ 	case 0x1a:
+-		if ((c->x86_mask & 0x0f) <= 2)
+-			break;
++        if ((c->x86_mask & 0x0f) <= 2)
++            goto error;
+ 		/* fall through */
+ 	case 0x1e: case 0x1f:
+ 	case 0x25: case 0x2c: case 0x2e: case 0x2f:
+@@ -113,9 +116,9 @@ static void __devinit set_cpuidmask(cons
+ 		      opt_cpuid_mask_ext_ecx,
+ 		      opt_cpuid_mask_ext_edx);
+ 		if (!~opt_cpuid_mask_xsave_eax)
+-			return;
++			goto out;
+ 		extra = "xsave ";
+-		break;
++		goto error;
+ 	case 0x2a: case 0x2d: case 0x3e:
+ 		wrmsr(MSR_INTEL_CPUID1_FEATURE_MASK_V2,
+ 		      opt_cpuid_mask_ecx,
+@@ -126,11 +129,16 @@ static void __devinit set_cpuidmask(cons
+ 		wrmsr(MSR_INTEL_CPUID80000001_FEATURE_MASK_V2,
+ 		      opt_cpuid_mask_ext_ecx,
+ 		      opt_cpuid_mask_ext_edx);
+-		return;
++		goto out;
+ 	}
+ 
++error:
+ 	printk(XENLOG_INFO "Cannot set CPU %sfeature mask on CPU#%d\n",
+ 	       extra, smp_processor_id());
++out:
++    cpuid(0x1, &eax, &ebx, &c->masked_base_ecx, &c->masked_base_edx);
++    cpuid(0x80000001, &eax, &ebx, &c->masked_ext_ecx, &c->masked_ext_edx);
++
+ }
+ 
+ void __devinit early_intel_workaround(struct cpuinfo_x86 *c)
+diff -r 172007b9e9f8 xen/arch/x86/platform_hypercall.c
+--- a/xen/arch/x86/platform_hypercall.c
++++ b/xen/arch/x86/platform_hypercall.c
+@@ -639,6 +639,34 @@ ret_t do_platform_op(XEN_GUEST_HANDLE(xe
+     }
+     break;
+ 
++    case XENPF_get_cpu_features:
++    {
++        uint32_t cpu;
++
++        op->u.cpu_features.base_ecx = 0xffffffff;
++        op->u.cpu_features.base_edx = 0xffffffff;
++        op->u.cpu_features.ext_ecx = 0xffffffff;
++        op->u.cpu_features.ext_edx = 0xffffffff;
++        op->u.cpu_features.masked_base_ecx = 0xffffffff;
++        op->u.cpu_features.masked_base_edx = 0xffffffff;
++        op->u.cpu_features.masked_ext_ecx = 0xffffffff;
++        op->u.cpu_features.masked_ext_edx = 0xffffffff;
++        for_each_online_cpu( cpu )
++        {
++            op->u.cpu_features.base_ecx &= cpu_data[cpu].boot_base_ecx;
++            op->u.cpu_features.base_edx &= cpu_data[cpu].boot_base_edx;
++            op->u.cpu_features.ext_ecx  &= cpu_data[cpu].boot_ext_ecx;
++            op->u.cpu_features.ext_edx  &= cpu_data[cpu].boot_ext_edx;
++            op->u.cpu_features.masked_base_ecx &= cpu_data[cpu].masked_base_ecx;
++            op->u.cpu_features.masked_base_edx &= cpu_data[cpu].masked_base_edx;
++            op->u.cpu_features.masked_ext_ecx  &= cpu_data[cpu].masked_ext_ecx;
++            op->u.cpu_features.masked_ext_edx  &= cpu_data[cpu].masked_ext_edx;
++        }
++
++        ret = copy_to_guest(u_xenpf_op, op, 1) ? -EFAULT : 0;
++    }
++    break;
++
+     default:
+         ret = -ENOSYS;
+         break;
+diff -r 172007b9e9f8 xen/include/asm-x86/processor.h
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -169,6 +169,10 @@ struct cpuinfo_x86 {
+     __u8 x86_mask;
+     int  cpuid_level;    /* Maximum supported CPUID level, -1=no CPUID */
+     unsigned int x86_capability[NCAPINTS];
++    unsigned int boot_base_ecx, boot_base_edx;
++    unsigned int boot_ext_ecx, boot_ext_edx;
++    unsigned int masked_base_ecx, masked_base_edx;
++    unsigned int masked_ext_ecx, masked_ext_edx;
+     char x86_vendor_id[16];
+     char x86_model_id[64];
+     int  x86_cache_size; /* in KB - valid for CPUS which support this call  */
+diff -r 172007b9e9f8 xen/include/public/platform.h
+--- a/xen/include/public/platform.h
++++ b/xen/include/public/platform.h
+@@ -504,6 +504,22 @@ struct xenpf_core_parking {
+ typedef struct xenpf_core_parking xenpf_core_parking_t;
+ DEFINE_XEN_GUEST_HANDLE(xenpf_core_parking_t);
+ 
++/* Get the CPUID feature lists before and after any hardware masks
++ * were applied.   Returns the ANDed aggregate of all online CPUs. */
++#define XENPF_get_cpu_features  511
++struct xenpf_cpu_features {
++    uint32_t base_ecx;          /* CPUID leaf 0x00000001:ECX */
++    uint32_t base_edx;          /* CPUID leaf 0x00000001:EDX */
++    uint32_t ext_ecx;           /* CPUID leaf 0x80000001:ECX */
++    uint32_t ext_edx;           /* CPUID leaf 0x80000001:EDX */
++    uint32_t masked_base_ecx;   /* CPUID leaf 0x00000001:ECX */
++    uint32_t masked_base_edx;   /* CPUID leaf 0x00000001:EDX */
++    uint32_t masked_ext_ecx;    /* CPUID leaf 0x80000001:ECX */
++    uint32_t masked_ext_edx;    /* CPUID leaf 0x80000001:EDX */
++};
++typedef struct xenpf_cpu_features xenpf_cpu_features_t;
++DEFINE_XEN_GUEST_HANDLE(xenpf_cpu_features_t);
++
+ /*
+  * ` enum neg_errnoval
+  * ` HYPERVISOR_platform_op(const struct xen_platform_op*);
+@@ -530,6 +546,7 @@ struct xen_platform_op {
+         struct xenpf_cpu_hotadd        cpu_add;
+         struct xenpf_mem_hotadd        mem_add;
+         struct xenpf_core_parking      core_parking;
++        struct xenpf_cpu_features      cpu_features;
+         uint8_t                        pad[128];
+     } u;
+ };

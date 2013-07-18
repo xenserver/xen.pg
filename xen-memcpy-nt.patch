@@ -1,0 +1,81 @@
+Use a non-temporal memcpy for grant copy operations.  This should reduce
+cache polution on network RX heavy workloads.
+
+diff -r d7f9194f4eb9 xen/common/grant_table.c
+--- a/xen/common/grant_table.c	Wed Jul 07 12:01:33 2010 +0100
++++ b/xen/common/grant_table.c	Wed Jul 07 14:24:06 2010 +0100
+@@ -2008,7 +2008,7 @@
+     sp = map_domain_page(s_frame);
+     dp = map_domain_page(d_frame);
+ 
+-    memcpy(dp + op->dest.offset, sp + op->source.offset, op->len);
++    memcpy_nt(dp + op->dest.offset, sp + op->source.offset, op->len);
+ 
+     unmap_domain_page(dp);
+     unmap_domain_page(sp);
+@@ -2308,6 +2308,7 @@
+         if ( unlikely(!guest_handle_okay(copy, count)) )
+             goto out;
+         rc = gnttab_copy(copy, count);
++        memcpy_nt_finish();
+         if ( rc > 0 )
+         {
+             guest_handle_add_offset(copy, rc);
+diff -r d7f9194f4eb9 xen/include/asm-x86/string.h
+--- a/xen/include/asm-x86/string.h	Wed Jul 07 12:01:33 2010 +0100
++++ b/xen/include/asm-x86/string.h	Wed Jul 07 14:24:06 2010 +0100
+@@ -13,4 +13,54 @@
+ #define __HAVE_ARCH_MEMSET
+ #define memset(s,c,n) (__builtin_memset((s),(c),(n)))
+ 
++#if defined(__x86_64__)
++/* Copy @size bytes from @src to @dest with a non-temporal hint.
++   Needs a memcpy_finish() after it's been used before any other CPU
++   tries to access the memory. */
++static inline void memcpy_nt(void *dest, const void *src, size_t size)
++{
++    unsigned long t0, t1, t2, t3, t4, t5, rsi, rdi, rcx;
++    __asm__ __volatile__ (
++        "    subq $0x30, %%rcx\n"
++        "    jb 1f\n"
++        "2:  movq 0x00(%%rsi), %0\n"
++        "    movq 0x08(%%rsi), %1\n"
++        "    movq 0x10(%%rsi), %2\n"
++        "    movq 0x18(%%rsi), %3\n"
++        "    movq 0x20(%%rsi), %4\n"
++        "    movq 0x28(%%rsi), %5\n"
++        "    addq $0x30, %%rsi\n"
++        "    movnti %0, 0x00(%%rdi)\n"
++        "    movnti %1, 0x08(%%rdi)\n"
++        "    movnti %2, 0x10(%%rdi)\n"
++        "    movnti %3, 0x18(%%rdi)\n"
++        "    movnti %4, 0x20(%%rdi)\n"
++        "    movnti %5, 0x28(%%rdi)\n"
++        "    addq $0x30, %%rdi\n"
++        "    subq $0x30, %%rcx\n"
++        "    jnb 2b\n"
++        "1:  addq $0x30, %%rcx\n"
++        "    rep movsb\n"
++        : "=r" (t0), "=r" (t1), "=r" (t2), "=r" (t3), "=r" (t4), "=r" (t5),
++          "=S" (rsi), "=D" (rdi), "=c" (rcx)
++        : "S" (src), "D" (dest), "c" (size)
++        : "memory" );
++}
++
++static inline void memcpy_nt_finish(void)
++{
++    __asm__ __volatile__ ("sfence" ::: "memory");
++}
++#else
++static inline void memcpy_nt(void *dest, const void *src, size_t size)
++{
++    memcpy(dest, src, size);
++}
++
++static inline void memcpy_nt_finish(void)
++{
++}
++
++#endif
++
+ #endif /* __X86_STRING_H__ */
