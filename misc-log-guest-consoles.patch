@@ -1,21 +1,48 @@
-Log guest's serial consoles.
-Logging is enable by writing the filename of the logfile to the
-node /local/logconsole/<domid> in xenstore.
-Writing the empty string or removing the node stops logging.
-Writing the same path to the node causes the daemon to close and
-reopen the file -- this can be used to logrotate the file.
-The /local/logconsole directory should not be removed as otherwise
-all console logging will not work until xenconsoled is restarted.
+commit 1a4ae2e79b67d6c345e46a9cb76174ee1eb2fc21
+Author: Andrew Cooper <andrew.cooper3@citrix.com>
+Date:   Tue Jul 2 18:47:25 2013 +0100
 
-Logging can also be enabled by writing a filename containing %d
-to the node /local/logconsole/@ in xenstore.  This enables logging
-for domains for which no /local/logconsole/<domid> node exists.
-The filename is expanded by replacing %d with the domain id.
+    tools/xenconsoled: Log guest serial consoles
 
-diff -r 478fd4140d1d tools/console/daemon/io.c
---- a/tools/console/daemon/io.c	Tue Jun 07 17:21:37 2011 +0100
-+++ b/tools/console/daemon/io.c	Tue Jun 07 17:22:03 2011 +0100
-@@ -94,8 +94,12 @@
+    The ability to log guest consoles can now be controlled using xenstore keys
+    under /local/logconsole.
+
+    Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+    --
+    This has been used extensivly in the XenServer automated testing
+    infrastructure for many years, and interest has been expressed in having the
+    functionality upstream.
+
+diff -r e56f8bab3944 docs/misc/xenstore-paths.markdown
+--- a/docs/misc/xenstore-paths.markdown
++++ b/docs/misc/xenstore-paths.markdown
+@@ -348,6 +348,21 @@ The time which the guest was started in 
+ 
+ The guest's virtual time offset from UTC in seconds.
+ 
++## Logging paths
++
++### /local/logconsole/$DOMID = PATH [n,INTERNAL]
++
++Write a path to this key to enable console logging for the specified domain.
++Writing an empty string or removing the node causes logging to stop.
++Rewriting the path causes the daemon to close and reopen the file, which can
++be uses to rotate the log file.
++
++### /local/logconsole/@ = PATH [n,INTERNAL]
++
++Wildcard logging path, for domains without a `/local/logconsole/$DOMID` path.
++The path must contain "%d" which shall be substituted with the domid, and must
++not contain any other "%" characters.
++
+ ## Platform-Level paths
+ 
+ ### libxl Specific Paths
+diff -r e56f8bab3944 tools/console/daemon/io.c
+--- a/tools/console/daemon/io.c
++++ b/tools/console/daemon/io.c
+@@ -103,8 +103,12 @@ struct domain {
  	struct xencons_interface *interface;
  	int event_count;
  	long long next_period;
@@ -28,7 +55,7 @@ diff -r 478fd4140d1d tools/console/daemon/io.c
  static struct domain *dom_head;
  
  static int write_all(int fd, const char* buf, size_t len)
-@@ -149,6 +153,7 @@
+@@ -158,6 +162,7 @@ static void buffer_append(struct domain 
  	struct buffer *buffer = &dom->buffer;
  	XENCONS_RING_IDX cons, prod, size;
  	struct xencons_interface *intf = dom->interface;
@@ -36,7 +63,7 @@ diff -r 478fd4140d1d tools/console/daemon/io.c
  
  	cons = intf->out_cons;
  	prod = intf->out_prod;
-@@ -167,9 +172,15 @@
+@@ -176,9 +181,15 @@ static void buffer_append(struct domain 
  		}
  	}
  
@@ -52,7 +79,7 @@ diff -r 478fd4140d1d tools/console/daemon/io.c
  
  	xen_mb();
  	intf->out_cons = cons;
-@@ -660,6 +671,9 @@
+@@ -683,6 +694,9 @@ static struct domain *create_domain(int 
  	if (!watch_domain(dom, true))
  		goto out;
  
@@ -62,25 +89,17 @@ diff -r 478fd4140d1d tools/console/daemon/io.c
  	dom->next = dom_head;
  	dom_head = dom;
  
-@@ -685,12 +699,17 @@
- static void remove_domain(struct domain *dom)
- {
- 	struct domain **pp;
-+	FILE *oldfile;
- 
- 	dolog(LOG_DEBUG, "Removing domain-%d", dom->domid);
- 
+@@ -714,6 +728,9 @@ static void remove_domain(struct domain 
  	for (pp = &dom_head; *pp; pp = &(*pp)->next) {
  		if (dom == *pp) {
  			*pp = dom->next;
-+			oldfile = dom->logfile;
++			if (dom->logfile)
++				fclose(dom->logfile);
 +			dom->logfile = NULL;
-+			if (oldfile)
-+				fclose(oldfile);
  			free(dom);
  			break;
  		}
-@@ -746,6 +765,37 @@
+@@ -773,6 +790,37 @@ static void enum_domains(void)
  	}
  }
  
@@ -118,7 +137,7 @@ diff -r 478fd4140d1d tools/console/daemon/io.c
  static int ring_free_bytes(struct domain *dom)
  {
  	struct xencons_interface *intf = dom->interface;
-@@ -871,6 +921,19 @@
+@@ -896,6 +944,30 @@ static void handle_xs(void)
  		   been removed, so dom may be NULL here. */
  		if (dom && dom->is_dead == false)
  			domain_create_ring(dom);
@@ -130,15 +149,26 @@ diff -r 478fd4140d1d tools/console/daemon/io.c
 +				update_logconsole(dom);
 +		} else if (!strcmp(vec[XS_WATCH_PATH],
 +				   "/local/logconsole/@")) {
++			char *wildcard, *tmp;
 +			free(wildcard_logfile);
-+			wildcard_logfile = xs_read(xs, XBT_NULL,
-+						   "/local/logconsole/@",
-+						   NULL);
++			wildcard_logfile = NULL;
++			wildcard = xs_read(xs, XBT_NULL,
++					   "/local/logconsole/@", NULL);
++			/* Sanitise string, as it gets used by asprintf().  It
++			 * should contain exactly one "%d" and no futher "%"s */
++			if(wildcard) {
++				tmp = strchr(wildcard, '%');
++				if(tmp && tmp[1] == 'd' &&
++				   strchr(&tmp[1], '%') == NULL)
++					wildcard_logfile = wildcard;
++				else
++					free(wildcard);
++			}
 +		}
  	}
  
  	free(vec);
-@@ -1090,6 +1153,17 @@
+@@ -1197,6 +1269,16 @@ void handle_io(void)
  	log_hv_evtchn = -1;
  }
  
@@ -152,29 +182,28 @@ diff -r 478fd4140d1d tools/console/daemon/io.c
 +      wildcard_logfile = xs_read(xs, XBT_NULL, "/local/logconsole/@", NULL);
 +}
 +
-+
  /*
   * Local variables:
   *  c-file-style: "linux"
-diff -r 478fd4140d1d tools/console/daemon/io.h
---- a/tools/console/daemon/io.h	Tue Jun 07 17:21:37 2011 +0100
-+++ b/tools/console/daemon/io.h	Tue Jun 07 17:22:03 2011 +0100
-@@ -23,5 +23,6 @@
+diff -r e56f8bab3944 tools/console/daemon/io.h
+--- a/tools/console/daemon/io.h
++++ b/tools/console/daemon/io.h
+@@ -22,5 +22,6 @@
+ #define CONSOLED_IO_H
  
- void enum_domains(void);
  void handle_io(void);
 +void watch_logconsole(void);
  
  #endif
-diff -r 478fd4140d1d tools/console/daemon/main.c
---- a/tools/console/daemon/main.c	Tue Jun 07 17:21:37 2011 +0100
-+++ b/tools/console/daemon/main.c	Tue Jun 07 17:22:03 2011 +0100
-@@ -161,6 +161,8 @@
+diff -r e56f8bab3944 tools/console/daemon/main.c
+--- a/tools/console/daemon/main.c
++++ b/tools/console/daemon/main.c
+@@ -161,6 +161,8 @@ int main(int argc, char **argv)
  	if (!xen_setup())
  		exit(1);
  
 +	watch_logconsole();
 +
- 	enum_domains();
- 
  	handle_io();
+ 
+ 	closelog();
