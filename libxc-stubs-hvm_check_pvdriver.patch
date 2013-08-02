@@ -2,7 +2,7 @@
 # User Ian Campbell <ian.campbell@citrix.com>
 # Date 1294742832 0
 # Node ID 4370aef36fb02c95dbe5e6ca96dba69a4faa7d62
-# Parent b782c77300fe550e553997f1e7c4152fa8a97c24
+# Parent c2d2f37ae7d7cdc653c8eb4f7f61a34bf55b5bd8
 PoC: libxc+ocaml: add interface to detect PV drivers in HVM guests
 
 Required by xapi.
@@ -11,49 +11,7 @@ Taken from xen-api-libs.hg/xc and adjusted for upstream libxc+ocaml.
 
 Signed-off-by: Ian Campbell <ian.campbell@citrix.com>
 
-diff -r b782c77300fe tools/libxc/xc_misc.c
---- a/tools/libxc/xc_misc.c
-+++ b/tools/libxc/xc_misc.c
-@@ -555,6 +555,26 @@ int xc_hvm_inject_trap(
-     return rc;
- }
- 
-+int xc_hvm_check_pvdriver(xc_interface *xch, unsigned int domid)
-+{
-+    int ret;
-+    unsigned long irq = 0;
-+    xc_domaininfo_t info;
-+
-+    ret = xc_domain_getinfolist(xch, domid, 1, &info);
-+    if (ret != 1) {
-+        PERROR("domain getinfo failed");
-+        return -1;
-+    }
-+
-+    if ((!info.flags) & XEN_DOMINF_hvm_guest) {
-+        ERROR("domain is not hvm");
-+        return -1;
-+    }
-+    xc_get_hvm_param(xch, domid, HVM_PARAM_CALLBACK_IRQ, &irq);
-+    return irq;
-+}
-+
- /*
-  * Local variables:
-  * mode: C
-diff -r b782c77300fe tools/libxc/xenctrl.h
---- a/tools/libxc/xenctrl.h
-+++ b/tools/libxc/xenctrl.h
-@@ -1629,6 +1629,8 @@ int xc_hvm_inject_trap(
-     uint32_t type, uint32_t error_code, uint32_t insn_len,
-     uint64_t cr2);
- 
-+int xc_hvm_check_pvdriver(xc_interface *xch, unsigned int domid);
-+
- /*
-  *  LOGGING AND ERROR REPORTING
-  */
-diff -r b782c77300fe tools/ocaml/libs/xc/xenctrl.ml
+diff -r c2d2f37ae7d7 tools/ocaml/libs/xc/xenctrl.ml
 --- a/tools/ocaml/libs/xc/xenctrl.ml
 +++ b/tools/ocaml/libs/xc/xenctrl.ml
 @@ -237,6 +237,10 @@ external domain_deassign_device: handle 
@@ -67,7 +25,7 @@ diff -r b782c77300fe tools/ocaml/libs/xc/xenctrl.ml
  external version: handle -> version = "stub_xc_version_version"
  external version_compile_info: handle -> compile_info
         = "stub_xc_version_compile_info"
-diff -r b782c77300fe tools/ocaml/libs/xc/xenctrl.mli
+diff -r c2d2f37ae7d7 tools/ocaml/libs/xc/xenctrl.mli
 --- a/tools/ocaml/libs/xc/xenctrl.mli
 +++ b/tools/ocaml/libs/xc/xenctrl.mli
 @@ -142,6 +142,8 @@ external domain_deassign_device: handle 
@@ -79,22 +37,34 @@ diff -r b782c77300fe tools/ocaml/libs/xc/xenctrl.mli
  external version : handle -> version = "stub_xc_version_version"
  external version_compile_info : handle -> compile_info
    = "stub_xc_version_compile_info"
-diff -r b782c77300fe tools/ocaml/libs/xc/xenctrl_stubs.c
+diff -r c2d2f37ae7d7 tools/ocaml/libs/xc/xenctrl_stubs.c
 --- a/tools/ocaml/libs/xc/xenctrl_stubs.c
 +++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
-@@ -1091,6 +1091,17 @@ static uint32_t encode_sbdf(int domain, 
+@@ -1112,6 +1112,29 @@ static uint32_t encode_sbdf(int domain, 
  		((uint32_t)func   &    0x7);
  }
  
 +CAMLprim value stub_xc_hvm_check_pvdriver(value xch, value domid)
 +{
 +	CAMLparam2(xch, domid);
++	xc_domaininfo_t info;
++	unsigned long irq;
 +	int ret;
 +
-+	ret = xc_hvm_check_pvdriver(_H(xch), _D(domid));
-+	if (ret < 0)
-+		failwith_xc(_H(xch));
-+	CAMLreturn(Val_bool(ret));
++	ret = xc_domain_getinfolist(_H(xch), _D(domid), 1, &info);
++	if (ret != 1 || info.domain != _D(domid)) {
++		caml_failwith("Domain does not exist.");
++	}
++
++	if (!(info.flags & XEN_DOMINF_hvm_guest)) {
++		caml_failwith("Domain is not HVM guest.");
++	}
++
++	xc_get_hvm_param(_H(xch), _D(domid), HVM_PARAM_CALLBACK_IRQ, &irq);
++	if (irq != 0)
++		CAMLreturn(Val_true);
++	else
++		CAMLreturn(Val_false);
 +}
 +
  CAMLprim value stub_xc_domain_test_assign_device(value xch, value domid, value desc)
