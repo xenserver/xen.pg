@@ -1,0 +1,50 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1376397061 -7200
+# Node ID 3275d5aa98a0d6424517ec4ddd122021609536c1
+# Parent  68e55e87d50d272b31ceb8f1e0c75f55d94f361f
+watchdog/crash: Always disable watchdog in console_force_unlock()
+
+Depending on the state of the conring and serial_tx_buffer,
+console_force_unlock() can be a long running operation, usually because of
+serial_start_sync()
+
+XenServer testing has found a reliable case where console_force_unlock() on
+one PCPU takes long enough for another PCPU to timeout due to the watchdog
+(such as waiting for a tlb flush callin).
+
+The watchdog timeout causes the second PCPU to repeat the
+console_force_unlock(), at which point the first PCPU typically fails an
+assertion in spin_unlock_irqrestore(&port->tx_lock) (because the tx_lock has
+been unlocked behind itself).
+
+console_force_unlock() is only on emergency paths, so one way or another the
+host is going down.  Disable the watchdog before forcing the console lock to
+help prevent having pcpus completing with each other to bring the host down.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 68e55e87d50d -r 3275d5aa98a0 xen/arch/x86/x86_64/traps.c
+--- a/xen/arch/x86/x86_64/traps.c
++++ b/xen/arch/x86/x86_64/traps.c
+@@ -227,8 +227,6 @@ void do_double_fault(struct cpu_user_reg
+     unsigned int cpu;
+     unsigned long crs[8];
+ 
+-    watchdog_disable();
+-
+     console_force_unlock();
+ 
+     asm ( "lsll %1, %0" : "=r" (cpu) : "rm" (PER_CPU_GDT_ENTRY << 3) );
+diff -r 68e55e87d50d -r 3275d5aa98a0 xen/drivers/char/console.c
+--- a/xen/drivers/char/console.c
++++ b/xen/drivers/char/console.c
+@@ -737,6 +737,7 @@ void console_end_log_everything(void)
+ 
+ void console_force_unlock(void)
+ {
++    watchdog_disable();
+     spin_lock_init(&console_lock);
+     serial_force_unlock(sercon_handle);
+     console_locks_busted = 1;
