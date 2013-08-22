@@ -1,0 +1,308 @@
+From 73e6218a9168c4dc4a4b53631acde974cc005629 Mon Sep 17 00:00:00 2001
+From: Rob Hoes <rob.hoes@citrix.com>
+Date: Tue, 19 Mar 2013 15:48:14 +0000
+Subject: [PATCH 27/34] libxl: ocaml: add VM lifecycle operations
+
+Also, reorganise toplevel OCaml functions into modules of Xenlight.
+
+Signed-off-by: Rob Hoes <rob.hoes@citrix.com>
+---
+ tools/ocaml/libs/xl/xenlight.ml.in   |   23 +++-
+ tools/ocaml/libs/xl/xenlight.mli.in  |   23 +++-
+ tools/ocaml/libs/xl/xenlight_stubs.c |  198 ++++++++++++++++++++++++++++++++++
+ tools/ocaml/test/send_debug_keys.ml  |    2 +-
+ 4 files changed, 237 insertions(+), 9 deletions(-)
+
+diff --git a/tools/ocaml/libs/xl/xenlight.ml.in b/tools/ocaml/libs/xl/xenlight.ml.in
+index 06c9f52..4cfd085 100644
+--- a/tools/ocaml/libs/xl/xenlight.ml.in
++++ b/tools/ocaml/libs/xl/xenlight.ml.in
+@@ -66,10 +66,25 @@ type event =
+ 
+ (* @@LIBXL_TYPES@@ *)
+ 
+-external send_trigger : ctx -> domid -> trigger -> int -> unit = "stub_xl_send_trigger"
+-external send_sysrq : ctx -> domid -> char -> unit = "stub_xl_send_sysrq"
+-external send_debug_keys : ctx -> string -> unit = "stub_xl_send_debug_keys"
+-external xen_console_read : ctx -> string list = "stub_xl_xen_console_read"
++module Domain = struct
++	external create_new : ctx -> Domain_config.t -> ?async:'a -> unit -> domid = "stub_libxl_domain_create_new"
++	external create_restore : ctx -> Domain_config.t -> Unix.file_descr -> ?async:'a -> unit -> domid = "stub_libxl_domain_create_restore"
++	external shutdown : ctx -> domid -> unit = "stub_libxl_domain_shutdown"
++	external wait_shutdown : ctx -> domid -> unit = "stub_libxl_domain_wait_shutdown"
++	external reboot : ctx -> domid -> unit = "stub_libxl_domain_reboot"
++	external destroy : ctx -> domid -> ?async:'a -> unit -> unit = "stub_libxl_domain_destroy"
++	external suspend : ctx -> domid -> Unix.file_descr -> ?async:'a -> unit -> unit = "stub_libxl_domain_suspend"
++	external pause : ctx -> domid -> unit = "stub_libxl_domain_pause"
++	external unpause : ctx -> domid -> unit = "stub_libxl_domain_unpause"
++
++	external send_trigger : ctx -> domid -> trigger -> int -> unit = "stub_xl_send_trigger"
++	external send_sysrq : ctx -> domid -> char -> unit = "stub_xl_send_sysrq"
++end
++
++module Host = struct
++	external send_debug_keys : ctx -> string -> unit = "stub_xl_send_debug_keys"
++	external xen_console_read : ctx -> string list = "stub_xl_xen_console_read"
++end
+ 
+ module type EVENT_USERS =
+ 	sig
+diff --git a/tools/ocaml/libs/xl/xenlight.mli.in b/tools/ocaml/libs/xl/xenlight.mli.in
+index 0b06712..d49edde 100644
+--- a/tools/ocaml/libs/xl/xenlight.mli.in
++++ b/tools/ocaml/libs/xl/xenlight.mli.in
+@@ -51,10 +51,25 @@ type event =
+ 
+ (* @@LIBXL_TYPES@@ *)
+ 
+-external send_trigger : ctx -> domid -> trigger -> int -> unit = "stub_xl_send_trigger"
+-external send_sysrq : ctx -> domid -> char -> unit = "stub_xl_send_sysrq"
+-external send_debug_keys : ctx -> string -> unit = "stub_xl_send_debug_keys"
+-external xen_console_read : ctx -> string list = "stub_xl_xen_console_read"
++module Domain : sig
++	external create_new : ctx -> Domain_config.t -> ?async:'a -> unit -> domid = "stub_libxl_domain_create_new"
++	external create_restore : ctx -> Domain_config.t -> Unix.file_descr -> ?async:'a -> unit -> domid = "stub_libxl_domain_create_restore"
++	external shutdown : ctx -> domid -> unit = "stub_libxl_domain_shutdown"
++	external wait_shutdown : ctx -> domid -> unit = "stub_libxl_domain_wait_shutdown"
++	external reboot : ctx -> domid -> unit = "stub_libxl_domain_reboot"
++	external destroy : ctx -> domid -> ?async:'a -> unit -> unit = "stub_libxl_domain_destroy"
++	external suspend : ctx -> domid -> Unix.file_descr -> ?async:'a -> unit -> unit = "stub_libxl_domain_suspend"
++	external pause : ctx -> domid -> unit = "stub_libxl_domain_pause"
++	external unpause : ctx -> domid -> unit = "stub_libxl_domain_unpause"
++
++	external send_trigger : ctx -> domid -> trigger -> int -> unit = "stub_xl_send_trigger"
++	external send_sysrq : ctx -> domid -> char -> unit = "stub_xl_send_sysrq"
++end
++
++module Host : sig
++	external send_debug_keys : ctx -> string -> unit = "stub_xl_send_debug_keys"
++	external xen_console_read : ctx -> string list = "stub_xl_xen_console_read"
++end
+ 
+ module type EVENT_USERS =
+ 	sig
+diff --git a/tools/ocaml/libs/xl/xenlight_stubs.c b/tools/ocaml/libs/xl/xenlight_stubs.c
+index 0faa425..aab3b21 100644
+--- a/tools/ocaml/libs/xl/xenlight_stubs.c
++++ b/tools/ocaml/libs/xl/xenlight_stubs.c
+@@ -416,6 +416,204 @@ void async_callback(libxl_ctx *ctx, int rc, void *for_callback)
+ 	caml_callback2(*func, error, (value) for_callback);
+ }
+ 
++static int domain_wait_event(libxl_ctx *ctx, int domid, libxl_event **event_r)
++{
++	int ret;
++	for (;;) {
++		ret = libxl_event_wait(ctx, event_r, LIBXL_EVENTMASK_ALL, 0,0);
++		if (ret) {
++			return ret;
++		}
++		if ((*event_r)->domid != domid) {
++			libxl_event_free(CTX, *event_r);
++			continue;
++		}
++		return ret;
++	}
++}
++
++value stub_libxl_domain_create_new(value ctx, value domain_config, value async, value unit)
++{
++	CAMLparam4(ctx, async, domain_config, unit);
++	int ret;
++	libxl_domain_config c_dconfig;
++	uint32_t c_domid;
++	libxl_asyncop_how ao_how;
++
++	if (async != Val_none) {
++		ao_how.callback = async_callback;
++		ao_how.u.for_callback = (void *) Some_val(async);
++	}
++
++	libxl_domain_config_init(&c_dconfig);
++	ret = domain_config_val(CTX, &c_dconfig, domain_config);
++	if (ret != 0) {
++		libxl_domain_config_dispose(&c_dconfig);
++		failwith_xl(ret, "domain_create_new");
++	}
++
++	ret = libxl_domain_create_new(CTX, &c_dconfig, &c_domid,
++		async != Val_none ? &ao_how : NULL, NULL);
++
++	libxl_domain_config_dispose(&c_dconfig);
++
++	if (ret != 0)
++		failwith_xl(ret, "domain_create_new");
++
++	CAMLreturn(Val_int(c_domid));
++}
++
++value stub_libxl_domain_create_restore(value ctx, value domain_config, value restore_fd, value async, value unit)
++{
++	CAMLparam5(ctx, domain_config, restore_fd, async, unit);
++	int ret;
++	libxl_domain_config c_dconfig;
++	uint32_t c_domid;
++	libxl_asyncop_how ao_how;
++
++	if (async != Val_none) {
++		ao_how.callback = async_callback;
++		ao_how.u.for_callback = (void *) Some_val(async);
++	}
++
++	libxl_domain_config_init(&c_dconfig);
++	ret = domain_config_val(CTX, &c_dconfig, domain_config);
++	if (ret != 0) {
++		libxl_domain_config_dispose(&c_dconfig);
++		failwith_xl(ret, "domain_create_restore");
++	}
++
++	ret = libxl_domain_create_restore(CTX, &c_dconfig, &c_domid, Int_val(restore_fd),
++		async != Val_none ? &ao_how : NULL, NULL);
++
++	libxl_domain_config_dispose(&c_dconfig);
++
++	if (ret != 0)
++		failwith_xl(ret, "domain_create_restore");
++
++	CAMLreturn(Val_int(c_domid));
++}
++
++value stub_libxl_domain_wait_shutdown(value ctx, value domid)
++{
++	CAMLparam2(ctx, domid);
++	int ret;
++	libxl_event *event;
++	libxl_evgen_domain_death *deathw;
++	ret = libxl_evenable_domain_death(CTX, Int_val(domid), 0, &deathw);
++	if (ret)
++		failwith_xl(ret, "domain_wait_shutdown");
++
++	for (;;) {
++		ret = domain_wait_event(CTX, Int_val(domid), &event);
++		if (ret) {
++			libxl_evdisable_domain_death(CTX, deathw);
++			failwith_xl(ret, "domain_wait_shutdown");
++		}
++
++		switch (event->type) {
++		case LIBXL_EVENT_TYPE_DOMAIN_DEATH:
++			goto done;
++		case LIBXL_EVENT_TYPE_DOMAIN_SHUTDOWN:
++			goto done;
++		default:
++			break;
++		}
++		libxl_event_free(CTX, event);
++	}
++done:
++	libxl_event_free(CTX, event);
++	libxl_evdisable_domain_death(CTX, deathw);
++
++	CAMLreturn(Val_unit);
++}
++
++value stub_libxl_domain_shutdown(value ctx, value domid)
++{
++	CAMLparam2(ctx, domid);
++	int ret;
++
++	ret = libxl_domain_shutdown(CTX, Int_val(domid));
++	if (ret != 0)
++		failwith_xl(ret, "domain_shutdown");
++
++	CAMLreturn(Val_unit);
++}
++
++value stub_libxl_domain_reboot(value ctx, value domid)
++{
++	CAMLparam2(ctx, domid);
++	int ret;
++
++	ret = libxl_domain_reboot(CTX, Int_val(domid));
++	if (ret != 0)
++		failwith_xl(ret, "domain_reboot");
++
++	CAMLreturn(Val_unit);
++}
++
++value stub_libxl_domain_destroy(value ctx, value domid, value async, value unit)
++{
++	CAMLparam4(ctx, domid, async, unit);
++	int ret;
++	libxl_asyncop_how ao_how;
++
++	if (async != Val_none) {
++		ao_how.callback = async_callback;
++		ao_how.u.for_callback = (void *) Some_val(async);
++	}
++
++	ret = libxl_domain_destroy(CTX, Int_val(domid),
++		async != Val_none ? &ao_how : NULL);
++	if (ret != 0)
++		failwith_xl(ret, "domain_destroy");
++
++	CAMLreturn(Val_unit);
++}
++
++value stub_libxl_domain_suspend(value ctx, value domid, value fd, value async, value unit)
++{
++	CAMLparam5(ctx, domid, fd, async, unit);
++	int ret;
++	libxl_asyncop_how ao_how;
++
++	if (async != Val_none) {
++		ao_how.callback = async_callback;
++		ao_how.u.for_callback = (void *) Some_val(async);
++	}
++
++	ret = libxl_domain_suspend(CTX, Int_val(domid), Int_val(fd), 0,
++		async != Val_none ? &ao_how : NULL);
++	if (ret != 0)
++		failwith_xl(ret, "domain_suspend");
++
++	CAMLreturn(Val_unit);
++}
++
++value stub_libxl_domain_pause(value ctx, value domid)
++{
++	CAMLparam2(ctx, domid);
++	int ret;
++
++	ret = libxl_domain_pause(CTX, Int_val(domid));
++	if (ret != 0)
++		failwith_xl(ret, "domain_pause");
++
++	CAMLreturn(Val_unit);
++}
++
++value stub_libxl_domain_unpause(value ctx, value domid)
++{
++	CAMLparam2(ctx, domid);
++	int ret;
++
++	ret = libxl_domain_unpause(CTX, Int_val(domid));
++	if (ret != 0)
++		failwith_xl(ret, "domain_unpause");
++
++	CAMLreturn(Val_unit);
++}
++
+ #define _STRINGIFY(x) #x
+ #define STRINGIFY(x) _STRINGIFY(x)
+ 
+diff --git a/tools/ocaml/test/send_debug_keys.ml b/tools/ocaml/test/send_debug_keys.ml
+index 6db89e8..6cf59ea 100644
+--- a/tools/ocaml/test/send_debug_keys.ml
++++ b/tools/ocaml/test/send_debug_keys.ml
+@@ -5,7 +5,7 @@ open Xenlight
+ 
+ let send_keys ctx s = 
+   printf "Sending debug key %s\n" s;
+-  Xenlight.send_debug_keys ctx s;
++  Xenlight.Host.send_debug_keys ctx s;
+   ()
+   
+ let _ = 
+-- 
+1.7.10.4
+
