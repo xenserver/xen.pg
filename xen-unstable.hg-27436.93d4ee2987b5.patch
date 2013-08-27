@@ -1,0 +1,47 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1377595706 -7200
+# Node ID 93d4ee2987b5fe561d92da6bc6a8edbbf86a03e0
+# Parent  c84c66d50d144d5f657f49a34ce0825b72be7bff
+x86/boot: Explicitly clean pcpu stacks in debug builds
+
+This reduces confusion when looking at a hexdump of the pcpu stacks and
+wondering were on earth some of the junk was coming from.  Also leave some
+grep fodder for finding where the BSP switches stack (because it took me
+far longer to find than I care to admit to).
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff -r c84c66d50d14 -r 93d4ee2987b5 xen/arch/x86/boot/x86_64.S
+--- a/xen/arch/x86/boot/x86_64.S
++++ b/xen/arch/x86/boot/x86_64.S
+@@ -13,6 +13,15 @@
+         mov     mmu_cr4_features(%rip),%rcx
+         mov     %rcx,%cr4
+ 
++#ifndef NDEBUG
++        /* Clean stack. */
++        mov     stack_start(%rip),%rdi
++        mov     $(STACK_SIZE / 8),%rcx
++        xor     %eax,%eax
++        rep stosq
++#endif
++
++        /* Switch to cpu0_stack. */
+         mov     stack_start(%rip),%rsp
+         or      $(STACK_SIZE-CPUINFO_sizeof),%rsp
+ 
+diff -r c84c66d50d14 -r 93d4ee2987b5 xen/arch/x86/smpboot.c
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -659,6 +659,10 @@ static int cpu_smpboot_alloc(unsigned in
+     stack_base[cpu] = alloc_xenheap_pages(STACK_ORDER, 0);
+     if ( stack_base[cpu] == NULL )
+         goto oom;
++#ifndef NDEBUG
++    for ( order = 0 ; order < (1<<STACK_ORDER); ++order )
++        clear_page(stack_base[cpu] + order * PAGE_SIZE);
++#endif
+     memguard_guard_stack(stack_base[cpu]);
+ 
+     order = get_order_from_pages(NR_RESERVED_GDT_PAGES);

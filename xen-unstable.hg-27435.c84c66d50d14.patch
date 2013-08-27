@@ -1,0 +1,132 @@
+# HG changeset patch
+# User Matt Wilson <msw@amazon.com>
+# Date 1377595389 -7200
+# Node ID c84c66d50d144d5f657f49a34ce0825b72be7bff
+# Parent  f353e27a1f99a7996cd87915899c284c91b94afd
+x86/time: remove Cyclone as a platform timer
+
+The Cyclone time source was part of IBM's Summit chipset, which was
+only used for 32-bit only ccNUMA and IA-64 machines. Neither of these
+are supported by Xen anymore.
+
+Signed-off-by: Matt Wilson <msw@amazon.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff -r f353e27a1f99 -r c84c66d50d14 docs/misc/xen-command-line.markdown
+--- a/docs/misc/xen-command-line.markdown
++++ b/docs/misc/xen-command-line.markdown
+@@ -194,7 +194,7 @@ and reboots.
+ If set, override Xen's calculation of the level 2 cache line size.
+ 
+ ### clocksource
+-> `= pit | hpet | cyclone | acpi`
++> `= pit | hpet | acpi`
+ 
+ If set, override Xen's default choice for the platform timer.
+ 
+diff -r f353e27a1f99 -r c84c66d50d14 xen/arch/x86/time.c
+--- a/xen/arch/x86/time.c
++++ b/xen/arch/x86/time.c
+@@ -39,7 +39,7 @@
+ #include <asm/setup.h> /* for early_time_init */
+ #include <public/arch-x86/cpuid.h>
+ 
+-/* opt_clocksource: Force clocksource to one of: pit, hpet, cyclone, acpi. */
++/* opt_clocksource: Force clocksource to one of: pit, hpet, acpi. */
+ static char __initdata opt_clocksource[10];
+ string_param("clocksource", opt_clocksource);
+ 
+@@ -378,72 +378,7 @@ static struct platform_timesource __init
+ };
+ 
+ /************************************************************
+- * PLATFORM TIMER 3: IBM 'CYCLONE' TIMER
+- */
+-
+-bool_t __initdata use_cyclone;
+-
+-/*
+- * Although the counter is read via a 64-bit register, I believe it is actually
+- * a 40-bit counter. Since this will wrap, I read only the low 32 bits and
+- * periodically fold into a 64-bit software counter, just as for PIT and HPET.
+- */
+-#define CYCLONE_CBAR_ADDR   0xFEB00CD0
+-#define CYCLONE_PMCC_OFFSET 0x51A0
+-#define CYCLONE_MPMC_OFFSET 0x51D0
+-#define CYCLONE_MPCS_OFFSET 0x51A8
+-#define CYCLONE_TIMER_FREQ  100000000
+-
+-/* Cyclone MPMC0 register. */
+-static volatile u32 *__read_mostly cyclone_timer;
+-
+-static u64 read_cyclone_count(void)
+-{
+-    return *cyclone_timer;
+-}
+-
+-static volatile u32 *__init map_cyclone_reg(unsigned long regaddr)
+-{
+-    unsigned long pageaddr = regaddr &  PAGE_MASK;
+-    unsigned long offset   = regaddr & ~PAGE_MASK;
+-    set_fixmap_nocache(FIX_CYCLONE_TIMER, pageaddr);
+-    return (volatile u32 *)(fix_to_virt(FIX_CYCLONE_TIMER) + offset);
+-}
+-
+-static int __init init_cyclone(struct platform_timesource *pts)
+-{
+-    u32 base;
+-    
+-    if ( !use_cyclone )
+-        return 0;
+-
+-    /* Find base address. */
+-    base = *(map_cyclone_reg(CYCLONE_CBAR_ADDR));
+-    if ( base == 0 )
+-    {
+-        printk(KERN_ERR "Cyclone: Could not find valid CBAR value.\n");
+-        return 0;
+-    }
+-
+-    /* Enable timer and map the counter register. */
+-    *(map_cyclone_reg(base + CYCLONE_PMCC_OFFSET)) = 1;
+-    *(map_cyclone_reg(base + CYCLONE_MPCS_OFFSET)) = 1;
+-    cyclone_timer = map_cyclone_reg(base + CYCLONE_MPMC_OFFSET);
+-    return 1;
+-}
+-
+-static struct platform_timesource __initdata plt_cyclone =
+-{
+-    .id = "cyclone",
+-    .name = "IBM Cyclone",
+-    .frequency = CYCLONE_TIMER_FREQ,
+-    .read_counter = read_cyclone_count,
+-    .counter_bits = 32,
+-    .init = init_cyclone
+-};
+-
+-/************************************************************
+- * PLATFORM TIMER 4: ACPI PM TIMER
++ * PLATFORM TIMER 3: ACPI PM TIMER
+  */
+ 
+ u32 __read_mostly pmtmr_ioport;
+@@ -600,7 +535,7 @@ static void resume_platform_timer(void)
+ static void __init init_platform_timer(void)
+ {
+     static struct platform_timesource * __initdata plt_timers[] = {
+-        &plt_cyclone, &plt_hpet, &plt_pmtimer, &plt_pit
++        &plt_hpet, &plt_pmtimer, &plt_pit
+     };
+ 
+     struct platform_timesource *pts = NULL;
+diff -r f353e27a1f99 -r c84c66d50d14 xen/include/asm-x86/fixmap.h
+--- a/xen/include/asm-x86/fixmap.h
++++ b/xen/include/asm-x86/fixmap.h
+@@ -56,7 +56,6 @@ enum fixed_addresses {
+     FIX_ACPI_BEGIN,
+     FIX_ACPI_END = FIX_ACPI_BEGIN + FIX_ACPI_PAGES - 1,
+     FIX_HPET_BASE,
+-    FIX_CYCLONE_TIMER,
+     FIX_KEXEC_BASE_0,
+     FIX_KEXEC_BASE_END = FIX_KEXEC_BASE_0 \
+       + ((KEXEC_XEN_NO_PAGES >> 1) * KEXEC_IMAGE_NR) - 1,
