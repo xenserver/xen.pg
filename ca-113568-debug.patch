@@ -1,0 +1,106 @@
+# HG changeset patch
+# Parent 481c1c694554f58f251fdfecbe70774f929fdedb
+
+diff -r 481c1c694554 xen/arch/x86/crash.c
+--- a/xen/arch/x86/crash.c
++++ b/xen/arch/x86/crash.c
+@@ -30,6 +30,8 @@
+ #include <xen/iommu.h>
+ #include <asm/hpet.h>
+ 
++void (*late_debug)(void) = NULL;
++
+ static atomic_t waiting_for_crash_ipi;
+ static unsigned int crashing_cpu;
+ static DEFINE_PER_CPU_READ_MOSTLY(bool_t, crash_save_done);
+@@ -168,6 +170,9 @@ static void nmi_shootdown_cpus(void)
+         msecs--;
+     }
+ 
++    if ( late_debug )
++        late_debug();
++
+     /* Crash shutdown any IOMMU functionality as the crashdump kernel is not
+      * happy when booting if interrupt/dma remapping is still enabled */
+     iommu_crash_shutdown();
+diff -r 481c1c694554 xen/arch/x86/hpet.c
+--- a/xen/arch/x86/hpet.c
++++ b/xen/arch/x86/hpet.c
+@@ -18,6 +18,7 @@
+ #include <asm/msi.h>
+ #include <mach_apic.h>
+ #include <xen/cpuidle.h>
++#include <xen/keyhandler.h>
+ 
+ #define MAX_DELTA_NS MILLISECS(10*1000)
+ #define MIN_DELTA_NS MICROSECS(20)
+@@ -48,6 +49,29 @@ static struct hpet_event_channel *__read
+ /* msi hpet channels used for broadcast */
+ static unsigned int __read_mostly num_hpets_used;
+ 
++extern void __dump_msi(int, bool_t);
++void ca_113568_hpet(void)
++{
++    unsigned i;
++    struct hpet_event_channel *c;
++
++    printk("num_hpets_used = %u\n", num_hpets_used);
++
++    for ( i = 0; i < num_hpets_used; ++i )
++    {
++        c = &hpet_events[i];
++
++        cpumask_scnprintf(keyhandler_scratch, sizeof(keyhandler_scratch),
++                          c->cpumask);
++
++        printk("  HPET[%02u] ", i);
++        printk("idx %u, cpu %u, flags 0x08%x, cpumask %s",
++               c->idx, c->cpu, c->flags, keyhandler_scratch);
++        __dump_msi(c->msi.irq, 0);
++        printk("\n");
++    }
++}
++
+ DEFINE_PER_CPU(struct hpet_event_channel *, cpu_bc_channel);
+ 
+ unsigned long __read_mostly hpet_address;
+diff -r 481c1c694554 xen/arch/x86/msi.c
+--- a/xen/arch/x86/msi.c
++++ b/xen/arch/x86/msi.c
+@@ -1206,7 +1206,7 @@ void __init early_msi_init(void)
+  * only be false for custom debugging when the lock state might not be
+  * consistent (e.g. on crash).
+  */
+-static void __dump_msi(int irq, bool_t use_locks)
++void __dump_msi(int irq, bool_t use_locks)
+ {
+     struct irq_desc *desc = irq_to_desc(irq);
+     const struct msi_desc *entry;
+diff -r 481c1c694554 xen/arch/x86/x86_64/traps.c
+--- a/xen/arch/x86/x86_64/traps.c
++++ b/xen/arch/x86/x86_64/traps.c
+@@ -221,6 +221,14 @@ void show_page_walk(unsigned long addr)
+            l1_table_offset(addr), l1e_get_intpte(l1e), pfn);
+ }
+ 
++extern void (*late_debug)(void);
++extern void ca_113568_hpet(void);
++void ca_113568_dump_state(void)
++{
++    printk("CA-113568 - Dumping interesting state:\n");
++    ca_113568_hpet();
++}
++
+ void double_fault(void);
+ void do_double_fault(struct cpu_user_regs *regs)
+ {
+@@ -248,6 +256,9 @@ void do_double_fault(struct cpu_user_reg
+     _show_registers(regs, crs, CTXT_hypervisor, NULL);
+     show_stack_overflow(cpu, regs->rsp);
+ 
++    late_debug = ca_113568_dump_state;
++    wmb();
++
+     panic("DOUBLE FAULT -- system shutdown\n");
+ }
+ 
