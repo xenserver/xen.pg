@@ -1,0 +1,633 @@
+From ccc07bf64df53f7bff7fc7837d87eb4674c6b98d Mon Sep 17 00:00:00 2001
+From: Rob Hoes <rob.hoes@citrix.com>
+Date: Tue, 19 Mar 2013 15:47:46 +0000
+Subject: [PATCH 10/34] libxc: ocaml: add simple binding for xentoollog
+ (output only).
+
+These bindings allow ocaml code to receive log message via xentoollog
+but do not support injecting messages into xentoollog from ocaml.
+Receiving log messages from libx{c,l} and forwarding them to ocaml is
+the use case which is needed by the following patches.
+
+Add a simple noddy test case (tools/ocaml/test).
+
+Signed-off-by: Ian Campbell <ian.campbell@citrix.com>
+Signed-off-by: Rob Hoes <rob.hoes@citrix.com>
+---
+ .gitignore                                     |    1 +
+ .hgignore                                      |    1 +
+ tools/ocaml/Makefile                           |    2 +-
+ tools/ocaml/Makefile.rules                     |    2 +-
+ tools/ocaml/libs/Makefile                      |    1 +
+ tools/ocaml/libs/xentoollog/META.in            |    4 +
+ tools/ocaml/libs/xentoollog/Makefile           |   33 ++++
+ tools/ocaml/libs/xentoollog/caml_xentoollog.h  |   24 +++
+ tools/ocaml/libs/xentoollog/xentoollog.ml      |   98 +++++++++++
+ tools/ocaml/libs/xentoollog/xentoollog.mli     |   53 ++++++
+ tools/ocaml/libs/xentoollog/xentoollog_stubs.c |  222 ++++++++++++++++++++++++
+ tools/ocaml/test/Makefile                      |   28 +++
+ tools/ocaml/test/xtl.ml                        |   19 ++
+ 13 files changed, 486 insertions(+), 2 deletions(-)
+ create mode 100644 tools/ocaml/libs/xentoollog/META.in
+ create mode 100644 tools/ocaml/libs/xentoollog/Makefile
+ create mode 100644 tools/ocaml/libs/xentoollog/caml_xentoollog.h
+ create mode 100644 tools/ocaml/libs/xentoollog/xentoollog.ml
+ create mode 100644 tools/ocaml/libs/xentoollog/xentoollog.mli
+ create mode 100644 tools/ocaml/libs/xentoollog/xentoollog_stubs.c
+ create mode 100644 tools/ocaml/test/Makefile
+ create mode 100644 tools/ocaml/test/xtl.ml
+
+diff --git a/.gitignore b/.gitignore
+index 960c29e..5acebd0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -401,6 +401,7 @@ tools/ocaml/libs/xl/_libxl_types.mli.in
+ tools/ocaml/libs/xl/xenlight.ml
+ tools/ocaml/libs/xl/xenlight.mli
+ tools/ocaml/xenstored/oxenstored
++tools/ocaml/test/xtl
+ 
+ tools/debugger/kdd/kdd
+ tools/firmware/etherboot/ipxe.tar.gz
+diff --git a/.hgignore b/.hgignore
+index f3877a9..685a785 100644
+--- a/.hgignore
++++ b/.hgignore
+@@ -326,6 +326,7 @@
+ ^tools/ocaml/libs/xl/xenlight\.ml$
+ ^tools/ocaml/libs/xl/xenlight\.mli$
+ ^tools/ocaml/xenstored/oxenstored$
++^tools/ocaml/test/xtl$
+ ^tools/autom4te\.cache$
+ ^tools/config\.h$
+ ^tools/config\.log$
+diff --git a/tools/ocaml/Makefile b/tools/ocaml/Makefile
+index 6b22bbe..8e4ca36 100644
+--- a/tools/ocaml/Makefile
++++ b/tools/ocaml/Makefile
+@@ -1,7 +1,7 @@
+ XEN_ROOT = $(CURDIR)/../..
+ include $(XEN_ROOT)/tools/Rules.mk
+ 
+-SUBDIRS_PROGRAMS = xenstored
++SUBDIRS_PROGRAMS = xenstored test
+ 
+ SUBDIRS = libs $(SUBDIRS_PROGRAMS)
+ 
+diff --git a/tools/ocaml/Makefile.rules b/tools/ocaml/Makefile.rules
+index 5e6d81e..0745e83 100644
+--- a/tools/ocaml/Makefile.rules
++++ b/tools/ocaml/Makefile.rules
+@@ -24,7 +24,7 @@ ALL_OCAML_OBJS ?= $(OBJS)
+ %.cmi: %.mli
+ 	$(call quiet-command, $(OCAMLC) $(OCAMLCFLAGS) -c -o $@ $<,MLI,$@)
+ 
+-%.cmx: %.ml
++%.cmx %.o: %.ml
+ 	$(call quiet-command, $(OCAMLOPT) $(OCAMLOPTFLAGS) -c -o $@ $<,MLOPT,$@)
+ 
+ %.ml: %.mll
+diff --git a/tools/ocaml/libs/Makefile b/tools/ocaml/libs/Makefile
+index bca0fa2..3afdc89 100644
+--- a/tools/ocaml/libs/Makefile
++++ b/tools/ocaml/libs/Makefile
+@@ -3,6 +3,7 @@ include $(XEN_ROOT)/tools/Rules.mk
+ 
+ SUBDIRS= \
+ 	mmap \
++	xentoollog \
+ 	xc eventchn \
+ 	xb xs xl
+ 
+diff --git a/tools/ocaml/libs/xentoollog/META.in b/tools/ocaml/libs/xentoollog/META.in
+new file mode 100644
+index 0000000..7b06683
+--- /dev/null
++++ b/tools/ocaml/libs/xentoollog/META.in
+@@ -0,0 +1,4 @@
++version = "@VERSION@"
++description = "Xen Tools Logger Interface"
++archive(byte) = "xentoollog.cma"
++archive(native) = "xentoollog.cmxa"
+diff --git a/tools/ocaml/libs/xentoollog/Makefile b/tools/ocaml/libs/xentoollog/Makefile
+new file mode 100644
+index 0000000..17dca95
+--- /dev/null
++++ b/tools/ocaml/libs/xentoollog/Makefile
+@@ -0,0 +1,33 @@
++TOPLEVEL=$(CURDIR)/../..
++XEN_ROOT=$(TOPLEVEL)/../..
++include $(TOPLEVEL)/common.make
++
++CFLAGS += $(CFLAGS_libxenctrl) $(CFLAGS_libxenguest)
++OCAMLINCLUDE +=
++
++OBJS = xentoollog
++INTF = xentoollog.cmi
++LIBS = xentoollog.cma xentoollog.cmxa
++
++LIBS_xentoollog = $(LDLIBS_libxenctrl)
++
++xentoollog_OBJS = $(OBJS)
++xentoollog_C_OBJS = xentoollog_stubs
++
++OCAML_LIBRARY = xentoollog
++
++all: $(INTF) $(LIBS)
++
++libs: $(LIBS)
++
++.PHONY: install
++install: $(LIBS) META
++	mkdir -p $(OCAMLDESTDIR)
++	ocamlfind remove -destdir $(OCAMLDESTDIR) xentoollog
++	ocamlfind install -destdir $(OCAMLDESTDIR) -ldconf ignore xentoollog META $(INTF) $(LIBS) *.a *.so *.cmx
++
++.PHONY: uninstall
++uninstall:
++	ocamlfind remove -destdir $(OCAMLDESTDIR) xentoollog
++
++include $(TOPLEVEL)/Makefile.rules
+diff --git a/tools/ocaml/libs/xentoollog/caml_xentoollog.h b/tools/ocaml/libs/xentoollog/caml_xentoollog.h
+new file mode 100644
+index 0000000..0eb7618
+--- /dev/null
++++ b/tools/ocaml/libs/xentoollog/caml_xentoollog.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright (C) 2013      Citrix Ltd.
++ * Author Ian Campbell <ian.campbell@citrix.com>
++ * Author Rob Hoes <rob.hoes@citrix.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation; version 2.1 only. with the special
++ * exception on linking described in file LICENSE.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ */
++
++struct caml_xtl {
++	xentoollog_logger vtable;
++	char *vmessage_cb;
++	char *progress_cb;
++};
++
++#define Xtl_val(x)(*((struct caml_xtl **) Data_custom_val(x)))
++
+diff --git a/tools/ocaml/libs/xentoollog/xentoollog.ml b/tools/ocaml/libs/xentoollog/xentoollog.ml
+new file mode 100644
+index 0000000..0be736c
+--- /dev/null
++++ b/tools/ocaml/libs/xentoollog/xentoollog.ml
+@@ -0,0 +1,98 @@
++(*
++ * Copyright (C) 2012      Citrix Ltd.
++ * Author Ian Campbell <ian.campbell@citrix.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation; version 2.1 only. with the special
++ * exception on linking described in file LICENSE.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *)
++
++open Printf
++open Random
++open Callback
++
++type level = Debug
++	| Verbose
++	| Detail
++	| Progress
++	| Info
++	| Notice
++	| Warn
++	| Error
++	| Critical
++
++let level_to_string level =
++	match level with
++	| Debug -> "Debug"
++	| Verbose -> "Verbose"
++	| Detail -> "Detail"
++	| Progress -> "Progress"
++	| Info -> "Info"
++	| Notice -> "Notice"
++	| Warn -> "Warn"
++	| Error -> "Error"
++	| Critical -> "Critical"
++
++let level_to_prio level = 
++	match level with
++	| Debug -> 0
++	| Verbose -> 1
++	| Detail -> 2
++	| Progress -> 3
++	| Info -> 4
++	| Notice -> 5
++	| Warn -> 6
++	| Error -> 7
++	| Critical -> 8
++
++let compare_level x y =
++	compare (level_to_prio x) (level_to_prio y)
++
++type handle
++
++type logger_cbs = {
++	vmessage : level -> int option -> string option -> string -> unit;
++	progress : string option -> string -> int -> int64 -> int64 -> unit;
++	(*destroy : unit -> unit*)
++}
++
++external _create_logger: (string * string) -> handle = "stub_xtl_create_logger"
++external test: handle -> unit = "stub_xtl_test"
++
++let create name cbs : handle =
++	(* Callback names are supposed to be unique *)
++	let suffix = string_of_int (Random.int 1000000) in
++	let vmessage_name = sprintf "%s_vmessage_%s" name suffix in
++	let progress_name = sprintf "%s_progress_%s" name suffix in
++	(*let destroy_name = sprintf "%s_destroy" name in*)
++	Callback.register vmessage_name cbs.vmessage;
++	Callback.register progress_name cbs.progress;
++	_create_logger (vmessage_name, progress_name)
++
++
++let stdio_vmessage min_level level errno ctx msg =
++	let level_str = level_to_string level
++	and errno_str = match errno with None -> "" | Some s -> sprintf ": errno=%d" s
++	and ctx_str = match ctx with None -> "" | Some s -> sprintf ": %s" s in
++	if compare min_level level <= 0 then begin
++		printf "%s%s%s: %s\n" level_str ctx_str errno_str msg;
++		flush stdout;
++	end
++
++let stdio_progress ctx what percent dne total =
++	let nl = if dne = total then "\n" else "" in
++	printf "\rProgress %s %d%% (%Ld/%Ld)%s" what percent dne total nl;
++	flush stdout
++
++let create_stdio_logger ?(level=Info) () =
++	let cbs = {
++		vmessage = stdio_vmessage level;
++		progress = stdio_progress; } in
++	create "Xentoollog.stdio_logger" cbs
++
+diff --git a/tools/ocaml/libs/xentoollog/xentoollog.mli b/tools/ocaml/libs/xentoollog/xentoollog.mli
+new file mode 100644
+index 0000000..c5c4f59
+--- /dev/null
++++ b/tools/ocaml/libs/xentoollog/xentoollog.mli
+@@ -0,0 +1,53 @@
++(*
++ * Copyright (C) 2012      Citrix Ltd.
++ * Author Ian Campbell <ian.campbell@citrix.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation; version 2.1 only. with the special
++ * exception on linking described in file LICENSE.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *)
++
++type level =
++	| Debug
++	| Verbose
++	| Detail
++	| Progress (* also used for "progress" messages *)
++	| Info
++	| Notice
++	| Warn
++	| Error
++	| Critical
++
++val level_to_string : level -> string
++val compare_level : level -> level -> int
++
++type handle
++
++(** call back arguments. See xentoollog.h for more info.
++    vmessage:
++      level: level as above
++      errno: Some <errno> or None
++      context: Some <string> or None
++      message: The log message (already formatted)
++    progress:
++      context: Some <string> or None
++      doing_what: string
++      percent, done, total.
++*)
++type logger_cbs = {
++	vmessage : level -> int option -> string option -> string -> unit;
++	progress : string option -> string -> int -> int64 -> int64 -> unit;
++	(*destroy : handle -> unit*)
++}
++
++external test: handle -> unit = "stub_xtl_test"
++
++val create : string -> logger_cbs -> handle
++val create_stdio_logger : ?level:level -> unit -> handle
++
+diff --git a/tools/ocaml/libs/xentoollog/xentoollog_stubs.c b/tools/ocaml/libs/xentoollog/xentoollog_stubs.c
+new file mode 100644
+index 0000000..c6430b1
+--- /dev/null
++++ b/tools/ocaml/libs/xentoollog/xentoollog_stubs.c
+@@ -0,0 +1,222 @@
++/*
++ * Copyright (C) 2012      Citrix Ltd.
++ * Author Ian Campbell <ian.campbell@citrix.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation; version 2.1 only. with the special
++ * exception on linking described in file LICENSE.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ */
++
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++
++#define CAML_NAME_SPACE
++#include <caml/alloc.h>
++#include <caml/memory.h>
++#include <caml/signals.h>
++#include <caml/fail.h>
++#include <caml/callback.h>
++#include <caml/custom.h>
++
++#include <xentoollog.h>
++
++#include "caml_xentoollog.h"
++
++#define XTL ((xentoollog_logger *) Xtl_val(handle))
++
++static char * dup_String_val(value s)
++{
++	int len;
++	char *c;
++	len = caml_string_length(s);
++	c = calloc(len + 1, sizeof(char));
++	if (!c)
++		caml_raise_out_of_memory();
++	memcpy(c, String_val(s), len);
++	return c;
++}
++
++static value Val_level(xentoollog_level c_level)
++{
++	/* Must correspond to order in .mli */
++	switch (c_level) {
++	case XTL_NONE: /* Not a real value */
++		caml_raise_sys_error(caml_copy_string("Val_level XTL_NONE"));
++		break;
++	case XTL_DEBUG:    return Val_int(0);
++	case XTL_VERBOSE:  return Val_int(1);
++	case XTL_DETAIL:   return Val_int(2);
++	case XTL_PROGRESS: return Val_int(3);
++	case XTL_INFO:     return Val_int(4);
++	case XTL_NOTICE:   return Val_int(5);
++	case XTL_WARN:     return Val_int(6);
++	case XTL_ERROR:    return Val_int(7);
++	case XTL_CRITICAL: return Val_int(8);
++	case XTL_NUM_LEVELS: /* Not a real value! */
++		caml_raise_sys_error(
++			caml_copy_string("Val_level XTL_NUM_LEVELS"));
++#if 0 /* Let the compiler catch this */
++	default:
++		caml_raise_sys_error(caml_copy_string("Val_level Unknown"));
++		break;
++#endif
++	}
++	abort();
++}
++
++/* Option type support as per http://www.linux-nantes.org/~fmonnier/ocaml/ocaml-wrapping-c.php */
++#define Val_none Val_int(0)
++#define Some_val(v) Field(v,0)
++
++static value Val_some(value v)
++{
++	CAMLparam1(v);
++	CAMLlocal1(some);
++	some = caml_alloc(1, 0);
++	Store_field(some, 0, v);
++	CAMLreturn(some);
++}
++
++static value Val_errno(int errnoval)
++{
++	if (errnoval == -1)
++		return Val_none;
++	return Val_some(Val_int(errnoval));
++}
++
++static value Val_context(const char *context)
++{
++	if (context == NULL)
++		return Val_none;
++	return Val_some(caml_copy_string(context));
++}
++
++static void stub_xtl_ocaml_vmessage(struct xentoollog_logger *logger,
++	xentoollog_level level,
++	int errnoval,
++	const char *context,
++	const char *format,
++	va_list al)
++{
++	CAMLparam0();
++	CAMLlocalN(args, 4);
++	struct caml_xtl *xtl = (struct caml_xtl*)logger;
++	value *func = caml_named_value(xtl->vmessage_cb) ;
++	char *msg;
++
++	if (args == NULL)
++		caml_raise_out_of_memory();
++	if (func == NULL)
++		caml_raise_sys_error(caml_copy_string("Unable to find callback"));
++	if (vasprintf(&msg, format, al) < 0)
++		caml_raise_out_of_memory();
++
++	/* vmessage : level -> int option -> string option -> string -> unit; */
++	args[0] = Val_level(level);
++	args[1] = Val_errno(errnoval);
++	args[2] = Val_context(context);
++	args[3] = caml_copy_string(msg);
++
++	free(msg);
++
++	caml_callbackN(*func, 4, args);
++	CAMLreturn0;
++}
++
++static void stub_xtl_ocaml_progress(struct xentoollog_logger *logger,
++	const char *context,
++	const char *doing_what /* no \r,\n */,
++	int percent, unsigned long done, unsigned long total)
++{
++	CAMLparam0();
++	CAMLlocalN(args, 5);
++	struct caml_xtl *xtl = (struct caml_xtl*)logger;
++	value *func = caml_named_value(xtl->progress_cb) ;
++
++	if (args == NULL)
++		caml_raise_out_of_memory();
++	if (func == NULL)
++		caml_raise_sys_error(caml_copy_string("Unable to find callback"));
++
++	/* progress : string option -> string -> int -> int64 -> int64 -> unit; */
++	args[0] = Val_context(context);
++	args[1] = caml_copy_string(doing_what);
++	args[2] = Val_int(percent);
++	args[3] = caml_copy_int64(done);
++	args[4] = caml_copy_int64(total);
++
++	caml_callbackN(*func, 5, args);
++	CAMLreturn0;
++}
++
++static void xtl_destroy(struct xentoollog_logger *logger)
++{
++	struct caml_xtl *xtl = (struct caml_xtl*)logger;
++	free(xtl->vmessage_cb);
++	free(xtl->progress_cb);
++	free(xtl);
++}
++
++void xtl_finalize(value handle)
++{
++	xtl_destroy(XTL);
++}
++
++static struct custom_operations xentoollogger_custom_operations = {
++	"xentoollogger_custom_operations",
++	xtl_finalize /* custom_finalize_default */,
++	custom_compare_default,
++	custom_hash_default,
++	custom_serialize_default,
++	custom_deserialize_default
++};
++
++/* external _create_logger: (string * string) -> handle = "stub_xtl_create_logger" */
++CAMLprim value stub_xtl_create_logger(value cbs)
++{
++	CAMLparam1(cbs);
++	CAMLlocal1(handle);
++	struct caml_xtl *xtl = malloc(sizeof(*xtl));
++	if (xtl == NULL)
++		caml_raise_out_of_memory();
++
++	memset(xtl, 0, sizeof(*xtl));
++
++	xtl->vtable.vmessage = &stub_xtl_ocaml_vmessage;
++	xtl->vtable.progress = &stub_xtl_ocaml_progress;
++	xtl->vtable.destroy = &xtl_destroy;
++
++	xtl->vmessage_cb = dup_String_val(Field(cbs, 0));
++	xtl->progress_cb = dup_String_val(Field(cbs, 1));
++
++	handle = caml_alloc_custom(&xentoollogger_custom_operations, sizeof(xtl), 0, 1);
++	Xtl_val(handle) = xtl;
++
++	CAMLreturn(handle);
++}
++
++/* external test: handle -> unit = "stub_xtl_test" */
++CAMLprim value stub_xtl_test(value handle)
++{
++	unsigned long l;
++	CAMLparam1(handle);
++	xtl_log(XTL, XTL_DEBUG, -1, "debug", "%s -- debug", __func__);
++	xtl_log(XTL, XTL_INFO, -1, "test", "%s -- test 1", __func__);
++	xtl_log(XTL, XTL_INFO, ENOSYS, "test errno", "%s -- test 2", __func__);
++	xtl_log(XTL, XTL_CRITICAL, -1, "critical", "%s -- critical", __func__);
++	for (l = 0UL; l<=100UL; l += 10UL) {
++		xtl_progress(XTL, "progress", "testing", l, 100UL);
++		usleep(10000);
++	}
++	CAMLreturn(Val_unit);
++}
++
+diff --git a/tools/ocaml/test/Makefile b/tools/ocaml/test/Makefile
+new file mode 100644
+index 0000000..980054c
+--- /dev/null
++++ b/tools/ocaml/test/Makefile
+@@ -0,0 +1,28 @@
++XEN_ROOT = $(CURDIR)/../../..
++OCAML_TOPLEVEL = $(CURDIR)/..
++include $(OCAML_TOPLEVEL)/common.make
++
++OCAMLINCLUDE += \
++	-I $(OCAML_TOPLEVEL)/libs/xentoollog
++
++OBJS = xtl
++
++PROGRAMS = xtl
++
++xtl_LIBS =  \
++	-ccopt -L -ccopt $(OCAML_TOPLEVEL)/libs/xentoollog $(OCAML_TOPLEVEL)/libs/xentoollog/xentoollog.cmxa \
++	-cclib -lxenctrl
++
++xtl_OBJS = xtl
++
++OCAML_PROGRAM = xtl
++
++all: $(PROGRAMS)
++
++bins: $(PROGRAMS)
++
++install: all
++	$(INSTALL_DIR) $(DESTDIR)$(BINDIR)
++	$(INSTALL_PROG) $(PROGRAMS) $(DESTDIR)$(BINDIR)
++
++include $(OCAML_TOPLEVEL)/Makefile.rules
+diff --git a/tools/ocaml/test/xtl.ml b/tools/ocaml/test/xtl.ml
+new file mode 100644
+index 0000000..3a1df82
+--- /dev/null
++++ b/tools/ocaml/test/xtl.ml
+@@ -0,0 +1,19 @@
++open Arg
++open Xentoollog
++  
++let do_test level = 
++  let lgr = Xentoollog.create_stdio_logger ~level:level () in
++  begin
++    Xentoollog.test lgr;
++  end
++
++let () =
++  let debug_level = ref Xentoollog.Info in
++  let speclist = [
++    ("-v", Arg.Unit (fun () -> debug_level := Xentoollog.Debug), "Verbose");
++    ("-q", Arg.Unit (fun () -> debug_level := Xentoollog.Critical), "Quiet");
++  ] in
++  let usage_msg = "usage: xtl [OPTIONS]" in
++  Arg.parse speclist (fun s -> ()) usage_msg;
++
++  do_test !debug_level
+-- 
+1.7.10.4
+

@@ -1,0 +1,165 @@
+From b08d622d43f9d076ec308b5b9970a34aaa87800e Mon Sep 17 00:00:00 2001
+From: Rob Hoes <rob.hoes@citrix.com>
+Date: Sun, 24 Mar 2013 19:29:03 +0000
+Subject: [PATCH 11/34] libxl: ocaml: allocate a long lived libxl context.
+
+Rather than allocating a new context for every libxl call begin to
+switch to a model where a context is allocated by the caller and may
+then be used for multiple calls down into the library.
+
+Signed-off-by: Ian Campbell <ian.campbell@citrix.com>
+Signed-off-by: Rob Hoes <rob.hoes@citrix.com>
+---
+ tools/ocaml/libs/xl/META.in          |    1 +
+ tools/ocaml/libs/xl/Makefile         |    3 +++
+ tools/ocaml/libs/xl/xenlight.ml.in   |    4 ++++
+ tools/ocaml/libs/xl/xenlight.mli.in  |    4 ++++
+ tools/ocaml/libs/xl/xenlight_stubs.c |   42 +++++++++++++++++++++++++++++++++-
+ 5 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/tools/ocaml/libs/xl/META.in b/tools/ocaml/libs/xl/META.in
+index fe2c60b..3f0c552 100644
+--- a/tools/ocaml/libs/xl/META.in
++++ b/tools/ocaml/libs/xl/META.in
+@@ -1,4 +1,5 @@
+ version = "@VERSION@"
+ description = "Xen Toolstack Library"
++requires = "xentoollog"
+ archive(byte) = "xenlight.cma"
+ archive(native) = "xenlight.cmxa"
+diff --git a/tools/ocaml/libs/xl/Makefile b/tools/ocaml/libs/xl/Makefile
+index c9e5274..6917a20 100644
+--- a/tools/ocaml/libs/xl/Makefile
++++ b/tools/ocaml/libs/xl/Makefile
+@@ -5,11 +5,14 @@ include $(TOPLEVEL)/common.make
+ # ignore unused generated functions
+ CFLAGS += -Wno-unused
+ CFLAGS += $(CFLAGS_libxenlight)
++CFLAGS += -I ../xentoollog
+ 
+ OBJS = xenlight
+ INTF = xenlight.cmi
+ LIBS = xenlight.cma xenlight.cmxa
+ 
++OCAMLINCLUDE += -I ../xentoollog
++
+ LIBS_xenlight = $(LDLIBS_libxenlight)
+ 
+ xenlight_OBJS = $(OBJS)
+diff --git a/tools/ocaml/libs/xl/xenlight.ml.in b/tools/ocaml/libs/xl/xenlight.ml.in
+index dcc1a38..3d663d8 100644
+--- a/tools/ocaml/libs/xl/xenlight.ml.in
++++ b/tools/ocaml/libs/xl/xenlight.ml.in
+@@ -20,6 +20,10 @@ type devid = int
+ 
+ (* @@LIBXL_TYPES@@ *)
+ 
++type ctx
++
++external ctx_alloc: Xentoollog.handle -> ctx = "stub_libxl_ctx_alloc"
++
+ external send_trigger : domid -> trigger -> int -> unit = "stub_xl_send_trigger"
+ external send_sysrq : domid -> char -> unit = "stub_xl_send_sysrq"
+ external send_debug_keys : domid -> string -> unit = "stub_xl_send_debug_keys"
+diff --git a/tools/ocaml/libs/xl/xenlight.mli.in b/tools/ocaml/libs/xl/xenlight.mli.in
+index 3fd0165..96d859c 100644
+--- a/tools/ocaml/libs/xl/xenlight.mli.in
++++ b/tools/ocaml/libs/xl/xenlight.mli.in
+@@ -20,6 +20,10 @@ type devid = int
+ 
+ (* @@LIBXL_TYPES@@ *)
+ 
++type ctx
++
++external ctx_alloc: Xentoollog.handle -> ctx = "stub_libxl_ctx_alloc"
++
+ external send_trigger : domid -> trigger -> int -> unit = "stub_xl_send_trigger"
+ external send_sysrq : domid -> char -> unit = "stub_xl_send_sysrq"
+ external send_debug_keys : domid -> string -> unit = "stub_xl_send_debug_keys"
+diff --git a/tools/ocaml/libs/xl/xenlight_stubs.c b/tools/ocaml/libs/xl/xenlight_stubs.c
+index a7bf6ba..65e9a4a 100644
+--- a/tools/ocaml/libs/xl/xenlight_stubs.c
++++ b/tools/ocaml/libs/xl/xenlight_stubs.c
+@@ -21,6 +21,7 @@
+ #include <caml/signals.h>
+ #include <caml/fail.h>
+ #include <caml/callback.h>
++#include <caml/custom.h>
+ 
+ #include <sys/mman.h>
+ #include <stdint.h>
+@@ -29,6 +30,11 @@
+ #include <libxl.h>
+ #include <libxl_utils.h>
+ 
++#include "caml_xentoollog.h"
++
++#define Ctx_val(x)(*((libxl_ctx **) Data_custom_val(x)))
++#define CTX ((libxl_ctx *) Ctx_val(ctx))
++
+ struct caml_logger {
+ 	struct xentoollog_logger logger;
+ 	int log_offset;
+@@ -59,6 +65,8 @@ static void log_destroy(struct xentoollog_logger *logger)
+ 	lg.logger.vmessage = log_vmessage; \
+ 	lg.logger.destroy = log_destroy; \
+ 	lg.logger.progress = NULL; \
++	lg.log_offset = 0; \
++	memset(&lg.log_buf,0,sizeof(lg.log_buf));	\
+ 	caml_enter_blocking_section(); \
+ 	ret = libxl_ctx_alloc(&ctx, LIBXL_VERSION, 0, (struct xentoollog_logger *) &lg); \
+ 	if (ret != 0) \
+@@ -77,7 +85,7 @@ static char * dup_String_val(caml_gc *gc, value s)
+ 	c = calloc(len + 1, sizeof(char));
+ 	if (!c)
+ 		caml_raise_out_of_memory();
+-	gc->ptrs[gc->offset++] = c;
++	if (gc) gc->ptrs[gc->offset++] = c;
+ 	memcpy(c, String_val(s), len);
+ 	return c;
+ }
+@@ -94,9 +102,41 @@ static void failwith_xl(char *fname, struct caml_logger *lg)
+ {
+ 	char *s;
+ 	s = (lg) ? lg->log_buf : fname;
++	printf("Error: %s\n", fname);
+ 	caml_raise_with_string(*caml_named_value("xl.error"), s);
+ }
+ 
++void ctx_finalize(value ctx)
++{
++	libxl_ctx_free(CTX);
++}
++
++static struct custom_operations libxl_ctx_custom_operations = {
++	"libxl_ctx_custom_operations",
++	ctx_finalize /* custom_finalize_default */,
++	custom_compare_default,
++	custom_hash_default,
++	custom_serialize_default,
++	custom_deserialize_default
++};
++
++CAMLprim value stub_libxl_ctx_alloc(value logger)
++{
++	CAMLparam1(logger);
++	CAMLlocal1(handle);
++	libxl_ctx *ctx;
++	int ret;
++
++	ret = libxl_ctx_alloc(&ctx, LIBXL_VERSION, 0, (xentoollog_logger *) Xtl_val(logger));
++	if (ret != 0) \
++		failwith_xl("cannot init context", NULL);
++
++	handle = caml_alloc_custom(&libxl_ctx_custom_operations, sizeof(ctx), 0, 1);
++	Ctx_val(handle) = ctx;
++
++	CAMLreturn(handle);
++}
++
+ static void * gc_calloc(caml_gc *gc, size_t nmemb, size_t size)
+ {
+ 	void *ptr;
+-- 
+1.7.10.4
+

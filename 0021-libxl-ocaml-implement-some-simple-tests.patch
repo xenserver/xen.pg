@@ -1,0 +1,173 @@
+From c4e0ad0003857f8dbc06cdb1674cfab658189ce4 Mon Sep 17 00:00:00 2001
+From: Rob Hoes <rob.hoes@citrix.com>
+Date: Sun, 24 Mar 2013 19:32:21 +0000
+Subject: [PATCH 21/34] libxl: ocaml: implement some simple tests
+
+Signed-off-by: Ian Campbell <ian.campbell@citrix.com>
+Signed-off-by: Rob Hoes <rob.hoes@citrix.com>
+---
+ .gitignore                          |    3 ++-
+ .hgignore                           |    2 ++
+ tools/ocaml/test/Makefile           |   30 ++++++++++++++++++++++++++----
+ tools/ocaml/test/list_domains.ml    |   29 +++++++++++++++++++++++++++++
+ tools/ocaml/test/raise_exception.ml |   11 +++++++++++
+ tools/ocaml/test/send_debug_keys.ml |   16 ++++++++++++++++
+ 6 files changed, 86 insertions(+), 5 deletions(-)
+ create mode 100644 tools/ocaml/test/list_domains.ml
+ create mode 100644 tools/ocaml/test/raise_exception.ml
+ create mode 100644 tools/ocaml/test/send_debug_keys.ml
+
+diff --git a/.gitignore b/.gitignore
+index 5acebd0..70cca17 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -402,7 +402,8 @@ tools/ocaml/libs/xl/xenlight.ml
+ tools/ocaml/libs/xl/xenlight.mli
+ tools/ocaml/xenstored/oxenstored
+ tools/ocaml/test/xtl
+-
++tools/ocaml/test/send_debug_keys
++tools/ocaml/test/list_domains
+ tools/debugger/kdd/kdd
+ tools/firmware/etherboot/ipxe.tar.gz
+ tools/firmware/etherboot/ipxe/
+diff --git a/.hgignore b/.hgignore
+index 685a785..9de4f27 100644
+--- a/.hgignore
++++ b/.hgignore
+@@ -327,6 +327,8 @@
+ ^tools/ocaml/libs/xl/xenlight\.mli$
+ ^tools/ocaml/xenstored/oxenstored$
+ ^tools/ocaml/test/xtl$
++^tools/ocaml/test/send_debug_keys$
++^tools/ocaml/test/list_domains$
+ ^tools/autom4te\.cache$
+ ^tools/config\.h$
+ ^tools/config\.log$
+diff --git a/tools/ocaml/test/Makefile b/tools/ocaml/test/Makefile
+index 980054c..2c5fdd8 100644
+--- a/tools/ocaml/test/Makefile
++++ b/tools/ocaml/test/Makefile
+@@ -3,11 +3,12 @@ OCAML_TOPLEVEL = $(CURDIR)/..
+ include $(OCAML_TOPLEVEL)/common.make
+ 
+ OCAMLINCLUDE += \
+-	-I $(OCAML_TOPLEVEL)/libs/xentoollog
++	-I $(OCAML_TOPLEVEL)/libs/xentoollog \
++	-I $(OCAML_TOPLEVEL)/libs/xl
+ 
+-OBJS = xtl
++OBJS = xtl send_debug_keys list_domains raise_exception
+ 
+-PROGRAMS = xtl
++PROGRAMS = xtl send_debug_keys list_domains raise_exception
+ 
+ xtl_LIBS =  \
+ 	-ccopt -L -ccopt $(OCAML_TOPLEVEL)/libs/xentoollog $(OCAML_TOPLEVEL)/libs/xentoollog/xentoollog.cmxa \
+@@ -15,7 +16,28 @@ xtl_LIBS =  \
+ 
+ xtl_OBJS = xtl
+ 
+-OCAML_PROGRAM = xtl
++send_debug_keys_LIBS =  \
++	-ccopt -L -ccopt $(OCAML_TOPLEVEL)/libs/xentoollog $(OCAML_TOPLEVEL)/libs/xentoollog/xentoollog.cmxa \
++	-ccopt -L -ccopt $(OCAML_TOPLEVEL)/libs/xl $(OCAML_TOPLEVEL)/libs/xl/xenlight.cmxa \
++	-cclib -lxenlight
++
++send_debug_keys_OBJS = send_debug_keys
++
++list_domains_LIBS =  \
++	-ccopt -L -ccopt $(OCAML_TOPLEVEL)/libs/xentoollog $(OCAML_TOPLEVEL)/libs/xentoollog/xentoollog.cmxa \
++	-ccopt -L -ccopt $(OCAML_TOPLEVEL)/libs/xl $(OCAML_TOPLEVEL)/libs/xl/xenlight.cmxa \
++	-cclib -lxenlight
++
++list_domains_OBJS = list_domains
++
++raise_exception_LIBS =  \
++	-ccopt -L -ccopt $(OCAML_TOPLEVEL)/libs/xentoollog $(OCAML_TOPLEVEL)/libs/xentoollog/xentoollog.cmxa \
++	-ccopt -L -ccopt $(OCAML_TOPLEVEL)/libs/xl $(OCAML_TOPLEVEL)/libs/xl/xenlight.cmxa \
++	-cclib -lxenlight
++
++raise_exception_OBJS = raise_exception
++
++OCAML_PROGRAM = xtl send_debug_keys list_domains raise_exception
+ 
+ all: $(PROGRAMS)
+ 
+diff --git a/tools/ocaml/test/list_domains.ml b/tools/ocaml/test/list_domains.ml
+new file mode 100644
+index 0000000..e21dd71
+--- /dev/null
++++ b/tools/ocaml/test/list_domains.ml
+@@ -0,0 +1,29 @@
++open Arg
++open Printf
++open Xentoollog
++open Xenlight
++
++let bool_as_char b c = if b then c else '-'
++
++let print_dominfo dominfo =
++  let id = dominfo.Xenlight.Dominfo.domid
++  and running = bool_as_char dominfo.Xenlight.Dominfo.running 'r'
++  and blocked = bool_as_char dominfo.Xenlight.Dominfo.blocked 'b'
++  and paused = bool_as_char dominfo.Xenlight.Dominfo.paused 'p'
++  and shutdown = bool_as_char dominfo.Xenlight.Dominfo.shutdown 's'
++  and dying = bool_as_char dominfo.Xenlight.Dominfo.dying 'd'
++  and memory = dominfo.Xenlight.Dominfo.current_memkb
++  in
++  printf "Dom %d: %c%c%c%c%c %LdKB\n" id running blocked paused shutdown dying memory
++
++let _ =
++  let logger = Xentoollog.create_stdio_logger (*~level:Xentoollog.Debug*) () in
++  let ctx = Xenlight.ctx_alloc logger in
++  try
++    let domains = Xenlight.Dominfo.list ctx in
++    List.iter (fun d -> print_dominfo d) domains
++  with Xenlight.Error(err, fn) -> begin
++    printf "Caught Exception: %s: %s\n" (Xenlight.string_of_error err) fn;
++  end
++
++
+diff --git a/tools/ocaml/test/raise_exception.ml b/tools/ocaml/test/raise_exception.ml
+new file mode 100644
+index 0000000..d4371f5
+--- /dev/null
++++ b/tools/ocaml/test/raise_exception.ml
+@@ -0,0 +1,11 @@
++open Printf
++open Xentoollog
++open Xenlight
++
++let _ = 
++  try
++    Xenlight.test_raise_exception ()
++  with Xenlight.Error(err, fn) -> begin
++    printf "Caught Exception: %s: %s\n" (Xenlight.string_of_error err) fn;
++  end
++
+diff --git a/tools/ocaml/test/send_debug_keys.ml b/tools/ocaml/test/send_debug_keys.ml
+new file mode 100644
+index 0000000..6db89e8
+--- /dev/null
++++ b/tools/ocaml/test/send_debug_keys.ml
+@@ -0,0 +1,16 @@
++open Arg
++open Printf
++open Xentoollog
++open Xenlight
++
++let send_keys ctx s = 
++  printf "Sending debug key %s\n" s;
++  Xenlight.send_debug_keys ctx s;
++  ()
++  
++let _ = 
++  let logger = Xentoollog.create_stdio_logger () in
++  let ctx = Xenlight.ctx_alloc logger in
++  Arg.parse [
++  ] (fun s -> send_keys ctx s) "usage: send_debug_keys <keys>"
++
+-- 
+1.7.10.4
+
