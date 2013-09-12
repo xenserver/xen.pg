@@ -1,10 +1,43 @@
-# HG changeset patch
-# Parent 0fad04d96f730a2e69669ddb29110b8e64552c6b
-
-diff -r 0fad04d96f73 xen/arch/x86/mm/shadow/common.c
+diff -r 62bf99853b53 xen/arch/x86/mm.c
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -820,9 +820,14 @@ get_page_from_l1e(
+         if ( (real_pg_owner == NULL) || (pg_owner == l1e_owner) ||
+              xsm_priv_mapping(XSM_TARGET, pg_owner, real_pg_owner) )
+         {
+-            MEM_LOG("pg_owner %d l1e_owner %d, but real_pg_owner %d",
+-                    pg_owner->domain_id, l1e_owner->domain_id,
+-                    real_pg_owner?real_pg_owner->domain_id:-1);
++            if ( real_pg_owner )
++                MEM_LOG("pg_owner %d l1e_owner %d, but real_pg_owner %d",
++                        pg_owner->domain_id, l1e_owner->domain_id,
++                        real_pg_owner->domain_id);
++            else
++                MEM_LOG("pg_owner %d l1e_owner %d, but real_pg_owner NULL",
++                        pg_owner->domain_id, l1e_owner->domain_id);
++
+             goto could_not_pin;
+         }
+         pg_owner = real_pg_owner;
+diff -r 62bf99853b53 xen/arch/x86/mm/shadow/common.c
 --- a/xen/arch/x86/mm/shadow/common.c
 +++ b/xen/arch/x86/mm/shadow/common.c
-@@ -1367,6 +1367,8 @@ static void shadow_blow_tables(struct do
+@@ -41,6 +41,14 @@
+ 
+ DEFINE_PER_CPU(uint32_t,trace_shadow_path_flags);
+ 
++mfn_t magic_mfn = {0x103fff3<<PAGE_SHIFT};
++static void parse_magic_mfn(char *s)
++{
++    magic_mfn = _mfn(simple_strtoull(s, NULL, 0));
++    printk("Magic mfn parameter set as %"PRI_mfn"\n", mfn_x(magic_mfn));
++}
++custom_param("magic_mfn", parse_magic_mfn);
++
+ /* Set up the shadow-specific parts of a domain struct at start of day.
+  * Called for every domain from arch_domain_create() */
+ void shadow_domain_init(struct domain *d, unsigned int domcr_flags)
+@@ -1367,6 +1375,8 @@ static void shadow_blow_tables(struct do
  
      ASSERT(v != NULL);
  
@@ -13,10 +46,137 @@ diff -r 0fad04d96f73 xen/arch/x86/mm/shadow/common.c
      /* Pass one: unpin all pinned pages */
      foreach_pinned_shadow(d, sp, t)
      {
-diff -r 0fad04d96f73 xen/arch/x86/mm/shadow/private.h
+@@ -1420,10 +1430,79 @@ static struct keyhandler shadow_blow_all
+     .desc = "reset shadow pagetables"
+ };
+ 
++static void shadow_test_mfn(unsigned char c)
++{
++    struct page_info *sp = mfn_to_page(magic_mfn), tmp;
++    unsigned long *ptr = (unsigned long *)sp;
++    unsigned i;
++
++    printk("'%c' pressed -> memtesting magic address\n", c);
++
++    paging_lock(dom0);
++
++    printk("Magic mfn %"PRI_mfn", sp %p\n", mfn_x(magic_mfn), _p(sp));
++
++    printk("Dumping current state:\n");
++    for ( i = 0; i < sizeof *sp / sizeof (unsigned long); ++i )
++        printk("    0x%02lx: %016lx\n", i * sizeof(unsigned long), ptr[i]);
++
++    // Save the page_info
++    memcpy(&tmp, sp, sizeof tmp);
++
++    // Trash the memory.
++    memset(sp, 0xcc, sizeof tmp);
++    printk("Inspecting memory pattern (expected 0xcc):\n");
++    for ( i = 0; i < sizeof *sp / sizeof (unsigned long); ++i )
++        printk("    0x%02lx: %016lx\n", i * sizeof(unsigned long), ptr[i]);
++
++    // Trash the memory.
++    memset(sp, 0xa1, sizeof tmp);
++    printk("Inspecting memory pattern (expected 0xa1):\n");
++    for ( i = 0; i < sizeof *sp / sizeof (unsigned long); ++i )
++        printk("    0x%02lx: %016lx\n", i * sizeof(unsigned long), ptr[i]);
++
++    // Trash the memory.
++    memset(sp, 0x5f, sizeof tmp);
++    printk("Inspecting memory pattern (expected 0x5f):\n");
++    for ( i = 0; i < sizeof *sp / sizeof (unsigned long); ++i )
++        printk("    0x%02lx: %016lx\n", i * sizeof(unsigned long), ptr[i]);
++
++    // Restore the page_info
++    memcpy(sp, &tmp, sizeof tmp);
++
++    printk("Verifying stored state:\n");
++    for ( i = 0; i < sizeof *sp / sizeof (unsigned long); ++i )
++        printk("    0x%02lx: %016lx\n", i * sizeof(unsigned long), ptr[i]);
++
++    paging_unlock(dom0);
++}
++
++static struct keyhandler shadow_test_mfn_keyhandler = {
++    .u.fn = shadow_test_mfn,
++    .desc = "Test magic page_info memory"
++};
++
++static void shadow_dump_idle(unsigned char c)
++{
++    l4_pgentry_t *idle = (l4_pgentry_t *)idle_pg_table;
++    unsigned i;
++
++    printk("'%c' pressed -> dumping upper l4es \n", c);
++    for ( i = 260; i <= 281; ++i )
++        printk("  idle[%3d] = %016lx\n", i, idle[i].l4);
++}
++
++static struct keyhandler shadow_dump_mfn_keyhandler = {
++    .u.fn = shadow_dump_idle,
++    .desc = "Dump the upper l4es from the idle pagetables"
++};
++
+ /* Register this function in the Xen console keypress table */
+ static __init int shadow_blow_tables_keyhandler_init(void)
+ {
+     register_keyhandler('S', &shadow_blow_all_tables_keyhandler);
++    register_keyhandler('1', &shadow_test_mfn_keyhandler);
++    register_keyhandler('2', &shadow_dump_mfn_keyhandler);
+     return 0;
+ }
+ __initcall(shadow_blow_tables_keyhandler_init);
+diff -r 62bf99853b53 xen/arch/x86/mm/shadow/multi.c
+--- a/xen/arch/x86/mm/shadow/multi.c
++++ b/xen/arch/x86/mm/shadow/multi.c
+@@ -42,6 +42,8 @@
+ #include "private.h"
+ #include "types.h"
+ 
++extern mfn_t magic_mfn;
++
+ /* THINGS TO DO LATER:
+  * 
+  * TEARDOWN HEURISTICS
+@@ -906,6 +908,13 @@ static int shadow_set_l4e(struct vcpu *v
+     ASSERT(sl4e != NULL);
+     old_sl4e = *sl4e;
+ 
++    if ( ((unsigned long)sl4e & ~PAGE_MASK)/sizeof(*sl4e) == 272 )
++    {
++        printk("**Set sl4e(slot 272) sl4mfn = %"PRI_mfn", "
++               "osl4e = %016lx, nsl4e = %016lx\n",
++               mfn_x(sl4mfn), old_sl4e.l4, new_sl4e.l4);
++    }
++
+     if ( old_sl4e.l4 == new_sl4e.l4 ) return 0; /* Nothing to do */
+     
+     paddr = ((((paddr_t)mfn_x(sl4mfn)) << PAGE_SHIFT) 
+@@ -934,12 +943,20 @@ static int shadow_set_l4e(struct vcpu *v
+     {
+         /* We lost a reference to an old mfn. */
+         mfn_t osl3mfn = shadow_l4e_get_mfn(old_sl4e);
++
+         if ( (mfn_x(osl3mfn) != mfn_x(shadow_l4e_get_mfn(new_sl4e)))
+              || !perms_strictly_increased(shadow_l4e_get_flags(old_sl4e), 
+                                           shadow_l4e_get_flags(new_sl4e)) )
+         {
+             flags |= SHADOW_SET_FLUSH;
+         }
++        if ( unlikely(mfn_x(osl3mfn) == mfn_x(magic_mfn)) )
++        {
++            printk("**Expecting to die shortly\n");
++            printk("    sl4mfn: %"PRI_mfn"\n", mfn_x(sl4mfn));
++            printk("    sl4e at %p, offset %ld\n", _p(sl4e),
++                   ((unsigned long)sl4e & ~PAGE_MASK)/sizeof(*sl4e) );
++        }
+         sh_put_ref(v, osl3mfn, paddr);
+     }
+     return flags;
+diff -r 62bf99853b53 xen/arch/x86/mm/shadow/private.h
 --- a/xen/arch/x86/mm/shadow/private.h
 +++ b/xen/arch/x86/mm/shadow/private.h
-@@ -552,7 +552,19 @@ static inline void sh_put_ref(struct vcp
+@@ -552,7 +552,28 @@ static inline void sh_put_ref(struct vcp
      struct page_info *sp = mfn_to_page(smfn);
  
      ASSERT(mfn_valid(smfn));
@@ -32,8 +192,37 @@ diff -r 0fad04d96f73 xen/arch/x86/mm/shadow/private.h
 +        for ( i = 0; i < sizeof *sp / sizeof (unsigned long); ++i )
 +            printk("    0x%02lx: %016lx\n", i * sizeof(unsigned long), ptr[i]);
 +
++        sp--; ptr = (unsigned long *)sp;
++        printk("Previous page_info at %p:\n", _p(sp));
++        for ( i = 0; i < sizeof *sp / sizeof (unsigned long); ++i )
++            printk("    0x%02lx: %016lx\n", i * sizeof(unsigned long), ptr[i]);
++
++        sp+=2; ptr = (unsigned long *)sp;
++        printk("Subsequent page_info at %p:\n", _p(sp));
++        for ( i = 0; i < sizeof *sp / sizeof (unsigned long); ++i )
++            printk("    0x%02lx: %016lx\n", i * sizeof(unsigned long), ptr[i]);
 +        ASSERT(sp->u.sh.head);
 +    }
      ASSERT(!(sp->count_info & PGC_count_mask));
  
      /* If this is the entry in the up-pointer, remove it */
+diff -r 62bf99853b53 xen/include/asm-x86/config.h
+--- a/xen/include/asm-x86/config.h
++++ b/xen/include/asm-x86/config.h
+@@ -126,6 +126,7 @@ extern unsigned char boot_edid_info[128]
+     (((_AC(_slot, UL) >> 8) * _AC(0xffff000000000000,UL)) | \
+      (_AC(_slot, UL) << PML4_ENTRY_BITS))
+ #define GB(_gb) (_AC(_gb, UL) << 30)
++#define MB(_mb) (_AC(_mb, UL) << 20)
+ 
+ /*
+  * Memory layout:
+@@ -246,7 +247,7 @@ extern unsigned char boot_edid_info[128]
+                                  (_AC(-1,UL) << SUPERPAGE_SHIFT))
+ /* Slot 261: page-frame information array (128GB). */
+ #define FRAMETABLE_VIRT_END     DIRECTMAP_VIRT_START
+-#define FRAMETABLE_SIZE         GB(128)
++#define FRAMETABLE_SIZE         (GB(128)-MB(2))
+ #define FRAMETABLE_NR           (FRAMETABLE_SIZE / sizeof(*frame_table))
+ #define FRAMETABLE_VIRT_START   (FRAMETABLE_VIRT_END - FRAMETABLE_SIZE)
+ /* Slot 262-271/510: A direct 1:1 mapping of all of physical memory. */
