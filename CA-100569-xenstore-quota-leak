@@ -1,0 +1,82 @@
+# HG changeset patch
+# Parent 528db51e1446738cfd79da3aa54a95fe95c618b1
+diff --git a/tools/ocaml/xenstored/quota.ml b/tools/ocaml/xenstored/quota.ml
+--- a/tools/ocaml/xenstored/quota.ml
++++ b/tools/ocaml/xenstored/quota.ml
+@@ -81,3 +81,8 @@ let add_entry quota id =
+ 
+ let add quota diff =
+ 	Hashtbl.iter (fun id nb -> set_entry quota id (get_entry quota id + nb)) diff.cur
++
++let merge orig_quota mod_quota dest_quota =
++	  Hashtbl.iter (fun id nb -> let diff = nb - (get_entry orig_quota id) in
++				if diff <> 0 then
++					set_entry dest_quota id ((get_entry dest_quota id) + diff)) mod_quota.cur
+diff --git a/tools/ocaml/xenstored/store.ml b/tools/ocaml/xenstored/store.ml
+--- a/tools/ocaml/xenstored/store.ml
++++ b/tools/ocaml/xenstored/store.ml
+@@ -188,20 +188,17 @@ let rec get_deepest_existing_node node =
+ 		with Not_found -> node
+ 
+ let set_node rnode path nnode =
+-	let quota = Quota.create () in
+-	if !Quota.activate then Node.recurse (fun node -> Quota.add_entry quota (Node.get_owner node)) nnode;
+ 	if path = [] then
+-		nnode, quota
++		nnode
+ 	else
+ 		let set_node node name =
+ 			try
+ 				let ent = Node.find node name in
+-				if !Quota.activate then Node.recurse (fun node -> Quota.del_entry quota (Node.get_owner node)) ent;
+ 				Node.replace_child node ent nnode
+ 			with Not_found ->
+ 				Node.add_child node nnode
+ 			in
+-		apply_modify rnode path set_node, quota
++		apply_modify rnode path set_node
+ 
+ (* read | ls | getperms use this *)
+ let rec lookup node path fct =
+@@ -375,10 +372,10 @@ let dump_buffer store = dump_store_buf s
+ 
+ 
+ (* modifying functions with quota udpate *)
+-let set_node store path node =
+-	let root, quota_diff = Path.set_node store.root path node in
++let set_node store path node orig_quota mod_quota =
++	let root = Path.set_node store.root path node in
+ 	store.root <- root;
+-	Quota.add store.quota quota_diff
++	Quota.merge orig_quota mod_quota store.quota
+ 
+ let write store perm path value =
+ 	let owner = Node.get_owner (get_deepest_existing_node store path) in
+diff --git a/tools/ocaml/xenstored/transaction.ml b/tools/ocaml/xenstored/transaction.ml
+--- a/tools/ocaml/xenstored/transaction.ml
++++ b/tools/ocaml/xenstored/transaction.ml
+@@ -74,6 +74,7 @@ type ty = No | Full of (int * Store.Node
+ type t = {
+ 	ty: ty;
+ 	store: Store.t;
++	quota: Quota.t;
+ 	mutable ops: (Xenbus.Xb.Op.operation * Store.Path.t) list;
+ 	mutable read_lowpath: Store.Path.t option;
+ 	mutable write_lowpath: Store.Path.t option;
+@@ -84,6 +85,7 @@ let make id store =
+ 	{
+ 		ty = ty;
+ 		store = if id = none then store else Store.copy store;
++		quota = Quota.copy store.Store.quota;
+ 		ops = [];
+ 		read_lowpath = None;
+ 		write_lowpath = None;
+@@ -155,7 +157,7 @@ let commit ~con t =
+ 
+ 					(* it has to be in the store, otherwise it means bugs
+ 					   in the lowpath registration. we don't need to handle none. *)
+-					maybe (fun n -> Store.set_node cstore p n) n;
++					maybe (fun n -> Store.set_node cstore p n t.quota store.Store.quota) n;
+ 					Logging.write_coalesce ~tid:(get_id t) ~con (Store.Path.to_string p);
+ 				) t.write_lowpath;
+ 				maybe (fun p ->
