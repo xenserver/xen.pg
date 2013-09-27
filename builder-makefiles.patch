@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 2f2cfc206f20464141686493663d4ce3e917826d
+# Parent 14f78d2dd7be0d87df80240dac271e93986f23a3
 
 diff --git a/.hgignore b/.hgignore
 --- a/.hgignore
@@ -17,7 +17,7 @@ diff --git a/mk/Makefile b/mk/Makefile
 new file mode 100644
 --- /dev/null
 +++ b/mk/Makefile
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,144 @@
 +USE_BRANDING := yes
 +IMPORT_BRANDING := yes
 +# makefile for xen component in build system
@@ -51,6 +51,11 @@ new file mode 100644
 +XEN_VERSION := $(shell $(MAKE) -C $(call hg_loc,$(REPO_NAME)) --no-print-directory xenversion)
 +XEN_RELEASE := $(PLATFORM_VERSION).$(CSET_NUMBER)
 +
++ifeq ($(BUILD_NUMBER),0x)
++XEN_VENDORVERSION := -xs-local
++else
++XEN_VENDORVERSION := -xs$(BUILD_NUMBER)
++endif
 +
 +cset_template := --template "{rev}:{node|short}"
 +cset_loc      := "$(call hg_loc,$(REPO_NAME))"
@@ -98,6 +103,7 @@ new file mode 100644
 +	sed -e s/@XEN_VERSION@/$(XEN_VERSION)/g \
 +	    -e s/@XEN_RELEASE@/$(XEN_RELEASE)/g \
 +	    -e s/@XEN_CHANGESET@/$(XEN_CHANGESET)/g \
++	    -e s/@XEN_VENDORVERSION@/$(XEN_VENDORVERSION)/g \
 +	< $< > $@.tmp; \
 +	mv -f $@.tmp $@; \
 +	}
@@ -118,8 +124,8 @@ new file mode 100644
 +
 +$(CDFILES_COOKIE): $(RPM_BUILD_COOKIE) $(MY_MAIN_CDFILES)/.dirstamp
 +	rpm2cpio $(MY_OUTPUT_DIR)/RPMS/$(DOMAIN0_ARCH_OPTIMIZED)/$(HYPERVISOR_OUTPUT_RPM) | \
-+		( cd $(MY_MAIN_CDFILES) ; cpio --extract --make-directories --unconditional ./boot/xen-$(XEN_VERSION).gz )
-+	mv $(MY_MAIN_CDFILES)/boot/xen-$(XEN_VERSION).gz $(MY_MAIN_CDFILES)/boot/xen.gz
++		( cd $(MY_MAIN_CDFILES) ; cpio --extract --make-directories --unconditional ./boot/xen-$(XEN_VERSION)$(XEN_VENDORVERSION)-d.gz )
++	mv $(MY_MAIN_CDFILES)/boot/xen-$(XEN_VERSION)$(XEN_VENDORVERSION)-d.gz $(MY_MAIN_CDFILES)/boot/xen.gz
 +	touch $@
 +
 +# # SOURCES, BRANDING etc
@@ -291,7 +297,7 @@ diff --git a/mk/xen-4.3.spec.in b/mk/xen-4.3.spec.in
 new file mode 100644
 --- /dev/null
 +++ b/mk/xen-4.3.spec.in
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,346 @@
 +# -*- rpm-spec -*-
 +
 +%{!?python_sitearch: %define python_sitearch %(%{__python} -c "from distutils.sysconfig import get_python_lib; print get_python_lib(1)")}
@@ -304,6 +310,8 @@ new file mode 100644
 +%define HVSOR_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 %{HV_COMMON_OPTIONS} CROSS_COMPILE=x86_64-linux-
 +%define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_32
 +%endif
++
++%define vendor_version @XEN_VENDORVERSION@
 +
 +# For 64bit
 +%ifarch x86_64
@@ -447,12 +455,34 @@ new file mode 100644
 +./configure --disable-seabios --prefix="/usr" --disable-stubdom
 +
 +%install
-+%{__make} %{HVSOR_OPTIONS} -C xen install
++
++mkdir -p %{buildroot}/boot/
++
++# Regular build of Xen
++%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version} debug=n build
++%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version} debug=n MAP
++
++cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}%{vendor_version}.gz
++cp xen/System.map %{buildroot}/boot/%{name}-%{version}%{vendor_version}.map
++cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}%{vendor_version}
++ln -sf /boot/%{name}-%{version}%{vendor_version}.gz %{buildroot}/boot/xen.gz
++ln -sf /boot/%{name}-%{version}%{vendor_version}.gz %{buildroot}/boot/xen-%{version}.gz
++
++# Debug build of Xen
++%{__make} %{HVSOR_OPTIONS} -C xen clean
++%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version}-d debug=y build
++%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version}-d debug=y MAP
++
++cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}%{vendor_version}-d.gz
++cp xen/System.map %{buildroot}/boot/%{name}-%{version}%{vendor_version}-d.map
++cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}%{vendor_version}-d
++ln -sf /boot/%{name}-%{version}%{vendor_version}-d.gz %{buildroot}/boot/xen-debug.gz
++
++# Force use of the debug build by default
++ln -sf /boot/%{name}-%{version}%{vendor_version}-d.gz %{buildroot}/boot/xen.gz
++
 +%{__make} %{TOOLS_OPTIONS} -C tools install
 +%{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
-+
-+%{__make} %{HVSOR_OPTIONS} -C xen MAP
-+cp xen/System.map %{buildroot}/boot/%{name}-%{version}.map
 +
 +rm -f %{buildroot}/usr/share/doc/xen/README.xenmon
 +
@@ -512,7 +542,7 @@ new file mode 100644
 +
 +%files hypervisor-debuginfo
 +%defattr(-,root,root,-)
-+/boot/%{name}-syms-%{version}
++/boot/%{name}-syms*
 +
 +%files dom0-tools
 +%defattr(-,root,root,-)
