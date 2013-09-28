@@ -1,8 +1,8 @@
 # HG changeset patch
-# Parent 91795619b59aa27f37f1bc93294eb74b2a4f0824
+# Parent 8a86d841e6d42fbffc9e20d3028875dd4990882d
 [RFC] Xen: Spread boot time page scrubbing across all available CPU's.
 
-The page scrubbing is done in 256MB chunks in lockstep across all the CPU's.
+The page scrubbing is done in 128MB chunks in lockstep across all the CPU's.
 This allows for the boot CPU to hold the heap_lock whilst each chunk is being
 scrubbed and then release the heap_lock when all CPU's are finished scrubing
 their individual chunk. This allows for the heap_lock to not be held
@@ -12,29 +12,63 @@ all CPU's.
 The page scrub memory chunks are allocated to the CPU's in a NUMA aware
 fashion to reduce Socket interconnect overhead and improve performance.
 
-This patch reduces the boot page scrub time on a 256GB 16 core AMD Opteron
-machine from 1 minute 46 seconds to 38 seconds.
+This patch reduces the boot page scrub time on a 128GB 64 core AMD Opteron
+machine from 49 seconds to 3 seconds.
 
-diff -r 91795619b59a xen/common/page_alloc.c
+diff -r f2e806b8b3e1 docs/misc/xen-command-line.markdown
+--- a/docs/misc/xen-command-line.markdown
++++ b/docs/misc/xen-command-line.markdown
+@@ -188,6 +188,16 @@ Scrub free RAM during boot.  This is a s
+ accidentally leaking sensitive VM data into other VMs if Xen crashes
+ and reboots.
+ 
++### bootscrub_blocksize
++> `= <size>`
++
++> Default: `128MiB`
++
++Maximum RAM block size to be scrubbed whilst holding the page heap lock and not
++running softirqs. Reduce this if softirqs are not being run frequently enough.
++Setting this to a high value may cause cause boot failure, particularly if the
++NMI watchdog is also enabled.
++
+ ### cachesize
+ > `= <size>`
+ 
+diff -r f2e806b8b3e1 xen/common/page_alloc.c
 --- a/xen/common/page_alloc.c
 +++ b/xen/common/page_alloc.c
-@@ -89,6 +89,15 @@ static struct bootmem_region {
+@@ -65,6 +65,12 @@ static bool_t opt_bootscrub __initdata =
+ boolean_param("bootscrub", opt_bootscrub);
+ 
+ /*
++ * bootscrub_blocksize -> Size (bytes) of mem block to scrub with heaplock held
++ */
++static unsigned int __initdata opt_bootscrub_blocksize = 128 * 1024 * 1024;
++size_param("bootscrub_blocksize", opt_bootscrub_blocksize);
++
++/*
+  * Bit width of the DMA heap -- used to override NUMA-node-first.
+  * allocation strategy, which can otherwise exhaust low memory.
+  */
+@@ -90,6 +96,16 @@ static struct bootmem_region {
  } *__initdata bootmem_region_list;
  static unsigned int __initdata nr_bootmem_regions;
  
 +static atomic_t __initdata bootscrub_count = ATOMIC_INIT(0);
 +
 +struct scrub_region {
-+    unsigned long offset;
-+    unsigned long start;
-+    unsigned long chunk_size;
-+    unsigned long cpu_block_size;
++    u64 offset;
++    u64 start;
++    u64 chunk_size;
++    u64 cpu_block_size;
 +};
++static struct scrub_region __initdata region[MAX_NUMNODES];
 +
  static void __init boot_bug(int line)
  {
      panic("Boot BUG at %s:%d\n", __FILE__, line);
-@@ -1090,28 +1099,43 @@ void __init end_boot_allocator(void)
+@@ -1254,28 +1270,44 @@ void __init end_boot_allocator(void)
      printk("\n");
  }
  
@@ -46,36 +80,38 @@ diff -r 91795619b59a xen/common/page_alloc.c
 -void __init scrub_heap_pages(void)
 +void __init smp_scrub_heap_pages(void *data)
  {
-     unsigned long mfn;
+-    unsigned long mfn;
++    unsigned long mfn, start_mfn, end_mfn;
      struct page_info *pg;
-+    unsigned long start_mfn, end_mfn;
-+    struct scrub_region *region = (struct scrub_region *) data;
-+    int temp_cpu, local_node, local_cpu_index;
++    struct scrub_region *region = data;
++    unsigned int temp_cpu, local_node, local_cpu_index = 0;
++    unsigned int cpu = smp_processor_id();
  
 -    if ( !opt_bootscrub )
 -        return;
 +    ASSERT(region != NULL);
  
 -    printk("Scrubbing Free RAM: ");
-+    /* Determine the current CPU's index into all this Node's CPU's*/
-+    local_node = cpu_to_node(smp_processor_id());
-+    local_cpu_index = 0;
-+    for_each_cpu(temp_cpu, &node_to_cpumask(local_node))
-+    {
-+        if(smp_processor_id() == temp_cpu)
-+            break;
-+        local_cpu_index++;
-+    }
++    local_node = cpu_to_node(cpu);
++    /* Determine if we are scrubbing using the boot CPU */
++    if ( region->cpu_block_size != ~0ULL )
++        /* Determine the current CPU's index into CPU's linked to this node*/
++        for_each_cpu( temp_cpu, &node_to_cpumask(local_node) )
++        {
++            if ( cpu == temp_cpu )
++                break;
++            local_cpu_index++;
++        }
  
 -    for ( mfn = first_valid_mfn; mfn < max_page; mfn++ )
 +    /* Calculate the starting mfn for this CPU's memory block */
 +    start_mfn = region->start + (region->cpu_block_size * local_cpu_index)
-+                 + region->offset;
++                + region->offset;
 +
 +    /* Calculate the end mfn into this CPU's memory block for this iteration */
-+    if ( ( region->offset + region->chunk_size ) > region->cpu_block_size )
++    if ( region->offset + region->chunk_size > region->cpu_block_size )
 +        end_mfn = region->start + (region->cpu_block_size * local_cpu_index)
-+                    + region->cpu_block_size;
++                  + region->cpu_block_size;
 +    else
 +        end_mfn = start_mfn + region->chunk_size;
 +
@@ -91,7 +127,7 @@ diff -r 91795619b59a xen/common/page_alloc.c
          if ( !mfn_valid(mfn) || !page_state_is(pg, free) )
              continue;
  
-@@ -1119,11 +1143,87 @@ void __init scrub_heap_pages(void)
+@@ -1283,15 +1315,124 @@ void __init scrub_heap_pages(void)
          if ( (mfn % ((100*1024*1024)/PAGE_SIZE)) == 0 )
              printk(".");
  
@@ -100,7 +136,7 @@ diff -r 91795619b59a xen/common/page_alloc.c
 +            scrub_one_page(pg);
 +    }
 +    /* Increment count to indicate scrubbing complete on this CPU */
-+    atomic_inc(&bootscrub_count);
++    atomic_dec(&bootscrub_count);
 +}
 +
 +/*
@@ -109,52 +145,55 @@ diff -r 91795619b59a xen/common/page_alloc.c
 + */
 +void __init scrub_heap_pages(void)
 +{
-+    cpumask_t node_cpus;
-+    unsigned int i;
-+    struct scrub_region region[MAX_NUMNODES];
-+    unsigned long mfn_off, chunk_size, max_cpu_blk_size, mem_start, mem_end;
-+    cpumask_t allbutself;
-+
++    cpumask_t node_cpus, total_node_cpus_mask = {{ 0 }};
++    unsigned int i, boot_cpu_node, total_node_cpus, cpu = smp_processor_id();
++    unsigned long mfn, mfn_off, chunk_size, max_cpu_blk_size = 0;
++    unsigned long mem_start, mem_end;
 +
 +    if ( !opt_bootscrub )
 +        return;
 +
++    boot_cpu_node = cpu_to_node(cpu);
++
 +    printk("Scrubbing Free RAM: ");
 +
 +    /* Scrub block size */
-+    chunk_size = (256*1024*1024/PAGE_SIZE);
++    chunk_size = opt_bootscrub_blocksize >> PAGE_SHIFT;
++    if ( chunk_size == 0 )
++        chunk_size = 1;
 +
-+    cpumask_andnot(&allbutself, &cpu_online_map,
-+                   cpumask_of(smp_processor_id()));
-+
-+    max_cpu_blk_size = 0;
 +    /* Determine the amount of memory to scrub, per CPU on each Node */
 +    for_each_online_node ( i )
 +    {
 +        /* Calculate Node memory start and end address */
 +        mem_start = max(node_start_pfn(i), first_valid_mfn);
 +        mem_end = min(mem_start + node_spanned_pages(i), max_page);
-+        node_cpus = node_to_cpumask(i);
 +        /* Divide by number of CPU's for this node */
++        node_cpus = node_to_cpumask(i);
++        /* It's possible a node has no CPU's */
++        if ( cpumask_empty(&node_cpus) )
++            continue;
++        cpumask_or(&total_node_cpus_mask, &total_node_cpus_mask, &node_cpus);
++
 +        region[i].cpu_block_size = (mem_end - mem_start) /
-+                                                    cpumask_weight(&node_cpus);
++                                    cpumask_weight(&node_cpus);
 +        region[i].start = mem_start;
 +
 +        if ( region[i].cpu_block_size > max_cpu_blk_size )
 +            max_cpu_blk_size = region[i].cpu_block_size;
 +    }
 +
-+    if ( chunk_size > max_cpu_blk_size )
++    /* Round default chunk size down if required */
++    if ( max_cpu_blk_size && chunk_size > max_cpu_blk_size )
 +        chunk_size = max_cpu_blk_size;
 +
-+    /*
-+     * Start all CPU's scrubbing memory, chunk_size at a time
-+     */
++    total_node_cpus = cpumask_weight(&total_node_cpus_mask);
++    /* Start all CPU's scrubbing memory, chunk_size at a time */
 +    for ( mfn_off = 0; mfn_off < max_cpu_blk_size; mfn_off += chunk_size )
 +    {
 +        process_pending_softirqs();
 +
-+        atomic_set(&bootscrub_count, 0);
++        atomic_set(&bootscrub_count, total_node_cpus);
 +
          spin_lock(&heap_lock);
  
@@ -168,17 +207,51 @@ diff -r 91795619b59a xen/common/page_alloc.c
 +            region[i].offset = mfn_off;
 +            node_cpus = node_to_cpumask(i);
 +            /* Clear local cpu ID */
-+            cpumask_clear_cpu(smp_processor_id(), &node_cpus);
++            cpumask_clear_cpu(cpu, &node_cpus);
 +            /* Start page scrubbing on all other CPU's */
-+            on_selected_cpus(&allbutself, smp_scrub_heap_pages, &region[i], 0);
++            on_selected_cpus(&node_cpus, smp_scrub_heap_pages, &region[i], 0);
 +        }
 +
-+        /* Start scrub on local CPU */
-+        smp_scrub_heap_pages(&region[cpu_to_node(smp_processor_id())]);
++        /* Start scrub on local CPU if CPU linked to a memory node */
++        if ( boot_cpu_node != NUMA_NO_NODE )
++            smp_scrub_heap_pages(&region[boot_cpu_node]);
 +
 +        /* Wait for page scrubbing to complete on all other CPU's */
-+        while ( atomic_read(&bootscrub_count) < cpumask_weight(&cpu_online_map) )
++        while ( atomic_read(&bootscrub_count) > 0 )
 +            cpu_relax();
  
          spin_unlock(&heap_lock);
      }
+ 
++    /* Use the boot CPU to scrub any nodes which have no CPU's linked to them */
++    for_each_online_node ( i )
++    {
++        node_cpus = node_to_cpumask(i);
++
++        if ( !cpumask_empty(&node_cpus) )
++            continue;
++
++        mem_start = max(node_start_pfn(i), first_valid_mfn);
++        mem_end = min(mem_start + node_spanned_pages(i), max_page);
++
++        region[0].offset = 0;
++        region[0].cpu_block_size = ~0ULL;
++
++        for ( mfn = mem_start; mfn < mem_end; mfn += chunk_size )
++        {
++            spin_lock(&heap_lock);
++            if ( mfn + chunk_size > mem_end )
++                region[0].chunk_size = mem_end - mfn;
++            else
++                region[0].chunk_size = chunk_size;
++
++            region[0].start = mfn;
++
++            smp_scrub_heap_pages(&region[0]);
++            spin_unlock(&heap_lock);
++            process_pending_softirqs();
++        }
++    }
+     printk("done.\n");
+ 
+     /* Now that the heap is initialized, run checks and set bounds
