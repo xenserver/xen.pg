@@ -1,19 +1,19 @@
 # HG changeset patch
-# Parent 36b6a4b470c4415915eb34e1ce1e42dcf9824d9f
+# Parent f4b752565e19de3234ec25ad44639af05f0161a2
 
-diff -r 36b6a4b470c4 xen/arch/x86/crash.c
+diff -r f4b752565e19 xen/arch/x86/crash.c
 --- a/xen/arch/x86/crash.c
 +++ b/xen/arch/x86/crash.c
-@@ -30,6 +30,8 @@
+@@ -31,6 +31,8 @@
  #include <xen/iommu.h>
  #include <asm/hpet.h>
  
 +void (*late_debug)(void) = NULL;
 +
- static atomic_t waiting_for_crash_ipi;
+ static cpumask_t waiting_to_crash;
  static unsigned int crashing_cpu;
  static DEFINE_PER_CPU_READ_MOSTLY(bool_t, crash_save_done);
-@@ -112,6 +114,7 @@ void __attribute__((noreturn)) do_nmi_cr
+@@ -113,6 +115,7 @@ void __attribute__((noreturn)) do_nmi_cr
          halt();
  }
  
@@ -21,16 +21,16 @@ diff -r 36b6a4b470c4 xen/arch/x86/crash.c
  static void nmi_shootdown_cpus(void)
  {
      unsigned long msecs;
-@@ -120,6 +123,7 @@ static void nmi_shootdown_cpus(void)
+@@ -121,6 +124,7 @@ static void nmi_shootdown_cpus(void)
      local_irq_disable();
  
      crashing_cpu = cpu;
 +    saved_local_irq_count = local_irq_count(crashing_cpu);
      local_irq_count(crashing_cpu) = 0;
  
-     atomic_set(&waiting_for_crash_ipi, num_online_cpus() - 1);
-@@ -168,6 +172,9 @@ static void nmi_shootdown_cpus(void)
-         msecs--;
+     cpumask_andnot(&waiting_to_crash, &cpu_online_map, cpumask_of(cpu));
+@@ -179,6 +183,9 @@ static void nmi_shootdown_cpus(void)
+         printk("Failed to shoot down CPUs {%s}\n", keyhandler_scratch);
      }
  
 +    if ( late_debug )
@@ -39,7 +39,7 @@ diff -r 36b6a4b470c4 xen/arch/x86/crash.c
      /* Crash shutdown any IOMMU functionality as the crashdump kernel is not
       * happy when booting if interrupt/dma remapping is still enabled */
      iommu_crash_shutdown();
-diff -r 36b6a4b470c4 xen/arch/x86/hpet.c
+diff -r f4b752565e19 xen/arch/x86/hpet.c
 --- a/xen/arch/x86/hpet.c
 +++ b/xen/arch/x86/hpet.c
 @@ -18,6 +18,7 @@
@@ -80,7 +80,7 @@ diff -r 36b6a4b470c4 xen/arch/x86/hpet.c
  DEFINE_PER_CPU(struct hpet_event_channel *, cpu_bc_channel);
  
  unsigned long __read_mostly hpet_address;
-diff -r 36b6a4b470c4 xen/arch/x86/msi.c
+diff -r f4b752565e19 xen/arch/x86/msi.c
 --- a/xen/arch/x86/msi.c
 +++ b/xen/arch/x86/msi.c
 @@ -1206,7 +1206,7 @@ void __init early_msi_init(void)
@@ -92,10 +92,10 @@ diff -r 36b6a4b470c4 xen/arch/x86/msi.c
  {
      struct irq_desc *desc = irq_to_desc(irq);
      const struct msi_desc *entry;
-diff -r 36b6a4b470c4 xen/arch/x86/x86_64/traps.c
+diff -r f4b752565e19 xen/arch/x86/x86_64/traps.c
 --- a/xen/arch/x86/x86_64/traps.c
 +++ b/xen/arch/x86/x86_64/traps.c
-@@ -221,6 +221,16 @@ void show_page_walk(unsigned long addr)
+@@ -220,6 +220,16 @@ void show_page_walk(unsigned long addr)
             l1_table_offset(addr), l1e_get_intpte(l1e), pfn);
  }
  
@@ -112,7 +112,7 @@ diff -r 36b6a4b470c4 xen/arch/x86/x86_64/traps.c
  void double_fault(void);
  void do_double_fault(struct cpu_user_regs *regs)
  {
-@@ -248,6 +258,9 @@ void do_double_fault(struct cpu_user_reg
+@@ -247,6 +257,9 @@ void do_double_fault(struct cpu_user_reg
      _show_registers(regs, crs, CTXT_hypervisor, NULL);
      show_stack_overflow(cpu, regs->rsp);
  

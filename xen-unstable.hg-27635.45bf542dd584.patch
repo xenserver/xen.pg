@@ -1,0 +1,81 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1380183291 -7200
+# Node ID 45bf542dd5844182ae4ebc0d0715cd5a14bb28ac
+# Parent  54bc3cd1e8abe6d62a7dd75f2e9544b89c5c074e
+x86/crash: Indicate how well nmi_shootdown_cpus() managed to do
+
+Having nmi_shootdown_cpus() report which pcpus failed to be shot down is a
+useful debugging hint as to what possibly went wrong (especially when the
+crash logs seem to indicate that an NMI timeout occurred while waiting for one
+of the problematic pcpus to perform an action).
+
+This is achieved by swapping an atomic_t count of unreported pcpus with a
+cpumask.  In the case that the 1 second timeout occurs, use the cpumask to
+identify the problematic pcpus.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 54bc3cd1e8ab -r 45bf542dd584 xen/arch/x86/crash.c
+--- a/xen/arch/x86/crash.c
++++ b/xen/arch/x86/crash.c
+@@ -22,6 +22,7 @@
+ #include <xen/perfc.h>
+ #include <xen/kexec.h>
+ #include <xen/sched.h>
++#include <xen/keyhandler.h>
+ #include <public/xen.h>
+ #include <asm/shared.h>
+ #include <asm/hvm/support.h>
+@@ -30,7 +31,7 @@
+ #include <xen/iommu.h>
+ #include <asm/hpet.h>
+ 
+-static atomic_t waiting_for_crash_ipi;
++static cpumask_t waiting_to_crash;
+ static unsigned int crashing_cpu;
+ static DEFINE_PER_CPU_READ_MOSTLY(bool_t, crash_save_done);
+ 
+@@ -65,7 +66,7 @@ void __attribute__((noreturn)) do_nmi_cr
+         __stop_this_cpu();
+ 
+         this_cpu(crash_save_done) = 1;
+-        atomic_dec(&waiting_for_crash_ipi);
++        cpumask_clear_cpu(cpu, &waiting_to_crash);
+     }
+ 
+     /* Poor mans self_nmi().  __stop_this_cpu() has reverted the LAPIC
+@@ -122,7 +123,7 @@ static void nmi_shootdown_cpus(void)
+     crashing_cpu = cpu;
+     local_irq_count(crashing_cpu) = 0;
+ 
+-    atomic_set(&waiting_for_crash_ipi, num_online_cpus() - 1);
++    cpumask_andnot(&waiting_to_crash, &cpu_online_map, cpumask_of(cpu));
+ 
+     /* Change NMI trap handlers.  Non-crashing pcpus get nmi_crash which
+      * invokes do_nmi_crash (above), which cause them to write state and
+@@ -162,12 +163,22 @@ static void nmi_shootdown_cpus(void)
+     smp_send_nmi_allbutself();
+ 
+     msecs = 1000; /* Wait at most a second for the other cpus to stop */
+-    while ( (atomic_read(&waiting_for_crash_ipi) > 0) && msecs )
++    while ( !cpumask_empty(&waiting_to_crash) && msecs )
+     {
+         mdelay(1);
+         msecs--;
+     }
+ 
++    /* Leave a hint of how well we did trying to shoot down the other cpus */
++    if ( cpumask_empty(&waiting_to_crash) )
++        printk("Shot down all CPUs\n");
++    else
++    {
++        cpulist_scnprintf(keyhandler_scratch, sizeof keyhandler_scratch,
++                          &waiting_to_crash);
++        printk("Failed to shoot down CPUs {%s}\n", keyhandler_scratch);
++    }
++
+     /* Crash shutdown any IOMMU functionality as the crashdump kernel is not
+      * happy when booting if interrupt/dma remapping is still enabled */
+     iommu_crash_shutdown();
