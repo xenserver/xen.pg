@@ -1,8 +1,9 @@
-From c173f07bf76140f812dd5e8a3398a4a3df3490d0 Mon Sep 17 00:00:00 2001
-From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Wed, 25 Sep 2013 17:19:44 +0100
-Subject: [PATCH 1/3] x86/idle: Fix get_cpu_idle_time()'s interaction with
- offline pcpus.
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1380882203 -7200
+# Node ID 34515e5a6e791d0544478c7a790a8599870394ec
+# Parent  e7ad8f8718a6a4de185c9c7c07f1aa8d5ed45d35
+x86/idle: Fix get_cpu_idle_time()'s interaction with offline pcpus
 
 Checking for "idle_vcpu[cpu] != NULL" is insufficient protection against
 offline pcpus.  From a hypercall, vcpu_runstate_get() will determine "v !=
@@ -39,42 +40,31 @@ As this crash can only be triggered with toolstack hypercalls, it is not a
 security issue and just a simple bug.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-CC: Keir Fraser <keir@xen.org>
-CC: Jan Beulich <JBeulich@suse.com>
-CC: Tim Deegan <tim@xen.org>
-CC: Ian Campbell <Ian.Campbell@citrix.com>
-CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
----
- xen/arch/x86/platform_hypercall.c |    8 ++++++--
- xen/common/schedule.c             |    9 ++++-----
- 2 files changed, 10 insertions(+), 7 deletions(-)
+Acked-by: Keir Fraser <keir@xen.org>
 
-diff --git a/xen/arch/x86/platform_hypercall.c b/xen/arch/x86/platform_hypercall.c
-index 7175a82..f00d508 100644
+diff -r e7ad8f8718a6 -r 34515e5a6e79 xen/arch/x86/platform_hypercall.c
 --- a/xen/arch/x86/platform_hypercall.c
 +++ b/xen/arch/x86/platform_hypercall.c
-@@ -355,10 +355,14 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
+@@ -355,9 +355,13 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PA
  
          for_each_cpu ( cpu, cpumap )
          {
 -            if ( idle_vcpu[cpu] == NULL )
--                cpumask_clear_cpu(cpu, cpumap);
-             idletime = get_cpu_idle_time(cpu);
- 
-+            if ( ! idletime )
++            idletime = get_cpu_idle_time(cpu);
++
++            if ( !idletime )
 +            {
-+                cpumask_clear_cpu(cpu, cpumap);
+                 cpumask_clear_cpu(cpu, cpumap);
+-            idletime = get_cpu_idle_time(cpu);
 +                continue;
 +            }
-+
+ 
              if ( copy_to_guest_offset(idletimes, cpu, &idletime, 1) )
              {
-                 ret = -EFAULT;
-diff --git a/xen/common/schedule.c b/xen/common/schedule.c
-index a8398bd..1ddfb22 100644
+diff -r e7ad8f8718a6 -r 34515e5a6e79 xen/common/schedule.c
 --- a/xen/common/schedule.c
 +++ b/xen/common/schedule.c
-@@ -176,13 +176,12 @@ void vcpu_runstate_get(struct vcpu *v, struct vcpu_runstate_info *runstate)
+@@ -176,13 +176,12 @@ void vcpu_runstate_get(struct vcpu *v, s
  
  uint64_t get_cpu_idle_time(unsigned int cpu)
  {
@@ -92,6 +82,3 @@ index a8398bd..1ddfb22 100644
      return state.time[RUNSTATE_running];
  }
  
--- 
-1.7.10.4
-
