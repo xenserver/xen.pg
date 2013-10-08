@@ -1,0 +1,299 @@
+# HG changeset patch
+# Parent 9ca92a7870d0fc29c4a0cc6aee6e3d7249da664a
+
+diff -r 9ca92a7870d0 tools/xenguest/xenguest_stubs.c
+--- a/tools/xenguest/xenguest_stubs.c
++++ b/tools/xenguest/xenguest_stubs.c
+@@ -54,6 +54,7 @@ struct flags {
+     int acpi_s4;
+     int tsc_mode;
+     int hpet;
++    int exp_viridian_timers;
+ };
+ 
+ static char *
+@@ -135,6 +136,8 @@ get_flags(xs_handle *xsh, struct flags *
+     f->acpi_s3  = xenstore_get(xsh, domid, "acpi_s3");
+     f->tsc_mode = xenstore_get(xsh, domid, "tsc_mode");
+ 
++    f->exp_viridian_timers = xenstore_get(xsh, domid, "exp-viridian-timers");
++
+     /*
+      * HACK - Migrated VMs wont have this xs key set, so the naive action
+      * would result in the HPET mysteriously disappearing.  If the key is not
+@@ -153,6 +156,7 @@ get_flags(xs_handle *xsh, struct flags *
+          "hpet: %d\n",
+          f->vcpus, f->vcpu_weight, f->vcpu_cap, f->nx, f->viridian, f->apic,
+          f->acpi, f->pae, f->acpi_s4, f->acpi_s3, f->tsc_mode, f->hpet);
++    info("Experimental support for viridian timers activated\n");
+     for (n = 0; n < f->vcpus; n++){
+         info("vcpu/%d/affinity:%s\n", n, (f->vcpu_affinity[n])?f->vcpu_affinity[n]:"unset");
+     }
+@@ -311,6 +315,7 @@ static int hvm_build_set_params(xc_inter
+ 	xc_set_hvm_param(xch, domid, HVM_PARAM_VIRIDIAN, f.viridian);
+ 	xc_set_hvm_param(xch, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
+ 	xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
++	xc_set_hvm_param(xch, domid, HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS, f.exp_viridian_timers);
+ #ifndef XEN_UNSTABLE
+ 	xc_set_hvm_param(xch, domid, HVM_PARAM_NX_ENABLED, f.nx);
+     xc_get_hvm_param(xch, domid, HVM_PARAM_CONSOLE_PFN, console_mfn);
+diff -r 9ca92a7870d0 xen/arch/x86/hvm/viridian.c
+--- a/xen/arch/x86/hvm/viridian.c
++++ b/xen/arch/x86/hvm/viridian.c
+@@ -17,13 +17,18 @@
+ #include <public/hvm/hvm_op.h>
+ 
+ /* Viridian MSR numbers. */
+-#define VIRIDIAN_MSR_GUEST_OS_ID 0x40000000
+-#define VIRIDIAN_MSR_HYPERCALL   0x40000001
+-#define VIRIDIAN_MSR_VP_INDEX    0x40000002
+-#define VIRIDIAN_MSR_EOI         0x40000070
+-#define VIRIDIAN_MSR_ICR         0x40000071
+-#define VIRIDIAN_MSR_TPR         0x40000072
+-#define VIRIDIAN_MSR_APIC_ASSIST 0x40000073
++#define VIRIDIAN_MSR_GUEST_OS_ID    0x40000000
++#define VIRIDIAN_MSR_HYPERCALL      0x40000001
++#define VIRIDIAN_MSR_VP_INDEX       0x40000002
++#define VIRIDIAN_MSR_TIME_REF_COUNT 0x40000020
++#define VIRIDIAN_MSR_REFERENCE_TSC  0x40000021
++#define VIRIDIAN_MSR_TSC_FREQUENCY  0x40000022
++#define VIRIDIAN_MSR_APIC_FREQUENCY 0x40000023
++#define VIRIDIAN_MSR_EOI            0x40000070
++#define VIRIDIAN_MSR_ICR            0x40000071
++#define VIRIDIAN_MSR_TPR            0x40000072
++#define VIRIDIAN_MSR_APIC_ASSIST    0x40000073
++#define VIRIDIAN_MSR_GUEST_IDLE     0x400000F0
+ 
+ /* Viridian Hypercall Status Codes. */
+ #define HV_STATUS_SUCCESS                       0x0000
+@@ -38,9 +43,13 @@
+ #define HvNotifyLongSpinWait          8
+ 
+ /* Viridian CPUID 4000003, Viridian MSR availability. */
++#define CPUID3A_MSR_REF_COUNT   (1 << 1)
+ #define CPUID3A_MSR_APIC_ACCESS (1 << 4)
+ #define CPUID3A_MSR_HYPERCALL   (1 << 5)
+ #define CPUID3A_MSR_VP_INDEX    (1 << 6)
++#define CPUID3A_MSR_REF_TSC     (1 << 9)
++#define CPUID3A_MSR_GUEST_IDLE  (1 << 10)
++#define CPUID3A_MSR_FREQ        (1 << 11)
+ 
+ /* Viridian CPUID 4000004, Implementation Recommendations. */
+ #define CPUID4A_MSR_BASED_APIC  (1 << 3)
+@@ -86,6 +95,14 @@ int cpuid_viridian_leaves(unsigned int l
+         *eax = (CPUID3A_MSR_APIC_ACCESS |
+                 CPUID3A_MSR_HYPERCALL   |
+                 CPUID3A_MSR_VP_INDEX);
++        if ( d->arch.hvm_domain.params[HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS] )
++        {
++            *eax |= (CPUID3A_MSR_REF_COUNT |
++                     CPUID3A_MSR_GUEST_IDLE  |
++                     CPUID3A_MSR_FREQ );
++            if ( host_tsc_is_safe() )
++                *eax |= CPUID3A_MSR_REF_TSC;
++        }
+         break;
+     case 4:
+         /* Recommended hypercall usage. */
+@@ -137,6 +154,15 @@ void dump_apic_assist(struct vcpu *v)
+             (unsigned long)v->arch.hvm_vcpu.viridian.apic_assist.fields.pfn);
+ }
+ 
++static void dump_reference_tsc(const struct domain *d)
++{
++    gdprintk(XENLOG_INFO, "REFERENCE_TSC:\n");
++    gdprintk(XENLOG_INFO, "\tenabled: %x\n",
++            d->arch.hvm_domain.viridian.reference_tsc_gpa.fields.enabled);
++    gdprintk(XENLOG_INFO, "\tpfn: %lx\n",
++            (unsigned long)d->arch.hvm_domain.viridian.reference_tsc_gpa.fields.pfn);
++}
++
+ static void enable_hypercall_page(struct domain *d)
+ {
+     unsigned long gmfn = d->arch.hvm_domain.viridian.hypercall_gpa.fields.pfn;
+@@ -206,6 +232,40 @@ void initialize_apic_assist(struct vcpu 
+     put_page_and_type(page);
+ }
+ 
++struct viridian_tsc_page {
++    uint32_t    TscSequence;
++    uint32_t    Reserved1;
++    uint64_t    TscScale;
++    int64_t     TscOffset;
++    uint64_t    Reserved2[509];
++};
++
++static void initialize_reference_tsc(struct domain *d)
++{
++    unsigned long gmfn = d->arch.hvm_domain.viridian.reference_tsc_gpa.fields.pfn;
++    struct page_info *page = get_page_from_gfn(d, gmfn, NULL, P2M_ALLOC);
++    struct viridian_tsc_page *p;
++
++    if ( !page || !get_page_type(page, PGT_writable_page) )
++    {
++        if ( page )
++            put_page(page);
++        gdprintk(XENLOG_WARNING, "Bad GMFN %lx (MFN %lx)\n",
++                 gmfn, page ? page_to_mfn(page) : -1ul );
++        return;
++    }
++
++    p = __map_domain_page(page);
++
++    p->TscSequence = 1;
++    p->TscScale = ((10000ull << 32) / d->arch.tsc_khz) << 32;
++    p->TscOffset = 0;
++
++    unmap_domain_page(p);
++
++    put_page_and_type(page);
++}
++
+ int wrmsr_viridian_regs(uint32_t idx, uint64_t val)
+ {
+     struct vcpu *v = current;
+@@ -264,6 +324,23 @@ int wrmsr_viridian_regs(uint32_t idx, ui
+             initialize_apic_assist(v);
+         break;
+ 
++    case VIRIDIAN_MSR_REFERENCE_TSC:
++        if ( !d->arch.hvm_domain.params[HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS] )
++            return 0;
++        perfc_incr(mshv_wrmsr_reference_tsc);
++        d->arch.hvm_domain.viridian.reference_tsc_gpa.raw = val;
++        dump_reference_tsc(d);
++        if ( d->arch.hvm_domain.viridian.reference_tsc_gpa.fields.enabled )
++            initialize_reference_tsc(d);
++        break;
++
++    case VIRIDIAN_MSR_GUEST_IDLE:
++        if ( !d->arch.hvm_domain.params[HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS] )
++            return 0;
++        perfc_incr(mshv_wrmsr_guest_idle);
++        do_sched_op_compat(SCHEDOP_yield, 0);
++        break;
++
+     default:
+         return 0;
+     }
+@@ -312,6 +389,34 @@ int rdmsr_viridian_regs(uint32_t idx, ui
+         *val = v->arch.hvm_vcpu.viridian.apic_assist.raw;
+         break;
+ 
++    case VIRIDIAN_MSR_TIME_REF_COUNT:
++        if ( !d->arch.hvm_domain.params[HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS] )
++            return 0;
++        perfc_incr(mshv_rdmsr_time_ref_count);
++        *val = hvm_get_guest_time(v) / 100;
++        break;
++
++    case VIRIDIAN_MSR_REFERENCE_TSC:
++        if ( !d->arch.hvm_domain.params[HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS] )
++            return 0;
++        perfc_incr(mshv_rdmsr_reference_tsc);
++        *val = d->arch.hvm_domain.viridian.reference_tsc_gpa.raw;
++        break;
++
++    case VIRIDIAN_MSR_TSC_FREQUENCY:
++        if ( !d->arch.hvm_domain.params[HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS] )
++            return 0;
++        perfc_incr(mshv_rdmsr_tsc_frequency);
++        *val = (uint64_t)d->arch.tsc_khz * 1000ull;
++        break;
++
++    case VIRIDIAN_MSR_APIC_FREQUENCY:
++        if ( !d->arch.hvm_domain.params[HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS] )
++            return 0;
++        perfc_incr(mshv_rdmsr_apic_frequency);
++        *val = 1000000000ull / APIC_BUS_CYCLE_NS;
++        break;
++
+     default:
+         return 0;
+     }
+diff -r 9ca92a7870d0 xen/arch/x86/hvm/vlapic.c
+--- a/xen/arch/x86/hvm/vlapic.c
++++ b/xen/arch/x86/hvm/vlapic.c
+@@ -44,9 +44,6 @@
+ #define VLAPIC_VERSION                  0x00050014
+ #define VLAPIC_LVT_NUM                  6
+ 
+-/* vlapic's frequence is 100 MHz */
+-#define APIC_BUS_CYCLE_NS               10
+-
+ #define LVT_MASK \
+     APIC_LVT_MASKED | APIC_SEND_PENDING | APIC_VECTOR_MASK
+ 
+diff -r 9ca92a7870d0 xen/include/asm-x86/hvm/viridian.h
+--- a/xen/include/asm-x86/hvm/viridian.h
++++ b/xen/include/asm-x86/hvm/viridian.h
+@@ -48,10 +48,21 @@ union viridian_hypercall_gpa
+     } fields;
+ };
+ 
++union viridian_reference_tsc_gpa
++{   uint64_t raw;
++    struct
++    {
++        uint64_t enabled:1;
++        uint64_t reserved_preserved:11;
++        uint64_t pfn:48;
++    } fields;
++};
++
+ struct viridian_domain
+ {
+     union viridian_guest_os_id guest_os_id;
+     union viridian_hypercall_gpa hypercall_gpa;
++    union viridian_reference_tsc_gpa reference_tsc_gpa;
+ };
+ 
+ int
+diff -r 9ca92a7870d0 xen/include/asm-x86/hvm/vlapic.h
+--- a/xen/include/asm-x86/hvm/vlapic.h
++++ b/xen/include/asm-x86/hvm/vlapic.h
+@@ -82,6 +82,9 @@ struct vlapic {
+     } init_sipi;
+ };
+ 
++/* vlapic's frequence is 100 MHz */
++#define APIC_BUS_CYCLE_NS               10
++
+ static inline uint32_t vlapic_get_reg(struct vlapic *vlapic, uint32_t reg)
+ {
+     return *((uint32_t *)(&vlapic->regs->data[reg]));
+diff -r 9ca92a7870d0 xen/include/asm-x86/perfc_defn.h
+--- a/xen/include/asm-x86/perfc_defn.h
++++ b/xen/include/asm-x86/perfc_defn.h
+@@ -122,6 +122,9 @@ PERFCOUNTER(mshv_rdmsr_icr,             
+ PERFCOUNTER(mshv_rdmsr_tpr,             "MS Hv rdmsr tpr")
+ PERFCOUNTER(mshv_rdmsr_apic_assist,     "MS Hv rdmsr APIC assist")
+ PERFCOUNTER(mshv_rdmsr_apic_msr,        "MS Hv rdmsr APIC msr")
++PERFCOUNTER(mshv_rdmsr_reference_tsc,   "MS Hv rdmsr reference TSC")
++PERFCOUNTER(mshv_rdmsr_tsc_frequency,   "MS Hv rdmsr TSC frequency")
++PERFCOUNTER(mshv_rdmsr_apic_frequency,  "MS Hv rdmsr APIC frequency")
+ PERFCOUNTER(mshv_wrmsr_osid,            "MS Hv wrmsr Guest OS ID")
+ PERFCOUNTER(mshv_wrmsr_hc_page,         "MS Hv wrmsr hypercall page")
+ PERFCOUNTER(mshv_wrmsr_vp_index,        "MS Hv wrmsr vp index")
+@@ -130,6 +133,8 @@ PERFCOUNTER(mshv_wrmsr_tpr,             
+ PERFCOUNTER(mshv_wrmsr_eoi,             "MS Hv wrmsr eoi")
+ PERFCOUNTER(mshv_wrmsr_apic_assist,     "MS Hv wrmsr APIC assist")
+ PERFCOUNTER(mshv_wrmsr_apic_msr,        "MS Hv wrmsr APIC msr")
++PERFCOUNTER(mshv_wrmsr_reference_tsc,   "MS Hv wrmsr reference TSC")
++PERFCOUNTER(mshv_wrmsr_guest_idle,      "MS Hv wrmsr guest idle")
+ 
+ PERFCOUNTER(realmode_emulations, "realmode instructions emulated")
+ PERFCOUNTER(realmode_exits,      "vmexits from realmode")
+diff -r 9ca92a7870d0 xen/include/public/hvm/params.h
+--- a/xen/include/public/hvm/params.h
++++ b/xen/include/public/hvm/params.h
+@@ -152,6 +152,8 @@
+ /* SHUTDOWN_* action in case of a triple fault */
+ #define HVM_PARAM_TRIPLE_FAULT_REASON 31
+ 
+-#define HVM_NR_PARAMS          32
++#define HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS 32
++
++#define HVM_NR_PARAMS          33
+ 
+ #endif /* __XEN_PUBLIC_HVM_PARAMS_H__ */
