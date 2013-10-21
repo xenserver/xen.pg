@@ -1,0 +1,70 @@
+From 52cbb9c4d7391ac8012f418b3776697e6837dbf7 Mon Sep 17 00:00:00 2001
+From: David Vrabel <david.vrabel@citrix.com>
+Date: Thu, 10 Oct 2013 18:02:51 +0100
+Subject: [PATCH] sched: fix race between sched_move_domain() and vcpu_wake()
+
+sched_move_domain() changes v->processor for all the domain's VCPUs.
+If another domain, softirq etc. triggers a simultaneous call to
+vcpu_wake() (e.g., by setting an event channel as pending), then
+vcpu_wake() may lock one schedule lock and try to unlock another.
+
+vcpu_schedule_lock() attempts to handle this but only does so for the
+window between reading the schedule_lock from the per-CPU data and the
+spin_lock() call.  This does not help with sched_move_domain()
+changing v->processor between the calls to vcpu_schedule_lock() and
+vcpu_schedule_unlock().
+
+Fix the race by taking the schedule_lock for v->processor in
+sched_move_domain().
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Cc: George Dunlap <george.dunlap@eu.citrix.com>
+Cc: Juergen Gross <juergen.gross@ts.fujitsu.com>
+Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+---
+
+Just taking the lock for the old processor seemed sufficient to me as
+anything seeing the new value would lock and unlock using the same new
+value.  But do we need to take the schedule_lock for the new processor
+as well (in the right order of course)?
+
+This is reproducable by constantly migrating a domain between two CPU
+pools.
+8<------------
+while true; do
+    xl cpupool-migrate $1 Pool-1
+    xl cpupool-migrate $1 Pool-0
+done
+---
+ xen/common/schedule.c |    7 +++++++
+ 1 files changed, 7 insertions(+), 0 deletions(-)
+
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 1ddfb22..28e063e 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -278,6 +278,9 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+     new_p = cpumask_first(c->cpu_valid);
+     for_each_vcpu ( d, v )
+     {
++        spinlock_t *schedule_lock = per_cpu(schedule_data,
++                                            v->processor).schedule_lock;
++
+         vcpudata = v->sched_priv;
+ 
+         migrate_timer(&v->periodic_timer, new_p);
+@@ -285,7 +288,11 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+         migrate_timer(&v->poll_timer, new_p);
+ 
+         cpumask_setall(v->cpu_affinity);
++
++        spin_lock_irq(schedule_lock);
+         v->processor = new_p;
++        spin_unlock_irq(schedule_lock);
++
+         v->sched_priv = vcpu_priv[v->vcpu_id];
+         evtchn_move_pirqs(v);
+ 
+-- 
+1.7.2.5
+

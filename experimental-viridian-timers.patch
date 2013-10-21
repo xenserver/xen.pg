@@ -1,7 +1,7 @@
 # HG changeset patch
-# Parent 9ca92a7870d0fc29c4a0cc6aee6e3d7249da664a
+# Parent 294d27d76e7f0a6e9e108d058ab0111fbf0edc6b
 
-diff -r 9ca92a7870d0 tools/xenguest/xenguest_stubs.c
+diff -r 294d27d76e7f tools/xenguest/xenguest_stubs.c
 --- a/tools/xenguest/xenguest_stubs.c
 +++ b/tools/xenguest/xenguest_stubs.c
 @@ -54,6 +54,7 @@ struct flags {
@@ -31,14 +31,23 @@ diff -r 9ca92a7870d0 tools/xenguest/xenguest_stubs.c
          info("vcpu/%d/affinity:%s\n", n, (f->vcpu_affinity[n])?f->vcpu_affinity[n]:"unset");
      }
 @@ -311,6 +316,7 @@ static int hvm_build_set_params(xc_inter
- 	xc_set_hvm_param(xch, domid, HVM_PARAM_VIRIDIAN, f.viridian);
- 	xc_set_hvm_param(xch, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
- 	xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
-+	xc_set_hvm_param(xch, domid, HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS, f.exp_viridian_timers);
+     xc_set_hvm_param(xch, domid, HVM_PARAM_VIRIDIAN, f.viridian);
+     xc_set_hvm_param(xch, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
+     xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
++    xc_set_hvm_param(xch, domid, HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS, f.exp_viridian_timers);
  #ifndef XEN_UNSTABLE
- 	xc_set_hvm_param(xch, domid, HVM_PARAM_NX_ENABLED, f.nx);
+     xc_set_hvm_param(xch, domid, HVM_PARAM_NX_ENABLED, f.nx);
      xc_get_hvm_param(xch, domid, HVM_PARAM_CONSOLE_PFN, console_mfn);
-diff -r 9ca92a7870d0 xen/arch/x86/hvm/viridian.c
+@@ -433,6 +439,8 @@ int stub_xc_domain_restore(xc_interface 
+     {
+         xc_set_hvm_param(xch, domid, HVM_PARAM_VIRIDIAN, f.viridian);
+         xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
++        xc_set_hvm_param(xch, domid, HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS,
++                         f.exp_viridian_timers);
+     }
+ 
+     configure_vcpus(xch, domid, f);
+diff -r 294d27d76e7f xen/arch/x86/hvm/viridian.c
 --- a/xen/arch/x86/hvm/viridian.c
 +++ b/xen/arch/x86/hvm/viridian.c
 @@ -17,13 +17,18 @@
@@ -135,7 +144,7 @@ diff -r 9ca92a7870d0 xen/arch/x86/hvm/viridian.c
 +        if ( page )
 +            put_page(page);
 +        gdprintk(XENLOG_WARNING, "Bad GMFN %lx (MFN %lx)\n",
-+                 gmfn, page ? page_to_mfn(page) : -1ul );
++                 gmfn, page ? page_to_mfn(page) : INVALID_MFN );
 +        return;
 +    }
 +
@@ -212,7 +221,33 @@ diff -r 9ca92a7870d0 xen/arch/x86/hvm/viridian.c
      default:
          return 0;
      }
-diff -r 9ca92a7870d0 xen/arch/x86/hvm/vlapic.c
+@@ -455,6 +560,7 @@ static int viridian_save_domain_ctxt(str
+ 
+     ctxt.hypercall_gpa = d->arch.hvm_domain.viridian.hypercall_gpa.raw;
+     ctxt.guest_os_id   = d->arch.hvm_domain.viridian.guest_os_id.raw;
++    ctxt.reference_tsc_gpa = d->arch.hvm_domain.viridian.reference_tsc_gpa.raw;
+ 
+     return (hvm_save_entry(VIRIDIAN_DOMAIN, 0, h, &ctxt) != 0);
+ }
+@@ -463,11 +569,16 @@ static int viridian_load_domain_ctxt(str
+ {
+     struct hvm_viridian_domain_context ctxt;
+ 
+-    if ( hvm_load_entry(VIRIDIAN_DOMAIN, h, &ctxt) != 0 )
++    if ( hvm_load_entry_zeroextend(VIRIDIAN_DOMAIN, h, &ctxt) != 0 )
+         return -EINVAL;
+ 
+     d->arch.hvm_domain.viridian.hypercall_gpa.raw = ctxt.hypercall_gpa;
+     d->arch.hvm_domain.viridian.guest_os_id.raw   = ctxt.guest_os_id;
++    d->arch.hvm_domain.viridian.reference_tsc_gpa.raw = ctxt.reference_tsc_gpa;
++
++    if ( d->arch.hvm_domain.params[HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS] &&
++         d->arch.hvm_domain.viridian.reference_tsc_gpa.fields.enabled )
++        initialize_reference_tsc(d);
+ 
+     return 0;
+ }
+diff -r 294d27d76e7f xen/arch/x86/hvm/vlapic.c
 --- a/xen/arch/x86/hvm/vlapic.c
 +++ b/xen/arch/x86/hvm/vlapic.c
 @@ -44,9 +44,6 @@
@@ -225,7 +260,7 @@ diff -r 9ca92a7870d0 xen/arch/x86/hvm/vlapic.c
  #define LVT_MASK \
      APIC_LVT_MASKED | APIC_SEND_PENDING | APIC_VECTOR_MASK
  
-diff -r 9ca92a7870d0 xen/include/asm-x86/hvm/viridian.h
+diff -r 294d27d76e7f xen/include/asm-x86/hvm/viridian.h
 --- a/xen/include/asm-x86/hvm/viridian.h
 +++ b/xen/include/asm-x86/hvm/viridian.h
 @@ -48,10 +48,21 @@ union viridian_hypercall_gpa
@@ -250,7 +285,7 @@ diff -r 9ca92a7870d0 xen/include/asm-x86/hvm/viridian.h
  };
  
  int
-diff -r 9ca92a7870d0 xen/include/asm-x86/hvm/vlapic.h
+diff -r 294d27d76e7f xen/include/asm-x86/hvm/vlapic.h
 --- a/xen/include/asm-x86/hvm/vlapic.h
 +++ b/xen/include/asm-x86/hvm/vlapic.h
 @@ -82,6 +82,9 @@ struct vlapic {
@@ -263,7 +298,7 @@ diff -r 9ca92a7870d0 xen/include/asm-x86/hvm/vlapic.h
  static inline uint32_t vlapic_get_reg(struct vlapic *vlapic, uint32_t reg)
  {
      return *((uint32_t *)(&vlapic->regs->data[reg]));
-diff -r 9ca92a7870d0 xen/include/asm-x86/perfc_defn.h
+diff -r 294d27d76e7f xen/include/asm-x86/perfc_defn.h
 --- a/xen/include/asm-x86/perfc_defn.h
 +++ b/xen/include/asm-x86/perfc_defn.h
 @@ -122,6 +122,9 @@ PERFCOUNTER(mshv_rdmsr_icr,             
@@ -285,14 +320,26 @@ diff -r 9ca92a7870d0 xen/include/asm-x86/perfc_defn.h
  
  PERFCOUNTER(realmode_emulations, "realmode instructions emulated")
  PERFCOUNTER(realmode_exits,      "vmexits from realmode")
-diff -r 9ca92a7870d0 xen/include/public/hvm/params.h
+diff -r 294d27d76e7f xen/include/public/arch-x86/hvm/save.h
+--- a/xen/include/public/arch-x86/hvm/save.h
++++ b/xen/include/public/arch-x86/hvm/save.h
+@@ -568,6 +568,7 @@ struct hvm_hw_cpu_xsave {
+ struct hvm_viridian_domain_context {
+     uint64_t hypercall_gpa;
+     uint64_t guest_os_id;
++    uint64_t reference_tsc_gpa;
+ };
+ 
+ DECLARE_HVM_SAVE_TYPE(VIRIDIAN_DOMAIN, 15, struct hvm_viridian_domain_context);
+diff -r 294d27d76e7f xen/include/public/hvm/params.h
 --- a/xen/include/public/hvm/params.h
 +++ b/xen/include/public/hvm/params.h
-@@ -152,6 +152,8 @@
+@@ -152,6 +152,9 @@
  /* SHUTDOWN_* action in case of a triple fault */
  #define HVM_PARAM_TRIPLE_FAULT_REASON 31
  
 -#define HVM_NR_PARAMS          32
++/* Exact number subject to change as still experimental */
 +#define HVM_PARAM_EXPERIMENTAL_VIRIDIAN_TIMERS 32
 +
 +#define HVM_NR_PARAMS          33
