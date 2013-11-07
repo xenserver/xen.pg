@@ -1,0 +1,175 @@
+From ced5fe3a2894655a93028cdb25445ebc60d3ab57 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 6 Nov 2013 21:55:54 +0000
+Subject: [Xen-devel] [PATCH v2 1/5] x86/hpet: Pre cleanup
+
+This is a set of changes which might not make sense alone, but are
+used/required for the main purpose of the series, and simply the mammoth patch
+making it easier to review.
+
+* Make hpet_msi_write conditionally disable MSIs while updating the route
+  register.  This removes the requirement that it must be masked while
+  writing.
+
+* Defer read of cfg register in hpet_setup_msi_irq.  As a result, an intremap
+  failure prevents us suffering a pointless MMIO read.
+
+* Change some instances of per_cpu($foo, cpu) to this_cpu($foo).  It is
+  cleaner to read, and makes it more obvious when the code is poking around in
+  another cpus data.
+
+* Convert hpet_next_event() to taking a struct hpet_event_channel *, and
+  rename to __hpet_set_counter() for a more accurate description of its
+  actions.
+
+* Insert some assertions about expected interrupt state.  The following patch
+  is rather stricter about its locking.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Keir Fraser <keir@xen.org>
+CC: Jan Beulich <JBeulich@suse.com>
+CC: Tim Deegan <tim@xen.org>
+---
+ xen/arch/x86/hpet.c |   38 ++++++++++++++++++++++++++------------
+ 1 file changed, 26 insertions(+), 12 deletions(-)
+
+diff --git a/xen/arch/x86/hpet.c b/xen/arch/x86/hpet.c
+index 3a4f7e8..14e49e5 100644
+--- a/xen/arch/x86/hpet.c
++++ b/xen/arch/x86/hpet.c
+@@ -94,7 +94,7 @@ static inline unsigned long ns2ticks(unsigned long nsec, int shift,
+     return (unsigned long) tmp;
+ }
+ 
+-static int hpet_next_event(unsigned long delta, int timer)
++static int __hpet_set_counter(struct hpet_event_channel *ch, unsigned long delta)
+ {
+     uint32_t cnt, cmp;
+     unsigned long flags;
+@@ -102,7 +102,7 @@ static int hpet_next_event(unsigned long delta, int timer)
+     local_irq_save(flags);
+     cnt = hpet_read32(HPET_COUNTER);
+     cmp = cnt + delta;
+-    hpet_write32(cmp, HPET_Tn_CMP(timer));
++    hpet_write32(cmp, HPET_Tn_CMP(ch->idx));
+     cmp = hpet_read32(HPET_COUNTER);
+     local_irq_restore(flags);
+ 
+@@ -143,11 +143,11 @@ static int reprogram_hpet_evt_channel(
+     delta = max_t(int64_t, delta, MIN_DELTA_NS);
+     delta = ns2ticks(delta, ch->shift, ch->mult);
+ 
+-    ret = hpet_next_event(delta, ch->idx);
++    ret = __hpet_set_counter(ch, delta);
+     while ( ret && force )
+     {
+         delta += delta;
+-        ret = hpet_next_event(delta, ch->idx);
++        ret = __hpet_set_counter(ch, delta);
+     }
+ 
+     return ret;
+@@ -254,8 +254,10 @@ static void hpet_msi_mask(struct irq_desc *desc)
+     ch->msi.msi_attrib.masked = 1;
+ }
+ 
+-static int hpet_msi_write(struct hpet_event_channel *ch, struct msi_msg *msg)
++static int __hpet_msi_write(struct hpet_event_channel *ch, struct msi_msg *msg)
+ {
++    u32 cfg;
++
+     ch->msi.msg = *msg;
+ 
+     if ( iommu_intremap )
+@@ -266,9 +268,16 @@ static int hpet_msi_write(struct hpet_event_channel *ch, struct msi_msg *msg)
+             return rc;
+     }
+ 
++    cfg = hpet_read32(HPET_Tn_CFG(ch->idx));
++    if ( cfg & HPET_TN_ENABLE )
++        hpet_write32(cfg & ~HPET_TN_ENABLE, HPET_Tn_CFG(ch->idx));
++
+     hpet_write32(msg->data, HPET_Tn_ROUTE(ch->idx));
+     hpet_write32(msg->address_lo, HPET_Tn_ROUTE(ch->idx) + 4);
+ 
++    if ( cfg & HPET_TN_ENABLE )
++        hpet_write32(cfg, HPET_Tn_CFG(ch->idx));
++
+     return 0;
+ }
+ 
+@@ -311,7 +320,7 @@ static void hpet_msi_set_affinity(struct irq_desc *desc, const cpumask_t *mask)
+     msg.address_lo &= ~MSI_ADDR_DEST_ID_MASK;
+     msg.address_lo |= MSI_ADDR_DEST_ID(msg.dest32);
+     if ( msg.data != ch->msi.msg.data || msg.dest32 != ch->msi.msg.dest32 )
+-        hpet_msi_write(ch, &msg);
++        __hpet_msi_write(ch, &msg);
+ }
+ 
+ /*
+@@ -332,13 +341,13 @@ static int __hpet_setup_msi_irq(struct irq_desc *desc)
+     struct msi_msg msg;
+ 
+     msi_compose_msg(desc->arch.vector, desc->arch.cpu_mask, &msg);
+-    return hpet_msi_write(desc->action->dev_id, &msg);
++    return __hpet_msi_write(desc->action->dev_id, &msg);
+ }
+ 
+ static int __init hpet_setup_msi_irq(struct hpet_event_channel *ch)
+ {
+     int ret;
+-    u32 cfg = hpet_read32(HPET_Tn_CFG(ch->idx));
++    u32 cfg;
+     irq_desc_t *desc = irq_to_desc(ch->msi.irq);
+ 
+     if ( iommu_intremap )
+@@ -350,6 +359,7 @@ static int __init hpet_setup_msi_irq(struct hpet_event_channel *ch)
+     }
+ 
+     /* set HPET Tn as oneshot */
++    cfg = hpet_read32(HPET_Tn_CFG(ch->idx));
+     cfg &= ~(HPET_TN_LEVEL | HPET_TN_PERIODIC);
+     cfg |= HPET_TN_FSB | HPET_TN_32BIT;
+     hpet_write32(cfg, HPET_Tn_CFG(ch->idx));
+@@ -697,14 +707,16 @@ void hpet_broadcast_enter(void)
+ {
+     unsigned int cpu = smp_processor_id();
+     struct hpet_event_channel *ch = per_cpu(cpu_bc_channel, cpu);
++    s_time_t deadline = this_cpu(timer_deadline);
++
++    ASSERT(!local_irq_is_enabled());
+ 
+-    if ( per_cpu(timer_deadline, cpu) == 0 )
++    if ( deadline == 0 )
+         return;
+ 
+     if ( !ch )
+         ch = hpet_get_channel(cpu);
+ 
+-    ASSERT(!local_irq_is_enabled());
+ 
+     if ( !(ch->flags & HPET_EVT_LEGACY) )
+         hpet_attach_channel(cpu, ch);
+@@ -725,7 +737,9 @@ void hpet_broadcast_exit(void)
+     unsigned int cpu = smp_processor_id();
+     struct hpet_event_channel *ch = per_cpu(cpu_bc_channel, cpu);
+ 
+-    if ( per_cpu(timer_deadline, cpu) == 0 )
++    ASSERT(local_irq_is_enabled());
++
++    if ( this_cpu(timer_deadline) == 0 )
+         return;
+ 
+     if ( !ch )
+@@ -733,7 +747,7 @@ void hpet_broadcast_exit(void)
+ 
+     /* Reprogram the deadline; trigger timer work now if it has passed. */
+     enable_APIC_timer();
+-    if ( !reprogram_timer(per_cpu(timer_deadline, cpu)) )
++    if ( !reprogram_timer(this_cpu(timer_deadline)) )
+         raise_softirq(TIMER_SOFTIRQ);
+ 
+     cpumask_clear_cpu(cpu, ch->cpumask);
+-- 
+1.7.10.4
+
