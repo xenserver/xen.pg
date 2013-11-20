@@ -1,8 +1,9 @@
-From fd48f645fe2f52bbcceb2601267ae20cc7651082 Mon Sep 17 00:00:00 2001
-From: David Vrabel <david.vrabel@citrix.com>
-Date: Wed, 20 Feb 2013 15:05:29 +0000
-Subject: [PATCH 03/10] kexec: add public interface for improved load/unload
- sub-ops
+# HG changeset patch
+# User David Vrabel <david.vrabel@citrix.com>
+# Date 1384252769 -3600
+# Node ID 5579ea7091b33a66e9816a243e4936fe7c9d225b
+# Parent  8fb2f75dfc3b4a67a5f31bf115da91285fa59a60
+kexec: add public interface for improved load/unload sub-ops
 
 Add replacement KEXEC_CMD_load and KEXEC_CMD_unload sub-ops to the
 kexec hypercall.  These new sub-ops allow a priviledged guest to
@@ -11,18 +12,17 @@ region instead of guests loading the image data themselves and
 providing the relocation code and metadata.
 
 The old interface is provided to guests requesting an interface
-version prior to 4.3.
+version prior to 4.4.
 
-Signed-off: David Vrabel <david.vrabel@citrix.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Don Slutz <dslutz@verizon.com>
+Tested-by: Don Slutz <dslutz@verizon.com>
 Reviewed-by: Daniel Kiper <daniel.kiper@oracle.com>
 Tested-by: Daniel Kiper <daniel.kiper@oracle.com>
----
- xen/common/kexec.c         |   12 ++++----
- xen/include/public/kexec.h |   66 +++++++++++++++++++++++++++++++++++++++++---
- 2 files changed, 68 insertions(+), 10 deletions(-)
+Acked-by: Keir Fraser <keir@xen.org>
 
-diff --git a/xen/common/kexec.c b/xen/common/kexec.c
-index 1ba8556..2d34524 100644
+diff -r 8fb2f75dfc3b -r 5579ea7091b3 xen/common/kexec.c
 --- a/xen/common/kexec.c
 +++ b/xen/common/kexec.c
 @@ -734,7 +734,7 @@ static void crash_save_vmcoreinfo(void)
@@ -34,7 +34,7 @@ index 1ba8556..2d34524 100644
  {
      xen_kexec_image_t *image;
      int base, bit, pos;
-@@ -781,7 +781,7 @@ static int kexec_load_unload_internal(unsigned long op, xen_kexec_load_t *load)
+@@ -781,7 +781,7 @@ static int kexec_load_unload_internal(un
  
  static int kexec_load_unload(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) uarg)
  {
@@ -43,7 +43,7 @@ index 1ba8556..2d34524 100644
  
      if ( unlikely(copy_from_guest(&load, uarg, 1)) )
          return -EFAULT;
-@@ -793,8 +793,8 @@ static int kexec_load_unload_compat(unsigned long op,
+@@ -793,8 +793,8 @@ static int kexec_load_unload_compat(unsi
                                      XEN_GUEST_HANDLE_PARAM(void) uarg)
  {
  #ifdef CONFIG_COMPAT
@@ -54,7 +54,7 @@ index 1ba8556..2d34524 100644
  
      if ( unlikely(copy_from_guest(&compat_load, uarg, 1)) )
          return -EFAULT;
-@@ -866,8 +866,8 @@ static int do_kexec_op_internal(unsigned long op,
+@@ -866,8 +866,8 @@ static int do_kexec_op_internal(unsigned
          else
                  ret = kexec_get_range(uarg);
          break;
@@ -65,11 +65,31 @@ index 1ba8556..2d34524 100644
          spin_lock_irqsave(&kexec_lock, flags);
          if (!test_bit(KEXEC_FLAG_IN_PROGRESS, &kexec_flags))
          {
-diff --git a/xen/include/public/kexec.h b/xen/include/public/kexec.h
-index 36409ff..5dddbec 100644
+diff -r 8fb2f75dfc3b -r 5579ea7091b3 xen/include/public/kexec.h
 --- a/xen/include/public/kexec.h
 +++ b/xen/include/public/kexec.h
-@@ -116,12 +116,12 @@ typedef struct xen_kexec_exec {
+@@ -105,6 +105,20 @@ typedef struct xen_kexec_image {
+  * Perform kexec having previously loaded a kexec or kdump kernel
+  * as appropriate.
+  * type == KEXEC_TYPE_DEFAULT or KEXEC_TYPE_CRASH [in]
++ *
++ * Control is transferred to the image entry point with the host in
++ * the following state.
++ *
++ * - The image may be executed on any PCPU and all other PCPUs are
++ *   stopped.
++ *
++ * - Local interrupts are disabled.
++ *
++ * - Register values are undefined.
++ *
++ * - The image segments have writeable 1:1 virtual to machine
++ *   mappings.  The location of any page tables is undefined and these
++ *   page table frames are not be mapped.
+  */
+ #define KEXEC_CMD_kexec                 0
+ typedef struct xen_kexec_exec {
+@@ -116,12 +130,12 @@ typedef struct xen_kexec_exec {
   * type  == KEXEC_TYPE_DEFAULT or KEXEC_TYPE_CRASH [in]
   * image == relocation information for kexec (ignored for unload) [in]
   */
@@ -86,7 +106,7 @@ index 36409ff..5dddbec 100644
  
  #define KEXEC_RANGE_MA_CRASH      0 /* machine address and size of crash area */
  #define KEXEC_RANGE_MA_XEN        1 /* machine address and size of Xen itself */
-@@ -152,6 +152,64 @@ typedef struct xen_kexec_range {
+@@ -152,6 +166,76 @@ typedef struct xen_kexec_range {
      unsigned long start;
  } xen_kexec_range_t;
  
@@ -96,7 +116,10 @@ index 36409ff..5dddbec 100644
 + * address.
 + */
 +typedef struct xen_kexec_segment {
-+    XEN_GUEST_HANDLE_64(const_void) buf;
++    union {
++        XEN_GUEST_HANDLE(const_void) h;
++        uint64_t _pad;
++    } buf;
 +    uint64_t buf_size;
 +    uint64_t dest_maddr;
 +    uint64_t dest_size;
@@ -113,6 +136,14 @@ index 36409ff..5dddbec 100644
 + * in the memory region reserved for kexec (KEXEC_RANGE_MA_CRASH) and
 + * the entry point must be within the image. The caller is responsible
 + * for ensuring that multiple images do not overlap.
++ *
++ * All image segments will be loaded to their destination machine
++ * addresses prior to being executed.  The trailing portion of any
++ * segments with a source buffer (from dest_maddr + buf_size to
++ * dest_maddr + dest_size) will be zeroed.
++ *
++ * Segments with no source buffer will be accessible to the image when
++ * it is executed.
 + */
 +
 +#define KEXEC_CMD_kexec_load 4
@@ -121,7 +152,10 @@ index 36409ff..5dddbec 100644
 +    uint8_t  _pad;
 +    uint16_t arch;        /* ELF machine type (EM_*). */
 +    uint32_t nr_segments;
-+    XEN_GUEST_HANDLE_64(xen_kexec_segment_t) segments;
++    union {
++        XEN_GUEST_HANDLE(xen_kexec_segment_t) h;
++        uint64_t _pad;
++    } segments;
 +    uint64_t entry_maddr; /* image entry point machine address. */
 +} xen_kexec_load_t;
 +DEFINE_XEN_GUEST_HANDLE(xen_kexec_load_t);
@@ -141,16 +175,11 @@ index 36409ff..5dddbec 100644
 +
 +#define KEXEC_CMD_kexec_load KEXEC_CMD_kexec_load_v1
 +#define KEXEC_CMD_kexec_unload KEXEC_CMD_kexec_unload_v1
-+typedef struct xen_kexec_load {
-+    int type;
-+    xen_kexec_image_t image;
-+} xen_kexec_load_t;
++#define xen_kexec_load xen_kexec_load_v1
++#define xen_kexec_load_t xen_kexec_load_v1_t
 +
 +#endif
 +
  #endif /* _XEN_PUBLIC_KEXEC_H */
  
  /*
--- 
-1.7.10.4
-

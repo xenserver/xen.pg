@@ -1,7 +1,9 @@
-From 45a60efa4a711e1f8504e4f7afb22e891db59ef9 Mon Sep 17 00:00:00 2001
-From: David Vrabel <david.vrabel@citrix.com>
-Date: Wed, 20 Feb 2013 14:55:11 +0000
-Subject: [PATCH 04/10] kexec: add infrastructure for handling kexec images
+# HG changeset patch
+# User David Vrabel <david.vrabel@citrix.com>
+# Date 1384252862 -3600
+# Node ID 899852bf48e17ca89c3e93ae3b77156c1c196f83
+# Parent  5579ea7091b33a66e9816a243e4936fe7c9d225b
+kexec: add infrastructure for handling kexec images
 
 Add the code needed to handle and load kexec images into Xen memory or
 into the crash region.  This is needed for the new KEXEC_CMD_load and
@@ -10,21 +12,17 @@ KEXEC_CMD_unload hypercall sub-ops.
 Much of this code is derived from the Linux kernel.
 
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Don Slutz <dslutz@verizon.com>
+Tested-by: Don Slutz <dslutz@verizon.com>
 Reviewed-by: Daniel Kiper <daniel.kiper@oracle.com>
 Tested-by: Daniel Kiper <daniel.kiper@oracle.com>
----
- xen/common/Makefile      |    1 +
- xen/common/kimage.c      |  823 ++++++++++++++++++++++++++++++++++++++++++++++
- xen/include/xen/kimage.h |   59 ++++
- 3 files changed, 883 insertions(+)
- create mode 100644 xen/common/kimage.c
- create mode 100644 xen/include/xen/kimage.h
+Acked-by: Keir Fraser <keir@xen.org>
 
-diff --git a/xen/common/Makefile b/xen/common/Makefile
-index 0dc2050..c821bb8 100644
+diff -r 5579ea7091b3 -r 899852bf48e1 xen/common/Makefile
 --- a/xen/common/Makefile
 +++ b/xen/common/Makefile
-@@ -11,6 +11,7 @@ obj-y += irq.o
+@@ -13,6 +13,7 @@ obj-y += irq.o
  obj-y += kernel.o
  obj-y += keyhandler.o
  obj-$(HAS_KEXEC) += kexec.o
@@ -32,12 +30,10 @@ index 0dc2050..c821bb8 100644
  obj-y += lib.o
  obj-y += memory.o
  obj-y += multicall.o
-diff --git a/xen/common/kimage.c b/xen/common/kimage.c
-new file mode 100644
-index 0000000..995ce36
+diff -r 5579ea7091b3 -r 899852bf48e1 xen/common/kimage.c
 --- /dev/null
 +++ b/xen/common/kimage.c
-@@ -0,0 +1,823 @@
+@@ -0,0 +1,820 @@
 +/*
 + * Kexec Image
 + *
@@ -70,14 +66,10 @@ index 0000000..995ce36
 + * where you can disable the MMU this is trivial, and easy.  For
 + * others it is still a simple predictable page table to setup.
 + *
-+ * The code for the transition from the current kernel to the
-+ * the new kernel is placed in the control_code_buffer, whose size
-+ * is given by KEXEC_CONTROL_PAGE_SIZE.  In the best case only a single
-+ * page of memory is necessary, but some architectures require more.
-+ * Because this memory must be identity mapped in the transition from
-+ * virtual to physical addresses it must live in the range
-+ * 0 - TASK_SIZE, as only the user space mappings are arbitrarily
-+ * modifiable.
++ * The code for the transition from the current kernel to the the new
++ * kernel is placed in the page-size control_code_buffer.  This memory
++ * must be identity mapped in the transition from virtual to physical
++ * addresses.
 + *
 + * The assembly stub in the control code buffer is passed a linked list
 + * of descriptor pages detailing the source pages of the new kernel,
@@ -118,7 +110,7 @@ index 0000000..995ce36
 +    struct page_info *page;
 +
 +    page = alloc_domheap_page(NULL, memflags);
-+    if ( page == NULL )
++    if ( !page )
 +        return NULL;
 +
 +    clear_domain_page(page_to_mfn(page));
@@ -140,11 +132,12 @@ index 0000000..995ce36
 +    if ( !image )
 +        goto out;
 +
-+    image->control_page = ~0; /* By default this does not apply */
 +    image->entry_maddr = entry;
 +    image->type = type;
 +    image->nr_segments = nr_segments;
 +    image->segments = segments;
++
++    image->next_crash_page = kexec_crash_area.start;
 +
 +    INIT_PAGE_LIST_HEAD(&image->control_pages);
 +    INIT_PAGE_LIST_HEAD(&image->dest_pages);
@@ -152,16 +145,15 @@ index 0000000..995ce36
 +
 +    /*
 +     * Verify we have good destination addresses.  The caller is
-+     * responsible for making certain we don't attempt to load
-+     * the new image into invalid or reserved areas of RAM.  This
-+     * just verifies it is an address we can use.
++     * responsible for making certain we don't attempt to load the new
++     * image into invalid or reserved areas of RAM.  This just
++     * verifies it is an address we can use.
 +     *
-+     * Since the kernel does everything in page size chunks ensure
-+     * the destination addresses are page aligned.  Too many
-+     * special cases crop of when we don't do this.  The most
-+     * insidious is getting overlapping destination addresses
-+     * simply because addresses are changed to page size
-+     * granularity.
++     * Since the kernel does everything in page size chunks ensure the
++     * destination addresses are page aligned.  Too many special cases
++     * crop of when we don't do this.  The most insidious is getting
++     * overlapping destination addresses simply because addresses are
++     * changed to page size granularity.
 +     */
 +    result = -EADDRNOTAVAIL;
 +    for ( i = 0; i < nr_segments; i++ )
@@ -174,10 +166,11 @@ index 0000000..995ce36
 +            goto out;
 +    }
 +
-+    /* Verify our destination addresses do not overlap.
-+     * If we allowed overlapping destination addresses
-+     * through very weird things can happen with no
-+     * easy explanation as one segment stops on another.
++    /*
++     * Verify our destination addresses do not overlap.  If we allowed
++     * overlapping destination addresses through very weird things can
++     * happen with no easy explanation as one segment stops on
++     * another.
 +     */
 +    result = -EINVAL;
 +    for ( i = 0; i < nr_segments; i++ )
@@ -192,16 +185,16 @@ index 0000000..995ce36
 +            paddr_t pstart, pend;
 +            pstart = image->segments[j].dest_maddr;
 +            pend   = pstart + image->segments[j].dest_size;
-+            /* Do the segments overlap ? */
++            /* Do the segments overlap? */
 +            if ( (mend > pstart) && (mstart < pend) )
 +                goto out;
 +        }
 +    }
 +
-+    /* Ensure our buffer sizes are strictly less than
-+     * our memory sizes.  This should always be the case,
-+     * and it is easier to check up front than to be surprised
-+     * later on.
++    /*
++     * Ensure our buffer sizes are strictly less than our memory
++     * sizes.  This should always be the case, and it is easier to
++     * check up front than to be surprised later on.
 +     */
 +    result = -EINVAL;
 +    for ( i = 0; i < nr_segments; i++ )
@@ -210,8 +203,10 @@ index 0000000..995ce36
 +            goto out;
 +    }
 +
-+    /* Page for the relocation code must still be accessible after the
-+       processor has switched to 32-bit mode. */
++    /* 
++     * Page for the relocation code must still be accessible after the
++     * processor has switched to 32-bit mode.
++     */
 +    result = -ENOMEM;
 +    image->control_code_page = kimage_alloc_control_page(image, MEMF_bits(32));
 +    if ( !image->control_code_page )
@@ -223,14 +218,16 @@ index 0000000..995ce36
 +        goto out;
 +
 +    image->head = page_to_maddr(image->entry_page);
-+    image->next_entry = 0;
 +
 +    result = 0;
 +out:
 +    if ( result == 0 )
 +        *rimage = image;
-+    else
++    else if ( image )
++    {
++        image->segments = NULL; /* caller frees segments after an error */
 +        kimage_free(image);
++    }
 +
 +    return result;
 +
@@ -249,7 +246,6 @@ index 0000000..995ce36
 +                              xen_kexec_segment_t *segments)
 +{
 +    unsigned long i;
-+    int result;
 +
 +    /* Verify we have a valid entry point */
 +    if ( (entry < kexec_crash_area.start)
@@ -269,25 +265,20 @@ index 0000000..995ce36
 +    {
 +        paddr_t mstart, mend;
 +
++        if ( guest_handle_is_null(segments[i].buf.h) )
++            continue;
++
 +        mstart = segments[i].dest_maddr;
-+        mend = mstart + segments[i].dest_size - 1;
-+        /* Ensure we are within the crash kernel limits */
++        mend = mstart + segments[i].dest_size;
++        /* Ensure we are within the crash kernel limits. */
 +        if ( (mstart < kexec_crash_area.start )
 +             || (mend > kexec_crash_area.start + kexec_crash_area.size))
 +            return -EADDRNOTAVAIL;
 +    }
 +
-+    /* Allocate and initialize a controlling structure */
-+    result = do_kimage_alloc(rimage, entry, nr_segments, segments,
-+                             KEXEC_TYPE_CRASH);
-+    if ( result )
-+        return result;
-+
-+    /* Enable the special crash kernel control page allocation
-+       policy. */
-+    (*rimage)->control_page = kexec_crash_area.start;
-+
-+    return 0;
++    /* Allocate and initialize a controlling structure. */
++    return do_kimage_alloc(rimage, entry, nr_segments, segments,
++                           KEXEC_TYPE_CRASH);
 +}
 +
 +static int kimage_is_destination_range(struct kexec_image *image,
@@ -323,16 +314,16 @@ index 0000000..995ce36
 +static struct page_info *kimage_alloc_normal_control_page(
 +    struct kexec_image *image, unsigned memflags)
 +{
-+    /* Control pages are special, they are the intermediaries
-+     * that are needed while we copy the rest of the pages
-+     * to their final resting place.  As such they must
-+     * not conflict with either the destination addresses
-+     * or memory the kernel is already using.
++    /*
++     * Control pages are special, they are the intermediaries that are
++     * needed while we copy the rest of the pages to their final
++     * resting place.  As such they must not conflict with either the
++     * destination addresses or memory the kernel is already using.
 +     *
-+     * The only case where we really need more than one of
-+     * these are for architectures where we cannot disable
-+     * the MMU and must instead generate an identity mapped
-+     * page table for all of the memory.
++     * The only case where we really need more than one of these are
++     * for architectures where we cannot disable the MMU and must
++     * instead generate an identity mapped page table for all of the
++     * memory.
 +     *
 +     * At worst this runs in O(N) of the image size.
 +     */
@@ -341,8 +332,9 @@ index 0000000..995ce36
 +
 +    INIT_PAGE_LIST_HEAD(&extra_pages);
 +
-+    /* Loop while I can allocate a page and the page allocated
-+     * is a destination page.
++    /*
++     * Loop while I can allocate a page and the page allocated is a
++     * destination page.
 +     */
 +    do {
 +        unsigned long mfn, emfn;
@@ -367,17 +359,18 @@ index 0000000..995ce36
 +        /* Remember the allocated page... */
 +        page_list_add(page, &image->control_pages);
 +
-+        /* Because the page is already in it's destination
-+         * location we will never allocate another page at
-+         * that address.  Therefore kimage_alloc_page
-+         * will not return it (again) and we don't need
-+         * to give it an entry in image->segments[].
++        /*
++         * Because the page is already in it's destination location we
++         * will never allocate another page at that address.
++         * Therefore kimage_alloc_page will not return it (again) and
++         * we don't need to give it an entry in image->segments[].
 +         */
 +    }
-+    /* Deal with the destination pages I have inadvertently allocated.
++    /*
++     * Deal with the destination pages I have inadvertently allocated.
 +     *
-+     * Ideally I would convert multi-page allocations into single
-+     * page allocations, and add everything to image->dest_pages.
++     * Ideally I would convert multi-page allocations into single page
++     * allocations, and add everything to image->dest_pages.
 +     *
 +     * For now it is simpler to just free the pages.
 +     */
@@ -388,52 +381,47 @@ index 0000000..995ce36
 +
 +static struct page_info *kimage_alloc_crash_control_page(struct kexec_image *image)
 +{
-+    /* Control pages are special, they are the intermediaries
-+     * that are needed while we copy the rest of the pages
-+     * to their final resting place.  As such they must
-+     * not conflict with either the destination addresses
-+     * or memory the kernel is already using.
++    /*
++     * Control pages are special, they are the intermediaries that are
++     * needed while we copy the rest of the pages to their final
++     * resting place.  As such they must not conflict with either the
++     * destination addresses or memory the kernel is already using.
 +     *
-+     * Control pages are also the only pags we must allocate
-+     * when loading a crash kernel.  All of the other pages
-+     * are specified by the segments and we just memcpy
-+     * into them directly.
++     * Control pages are also the only pags we must allocate when
++     * loading a crash kernel.  All of the other pages are specified
++     * by the segments and we just memcpy into them directly.
 +     *
-+     * The only case where we really need more than one of
-+     * these are for architectures where we cannot disable
-+     * the MMU and must instead generate an identity mapped
-+     * page table for all of the memory.
++     * The only case where we really need more than one of these are
++     * for architectures where we cannot disable the MMU and must
++     * instead generate an identity mapped page table for all of the
++     * memory.
 +     *
-+     * Given the low demand this implements a very simple
-+     * allocator that finds the first hole of the appropriate
-+     * size in the reserved memory region, and allocates all
-+     * of the memory up to and including the hole.
++     * Given the low demand this implements a very simple allocator
++     * that finds the first hole of the appropriate size in the
++     * reserved memory region, and allocates all of the memory up to
++     * and including the hole.
 +     */
-+    paddr_t hole_start, hole_end, size;
-+    struct page_info *page;
++    paddr_t hole_start, hole_end;
++    struct page_info *page = NULL;
 +
-+    page = NULL;
-+    size = PAGE_SIZE;
-+    hole_start = (image->control_page + (size - 1)) & ~(size - 1);
-+    hole_end   = hole_start + size - 1;
++    hole_start = PAGE_ALIGN(image->next_crash_page);
++    hole_end   = hole_start + PAGE_SIZE;
 +    while ( hole_end <= kexec_crash_area.start + kexec_crash_area.size )
 +    {
 +        unsigned long i;
 +
-+        if ( hole_end > kexec_crash_area.start + kexec_crash_area.size )
-+            break;
-+        /* See if I overlap any of the segments */
++        /* See if I overlap any of the segments. */
 +        for ( i = 0; i < image->nr_segments; i++ )
 +        {
 +            paddr_t mstart, mend;
 +
 +            mstart = image->segments[i].dest_maddr;
-+            mend   = mstart + image->segments[i].dest_size - 1;
-+            if ( (hole_end >= mstart) && (hole_start <= mend) )
++            mend   = mstart + image->segments[i].dest_size;
++            if ( (hole_end > mstart) && (hole_start < mend) )
 +            {
-+                /* Advance the hole to the end of the segment */
-+                hole_start = (mend + (size - 1)) & ~(size - 1);
-+                hole_end   = hole_start + size - 1;
++                /* Advance the hole to the end of the segment. */
++                hole_start = PAGE_ALIGN(mend);
++                hole_end   = hole_start + PAGE_SIZE;
 +                break;
 +            }
 +        }
@@ -446,7 +434,7 @@ index 0000000..995ce36
 +    }
 +    if ( page )
 +    {
-+        image->control_page = hole_end;
++        image->next_crash_page = hole_end;
 +        clear_domain_page(page_to_mfn(page));
 +    }
 +
@@ -496,7 +484,6 @@ index 0000000..995ce36
 +    image->next_entry++;
 +    unmap_domain_page(entries);
 +
-+
 +    return 0;
 +}
 +
@@ -517,7 +504,6 @@ index 0000000..995ce36
 +{
 +    kimage_free_page_list(&image->dest_pages);
 +    kimage_free_page_list(&image->unusable_pages);
-+
 +}
 +
 +static void kimage_terminate(struct kexec_image *image)
@@ -549,15 +535,14 @@ index 0000000..995ce36
 +    free_domheap_page(page);
 +}
 +
-+void kimage_free(struct kexec_image *image)
++static void kimage_free_all_entries(struct kexec_image *image)
 +{
 +    kimage_entry_t *ptr, entry;
 +    kimage_entry_t ind = 0;
 +
-+    if ( !image )
++    if ( !image->head )
 +        return;
 +
-+    kimage_free_extra_pages(image);
 +    for_each_kimage_entry(image, ptr, entry)
 +    {
 +        if ( entry & IND_INDIRECTION )
@@ -565,9 +550,7 @@ index 0000000..995ce36
 +            /* Free the previous indirection page */
 +            if ( ind & IND_INDIRECTION )
 +                kimage_free_entry(ind);
-+            /* Save this indirection page until we are
-+             * done with it.
-+             */
++            /* Save this indirection page until we are done with it. */
 +            ind = entry;
 +        }
 +        else if ( entry & IND_SOURCE )
@@ -575,11 +558,18 @@ index 0000000..995ce36
 +    }
 +    unmap_domain_page(ptr);
 +
-+    /* Free the final indirection page */
++    /* Free the final indirection page. */
 +    if ( ind & IND_INDIRECTION )
 +        kimage_free_entry(ind);
++}
 +
-+    /* Free the kexec control pages... */
++void kimage_free(struct kexec_image *image)
++{
++    if ( !image )
++        return;
++
++    kimage_free_extra_pages(image);
++    kimage_free_all_entries(image);
 +    kimage_free_page_list(&image->control_pages);
 +    xfree(image->segments);
 +    xfree(image);
@@ -611,29 +601,28 @@ index 0000000..995ce36
 +                                           paddr_t destination)
 +{
 +    /*
-+     * Here we implement safeguards to ensure that a source page
-+     * is not copied to its destination page before the data on
-+     * the destination page is no longer useful.
++     * Here we implement safeguards to ensure that a source page is
++     * not copied to its destination page before the data on the
++     * destination page is no longer useful.
 +     *
 +     * To do this we maintain the invariant that a source page is
-+     * either its own destination page, or it is not a
-+     * destination page at all.
++     * either its own destination page, or it is not a destination
++     * page at all.
 +     *
-+     * That is slightly stronger than required, but the proof
-+     * that no problems will not occur is trivial, and the
-+     * implementation is simply to verify.
++     * That is slightly stronger than required, but the proof that no
++     * problems will not occur is trivial, and the implementation is
++     * simply to verify.
 +     *
-+     * When allocating all pages normally this algorithm will run
-+     * in O(N) time, but in the worst case it will run in O(N^2)
-+     * time.   If the runtime is a problem the data structures can
-+     * be fixed.
++     * When allocating all pages normally this algorithm will run in
++     * O(N) time, but in the worst case it will run in O(N^2) time.
++     * If the runtime is a problem the data structures can be fixed.
 +     */
 +    struct page_info *page;
 +    paddr_t addr;
 +
 +    /*
-+     * Walk through the list of destination pages, and see if I
-+     * have a match.
++     * Walk through the list of destination pages, and see if I have a
++     * match.
 +     */
 +    page_list_for_each(page, &image->dest_pages)
 +    {
@@ -649,30 +638,30 @@ index 0000000..995ce36
 +    {
 +        kimage_entry_t *old;
 +
-+        /* Allocate a page, if we run out of memory give up */
++        /* Allocate a page, if we run out of memory give up. */
 +        page = kimage_alloc_zeroed_page(0);
 +        if ( !page )
 +            return NULL;
 +        addr = page_to_maddr(page);
 +
-+        /* If it is the destination page we want use it */
++        /* If it is the destination page we want use it. */
 +        if ( addr == destination )
 +            break;
 +
-+        /* If the page is not a destination page use it */
++        /* If the page is not a destination page use it. */
 +        if ( !kimage_is_destination_range(image, addr,
 +                                          addr + PAGE_SIZE) )
 +            break;
 +
 +        /*
-+         * I know that the page is someones destination page.
-+         * See if there is already a source page for this
-+         * destination page.  And if so swap the source pages.
++         * I know that the page is someones destination page.  See if
++         * there is already a source page for this destination page.
++         * And if so swap the source pages.
 +         */
 +        old = kimage_dst_used(image, addr);
 +        if ( old )
 +        {
-+            /* If so move it */
++            /* If so move it. */
 +            unsigned long old_mfn = *old >> PAGE_SHIFT;
 +            unsigned long mfn = addr >> PAGE_SHIFT;
 +
@@ -686,13 +675,13 @@ index 0000000..995ce36
 +        }
 +        else
 +        {
-+            /* Place the page on the destination list I
-+             * will use it later.
++            /*
++             * Place the page on the destination list; I will use it
++             * later.
 +             */
 +            page_list_add(page, &image->dest_pages);
 +        }
 +    }
-+
 +    return page;
 +}
 +
@@ -731,7 +720,7 @@ index 0000000..995ce36
 +            return ret;
 +
 +        dest_va = __map_domain_page(page);
-+        ret = copy_from_guest_offset(dest_va, segment->buf, src_offset, size);
++        ret = copy_from_guest_offset(dest_va, segment->buf.h, src_offset, size);
 +        unmap_domain_page(dest_va);
 +        if ( ret )
 +            return -EFAULT;
@@ -752,8 +741,9 @@ index 0000000..995ce36
 +static int kimage_load_crash_segment(struct kexec_image *image,
 +                                     xen_kexec_segment_t *segment)
 +{
-+    /* For crash dumps kernels we simply copy the data from
-+     * user space to it's destination.
++    /*
++     * For crash dumps kernels we simply copy the data from user space
++     * to it's destination.
 +     */
 +    paddr_t dest;
 +    unsigned long sbytes, dbytes;
@@ -776,10 +766,10 @@ index 0000000..995ce36
 +        schunk = min(dchunk, sbytes);
 +
 +        dest_va = map_domain_page(dest_mfn);
-+        if ( dest_va == NULL )
++        if ( !dest_va )
 +            return -EINVAL;
 +
-+        ret = copy_from_guest_offset(dest_va, segment->buf, src_offset, schunk);
++        ret = copy_from_guest_offset(dest_va, segment->buf.h, src_offset, schunk);
 +        memset(dest_va + schunk, 0, dchunk - schunk);
 +
 +        unmap_domain_page(dest_va);
@@ -799,14 +789,17 @@ index 0000000..995ce36
 +{
 +    int result = -ENOMEM;
 +
-+    switch ( image->type )
++    if ( !guest_handle_is_null(segment->buf.h) )
 +    {
-+    case KEXEC_TYPE_DEFAULT:
-+        result = kimage_load_normal_segment(image, segment);
-+        break;
-+    case KEXEC_TYPE_CRASH:
-+        result = kimage_load_crash_segment(image, segment);
-+        break;
++        switch ( image->type )
++        {
++        case KEXEC_TYPE_DEFAULT:
++            result = kimage_load_normal_segment(image, segment);
++            break;
++        case KEXEC_TYPE_CRASH:
++            result = kimage_load_crash_segment(image, segment);
++            break;
++        }
 +    }
 +
 +    return result;
@@ -861,29 +854,28 @@ index 0000000..995ce36
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff --git a/xen/include/xen/kimage.h b/xen/include/xen/kimage.h
-new file mode 100644
-index 0000000..9555688
+diff -r 5579ea7091b3 -r 899852bf48e1 xen/include/xen/kimage.h
 --- /dev/null
 +++ b/xen/include/xen/kimage.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,62 @@
 +#ifndef __XEN_KIMAGE_H__
 +#define __XEN_KIMAGE_H__
 +
-+#include <xen/list.h>
-+#include <xen/mm.h>
-+#include <public/kexec.h>
-+
-+#define KEXEC_CONTROL_PAGE_SIZE PAGE_SIZE
-+
-+#define KEXEC_SEGMENT_MAX 16
-+
-+typedef paddr_t kimage_entry_t;
 +#define IND_DESTINATION  0x1
 +#define IND_INDIRECTION  0x2
 +#define IND_DONE         0x4
 +#define IND_SOURCE       0x8
 +#define IND_ZERO        0x10
++
++#ifndef __ASSEMBLY__
++
++#include <xen/list.h>
++#include <xen/mm.h>
++#include <public/kexec.h>
++
++#define KEXEC_SEGMENT_MAX 16
++
++typedef paddr_t kimage_entry_t;
 +
 +struct kexec_image {
 +    uint8_t type;
@@ -904,7 +896,7 @@ index 0000000..9555688
 +    struct page_list_head unusable_pages;
 +
 +    /* Address of next control page to allocate for crash kernels. */
-+    paddr_t control_page;
++    paddr_t next_crash_page;
 +};
 +
 +int kimage_alloc(struct kexec_image **rimage, uint8_t type, uint16_t arch,
@@ -914,6 +906,8 @@ index 0000000..9555688
 +int kimage_load_segments(struct kexec_image *image);
 +struct page_info *kimage_alloc_control_page(struct kexec_image *image,
 +                                            unsigned memflags);
++
++#endif /* __ASSEMBLY__ */
 +
 +#endif /* __XEN_KIMAGE_H__ */
 +
@@ -926,6 +920,3 @@ index 0000000..9555688
 + * indent-tabs-mode: nil
 + * End:
 + */
--- 
-1.7.10.4
-
