@@ -1,0 +1,115 @@
+# HG changeset patch
+# User Rob Hoes <rob.hoes@citrix.com>
+# Date 1383584299 0
+# Node ID 02b33d7e56f62057dd88bef81068710598b150ca
+# Parent  bd84d8277c21da0990b34e312cca356ff6627639
+libxl: Allow 4 MB of video RAM for Cirrus graphics on traditional QEMU
+
+VMs using Cirrus graphics have always had 4 MB of video RAM on XenServer, while
+libxl currently does not allow values less than 8 MB.
+
+Signed-off-by: Rob Hoes <rob.hoes@citrix.com>
+Tested-by: Fabio Fantoni <fabio.fantoni@m2r.biz>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+
+diff -r bd84d8277c21 -r 02b33d7e56f6 docs/man/xl.cfg.pod.5
+--- a/docs/man/xl.cfg.pod.5
++++ b/docs/man/xl.cfg.pod.5
+@@ -1028,14 +1028,16 @@ in the B<VFB_SPEC_STRING> for configurin
+ Sets the amount of RAM which the emulated video card will contain,
+ which in turn limits the resolutions and bit depths which will be
+ available.
+-The default amount of video ram for stdvga is 8MB which is sufficient
+-for e.g. 1600x1200 at 32bpp and videoram option is currently working
+-only when using the qemu-xen-traditional device-model.
+ 
+-When using the emulated Cirrus graphics card (B<vga="cirrus">)
+-the amount of video ram is fixed at 4MB which is sufficient
+-for 1024x768 at 32 bpp and videoram option is currently working
+-only when using the upstream qemu-xen device-model.
++When using the qemu-xen-traditional device-model, the default as well as
++minimum amount of video RAM for stdvga is 8 MB, which is sufficient for e.g.
++1600x1200 at 32bpp. For the upstream qemu-xen device-model, the default and
++minimum is 16 MB.
++
++When using the emulated Cirrus graphics card (B<vga="cirrus">) and the
++qemu-xen-traditional device-model, the amount of video RAM is fixed at 4 MB,
++which is sufficient for 1024x768 at 32 bpp. For the upstream qemu-xen
++device-model, the default and minimum is 8 MB.
+ 
+ =item B<stdvga=BOOLEAN>
+ 
+diff -r bd84d8277c21 -r 02b33d7e56f6 tools/libxl/libxl_create.c
+--- a/tools/libxl/libxl_create.c
++++ b/tools/libxl/libxl_create.c
+@@ -216,20 +216,51 @@ int libxl__domain_build_info_setdefault(
+         if (b_info->shadow_memkb == LIBXL_MEMKB_DEFAULT)
+             b_info->shadow_memkb = 0;
+ 
+-        if (b_info->u.hvm.vga.kind == LIBXL_VGA_INTERFACE_TYPE_STD &&
+-            b_info->device_model_version ==
+-            LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN) {
++        if (!b_info->u.hvm.vga.kind)
++            b_info->u.hvm.vga.kind = LIBXL_VGA_INTERFACE_TYPE_CIRRUS;
++
++        switch (b_info->device_model_version) {
++        case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL:
++            switch (b_info->u.hvm.vga.kind) {
++            case LIBXL_VGA_INTERFACE_TYPE_STD:
++                if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
++                    b_info->video_memkb = 8 * 1024;
++                if (b_info->video_memkb < 8 * 1024) {
++                    LOG(ERROR, "videoram must be at least 8 MB for STDVGA on QEMU_XEN_TRADITIONAL");
++                    return ERROR_INVAL;
++                }
++                break;
++            case LIBXL_VGA_INTERFACE_TYPE_CIRRUS:
++            default:
++                if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
++                    b_info->video_memkb = 4 * 1024;
++                if (b_info->video_memkb != 4 * 1024)
++                    LOG(WARN, "ignoring videoram other than 4 MB for CIRRUS on QEMU_XEN_TRADITIONAL");
++                break;
++            }
++            break;
++        case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN:
++        default:
++            switch (b_info->u.hvm.vga.kind) {
++            case LIBXL_VGA_INTERFACE_TYPE_STD:
+                 if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
+                     b_info->video_memkb = 16 * 1024;
+-                else if (b_info->video_memkb < (16 * 1024) ){
+-                    LOG(ERROR, "videoram must be at least 16 mb with stdvga");
++                if (b_info->video_memkb < 16 * 1024) {
++                    LOG(ERROR, "videoram must be at least 16 MB for STDVGA on QEMU_XEN");
+                     return ERROR_INVAL;
+                 }
+-        } else if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
+-            b_info->video_memkb = 8 * 1024;
+-        else if (b_info->video_memkb < (8 * 1024) ){
+-            LOG(ERROR,"videoram must be at least 8 mb");
+-            return ERROR_INVAL;
++                break;
++            case LIBXL_VGA_INTERFACE_TYPE_CIRRUS:
++            default:
++                if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
++                    b_info->video_memkb = 8 * 1024;
++                if (b_info->video_memkb < 8 * 1024) {
++                    LOG(ERROR, "videoram must be at least 8 MB for CIRRUS on QEMU_XEN");
++                    return ERROR_INVAL;
++                }
++                break;
++            }
++            break;
+         }
+ 
+         if (b_info->u.hvm.timer_mode == LIBXL_TIMER_MODE_DEFAULT)
+@@ -254,8 +285,6 @@ int libxl__domain_build_info_setdefault(
+             if (!b_info->u.hvm.boot) return ERROR_NOMEM;
+         }
+ 
+-        if (!b_info->u.hvm.vga.kind)
+-            b_info->u.hvm.vga.kind = LIBXL_VGA_INTERFACE_TYPE_CIRRUS;
+         libxl_defbool_setdefault(&b_info->u.hvm.vnc.enable, true);
+         if (libxl_defbool_val(b_info->u.hvm.vnc.enable)) {
+             libxl_defbool_setdefault(&b_info->u.hvm.vnc.findunused, true);
