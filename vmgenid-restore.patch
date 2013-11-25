@@ -1,0 +1,236 @@
+# HG changeset patch
+# Parent e99aa4f4efdcd9b61596abdee39858ca6d6e6c86
+
+diff -r e99aa4f4efdc tools/libxc/xc_domain_restore.c
+--- a/tools/libxc/xc_domain_restore.c
++++ b/tools/libxc/xc_domain_restore.c
+@@ -1401,8 +1401,7 @@ int xc_domain_restore(xc_interface *xch,
+                       domid_t store_domid, unsigned int console_evtchn,
+                       unsigned long *console_mfn, domid_t console_domid,
+                       unsigned int hvm, unsigned int pae, int superpages,
+-                      int no_incr_generationid, int checkpointed_stream,
+-                      unsigned long *vm_generationid_addr,
++                      int checkpointed_stream,
+                       struct restore_callbacks *callbacks)
+ {
+     DECLARE_DOMCTL;
+@@ -1629,43 +1628,44 @@ int xc_domain_restore(xc_interface *xch,
+                 xc_set_hvm_param(xch, dom, HVM_PARAM_VM86_TSS, pagebuf.vm86_tss);
+             if ( pagebuf.console_pfn )
+                 console_pfn = pagebuf.console_pfn;
+-            if ( pagebuf.vm_generationid_addr ) {
+-                if ( !no_incr_generationid ) {
+-                    unsigned int offset;
+-                    unsigned char *buf;
+-                    unsigned long long generationid;
++            if ( pagebuf.vm_generationid_addr && callbacks->generation_id ) {
++                unsigned int offset;
++                unsigned char *buf;
+ 
+-                    /*
+-                     * Map the VM generation id buffer and inject the new value.
+-                     */
++                pfn = pagebuf.vm_generationid_addr >> PAGE_SHIFT;
++                offset = pagebuf.vm_generationid_addr & (PAGE_SIZE - 1);
+ 
+-                    pfn = pagebuf.vm_generationid_addr >> PAGE_SHIFT;
+-                    offset = pagebuf.vm_generationid_addr & (PAGE_SIZE - 1);
+-                
+-                    if ( (pfn >= dinfo->p2m_size) ||
+-                         (pfn_type[pfn] != XEN_DOMCTL_PFINFO_NOTAB) )
+-                    {
+-                        ERROR("generation id buffer frame is bad");
+-                        goto out;
+-                    }
+-
+-                    mfn = ctx->p2m[pfn];
+-                    buf = xc_map_foreign_range(xch, dom, PAGE_SIZE,
+-                                               PROT_READ | PROT_WRITE, mfn);
+-                    if ( buf == NULL )
+-                    {
+-                        ERROR("xc_map_foreign_range for generation id"
+-                              " buffer failed");
+-                        goto out;
+-                    }
+-
+-                    generationid = *(unsigned long long *)(buf + offset);
+-                    *(unsigned long long *)(buf + offset) = generationid + 1;
+-
+-                    munmap(buf, PAGE_SIZE);
++                if ( pfn >= dinfo->p2m_size )
++                {
++                    ERROR("generation id frame (pfn %#lx) outside p2m (size %#lx)\n",
++                          pfn, dinfo->p2m_size);
++                    rc = -1;
++                    goto out;
++                }
++                else if ( pfn_type[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
++                {
++                    ERROR("generation id frame (pfn %#lx) bad type %#x",
++                          pfn, pfn_type[pfn]);
++                    rc = -1;
++                    goto out;
+                 }
+ 
+-                *vm_generationid_addr = pagebuf.vm_generationid_addr;
++                mfn = ctx->p2m[pfn];
++                buf = xc_map_foreign_range(xch, dom, PAGE_SIZE,
++                                           PROT_READ | PROT_WRITE, mfn);
++                if ( !buf )
++                {
++                    PERROR("Failed to map generation id frame: (mfn %#lx)", mfn);
++                    rc = -1;
++                    goto out;
++                }
++
++                rc = callbacks->generation_id(dom, pagebuf.vm_generationid_addr,
++                                              buf + offset, callbacks->data);
++                munmap(buf, PAGE_SIZE);
++
++                if ( rc )
++                    goto out;
+             }
+ 
+             break;  /* our work here is done */
+diff -r e99aa4f4efdc tools/libxc/xc_nomigrate.c
+--- a/tools/libxc/xc_nomigrate.c
++++ b/tools/libxc/xc_nomigrate.c
+@@ -35,8 +35,7 @@ int xc_domain_restore(xc_interface *xch,
+                       domid_t store_domid, unsigned int console_evtchn,
+                       unsigned long *console_mfn, domid_t console_domid,
+                       unsigned int hvm, unsigned int pae, int superpages,
+-                      int no_incr_generationid, int checkpointed_stream,
+-                      unsigned long *vm_generationid_addr,
++                      int checkpointed_stream,
+                       struct restore_callbacks *callbacks)
+ {
+     errno = ENOSYS;
+diff -r e99aa4f4efdc tools/libxc/xenguest.h
+--- a/tools/libxc/xenguest.h
++++ b/tools/libxc/xenguest.h
+@@ -96,6 +96,25 @@ struct restore_callbacks {
+     int (*toolstack_restore)(uint32_t domid, const uint8_t *buf,
+             uint32_t size, void* data);
+ 
++    /**
++     * Callback to allow the toolstack to manage a domain's generation ID.
++     * This function is called if a generation ID chunk is found in the
++     * migration stream, and the function pointer is provided.
++     *
++     * The generation ID location is a special chhunk in the migration stream.
++     * The toolstack must take a record of the generation ID address, to
++     * provide it back to xc_domain_save() in the future.  It must also update
++     * the value of the generation id when appropriate.
++     *
++     * @param domid The domain id.
++     * @param genid_gpa Guest physical address of the generation id.
++     * @param mapped_genid Pointer to the generation id, mapped from the domain.
++     * @param data General restore_callbacks data pointer.
++     * @returns 0 for success, -1 for error.
++     */
++    int (*generation_id)(uint32_t domid, uint64_t genid_gpa,
++                         void *mapped_genid, void *data);
++
+     /* to be provided as the last argument to each callback function */
+     void* data;
+ };
+@@ -113,9 +132,7 @@ struct restore_callbacks {
+  * @parm hvm non-zero if this is a HVM restore
+  * @parm pae non-zero if this HVM domain has PAE support enabled
+  * @parm superpages non-zero to allocate guest memory with superpages
+- * @parm no_incr_generationid non-zero if generation id is NOT to be incremented
+  * @parm checkpointed_stream non-zero if the far end of the stream is using checkpointing
+- * @parm vm_generationid_addr returned with the address of the generation id buffer
+  * @parm callbacks non-NULL to receive a callback to restore toolstack
+  *       specific data
+  * @return 0 on success, -1 on failure
+@@ -125,8 +142,7 @@ int xc_domain_restore(xc_interface *xch,
+                       domid_t store_domid, unsigned int console_evtchn,
+                       unsigned long *console_mfn, domid_t console_domid,
+                       unsigned int hvm, unsigned int pae, int superpages,
+-                      int no_incr_generationid, int checkpointed_stream,
+-                      unsigned long *vm_generationid_addr,
++                      int checkpointed_stream,
+                       struct restore_callbacks *callbacks);
+ /**
+  * xc_domain_restore writes a file to disk that contains the device
+diff -r e99aa4f4efdc tools/libxl/libxl_create.c
+--- a/tools/libxl/libxl_create.c
++++ b/tools/libxl/libxl_create.c
+@@ -776,7 +776,7 @@ static void domcreate_bootloader_done(li
+         goto out;
+     }
+     libxl__xc_domain_restore(egc, dcs,
+-                             hvm, pae, superpages, 1);
++                             hvm, pae, superpages);
+     return;
+ 
+  out:
+diff -r e99aa4f4efdc tools/libxl/libxl_internal.h
+--- a/tools/libxl/libxl_internal.h
++++ b/tools/libxl/libxl_internal.h
+@@ -2558,8 +2558,7 @@ void libxl__xc_domain_saverestore_async_
+ /* calls libxl__xc_domain_restore_done when done */
+ _hidden void libxl__xc_domain_restore(libxl__egc *egc,
+                                       libxl__domain_create_state *dcs,
+-                                      int hvm, int pae, int superpages,
+-                                      int no_incr_generationid);
++                                      int hvm, int pae, int superpages);
+ /* If rc==0 then retval is the return value from xc_domain_save
+  * and errnoval is the errno value it provided.
+  * If rc!=0, retval and errnoval are undefined. */
+diff -r e99aa4f4efdc tools/libxl/libxl_save_callout.c
+--- a/tools/libxl/libxl_save_callout.c
++++ b/tools/libxl/libxl_save_callout.c
+@@ -41,8 +41,7 @@ static void helper_done(libxl__egc *egc,
+ /*----- entrypoints -----*/
+ 
+ void libxl__xc_domain_restore(libxl__egc *egc, libxl__domain_create_state *dcs,
+-                              int hvm, int pae, int superpages,
+-                              int no_incr_generationid)
++                              int hvm, int pae, int superpages)
+ {
+     STATE_AO_GC(dcs->ao);
+ 
+@@ -59,7 +58,7 @@ void libxl__xc_domain_restore(libxl__egc
+         state->store_port,
+         state->store_domid, state->console_port,
+         state->console_domid,
+-        hvm, pae, superpages, no_incr_generationid,
++        hvm, pae, superpages,
+         cbflags,
+     };
+ 
+diff -r e99aa4f4efdc tools/libxl/libxl_save_helper.c
+--- a/tools/libxl/libxl_save_helper.c
++++ b/tools/libxl/libxl_save_helper.c
+@@ -250,7 +250,6 @@ int main(int argc, char **argv)
+         unsigned int hvm =         strtoul(NEXTARG,0,10);
+         unsigned int pae =         strtoul(NEXTARG,0,10);
+         int superpages =           strtoul(NEXTARG,0,10);
+-        int no_incr_genidad =      strtoul(NEXTARG,0,10);
+         unsigned cbflags =         strtoul(NEXTARG,0,10);
+         assert(!*++argv);
+ 
+@@ -263,8 +262,7 @@ int main(int argc, char **argv)
+         startup("restore");
+         r = xc_domain_restore(xch, io_fd, dom, store_evtchn, &store_mfn,
+                               store_domid, console_evtchn, &console_mfn,
+-                              console_domid, hvm, pae, superpages,
+-                              no_incr_genidad, 0, &genidad,
++                              console_domid, hvm, pae, superpages, 0,
+                               &helper_restore_callbacks);
+         helper_stub_restore_results(store_mfn,console_mfn,genidad,0);
+         complete(r);
+diff -r e99aa4f4efdc tools/xcutils/xc_restore.c
+--- a/tools/xcutils/xc_restore.c
++++ b/tools/xcutils/xc_restore.c
+@@ -56,7 +56,7 @@ main(int argc, char **argv)
+ 
+     ret = xc_domain_restore(xch, io_fd, domid, store_evtchn, &store_mfn, 0,
+                             console_evtchn, &console_mfn, 0, hvm, pae, superpages,
+-                            0, checkpointed, NULL, NULL);
++                            checkpointed, NULL);
+ 
+     if ( ret == 0 )
+     {

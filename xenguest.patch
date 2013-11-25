@@ -1,7 +1,7 @@
 # HG changeset patch
-# Parent 93198b4bdba563c5e01900756b789f3c0f7beb38
+# Parent 3b2dce2ce646ba034a2d36888344dd16006f7a18
 
-diff -r 93198b4bdba5 .hgignore
+diff -r 3b2dce2ce646 .hgignore
 --- a/.hgignore
 +++ b/.hgignore
 @@ -262,6 +262,7 @@
@@ -12,7 +12,7 @@ diff -r 93198b4bdba5 .hgignore
  ^tools/xcutils/lsevtchn$
  ^tools/xcutils/xc_restore$
  ^tools/xcutils/xc_save$
-diff -r 93198b4bdba5 mk/xen-4.3.spec.in
+diff -r 3b2dce2ce646 mk/xen-4.3.spec.in
 --- a/mk/xen-4.3.spec.in
 +++ b/mk/xen-4.3.spec.in
 @@ -302,6 +302,7 @@ rm -rf $RPM_BUILD_ROOT
@@ -23,7 +23,7 @@ diff -r 93198b4bdba5 mk/xen-4.3.spec.in
  %{python_sitearch}/grub
  %{python_sitearch}/%{name}
  %{python_sitearch}/fsimage.so
-diff -r 93198b4bdba5 tools/Makefile
+diff -r 3b2dce2ce646 tools/Makefile
 --- a/tools/Makefile
 +++ b/tools/Makefile
 @@ -24,6 +24,7 @@ SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
@@ -34,7 +34,7 @@ diff -r 93198b4bdba5 tools/Makefile
  
  # do not recurse in to a dir we are about to delete
  ifneq "$(MAKECMDGOALS)" "distclean"
-diff -r 93198b4bdba5 tools/xenguest/Makefile
+diff -r 3b2dce2ce646 tools/xenguest/Makefile
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,29 @@
@@ -67,7 +67,7 @@ diff -r 93198b4bdba5 tools/xenguest/Makefile
 +clean:
 +	$(RM) *.o $(ALL_TARGETS)
 +	$(RM) $(DEPS)
-diff -r 93198b4bdba5 tools/xenguest/xenguest.c
+diff -r 3b2dce2ce646 tools/xenguest/xenguest.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
 @@ -0,0 +1,534 @@
@@ -605,10 +605,10 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
+diff -r 3b2dce2ce646 tools/xenguest/xenguest_stubs.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,577 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -678,7 +678,7 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
 +    if (path == NULL)
 +        goto out;
 +
-+    n = snprintf(key, sizeof(key), "%s/platform/", path);
++    n = snprintf(key, sizeof(key), "%s/", path);
 +    if (n < 0)
 +        goto out;
 +    m = vsnprintf(key + n, sizeof(key) - n, fmt, ap);
@@ -715,12 +715,52 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
 +    if (s) {
 +        if (!strcasecmp(s, "true"))
 +            value = 1;
-+        else if (sscanf(s, "%" PRIu64 "d", &value) != 1)
-+            value = 0;
++        else
++        {
++            errno = 0;
++            value = strtoull(s, NULL, 0);
++            if ( errno )
++                value = 0;
++        }
 +        free(s);
 +    }
 +    va_end(ap);
 +    return value;
++}
++
++static int
++xenstore_putsv(xs_handle *xsh, int domid, const char *val, const char *fmt, va_list ap)
++{
++    int n, m, rc = -1;
++    char *path, key[1024] = { 0 };
++
++    path = xs_get_domain_path(xsh, domid);
++    if (path == NULL)
++        goto out;
++
++    n = snprintf(key, sizeof(key), "%s/", path);
++    if (n < 0)
++        goto out;
++    m = vsnprintf(key + n, sizeof(key) - n, fmt, ap);
++    if (m < 0)
++        goto out;
++
++    rc = xs_write(xsh, XBT_NULL, key, val, strlen(val));
++out:
++    free(path);
++    return rc;
++}
++
++static int
++xenstore_puts(xs_handle *xsh, int domid, const char *val, const char *fmt, ...)
++{
++    int rc;
++    va_list ap;
++
++    va_start(ap, fmt);
++    rc = xenstore_putsv(xsh, domid, val, fmt, ap);
++    va_end(ap);
++    return rc;
 +}
 +
 +static void
@@ -728,32 +768,32 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
 +{
 +    char * tmp;
 +    int n;
-+    f->vcpus    = xenstore_get(xsh, domid, "vcpu/number");
++    f->vcpus = xenstore_get(xsh, domid, "platform/vcpu/number");
 +    f->vcpu_affinity = malloc(sizeof(char*) * f->vcpus);
 +
 +    for (n = 0; n < f->vcpus; n++) {
-+        f->vcpu_affinity[n] = xenstore_gets(xsh, domid, "vcpu/%d/affinity", n);
++        f->vcpu_affinity[n] = xenstore_gets(xsh, domid, "platform/vcpu/%d/affinity", n);
 +    }
-+    f->vcpus_current = xenstore_get(xsh, domid, "vcpu/current");
-+    f->vcpu_weight = xenstore_get(xsh, domid, "vcpu/weight");
-+    f->vcpu_cap = xenstore_get(xsh, domid, "vcpu/cap");
-+    f->nx       = xenstore_get(xsh, domid, "nx");
-+    f->viridian = xenstore_get(xsh, domid, "viridian");
-+    f->apic     = xenstore_get(xsh, domid, "apic");
-+    f->acpi     = xenstore_get(xsh, domid, "acpi");
-+    f->pae      = xenstore_get(xsh, domid, "pae");
-+    f->acpi_s4  = xenstore_get(xsh, domid, "acpi_s4");
-+    f->acpi_s3  = xenstore_get(xsh, domid, "acpi_s3");
-+    f->tsc_mode = xenstore_get(xsh, domid, "tsc_mode");
++    f->vcpus_current = xenstore_get(xsh, domid, "platform/vcpu/current");
++    f->vcpu_weight = xenstore_get(xsh, domid, "platform/vcpu/weight");
++    f->vcpu_cap = xenstore_get(xsh, domid, "platform/vcpu/cap");
++    f->nx       = xenstore_get(xsh, domid, "platform/nx");
++    f->viridian = xenstore_get(xsh, domid, "platform/viridian");
++    f->apic     = xenstore_get(xsh, domid, "platform/apic");
++    f->acpi     = xenstore_get(xsh, domid, "platform/acpi");
++    f->pae      = xenstore_get(xsh, domid, "platform/pae");
++    f->acpi_s4  = xenstore_get(xsh, domid, "platform/acpi_s4");
++    f->acpi_s3  = xenstore_get(xsh, domid, "platform/acpi_s3");
++    f->tsc_mode = xenstore_get(xsh, domid, "platform/tsc_mode");
 +
 +    /*
 +     * HACK - Migrated VMs wont have this xs key set, so the naive action
 +     * would result in the HPET mysteriously disappearing.  If the key is not
 +     * present then enable the hpet to match its default.
 +     */
-+    tmp = xenstore_gets(xsh, domid, "hpet");
++    tmp = xenstore_gets(xsh, domid, "platform/hpet");
 +    if ( tmp && strlen(tmp) )
-+        f->hpet = xenstore_get(xsh, domid, "hpet");
++        f->hpet = xenstore_get(xsh, domid, "platform/hpet");
 +    else
 +        f->hpet = 1;
 +    free(tmp);
@@ -993,6 +1033,8 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
 +
 +}
 +
++#define GENERATION_ID_ADDRESS "hvmloader/generation-id-address"
++
 +int stub_xc_domain_save(xc_interface *xch, xs_handle *xsh, int fd, int domid,
 +                        int max_iters, int max_factors,
 +                        int flags, int hvm)
@@ -1006,10 +1048,11 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
 +            .switch_qemu_logdirty = switch_qemu_logdirty,
 +            .data = &cb_data
 +        };
++    uint64_t generation_id_addr = xenstore_get(xsh, domid, GENERATION_ID_ADDRESS);
 +
 +    r = xc_domain_save(xch, fd, domid,
 +                       max_iters, max_factors,
-+                       flags, &callbacks, hvm, 0);
++                       flags, &callbacks, hvm, generation_id_addr);
 +    if (r)
 +        failwith_oss_xc(xch, "xc_domain_save");
 +
@@ -1029,6 +1072,70 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
 +    return 0;
 +}
 +
++struct restore_callbacks_data
++{
++    xs_handle *xsh;
++};
++
++int restore_genid_cb(uint32_t _domid, uint64_t genid_gpa, void *mapped_genid,
++                     void * _data)
++{
++    int domid = _domid;
++    uint64_t *genid = mapped_genid;
++    struct restore_callbacks_data *rcbd = _data;
++    const char *genid_val_str;
++    char *genid_addr_str, *end;
++
++    if ( genid_gpa == 0 )
++    {
++        err("Bad generation ID guest physical address\n");
++        return -1;
++    }
++    else if ( !mapped_genid )
++    {
++        err("Bad generation id mapped location\n");
++        return -1;
++    }
++
++    genid_val_str = xenstore_gets(rcbd->xsh, domid, "platform/generation-id");
++
++    errno = 0;
++    genid[0] = strtoull(genid_val_str, &end, 0);
++    genid[1] = 0;
++    if ( end && end[0] == ':' )
++        genid[1] = strtoull(end+1, NULL, 0);
++
++    if ( errno )
++    {
++        err("strtoull of '%s' failed: %s\n", genid_val_str, strerror(errno));
++        return -1;
++    }
++    else if ( genid[0] == 0 || genid[1] == 0 )
++    {
++        err("'%s' is not a valid generation id", genid_val_str);
++        return -1;
++    }
++
++    if ( asprintf(&genid_addr_str, "0x%"PRIx64, genid_gpa) == -1 )
++    {
++        err("Failed to format genid address: %s", strerror(errno));
++        return -1;
++    }
++
++    if ( xenstore_puts(rcbd->xsh, domid, genid_addr_str,
++                       "hvmloader/generation-id-address") != 1 )
++    {
++        err("Failed to write generation id to xenstore");
++        free(genid_addr_str);
++        return -1;
++    }
++
++    info("Wrote generation ID %"PRId64":%"PRId64" at 0x%"PRIx64,
++         genid[0], genid[1], genid_gpa);
++
++    free(genid_addr_str);
++    return 0;
++}
 +
 +int stub_xc_domain_restore(xc_interface *xch, xs_handle *xsh, int fd, int domid,
 +                           int store_evtchn, int console_evtchn,
@@ -1036,8 +1143,19 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
 +                           unsigned long *store_mfn, unsigned long *console_mfn)
 +{
 +    int r;
-+
 +    struct flags f;
++
++    struct restore_callbacks_data rcbd =
++    {
++        .xsh = xsh,
++    };
++
++    struct restore_callbacks rcb =
++    {
++        .generation_id = restore_genid_cb,
++        .data = &rcbd,
++    };
++
 +    get_flags(xsh, &f, domid);
 +
 +    if ( hvm )
@@ -1051,8 +1169,7 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
 +    r = xc_domain_restore(xch, fd, domid,
 +                          store_evtchn, store_mfn, 0,
 +                          console_evtchn, console_mfn, 0,
-+                          hvm, f.pae, 0, /*superpages*/
-+                          0, 0, NULL, NULL);
++                          hvm, f.pae, 0, 0, &rcb);
 +
 +    free_flags(&f);
 +    if (r)
@@ -1069,7 +1186,7 @@ diff -r 93198b4bdba5 tools/xenguest/xenguest_stubs.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r 93198b4bdba5 tools/xenguest/xg_internal.h
+diff -r 3b2dce2ce646 tools/xenguest/xg_internal.h
 --- /dev/null
 +++ b/tools/xenguest/xg_internal.h
 @@ -0,0 +1,42 @@
