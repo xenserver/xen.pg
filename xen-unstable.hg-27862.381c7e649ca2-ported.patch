@@ -1,0 +1,87 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1383833868 -3600
+# Node ID 381c7e649ca2407a09e161665fe0b43135a574af
+# Parent 7ee8cbe671bc28d409e93aed012c4f7aeac735ad
+x86/msi: Refactor msi_compose_message() to not require an irq_desc
+
+Subsequent changes will cause HPET MSIs to not have an associated IRQ.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Tim Deegan <tim@xen.org>
+
+diff -r 7ee8cbe671bc xen/arch/x86/hpet.c
+--- a/xen/arch/x86/hpet.c
++++ b/xen/arch/x86/hpet.c
+@@ -331,7 +331,7 @@ static int __hpet_setup_msi_irq(struct i
+ {
+     struct msi_msg msg;
+ 
+-    msi_compose_msg(desc, &msg);
++    msi_compose_msg(desc->arch.vector, desc->arch.cpu_mask, &msg);
+     return hpet_msi_write(desc->action->dev_id, &msg);
+ }
+ 
+diff -r 7ee8cbe671bc xen/arch/x86/msi.c
+--- a/xen/arch/x86/msi.c
++++ b/xen/arch/x86/msi.c
+@@ -126,13 +126,12 @@ static void msix_put_fixmap(struct pci_d
+ /*
+  * MSI message composition
+  */
+-void msi_compose_msg(struct irq_desc *desc, struct msi_msg *msg)
++void msi_compose_msg(unsigned vector, const cpumask_t *cpu_mask, struct msi_msg *msg)
+ {
+     unsigned dest;
+-    int vector = desc->arch.vector;
+ 
+     memset(msg, 0, sizeof(*msg));
+-    if ( !cpumask_intersects(desc->arch.cpu_mask, &cpu_online_map) ) {
++    if ( !cpumask_intersects(cpu_mask, &cpu_online_map) ) {
+         dprintk(XENLOG_ERR,"%s, compose msi message error!!\n", __func__);
+         return;
+     }
+@@ -140,7 +139,7 @@ void msi_compose_msg(struct irq_desc *de
+     if ( vector ) {
+         cpumask_t *mask = this_cpu(scratch_mask);
+ 
+-        cpumask_and(mask, desc->arch.cpu_mask, &cpu_online_map);
++        cpumask_and(mask, cpu_mask, &cpu_online_map);
+         dest = cpu_mask_to_apicid(mask);
+ 
+         msg->address_hi = MSI_ADDR_BASE_HI;
+@@ -484,7 +483,7 @@ int __setup_msi_irq(struct irq_desc *des
+ 
+     desc->msi_desc = msidesc;
+     desc->handler = handler;
+-    msi_compose_msg(desc, &msg);
++    msi_compose_msg(desc->arch.vector, desc->arch.cpu_mask, &msg);
+     return write_msi_msg(msidesc, &msg);
+ }
+ 
+diff -r 7ee8cbe671bc xen/drivers/passthrough/vtd/iommu.c
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -1055,7 +1055,7 @@ static void dma_msi_set_affinity(struct 
+         return;
+     }
+ 
+-    msi_compose_msg(desc, &msg);
++    msi_compose_msg(desc->arch.vector, desc->arch.cpu_mask, &msg);
+     /* Are these overrides really needed? */
+     if (x2apic_enabled)
+         msg.address_hi = dest & 0xFFFFFF00;
+diff -r 7ee8cbe671bc xen/include/asm-x86/msi.h
+--- a/xen/include/asm-x86/msi.h
++++ b/xen/include/asm-x86/msi.h
+@@ -215,7 +215,8 @@ struct msg_address {
+ } __attribute__ ((packed));
+ 
+ void early_msi_init(void);
+-void msi_compose_msg(struct irq_desc *, struct msi_msg *);
++void msi_compose_msg(unsigned vector, const cpumask_t *mask,
++                     struct msi_msg *msg);
+ void __msi_set_enable(u16 seg, u8 bus, u8 slot, u8 func, int pos, int enable);
+ void mask_msi_irq(struct irq_desc *);
+ void unmask_msi_irq(struct irq_desc *);
