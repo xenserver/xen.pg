@@ -1,0 +1,169 @@
+# HG changeset patch
+# Parent c1a31da689e950f2fd988659345c7e8781bd64c1
+
+diff -r c1a31da689e9 tools/libxl/xl_cmdimpl.c
+--- a/tools/libxl/xl_cmdimpl.c
++++ b/tools/libxl/xl_cmdimpl.c
+@@ -4564,6 +4564,33 @@ int main_vcpuset(int argc, char **argv)
+     return 0;
+ }
+ 
++static const char *emit_restrict;
++static int emit(const char *fmt, ...)
++{
++    va_list ap;
++    char *str;
++    int count = 0;
++
++    va_start(ap, fmt);
++    if ( vasprintf(&str, fmt, ap) != -1 )
++    {
++        if ( emit_restrict )
++        {
++            char *s;
++            if ( !strncmp(str, emit_restrict, strlen(emit_restrict)) &&
++                 (s = strchr(str, ':')) && s[1] == ' ' )
++                count = fputs(&s[2], stdout);
++        }
++        else
++            count = fputs(str, stdout);
++
++        free(str);
++    }
++    va_end(ap);
++
++    return count;
++}
++
+ static void output_xeninfo(void)
+ {
+     const libxl_version_info *info;
+@@ -4579,21 +4606,21 @@ static void output_xeninfo(void)
+         return;
+     }
+ 
+-    printf("xen_major              : %d\n", info->xen_version_major);
+-    printf("xen_minor              : %d\n", info->xen_version_minor);
+-    printf("xen_extra              : %s\n", info->xen_version_extra);
+-    printf("xen_version            : %d.%d%s\n", info->xen_version_major,
++    emit("xen_major              : %d\n", info->xen_version_major);
++    emit("xen_minor              : %d\n", info->xen_version_minor);
++    emit("xen_extra              : %s\n", info->xen_version_extra);
++    emit("xen_version            : %d.%d%s\n", info->xen_version_major,
+            info->xen_version_minor, info->xen_version_extra);
+-    printf("xen_caps               : %s\n", info->capabilities);
+-    printf("xen_scheduler          : %s\n", libxl_scheduler_to_string(sched));
+-    printf("xen_pagesize           : %u\n", info->pagesize);
+-    printf("platform_params        : virt_start=0x%"PRIx64"\n", info->virt_start);
+-    printf("xen_changeset          : %s\n", info->changeset);
+-    printf("xen_commandline        : %s\n", info->commandline);
+-    printf("cc_compiler            : %s\n", info->compiler);
+-    printf("cc_compile_by          : %s\n", info->compile_by);
+-    printf("cc_compile_domain      : %s\n", info->compile_domain);
+-    printf("cc_compile_date        : %s\n", info->compile_date);
++    emit("xen_caps               : %s\n", info->capabilities);
++    emit("xen_scheduler          : %s\n", libxl_scheduler_to_string(sched));
++    emit("xen_pagesize           : %u\n", info->pagesize);
++    emit("platform_params        : virt_start=0x%"PRIx64"\n", info->virt_start);
++    emit("xen_changeset          : %s\n", info->changeset);
++    emit("xen_commandline        : %s\n", info->commandline);
++    emit("cc_compiler            : %s\n", info->compiler);
++    emit("cc_compile_by          : %s\n", info->compile_by);
++    emit("cc_compile_domain      : %s\n", info->compile_domain);
++    emit("cc_compile_date        : %s\n", info->compile_date);
+ 
+     return;
+ }
+@@ -4605,10 +4632,10 @@ static void output_nodeinfo(void)
+     if (uname(&utsbuf) < 0)
+         return;
+ 
+-    printf("host                   : %s\n", utsbuf.nodename);
+-    printf("release                : %s\n", utsbuf.release);
+-    printf("version                : %s\n", utsbuf.version);
+-    printf("machine                : %s\n", utsbuf.machine);
++    emit("host                   : %s\n", utsbuf.nodename);
++    emit("release                : %s\n", utsbuf.release);
++    emit("version                : %s\n", utsbuf.version);
++    emit("machine                : %s\n", utsbuf.machine);
+ }
+ 
+ static void output_physinfo(void)
+@@ -4623,35 +4650,37 @@ static void output_physinfo(void)
+         fprintf(stderr, "libxl_physinfo failed.\n");
+         return;
+     }
+-    printf("nr_cpus                : %d\n", info.nr_cpus);
+-    printf("max_cpu_id             : %d\n", info.max_cpu_id);
+-    printf("nr_nodes               : %d\n", info.nr_nodes);
+-    printf("cores_per_socket       : %d\n", info.cores_per_socket);
+-    printf("threads_per_core       : %d\n", info.threads_per_core);
+-    printf("cpu_mhz                : %d\n", info.cpu_khz / 1000);
+-    printf("hw_caps                : ");
+-    for (i = 0; i < 8; i++)
+-        printf("%08x%c", info.hw_cap[i], i < 7 ? ':' : '\n');
+-    printf("virt_caps              :");
+-    if (info.cap_hvm)
+-        printf(" hvm");
+-    if (info.cap_hvm_directio)
+-        printf(" hvm_directio");
+-    printf("\n");
++    emit("nr_cpus                : %d\n", info.nr_cpus);
++    emit("max_cpu_id             : %d\n", info.max_cpu_id);
++    emit("nr_nodes               : %d\n", info.nr_nodes);
++    emit("cores_per_socket       : %d\n", info.cores_per_socket);
++    emit("threads_per_core       : %d\n", info.threads_per_core);
++    emit("cpu_mhz                : %d\n", info.cpu_khz / 1000);
++
++    emit("hw_caps                : %08x:%08x:%08x:%08x:%08x:%08x:%08x:%08x\n",
++         info.hw_cap[0], info.hw_cap[1], info.hw_cap[2], info.hw_cap[3],
++         info.hw_cap[4], info.hw_cap[5], info.hw_cap[6], info.hw_cap[7]
++        );
++
++    emit("virt_caps              :%s%s\n",
++         info.cap_hvm ? " hvm" : "",
++         info.cap_hvm_directio ? " hvm_directio" : ""
++        );
++
+     vinfo = libxl_get_version_info(ctx);
+     if (vinfo) {
+         i = (1 << 20) / vinfo->pagesize;
+-        printf("total_memory           : %"PRIu64"\n", info.total_pages / i);
+-        printf("free_memory            : %"PRIu64"\n", (info.free_pages - info.outstanding_pages) / i);
+-        printf("sharing_freed_memory   : %"PRIu64"\n", info.sharing_freed_pages / i);
+-        printf("sharing_used_memory    : %"PRIu64"\n", info.sharing_used_frames / i);
+-        printf("outstanding_claims     : %"PRIu64"\n", info.outstanding_pages / i);
++        emit("total_memory           : %"PRIu64"\n", info.total_pages / i);
++        emit("free_memory            : %"PRIu64"\n", (info.free_pages - info.outstanding_pages) / i);
++        emit("sharing_freed_memory   : %"PRIu64"\n", info.sharing_freed_pages / i);
++        emit("sharing_used_memory    : %"PRIu64"\n", info.sharing_used_frames / i);
++        emit("outstanding_claims     : %"PRIu64"\n", info.outstanding_pages / i);
+     }
+     if (!libxl_get_freecpus(ctx, &cpumap)) {
+         libxl_for_each_bit(i, cpumap)
+             if (libxl_bitmap_test(&cpumap, i))
+                 n++;
+-        printf("free_cpus              : %d\n", n);
++        emit("free_cpus              : %d\n", n);
+         free(cpumap.map);
+     }
+     libxl_physinfo_dispose(&info);
+@@ -4725,7 +4754,7 @@ static void print_info(int numa)
+     }
+     output_xeninfo();
+ 
+-    printf("xend_config_format     : 4\n");
++    emit("xend_config_format     : 4\n");
+ 
+     return;
+ }
+@@ -4746,6 +4775,9 @@ int main_info(int argc, char **argv)
+         break;
+     }
+ 
++    if ( numa == 0 && argc > optind )
++        emit_restrict = argv[optind];
++
+     print_info(numa);
+     return 0;
+ }
