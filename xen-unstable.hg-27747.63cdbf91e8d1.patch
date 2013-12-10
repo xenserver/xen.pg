@@ -1,0 +1,97 @@
+# HG changeset patch
+# User David Vrabel <david.vrabel@citrix.com>
+# Date 1381738634 -7200
+# Node ID 63cdbf91e8d15e6df6546469f2a94384c2cc1d4c
+# Parent  478c7771a64924d8f7f72966292338f26d3d9bb7
+evtchn: print ABI specific state with the 'e' debug key
+
+In the output of the 'e' debug key, print some ABI specific state in
+addition to the (p)ending and (m)asked bits.
+
+For the 2-level ABI, print the state of that event's selector
+bit. e.g.,
+
+(XEN)     port [p/m/s]
+(XEN)        1 [0/0/1]: s=3 n=0 x=0 d=0 p=74
+(XEN)        2 [0/0/1]: s=3 n=0 x=0 d=0 p=75
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 478c7771a649 -r 63cdbf91e8d1 xen/common/event_2l.c
+--- a/xen/common/event_2l.c	Mon Oct 14 10:15:49 2013 +0200
++++ b/xen/common/event_2l.c	Mon Oct 14 10:17:14 2013 +0200
+@@ -74,6 +74,15 @@ static bool_t evtchn_2l_is_masked(struct
+     return test_bit(evtchn->port, &shared_info(d, evtchn_mask));
+ }
+ 
++static void evtchn_2l_print_state(struct domain *d,
++                                  const struct evtchn *evtchn)
++{
++    struct vcpu *v = d->vcpu[evtchn->notify_vcpu_id];
++
++    printk("%d", !!test_bit(evtchn->port / BITS_PER_EVTCHN_WORD(d),
++                            &vcpu_info(v, evtchn_pending_sel)));
++}
++
+ static const struct evtchn_port_ops evtchn_port_ops_2l =
+ {
+     .set_pending   = evtchn_2l_set_pending,
+@@ -81,6 +90,7 @@ static const struct evtchn_port_ops evtc
+     .unmask        = evtchn_2l_unmask,
+     .is_pending    = evtchn_2l_is_pending,
+     .is_masked     = evtchn_2l_is_masked,
++    .print_state   = evtchn_2l_print_state,
+ };
+ 
+ void evtchn_2l_init(struct domain *d)
+diff -r 478c7771a649 -r 63cdbf91e8d1 xen/common/event_channel.c
+--- a/xen/common/event_channel.c	Mon Oct 14 10:15:49 2013 +0200
++++ b/xen/common/event_channel.c	Mon Oct 14 10:17:14 2013 +0200
+@@ -1232,7 +1232,7 @@ static void domain_dump_evtchn_info(stru
+                          d->poll_mask, d->max_vcpus);
+     printk("Event channel information for domain %d:\n"
+            "Polling vCPUs: {%s}\n"
+-           "    port [p/m]\n", d->domain_id, keyhandler_scratch);
++           "    port [p/m/s]\n", d->domain_id, keyhandler_scratch);
+ 
+     spin_lock(&d->event_lock);
+ 
+@@ -1247,10 +1247,12 @@ static void domain_dump_evtchn_info(stru
+         if ( chn->state == ECS_FREE )
+             continue;
+ 
+-        printk("    %4u [%d/%d]: s=%d n=%d x=%d",
++        printk("    %4u [%d/%d/",
+                port,
+                !!evtchn_port_is_pending(d, chn),
+-               !!evtchn_port_is_masked(d, chn),
++               !!evtchn_port_is_masked(d, chn));
++        evtchn_port_print_state(d, chn);
++        printk("]: s=%d n=%d x=%d",
+                chn->state, chn->notify_vcpu_id, chn->xen_consumer);
+ 
+         switch ( chn->state )
+diff -r 478c7771a649 -r 63cdbf91e8d1 xen/include/xen/event.h
+--- a/xen/include/xen/event.h	Mon Oct 14 10:15:49 2013 +0200
++++ b/xen/include/xen/event.h	Mon Oct 14 10:17:14 2013 +0200
+@@ -115,6 +115,7 @@ struct evtchn_port_ops {
+     void (*unmask)(struct domain *d, struct evtchn *evtchn);
+     bool_t (*is_pending)(struct domain *d, const struct evtchn *evtchn);
+     bool_t (*is_masked)(struct domain *d, const struct evtchn *evtchn);
++    void (*print_state)(struct domain *d, const struct evtchn *evtchn);
+ };
+ 
+ static inline void evtchn_port_set_pending(struct vcpu *v,
+@@ -147,4 +148,10 @@ static inline bool_t evtchn_port_is_mask
+     return d->evtchn_port_ops->is_masked(d, evtchn);
+ }
+ 
++static inline void evtchn_port_print_state(struct domain *d,
++                                           const struct evtchn *evtchn)
++{
++    d->evtchn_port_ops->print_state(d, evtchn);
++}
++
+ #endif /* __XEN_EVENT_H__ */

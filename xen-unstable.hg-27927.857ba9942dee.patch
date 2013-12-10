@@ -1,0 +1,164 @@
+# HG changeset patch
+# User David Vrabel <david.vrabel@citrix.com>
+# Date 1384258765 -3600
+# Node ID 857ba9942dee58b5c3c88992fc6ac45ab3ee2bee
+# Parent  d5678d9e70adb0c82fac5fbd58a2e3ee64416c8e
+evtchn/fifo: don't spin indefinitely when setting LINK
+
+A malicious or buggy guest can cause another domain to spin
+indefinitely by repeatedly writing to an event word when the other
+guest is trying to link a new event.  The cmpxchg() in
+evtchn_fifo_set_link() will repeatedly fail and the loop may never
+terminate.
+
+Fixing this requires a change to the ABI which is documented in draft
+H of the design.
+
+  http://xenbits.xen.org/people/dvrabel/event-channels-H.pdf
+
+Since a well-behaved guest only makes a limited set of state changes,
+the loop can terminate early if the guest makes an invalid state
+transition.
+
+The guest may:
+
+- clear LINKED and LINK.
+- clear PENDING
+- set MASKED
+- clear MASKED
+
+It is valid for the guest to mask and unmask an event at any time so
+specify that it is not valid for a guest to clear MASKED if Xen is
+trying to update LINK.  Indicate this to the guest with an additional
+BUSY bit in the event word.  The guest must not clear MASKED if BUSY
+is set and it should spin until BUSY is cleared.
+
+The remaining valid writes (clear LINKED, clear PENDING, set MASKED,
+clear MASKED by Xen) will limit the number of failures of the
+cmpxchg() to at most 4.  A clear of LINKED will also terminate the
+loop early. Therefore, the loop can then be limited to at most 4
+iterations.
+
+If the buggy or malicious guest does cause the loop to exit with
+LINKED set and LINK unset then that buggy guest will lose events.
+
+Reported-by: Anthony Liguori <aliguori@amazon.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r d5678d9e70ad -r 857ba9942dee xen/common/event_fifo.c
+--- a/xen/common/event_fifo.c	Tue Nov 12 11:52:19 2013 +0100
++++ b/xen/common/event_fifo.c	Tue Nov 12 13:19:25 2013 +0100
+@@ -34,19 +34,67 @@ static inline event_word_t *evtchn_fifo_
+     return d->evtchn_fifo->event_array[p] + w;
+ }
+ 
+-static bool_t evtchn_fifo_set_link(event_word_t *word, uint32_t link)
++static int try_set_link(event_word_t *word, event_word_t *w, uint32_t link)
+ {
+-    event_word_t n, o, w;
++    event_word_t new, old;
+ 
+-    w = *word;
++    if ( !(*w & (1 << EVTCHN_FIFO_LINKED)) )
++        return 0;
+ 
+-    do {
+-        if ( !(w & (1 << EVTCHN_FIFO_LINKED)) )
+-            return 0;
+-        o = w;
+-        n = (w & ~EVTCHN_FIFO_LINK_MASK) | link;
+-    } while ( (w = cmpxchg(word, o, n)) != o );
++    old = *w;
++    new = (old & ~((1 << EVTCHN_FIFO_BUSY) | EVTCHN_FIFO_LINK_MASK)) | link;
++    *w = cmpxchg(word, old, new);
++    if ( *w == old )
++        return 1;
+ 
++    return -EAGAIN;
++}
++
++/*
++ * Atomically set the LINK field iff it is still LINKED.
++ *
++ * The guest is only permitted to make the following changes to a
++ * LINKED event.
++ *
++ * - set MASKED
++ * - clear MASKED
++ * - clear PENDING
++ * - clear LINKED (and LINK)
++ *
++ * We block unmasking by the guest by marking the tail word as BUSY,
++ * therefore, the cmpxchg() may fail at most 4 times.
++ */
++static bool_t evtchn_fifo_set_link(const struct domain *d, event_word_t *word,
++                                   uint32_t link)
++{
++    event_word_t w;
++    unsigned int try;
++    int ret;
++
++    w = read_atomic(word);
++
++    ret = try_set_link(word, &w, link);
++    if ( ret >= 0 )
++        return ret;
++
++    /* Lock the word to prevent guest unmasking. */
++    set_bit(EVTCHN_FIFO_BUSY, word);
++
++    w = read_atomic(word);
++
++    for ( try = 0; try < 4; try++ )
++    {
++        ret = try_set_link(word, &w, link);
++        if ( ret >= 0 )
++        {
++            if ( ret == 0 )
++                clear_bit(EVTCHN_FIFO_BUSY, word);
++            return ret;
++        }
++    }
++    gdprintk(XENLOG_WARNING, "domain %d, port %d not linked\n",
++             d->domain_id, link);
++    clear_bit(EVTCHN_FIFO_BUSY, word);
+     return 1;
+ }
+ 
+@@ -105,7 +153,7 @@ static void evtchn_fifo_set_pending(stru
+         if ( port != q->tail )
+         {
+             tail_word = evtchn_fifo_word_from_port(d, q->tail);
+-            linked = evtchn_fifo_set_link(tail_word, port);
++            linked = evtchn_fifo_set_link(d, tail_word, port);
+         }
+         if ( !linked )
+             write_atomic(q->head, port);
+@@ -202,11 +250,12 @@ static void evtchn_fifo_print_state(stru
+ 
+     word = evtchn_fifo_word_from_port(d, evtchn->port);
+     if ( !word )
+-        printk("?   ");
++        printk("?     ");
+     else if ( test_bit(EVTCHN_FIFO_LINKED, word) )
+-        printk("%-4u", *word & EVTCHN_FIFO_LINK_MASK);
++        printk("%c %-4u", test_bit(EVTCHN_FIFO_BUSY, word) ? 'B' : ' ',
++               *word & EVTCHN_FIFO_LINK_MASK);
+     else
+-        printk("-   ");
++        printk("%c -   ", test_bit(EVTCHN_FIFO_BUSY, word) ? 'B' : ' ');
+ }
+ 
+ static const struct evtchn_port_ops evtchn_port_ops_fifo =
+diff -r d5678d9e70ad -r 857ba9942dee xen/include/public/event_channel.h
+--- a/xen/include/public/event_channel.h	Tue Nov 12 11:52:19 2013 +0100
++++ b/xen/include/public/event_channel.h	Tue Nov 12 13:19:25 2013 +0100
+@@ -343,6 +343,7 @@ typedef uint32_t event_word_t;
+ #define EVTCHN_FIFO_PENDING 31
+ #define EVTCHN_FIFO_MASKED  30
+ #define EVTCHN_FIFO_LINKED  29
++#define EVTCHN_FIFO_BUSY    28
+ 
+ #define EVTCHN_FIFO_LINK_BITS 17
+ #define EVTCHN_FIFO_LINK_MASK ((1 << EVTCHN_FIFO_LINK_BITS) - 1)

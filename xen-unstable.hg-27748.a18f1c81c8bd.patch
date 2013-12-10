@@ -1,0 +1,89 @@
+# HG changeset patch
+# User David Vrabel <david.vrabel@citrix.com>
+# Date 1381738704 -7200
+# Node ID a18f1c81c8bdf860b98e462a446fd3a6185f646d
+# Parent  63cdbf91e8d15e6df6546469f2a94384c2cc1d4c
+evtchn: use a per-domain variable for the max number of event channels
+
+Instead of the MAX_EVTCHNS(d) macro, use d->max_evtchns instead.  This
+avoids having to repeatedly check the ABI type.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 63cdbf91e8d1 -r a18f1c81c8bd xen/common/event_2l.c
+--- a/xen/common/event_2l.c	Mon Oct 14 10:17:14 2013 +0200
++++ b/xen/common/event_2l.c	Mon Oct 14 10:18:24 2013 +0200
+@@ -96,6 +96,7 @@ static const struct evtchn_port_ops evtc
+ void evtchn_2l_init(struct domain *d)
+ {
+     d->evtchn_port_ops = &evtchn_port_ops_2l;
++    d->max_evtchns = BITS_PER_EVTCHN_WORD(d) * BITS_PER_EVTCHN_WORD(d);
+ }
+ 
+ /*
+diff -r 63cdbf91e8d1 -r a18f1c81c8bd xen/common/event_channel.c
+--- a/xen/common/event_channel.c	Mon Oct 14 10:17:14 2013 +0200
++++ b/xen/common/event_channel.c	Mon Oct 14 10:18:24 2013 +0200
+@@ -134,7 +134,7 @@ static int get_free_port(struct domain *
+         if ( evtchn_from_port(d, port)->state == ECS_FREE )
+             return port;
+ 
+-    if ( port == MAX_EVTCHNS(d) )
++    if ( port == d->max_evtchns )
+         return -ENOSPC;
+ 
+     chn = xzalloc_array(struct evtchn, EVTCHNS_PER_BUCKET);
+@@ -1236,7 +1236,7 @@ static void domain_dump_evtchn_info(stru
+ 
+     spin_lock(&d->event_lock);
+ 
+-    for ( port = 1; port < MAX_EVTCHNS(d); ++port )
++    for ( port = 1; port < d->max_evtchns; ++port )
+     {
+         const struct evtchn *chn;
+         char *ssid;
+diff -r 63cdbf91e8d1 -r a18f1c81c8bd xen/common/schedule.c
+--- a/xen/common/schedule.c	Mon Oct 14 10:17:14 2013 +0200
++++ b/xen/common/schedule.c	Mon Oct 14 10:18:24 2013 +0200
+@@ -756,7 +756,7 @@ static long do_poll(struct sched_poll *s
+             goto out;
+ 
+         rc = -EINVAL;
+-        if ( port >= MAX_EVTCHNS(d) )
++        if ( port >= d->max_evtchns )
+             goto out;
+ 
+         rc = 0;
+diff -r 63cdbf91e8d1 -r a18f1c81c8bd xen/include/xen/event.h
+--- a/xen/include/xen/event.h	Mon Oct 14 10:17:14 2013 +0200
++++ b/xen/include/xen/event.h	Mon Oct 14 10:18:24 2013 +0200
+@@ -73,7 +73,7 @@ void notify_via_xen_event_channel(struct
+ #define bucket_from_port(d,p) \
+     ((d)->evtchn[(p)/EVTCHNS_PER_BUCKET])
+ #define port_is_valid(d,p)    \
+-    (((p) >= 0) && ((p) < MAX_EVTCHNS(d)) && \
++    (((p) >= 0) && ((p) < (d)->max_evtchns) &&  \
+      (bucket_from_port(d,p) != NULL))
+ #define evtchn_from_port(d,p) \
+     (&(bucket_from_port(d,p))[(p)&(EVTCHNS_PER_BUCKET-1)])
+diff -r 63cdbf91e8d1 -r a18f1c81c8bd xen/include/xen/sched.h
+--- a/xen/include/xen/sched.h	Mon Oct 14 10:17:14 2013 +0200
++++ b/xen/include/xen/sched.h	Mon Oct 14 10:18:24 2013 +0200
+@@ -50,7 +50,6 @@ extern struct domain *dom0;
+ #else
+ #define BITS_PER_EVTCHN_WORD(d) (has_32bit_shinfo(d) ? 32 : BITS_PER_XEN_ULONG)
+ #endif
+-#define MAX_EVTCHNS(d) (BITS_PER_EVTCHN_WORD(d) * BITS_PER_EVTCHN_WORD(d))
+ #define EVTCHNS_PER_BUCKET 128
+ #define NR_EVTCHN_BUCKETS  (NR_EVENT_CHANNELS / EVTCHNS_PER_BUCKET)
+ 
+@@ -273,6 +272,7 @@ struct domain
+ 
+     /* Event channel information. */
+     struct evtchn   *evtchn[NR_EVTCHN_BUCKETS];
++    unsigned int     max_evtchns;
+     spinlock_t       event_lock;
+     const struct evtchn_port_ops *evtchn_port_ops;
+ 
