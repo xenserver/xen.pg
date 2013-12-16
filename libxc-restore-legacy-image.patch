@@ -1,20 +1,55 @@
 # HG changeset patch
-# Parent 17c4cd134b82a5d6b2ce3e6bdf148544bac6cc4d
+# Parent ca5e14f0378c0876030711a57ed261c0b188327f
 
 diff --git a/tools/libxc/xc_domain_restore.c b/tools/libxc/xc_domain_restore.c
 --- a/tools/libxc/xc_domain_restore.c
 +++ b/tools/libxc/xc_domain_restore.c
-@@ -437,6 +437,13 @@
+@@ -38,6 +38,7 @@
+ 
+ #include <stdlib.h>
+ #include <unistd.h>
++#include <arpa/inet.h>
+ 
+ #include "xg_private.h"
+ #include "xg_save_restore.h"
+@@ -414,6 +415,31 @@
          return -1;
      }
  
-+    /* suspend images from legacy xenopsd contain a newline and 32-bit int */
++    /* Suspend images from legacy xenopsd contain a newline and 32-bit int
++     * We need to convert this int (big-endian) into a length that we can use
++     * to read the remainder of the record. Note, consuming the newline and int
++     * is not an option since we won't be able to read to EOF because legacy
++     * xenopsd keeps this fd open as it's also used for the hanshaking around
++     * the migration.
++     */
++    if ( RDEXACT(fd, qbuf, 5 + sizeof("QEVM")) ) {
++        PERROR("Error checking for legacy xenopsd QEMU signature");
++        free(qbuf);
++        return -1;
++    }
 +    if ( *qbuf == '\n' && !memcmp(qbuf + 5, "QEVM", 4) ) {
-+        DPRINTF("Detected legacy xenopsd signature; consuming...\n");
-+        dlen -= 5;
-+        memmove(qbuf, qbuf + 5, dlen);
++        DPRINTF("Read %d bytes of QEMU data\n", sizeof("QEVM"));
++        DPRINTF("Detected legacy xenopsd QEMU signature; translating...\n");
++        dlen = ntohl( *((uint32_t*) &qbuf[1]) );
++        memmove(qbuf, qbuf + 5, sizeof("QEVM"));
++        DPRINTF("Reading %d bytes of QEMU data\n", dlen - sizeof("QEVM"));
++        rc = RDEXACT(fd, qbuf + sizeof("QEVM"), dlen - sizeof("QEVM"));
++        goto check_data;
++    } else {
++        dlen = 5 + sizeof("QEVM");
++        DPRINTF("Read %d bytes of QEMU data\n", dlen);
 +    }
 +
-     if ( memcmp(qbuf, "QEVM", 4) ) {
-         ERROR("Invalid QEMU magic: 0x%08x", *(unsigned long*)qbuf);
+     while( (rc = read(fd, qbuf+dlen, blen-dlen)) > 0 ) {
+         DPRINTF("Read %d bytes of QEMU data\n", rc);
+         dlen += rc;
+@@ -431,6 +457,8 @@
+         }
+     }
+ 
++check_data:
++
+     if ( rc < 0 ) {
+         ERROR("Error reading QEMU data");
          free(qbuf);
