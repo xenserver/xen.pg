@@ -1,10 +1,10 @@
 # HG changeset patch
-# Parent 24f785cea66eee0abb7dd3fc6ce0c7e261e96df6
+# Parent 223fdf0823128d28a950c0c11dbe74296b077075
 
-diff -r 24f785cea66e xen/arch/x86/crash.c
+diff -r 223fdf082312 xen/arch/x86/crash.c
 --- a/xen/arch/x86/crash.c
 +++ b/xen/arch/x86/crash.c
-@@ -33,6 +33,7 @@
+@@ -33,12 +33,15 @@
  
  static cpumask_t waiting_to_crash;
  static unsigned int crashing_cpu;
@@ -12,7 +12,15 @@ diff -r 24f785cea66e xen/arch/x86/crash.c
  static DEFINE_PER_CPU_READ_MOSTLY(bool_t, crash_save_done);
  
  /* This becomes the NMI handler for non-crashing CPUs, when Xen is crashing. */
-@@ -67,6 +68,18 @@ void __attribute__((noreturn)) do_nmi_cr
+ void __attribute__((noreturn)) do_nmi_crash(struct cpu_user_regs *regs)
+ {
+     int cpu = smp_processor_id();
++    volatile s_time_t __maybe_unused data[] =
++        { 0xffff00123400ffffUL, 0UL, 0UL, 0xffff00432100ffffUL};
+ 
+     /* nmi_shootdown_cpus() should ensure that this assertion is correct. */
+     ASSERT(cpu != crashing_cpu);
+@@ -67,6 +70,17 @@ void __attribute__((noreturn)) do_nmi_cr
  
          this_cpu(crash_save_done) = 1;
          cpumask_clear_cpu(cpu, &waiting_to_crash);
@@ -21,9 +29,8 @@ diff -r 24f785cea66e xen/arch/x86/crash.c
 +        if ( callin_done )
 +        {
 +            s_time_t now = NOW();
-+            volatile s_time_t __maybe_unused data[] =
-+                { 0xffff00123400fffful, now, now - callin_done,
-+                  0xffff00432100fffful};
++            data[1] = now;
++            data[2] = now - callin_done;
 +
 +            printk("**Late callin: cpu%u, now %"PRId64", delta %"PRId64"\n",
 +                   cpu, now, now - callin_done);
@@ -31,7 +38,7 @@ diff -r 24f785cea66e xen/arch/x86/crash.c
      }
  
      /* Poor mans self_nmi().  __stop_this_cpu() has reverted the LAPIC
-@@ -185,6 +198,9 @@ static void nmi_shootdown_cpus(void)
+@@ -180,6 +194,9 @@ static void nmi_shootdown_cpus(void)
          printk("Failed to shoot down CPUs {%s}\n", keyhandler_scratch);
      }
  
@@ -41,3 +48,15 @@ diff -r 24f785cea66e xen/arch/x86/crash.c
      /* Crash shutdown any IOMMU functionality as the crashdump kernel is not
       * happy when booting if interrupt/dma remapping is still enabled */
      iommu_crash_shutdown();
+diff -r 223fdf082312 xen/common/kexec.c
+--- a/xen/common/kexec.c
++++ b/xen/common/kexec.c
+@@ -340,7 +340,7 @@ void kexec_crash(void)
+     if ( !test_bit(KEXEC_IMAGE_CRASH_BASE + pos, &kexec_flags) )
+         return;
+ 
+-    printk("Executing crash image\n");
++    printk("Executing crash image on cpu%u\n", smp_processor_id());
+ 
+     kexecing = TRUE;
+ 
