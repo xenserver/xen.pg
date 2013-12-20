@@ -1,0 +1,93 @@
+# HG changeset patch
+# Parent 15134449353f6bbda0dd8c11b5233447fec63efa
+
+diff -r 15134449353f xen/arch/x86/hpet.c
+--- a/xen/arch/x86/hpet.c
++++ b/xen/arch/x86/hpet.c
+@@ -24,19 +24,7 @@
+ #define HPET_EVT_LEGACY_BIT  1
+ #define HPET_EVT_LEGACY     (1 << HPET_EVT_LEGACY_BIT)
+ 
+-struct hpet_event_channel
+-{
+-    unsigned long   mult;       /* tick <-> time conversion */
+-    unsigned int    shift;      /* tick <-> time conversion */
+-    unsigned int    flags;      /* HPET_EVT_x */
+-    s_time_t        next_event; /* expected time of next interrupt */
+-    unsigned int    idx;        /* HPET counter index */
+-    unsigned int    cpu;        /* owner of channel (or -1) */
+-    struct msi_desc msi;        /* msi state */
+-    cpumask_var_t   cpumask;    /* cpus wishing to be woken */
+-    spinlock_t      lock;
+-} __cacheline_aligned;
+-static struct hpet_event_channel *__read_mostly hpet_events;
++struct hpet_event_channel *__read_mostly hpet_events;
+ 
+ /* msi hpet channels used for broadcast */
+ static unsigned int __read_mostly num_hpets_used;
+diff -r 15134449353f xen/common/spinlock.c
+--- a/xen/common/spinlock.c
++++ b/xen/common/spinlock.c
+@@ -10,17 +10,30 @@
+ #include <asm/processor.h>
+ #include <asm/atomic.h>
+ 
++#include <asm/hpet.h>
++
+ #ifndef NDEBUG
+ 
+ static atomic_t spin_debug __read_mostly = ATOMIC_INIT(0);
+ 
+ static void check_lock(struct lock_debug *debug)
+ {
++    static int ca_123148_times = 3;
+     int irq_safe = !local_irq_is_enabled();
+ 
+     if ( unlikely(atomic_read(&spin_debug) <= 0) )
+         return;
+ 
++    /* CA-123148 - investigation of check_lock() failure under qemu */
++    if ( unlikely( ca_123148_times > 0 && hpet_events &&
++                   (&hpet_events[0].lock.debug == debug) ) )
++    {
++        printk("In check_lock() for hpet_events[0].lock: "
++               "debug->irq_safe = %d, irq_save = %d\n",
++               debug->irq_safe, irq_safe);
++        ca_123148_times--;
++    }
++
+     /* A few places take liberties with this. */
+     /* BUG_ON(in_irq() && !irq_safe); */
+ 
+diff -r 15134449353f xen/include/asm-x86/hpet.h
+--- a/xen/include/asm-x86/hpet.h
++++ b/xen/include/asm-x86/hpet.h
+@@ -1,6 +1,8 @@
+ #ifndef __X86_HPET_H__
+ #define __X86_HPET_H__
+ 
++#include <asm/msi.h>
++
+ /*
+  * Documentation on HPET can be found at:
+  *      http://www.intel.com/content/dam/www/public/us/en/documents/
+@@ -84,4 +86,19 @@ void hpet_disable_legacy_broadcast(void)
+ 
+ extern void (*pv_rtc_handler)(uint8_t reg, uint8_t value);
+ 
++struct hpet_event_channel
++{
++    unsigned long   mult;       /* tick <-> time conversion */
++    unsigned int    shift;      /* tick <-> time conversion */
++    unsigned int    flags;      /* HPET_EVT_x */
++    s_time_t        next_event; /* expected time of next interrupt */
++    unsigned int    idx;        /* HPET counter index */
++    unsigned int    cpu;        /* owner of channel (or -1) */
++    struct msi_desc msi;        /* msi state */
++    cpumask_var_t   cpumask;    /* cpus wishing to be woken */
++    spinlock_t      lock;
++} __cacheline_aligned;
++
++extern struct hpet_event_channel * hpet_events;
++
+ #endif /* __X86_HPET_H__ */
