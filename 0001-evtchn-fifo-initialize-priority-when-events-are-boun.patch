@@ -1,0 +1,131 @@
+From bce3fdb3eca250c98165c55555611e2aacd72ee3 Mon Sep 17 00:00:00 2001
+From: David Vrabel <david.vrabel@citrix.com>
+Date: Tue, 10 Dec 2013 13:01:53 +0000
+Subject: [PATCH 1/2] evtchn/fifo: initialize priority when events are bound
+
+Event channel ports that are reused or that were not in the initial
+bucket would have a non-default priority.
+
+Add an init evtchn_port_op hook and use this to set the priority when
+an event channel is bound.
+
+Within this new evtchn_fifo_init() call, also check if the event is
+already on a queue and print a warning, as this event may have its
+first event delivered on a queue with the wrong VCPU or priority.
+This guest is expected to prevent this (if it cares) by not unbinding
+events that are still linked.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+---
+ xen/common/event_channel.c |    5 +++++
+ xen/common/event_fifo.c    |   17 +++++++++++++++++
+ xen/include/xen/event.h    |    7 +++++++
+ 3 files changed, 29 insertions(+), 0 deletions(-)
+
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index 34efd24..db952af 100644
+--- a/xen/common/event_channel.c
++++ b/xen/common/event_channel.c
+@@ -220,6 +220,7 @@ static long evtchn_alloc_unbound(evtchn_alloc_unbound_t *alloc)
+     chn->state = ECS_UNBOUND;
+     if ( (chn->u.unbound.remote_domid = alloc->remote_dom) == DOMID_SELF )
+         chn->u.unbound.remote_domid = current->domain->domain_id;
++    evtchn_port_init(d, chn);
+ 
+     alloc->port = port;
+ 
+@@ -276,6 +277,7 @@ static long evtchn_bind_interdomain(evtchn_bind_interdomain_t *bind)
+     lchn->u.interdomain.remote_dom  = rd;
+     lchn->u.interdomain.remote_port = (u16)rport;
+     lchn->state                     = ECS_INTERDOMAIN;
++    evtchn_port_init(ld, lchn);
+     
+     rchn->u.interdomain.remote_dom  = ld;
+     rchn->u.interdomain.remote_port = (u16)lport;
+@@ -330,6 +332,7 @@ static long evtchn_bind_virq(evtchn_bind_virq_t *bind)
+     chn->state          = ECS_VIRQ;
+     chn->notify_vcpu_id = vcpu;
+     chn->u.virq         = virq;
++    evtchn_port_init(d, chn);
+ 
+     v->virq_to_evtchn[virq] = bind->port = port;
+ 
+@@ -359,6 +362,7 @@ static long evtchn_bind_ipi(evtchn_bind_ipi_t *bind)
+     chn = evtchn_from_port(d, port);
+     chn->state          = ECS_IPI;
+     chn->notify_vcpu_id = vcpu;
++    evtchn_port_init(d, chn);
+ 
+     bind->port = port;
+ 
+@@ -437,6 +441,7 @@ static long evtchn_bind_pirq(evtchn_bind_pirq_t *bind)
+     chn->state  = ECS_PIRQ;
+     chn->u.pirq.irq = pirq;
+     link_pirq_port(port, chn, v);
++    evtchn_port_init(d, chn);
+ 
+     bind->port = port;
+ 
+diff --git a/xen/common/event_fifo.c b/xen/common/event_fifo.c
+index 6048784..2ab4c29 100644
+--- a/xen/common/event_fifo.c
++++ b/xen/common/event_fifo.c
+@@ -34,6 +34,22 @@ static inline event_word_t *evtchn_fifo_word_from_port(struct domain *d,
+     return d->evtchn_fifo->event_array[p] + w;
+ }
+ 
++static void evtchn_fifo_init(struct domain *d, struct evtchn *evtchn)
++{
++    event_word_t *word;
++
++    evtchn->priority = EVTCHN_FIFO_PRIORITY_DEFAULT;
++
++    /*
++     * If this event is still linked, the first event may be delivered
++     * on the wrong VCPU or with an unexpected priority.
++     */
++    word = evtchn_fifo_word_from_port(d, evtchn->port);
++    if ( word && test_bit(EVTCHN_FIFO_LINKED, word) )
++        gdprintk(XENLOG_WARNING, "domain %d, port %d already on a queue\n",
++                 d->domain_id, evtchn->port);
++}
++
+ static int try_set_link(event_word_t *word, event_word_t *w, uint32_t link)
+ {
+     event_word_t new, old;
+@@ -261,6 +277,7 @@ static void evtchn_fifo_print_state(struct domain *d,
+ 
+ static const struct evtchn_port_ops evtchn_port_ops_fifo =
+ {
++    .init          = evtchn_fifo_init,
+     .set_pending   = evtchn_fifo_set_pending,
+     .clear_pending = evtchn_fifo_clear_pending,
+     .unmask        = evtchn_fifo_unmask,
+diff --git a/xen/include/xen/event.h b/xen/include/xen/event.h
+index 70fc271..06c0654 100644
+--- a/xen/include/xen/event.h
++++ b/xen/include/xen/event.h
+@@ -132,6 +132,7 @@ void evtchn_2l_init(struct domain *d);
+  * Low-level event channel port ops.
+  */
+ struct evtchn_port_ops {
++    void (*init)(struct domain *d, struct evtchn *evtchn);
+     void (*set_pending)(struct vcpu *v, struct evtchn *evtchn);
+     void (*clear_pending)(struct domain *d, struct evtchn *evtchn);
+     void (*unmask)(struct domain *d, struct evtchn *evtchn);
+@@ -142,6 +143,12 @@ struct evtchn_port_ops {
+     void (*print_state)(struct domain *d, const struct evtchn *evtchn);
+ };
+ 
++static inline void evtchn_port_init(struct domain *d, struct evtchn *evtchn)
++{
++    if ( d->evtchn_port_ops->init )
++        d->evtchn_port_ops->init(d, evtchn);
++}
++
+ static inline void evtchn_port_set_pending(struct vcpu *v,
+                                            struct evtchn *evtchn)
+ {
+-- 
+1.7.2.5
+

@@ -1,0 +1,263 @@
+# HG changeset patch
+# User David Vrabel <david.vrabel@citrix.com>
+# Date 1381738761 -7200
+# Node ID b25b493f8c047ba265d2fb370ed34b9962cd4a4a
+# Parent  a18f1c81c8bdf860b98e462a446fd3a6185f646d
+evtchn: allow many more evtchn objects to be allocated per domain
+
+Expand the number of event channels that can be supported internally
+by altering now struct evtchn's are allocated.
+
+The objects are indexed using a two level scheme of groups and buckets
+(instead of only buckets).  Each group is a page of bucket pointers.
+Each bucket is a page-sized array of struct evtchn's.
+
+The optimal number of evtchns per bucket is calculated at compile
+time.
+
+If XSM is not enabled, struct evtchn is 16 bytes and each bucket
+contains 256, requiring only 1 group of 512 pointers for 2^17
+(131,072) event channels.  With XSM enabled, struct evtchn is 24
+bytes, each bucket contains 128 and 2 groups are required.
+
+For the common case of a domain with only a few event channels,
+instead of requiring an additional allocation for the group page, the
+first bucket is indexed directly.
+
+As a consequence of this, struct domain shrinks by at least 232 bytes
+as 32 bucket pointers are replaced with 1 bucket pointer and (at most)
+2 group pointers.
+
+[ Based on a patch from Wei Liu with improvements from Malcolm
+Crossley. ]
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r a18f1c81c8bd -r b25b493f8c04 xen/common/event_channel.c
+--- a/xen/common/event_channel.c	Mon Oct 14 10:18:24 2013 +0200
++++ b/xen/common/event_channel.c	Mon Oct 14 10:19:21 2013 +0200
+@@ -121,11 +121,47 @@ static int virq_is_global(uint32_t virq)
+ }
+ 
+ 
++static struct evtchn *alloc_evtchn_bucket(struct domain *d, unsigned int port)
++{
++    struct evtchn *chn;
++    unsigned int i;
++
++    chn = xzalloc_array(struct evtchn, EVTCHNS_PER_BUCKET);
++    if ( !chn )
++        return NULL;
++
++    for ( i = 0; i < EVTCHNS_PER_BUCKET; i++ )
++    {
++        if ( xsm_alloc_security_evtchn(&chn[i]) )
++        {
++            while ( i-- )
++                xsm_free_security_evtchn(&chn[i]);
++            xfree(chn);
++            return NULL;
++        }
++        chn[i].port = port + i;
++    }
++    return chn;
++}
++
++static void free_evtchn_bucket(struct domain *d, struct evtchn *bucket)
++{
++    unsigned int i;
++
++    if ( !bucket )
++        return;
++
++    for ( i = 0; i < EVTCHNS_PER_BUCKET; i++ )
++        xsm_free_security_evtchn(bucket + i);
++
++    xfree(bucket);
++}
++
+ static int get_free_port(struct domain *d)
+ {
+     struct evtchn *chn;
++    struct evtchn **grp;
+     int            port;
+-    int            i, j;
+ 
+     if ( d->is_dying )
+         return -EINVAL;
+@@ -137,22 +173,17 @@ static int get_free_port(struct domain *
+     if ( port == d->max_evtchns )
+         return -ENOSPC;
+ 
+-    chn = xzalloc_array(struct evtchn, EVTCHNS_PER_BUCKET);
+-    if ( unlikely(chn == NULL) )
+-        return -ENOMEM;
+-
+-    for ( i = 0; i < EVTCHNS_PER_BUCKET; i++ )
++    if ( !group_from_port(d, port) )
+     {
+-        if ( xsm_alloc_security_evtchn(&chn[i]) )
+-        {
+-            for ( j = 0; j < i; j++ )
+-                xsm_free_security_evtchn(&chn[j]);
+-            xfree(chn);
++        grp = xzalloc_array(struct evtchn *, BUCKETS_PER_GROUP);
++        if ( !grp )
+             return -ENOMEM;
+-        }
+-        chn[i].port = port + i;
++        group_from_port(d, port) = grp;
+     }
+ 
++    chn = alloc_evtchn_bucket(d, port);
++    if ( !chn )
++        return -ENOMEM;
+     bucket_from_port(d, port) = chn;
+ 
+     return port;
+@@ -1152,15 +1183,25 @@ int evtchn_init(struct domain *d)
+ {
+     evtchn_2l_init(d);
+ 
++    d->evtchn = alloc_evtchn_bucket(d, 0);
++    if ( !d->evtchn )
++        return -ENOMEM;
++
+     spin_lock_init(&d->event_lock);
+     if ( get_free_port(d) != 0 )
++    {
++        free_evtchn_bucket(d, d->evtchn);
+         return -EINVAL;
++    }
+     evtchn_from_port(d, 0)->state = ECS_RESERVED;
+ 
+ #if MAX_VIRT_CPUS > BITS_PER_LONG
+     d->poll_mask = xmalloc_array(unsigned long, BITS_TO_LONGS(MAX_VIRT_CPUS));
+     if ( !d->poll_mask )
++    {
++        free_evtchn_bucket(d, d->evtchn);
+         return -ENOMEM;
++    }
+     bitmap_zero(d->poll_mask, MAX_VIRT_CPUS);
+ #endif
+ 
+@@ -1170,7 +1211,7 @@ int evtchn_init(struct domain *d)
+ 
+ void evtchn_destroy(struct domain *d)
+ {
+-    int i;
++    unsigned int i, j;
+ 
+     /* After this barrier no new event-channel allocations can occur. */
+     BUG_ON(!d->is_dying);
+@@ -1185,12 +1226,17 @@ void evtchn_destroy(struct domain *d)
+ 
+     /* Free all event-channel buckets. */
+     spin_lock(&d->event_lock);
+-    for ( i = 0; i < NR_EVTCHN_BUCKETS; i++ )
++    for ( i = 0; i < NR_EVTCHN_GROUPS; i++ )
+     {
+-        xsm_free_security_evtchn(d->evtchn[i]);
+-        xfree(d->evtchn[i]);
+-        d->evtchn[i] = NULL;
++        if ( !d->evtchn_group[i] )
++            continue;
++        for ( j = 0; j < BUCKETS_PER_GROUP; j++ )
++            free_evtchn_bucket(d, d->evtchn_group[i][j]);
++        xfree(d->evtchn_group[i]);
++        d->evtchn_group[i] = NULL;
+     }
++    free_evtchn_bucket(d, d->evtchn);
++    d->evtchn = NULL;
+     spin_unlock(&d->event_lock);
+ 
+     clear_global_virq_handlers(d);
+diff -r a18f1c81c8bd -r b25b493f8c04 xen/include/xen/event.h
+--- a/xen/include/xen/event.h	Mon Oct 14 10:18:24 2013 +0200
++++ b/xen/include/xen/event.h	Mon Oct 14 10:19:21 2013 +0200
+@@ -69,15 +69,37 @@ int guest_enabled_event(struct vcpu *v, 
+ /* Notify remote end of a Xen-attached event channel.*/
+ void notify_via_xen_event_channel(struct domain *ld, int lport);
+ 
+-/* Internal event channel object accessors */
+-#define bucket_from_port(d,p) \
+-    ((d)->evtchn[(p)/EVTCHNS_PER_BUCKET])
+-#define port_is_valid(d,p)    \
+-    (((p) >= 0) && ((p) < (d)->max_evtchns) &&  \
+-     (bucket_from_port(d,p) != NULL))
+-#define evtchn_from_port(d,p) \
+-    (&(bucket_from_port(d,p))[(p)&(EVTCHNS_PER_BUCKET-1)])
++/*
++ * Internal event channel object storage.
++ *
++ * The objects (struct evtchn) are indexed using a two level scheme of
++ * groups and buckets.  Each group is a page of bucket pointers.  Each
++ * bucket is a page-sized array of struct evtchn's.
++ *
++ * The first bucket is directly accessed via d->evtchn.
++ */
++#define group_from_port(d, p) \
++    ((d)->evtchn_group[(p) / EVTCHNS_PER_GROUP])
++#define bucket_from_port(d, p) \
++    ((group_from_port(d, p))[((p) % EVTCHNS_PER_GROUP) / EVTCHNS_PER_BUCKET])
+ 
++static inline bool_t port_is_valid(struct domain *d, unsigned int p)
++{
++    if ( p >= d->max_evtchns )
++        return 0;
++    if ( !d->evtchn )
++        return 0;
++    if ( p < EVTCHNS_PER_BUCKET )
++        return 1;
++    return group_from_port(d, p) != NULL && bucket_from_port(d, p) != NULL;
++}
++
++static inline struct evtchn *evtchn_from_port(struct domain *d, unsigned int p)
++{
++    if ( p < EVTCHNS_PER_BUCKET )
++        return &d->evtchn[p];
++    return bucket_from_port(d, p) + (p % EVTCHNS_PER_BUCKET);
++}
+ 
+ /* Wait on a Xen-attached event channel. */
+ #define wait_on_xen_event_channel(port, condition)                      \
+diff -r a18f1c81c8bd -r b25b493f8c04 xen/include/xen/sched.h
+--- a/xen/include/xen/sched.h	Mon Oct 14 10:18:24 2013 +0200
++++ b/xen/include/xen/sched.h	Mon Oct 14 10:19:21 2013 +0200
+@@ -50,8 +50,22 @@ extern struct domain *dom0;
+ #else
+ #define BITS_PER_EVTCHN_WORD(d) (has_32bit_shinfo(d) ? 32 : BITS_PER_XEN_ULONG)
+ #endif
+-#define EVTCHNS_PER_BUCKET 128
+-#define NR_EVTCHN_BUCKETS  (NR_EVENT_CHANNELS / EVTCHNS_PER_BUCKET)
++
++#define BUCKETS_PER_GROUP  (PAGE_SIZE/sizeof(struct evtchn *))
++/* Round size of struct evtchn up to power of 2 size */
++#define __RDU2(x)   (       (x) | (   (x) >> 1))
++#define __RDU4(x)   ( __RDU2(x) | ( __RDU2(x) >> 2))
++#define __RDU8(x)   ( __RDU4(x) | ( __RDU4(x) >> 4))
++#define __RDU16(x)  ( __RDU8(x) | ( __RDU8(x) >> 8))
++#define __RDU32(x)  (__RDU16(x) | (__RDU16(x) >>16))
++#define next_power_of_2(x)      (__RDU32((x)-1) + 1)
++
++/* Maximum number of event channels for any ABI. */
++#define MAX_NR_EVTCHNS NR_EVENT_CHANNELS
++
++#define EVTCHNS_PER_BUCKET (PAGE_SIZE / next_power_of_2(sizeof(struct evtchn)))
++#define EVTCHNS_PER_GROUP  (BUCKETS_PER_GROUP * EVTCHNS_PER_BUCKET)
++#define NR_EVTCHN_GROUPS   DIV_ROUND_UP(MAX_NR_EVTCHNS, EVTCHNS_PER_GROUP)
+ 
+ struct evtchn
+ {
+@@ -271,7 +285,8 @@ struct domain
+     spinlock_t       rangesets_lock;
+ 
+     /* Event channel information. */
+-    struct evtchn   *evtchn[NR_EVTCHN_BUCKETS];
++    struct evtchn   *evtchn;                         /* first bucket only */
++    struct evtchn  **evtchn_group[NR_EVTCHN_GROUPS]; /* all other buckets */
+     unsigned int     max_evtchns;
+     spinlock_t       event_lock;
+     const struct evtchn_port_ops *evtchn_port_ops;

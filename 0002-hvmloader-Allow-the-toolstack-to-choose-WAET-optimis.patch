@@ -1,0 +1,112 @@
+From 4de23a82771cb212efeabecc7b16e9493ebaebe0 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 26 Nov 2013 20:18:07 +0000
+Subject: [PATCH 2/2] hvmloader: Allow the toolstack to choose WAET
+ optimisations
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Keir Fraser <keir@xen.org>
+CC: Jan Beulich <JBeulich@suse.com>
+CC: Tim Deegan <tim@xen.org>
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+---
+ tools/firmware/hvmloader/acpi/acpi2_0.h       |    4 ++++
+ tools/firmware/hvmloader/acpi/build.c         |   19 +++++++++++++++++++
+ tools/firmware/hvmloader/acpi/static_tables.c |   12 +-----------
+ 3 files changed, 24 insertions(+), 11 deletions(-)
+
+diff --git a/tools/firmware/hvmloader/acpi/acpi2_0.h b/tools/firmware/hvmloader/acpi/acpi2_0.h
+index 7b22d80..bebe4e6 100644
+--- a/tools/firmware/hvmloader/acpi/acpi2_0.h
++++ b/tools/firmware/hvmloader/acpi/acpi2_0.h
+@@ -303,6 +303,10 @@ struct acpi_20_waet {
+     struct acpi_header header;
+     uint32_t           flags;
+ };
++#define ACPI_WAET_RTC_NO_ACK        (1<<0) /* RTC requires no int acknowledge */
++#define ACPI_WAET_TIMER_ONE_READ    (1<<1) /* PM timer requires only one read */
++
++#define ACPI_WAET_DEFAULT_FLAGS (ACPI_WAET_TIMER_ONE_READ)
+ 
+ /*
+  * Multiple APIC Flags.
+diff --git a/tools/firmware/hvmloader/acpi/build.c b/tools/firmware/hvmloader/acpi/build.c
+index f1dd3f0..a7f5596 100644
+--- a/tools/firmware/hvmloader/acpi/build.c
++++ b/tools/firmware/hvmloader/acpi/build.c
+@@ -23,6 +23,8 @@
+ #include "ssdt_pm.h"
+ #include "../config.h"
+ #include "../util.h"
++#include "../hypercall.h"
++#include <xen/hvm/params.h>
+ #include <xen/hvm/hvm_xs_strings.h>
+ 
+ #define ACPI_MAX_SECONDARY_TABLES 16
+@@ -189,6 +191,9 @@ static struct acpi_20_hpet *construct_hpet(void)
+ static struct acpi_20_waet *construct_waet(void)
+ {
+     struct acpi_20_waet *waet;
++    const char *s;
++    struct xen_hvm_param p =
++        { .domid = DOMID_SELF, .index = HVM_PARAM_RTC_MODE };
+ 
+     waet = mem_alloc(sizeof(*waet), 16);
+     if (!waet) return NULL;
+@@ -196,8 +201,22 @@ static struct acpi_20_waet *construct_waet(void)
+     memcpy(waet, &Waet, sizeof(*waet));
+ 
+     waet->header.length = sizeof(*waet);
++
++    s = xenstore_read("platform/waet-rtc-noack", NULL);
++    if ( s )
++    {
++        if ( !strncmp(s, "1", 1) )
++            waet->flags |= ACPI_WAET_RTC_NO_ACK;
++        else
++            waet->flags &= ~ACPI_WAET_RTC_NO_ACK;
++    }
++
+     set_checksum(waet, offsetof(struct acpi_header, checksum), sizeof(*waet));
+ 
++    /* Inform Xen which RTC mode has been chosen */
++    p.value = !!(waet->flags & ACPI_WAET_RTC_NO_ACK);
++    hypercall_hvm_op(HVMOP_set_param, &p);
++
+     return waet;
+ }
+ 
+diff --git a/tools/firmware/hvmloader/acpi/static_tables.c b/tools/firmware/hvmloader/acpi/static_tables.c
+index 323ae31..5c699ba 100644
+--- a/tools/firmware/hvmloader/acpi/static_tables.c
++++ b/tools/firmware/hvmloader/acpi/static_tables.c
+@@ -136,16 +136,6 @@ struct acpi_20_rsdp Rsdp = {
+     .length    = sizeof(struct acpi_20_rsdp)
+ };
+ 
+-#define ACPI_WAET_RTC_NO_ACK        (1<<0) /* RTC requires no int acknowledge */
+-#define ACPI_WAET_TIMER_ONE_READ    (1<<1) /* PM timer requires only one read */
+-
+-/*
+- * The state of the RTC flag getting passed to the guest must be in
+- * sync with the mode selection in the hypervisor RTC emulation code.
+- */
+-#define ACPI_WAET_FLAGS (ACPI_WAET_RTC_NO_ACK | \
+-                         ACPI_WAET_TIMER_ONE_READ)
+-
+ struct acpi_20_waet Waet = {
+     .header = {
+         .signature    = ACPI_2_0_WAET_SIGNATURE,
+@@ -157,7 +147,7 @@ struct acpi_20_waet Waet = {
+         .creator_id   = ACPI_CREATOR_ID,
+         .creator_revision = ACPI_CREATOR_REVISION
+     },
+-    .flags = ACPI_WAET_FLAGS
++    .flags = ACPI_WAET_DEFAULT_FLAGS
+ };
+ 
+ /*
+-- 
+1.7.10.4
+

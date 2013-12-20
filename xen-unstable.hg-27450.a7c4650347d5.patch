@@ -1,0 +1,208 @@
+# HG changeset patch
+# User Tomasz Wroblewski <tomasz.wroblewski@citrix.com>
+# Date 1377677982 -7200
+# Node ID a7c4650347d59b122a08011b15dc2f39c7ca0278
+# Parent  f8065d24d68395cdc46698f70abd1e746d8ad336
+PCI UART: better cope with UART being temporarily unavailable
+
+This happens for example when dom0 disables ioport responses during PCI
+subsystem initialisation. If a __ns16550_poll() happens to be scheduled
+during that time, Xen hangs. Detect and exit that condition.
+
+Amended ns16550_ioport_invalid function to only check IER register,
+which contins 3 reserved (always 0) bits, therefore it's sufficient for
+that test.
+
+Signed-off-by: Tomasz Wroblewski <tomasz.wroblewski@citrix.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r f8065d24d683 -r a7c4650347d5 xen/drivers/char/ehci-dbgp.c
+--- a/xen/drivers/char/ehci-dbgp.c
++++ b/xen/drivers/char/ehci-dbgp.c
+@@ -1204,7 +1204,7 @@ static void ehci_dbgp_putc(struct serial
+         ehci_dbgp_flush(port);
+ }
+ 
+-static unsigned int ehci_dbgp_tx_ready(struct serial_port *port)
++static int ehci_dbgp_tx_ready(struct serial_port *port)
+ {
+     struct ehci_dbgp *dbgp = port->uart;
+ 
+diff -r f8065d24d683 -r a7c4650347d5 xen/drivers/char/ns16550.c
+--- a/xen/drivers/char/ns16550.c
++++ b/xen/drivers/char/ns16550.c
+@@ -75,6 +75,11 @@ static void ns_write_reg(struct ns16550 
+     writeb(c, uart->remapped_io_base + reg);
+ }
+ 
++static int ns16550_ioport_invalid(struct ns16550 *uart)
++{
++    return (unsigned char)ns_read_reg(uart, UART_IER) == 0xff;
++}
++
+ static void ns16550_interrupt(
+     int irq, void *dev_id, struct cpu_user_regs *regs)
+ {
+@@ -105,11 +110,17 @@ static void __ns16550_poll(struct cpu_us
+         return; /* Interrupts work - no more polling */
+ 
+     while ( ns_read_reg(uart, UART_LSR) & UART_LSR_DR )
++    {
++        if ( ns16550_ioport_invalid(uart) )
++            goto out;
++
+         serial_rx_interrupt(port, regs);
++    }
+ 
+     if ( ns_read_reg(uart, UART_LSR) & UART_LSR_THRE )
+         serial_tx_interrupt(port, regs);
+ 
++out:
+     set_timer(&uart->timer, NOW() + MILLISECS(uart->timeout_ms));
+ }
+ 
+@@ -123,10 +134,12 @@ static void ns16550_poll(void *data)
+ #endif
+ }
+ 
+-static unsigned int ns16550_tx_ready(struct serial_port *port)
++static int ns16550_tx_ready(struct serial_port *port)
+ {
+     struct ns16550 *uart = port->uart;
+ 
++    if ( ns16550_ioport_invalid(uart) )
++        return -EIO;
+     return ns_read_reg(uart, UART_LSR) & UART_LSR_THRE ? uart->fifo_size : 0;
+ }
+ 
+@@ -140,7 +153,8 @@ static int ns16550_getc(struct serial_po
+ {
+     struct ns16550 *uart = port->uart;
+ 
+-    if ( !(ns_read_reg(uart, UART_LSR) & UART_LSR_DR) )
++    if ( ns16550_ioport_invalid(uart) ||
++        !(ns_read_reg(uart, UART_LSR) & UART_LSR_DR) )
+         return 0;
+ 
+     *pc = ns_read_reg(uart, UART_RBR);
+@@ -308,15 +322,6 @@ static void _ns16550_resume(struct seria
+     ns16550_setup_postirq(port->uart);
+ }
+ 
+-static int ns16550_ioport_invalid(struct ns16550 *uart)
+-{
+-    return ((((unsigned char)ns_read_reg(uart, UART_LSR)) == 0xff) &&
+-            (((unsigned char)ns_read_reg(uart, UART_MCR)) == 0xff) &&
+-            (((unsigned char)ns_read_reg(uart, UART_IER)) == 0xff) &&
+-            (((unsigned char)ns_read_reg(uart, UART_IIR)) == 0xff) &&
+-            (((unsigned char)ns_read_reg(uart, UART_LCR)) == 0xff));
+-}
+-
+ static int delayed_resume_tries;
+ static void ns16550_delayed_resume(void *data)
+ {
+diff -r f8065d24d683 -r a7c4650347d5 xen/drivers/char/serial.c
+--- a/xen/drivers/char/serial.c
++++ b/xen/drivers/char/serial.c
+@@ -59,7 +59,7 @@ void serial_rx_interrupt(struct serial_p
+ 
+ void serial_tx_interrupt(struct serial_port *port, struct cpu_user_regs *regs)
+ {
+-    unsigned int i, n;
++    int i, n;
+     unsigned long flags;
+ 
+     local_irq_save(flags);
+@@ -71,7 +71,7 @@ void serial_tx_interrupt(struct serial_p
+      */
+     while ( !spin_trylock(&port->tx_lock) )
+     {
+-        if ( !port->driver->tx_ready(port) )
++        if ( port->driver->tx_ready(port) <= 0 )
+             goto out;
+         cpu_relax();
+     }
+@@ -111,15 +111,18 @@ static void __serial_putc(struct serial_
+             if ( port->tx_log_everything )
+             {
+                 /* Buffer is full: we spin waiting for space to appear. */
+-                unsigned int n;
++                int n;
+ 
+                 while ( (n = port->driver->tx_ready(port)) == 0 )
+                     cpu_relax();
+-                while ( n-- )
+-                    port->driver->putc(
+-                        port,
+-                        port->txbuf[mask_serial_txbuf_idx(port->txbufc++)]);
+-                port->txbuf[mask_serial_txbuf_idx(port->txbufp++)] = c;
++                if ( n > 0 )
++                {
++                    while ( n-- )
++                        port->driver->putc(
++                            port,
++                            port->txbuf[mask_serial_txbuf_idx(port->txbufc++)]);
++                    port->txbuf[mask_serial_txbuf_idx(port->txbufp++)] = c;
++                }
+             }
+             else
+             {
+@@ -130,9 +133,9 @@ static void __serial_putc(struct serial_
+         }
+ 
+         if ( ((port->txbufp - port->txbufc) == 0) &&
+-             port->driver->tx_ready(port) )
++             port->driver->tx_ready(port) > 0 )
+         {
+-            /* Buffer and UART FIFO are both empty. */
++            /* Buffer and UART FIFO are both empty, and port is available. */
+             port->driver->putc(port, c);
+         }
+         else
+@@ -143,10 +146,13 @@ static void __serial_putc(struct serial_
+     }
+     else if ( port->driver->tx_ready )
+     {
++        int n;
++
+         /* Synchronous finite-capacity transmitter. */
+-        while ( !port->driver->tx_ready(port) )
++        while ( !(n = port->driver->tx_ready(port)) )
+             cpu_relax();
+-        port->driver->putc(port, c);
++        if ( n > 0 )
++            port->driver->putc(port, c);
+     }
+     else
+     {
+@@ -390,8 +396,14 @@ void serial_start_sync(int handle)
+     {
+         while ( (port->txbufp - port->txbufc) != 0 )
+         {
+-            while ( !port->driver->tx_ready(port) )
++            int n;
++
++            while ( !(n = port->driver->tx_ready(port)) )
+                 cpu_relax();
++            if ( n < 0 )
++                /* port is unavailable and might not come up until reenabled by
++                   dom0, we can't really do proper sync */
++                break;
+             port->driver->putc(
+                 port, port->txbuf[mask_serial_txbuf_idx(port->txbufc++)]);
+         }
+diff -r f8065d24d683 -r a7c4650347d5 xen/include/xen/serial.h
+--- a/xen/include/xen/serial.h
++++ b/xen/include/xen/serial.h
+@@ -70,8 +70,9 @@ struct uart_driver {
+     /* Driver suspend/resume. */
+     void (*suspend)(struct serial_port *);
+     void (*resume)(struct serial_port *);
+-    /* Return number of characters the port can hold for transmit. */
+-    unsigned int (*tx_ready)(struct serial_port *);
++    /* Return number of characters the port can hold for transmit,
++     * or -EIO if port is inaccesible */
++    int (*tx_ready)(struct serial_port *);
+     /* Put a character onto the serial line. */
+     void (*putc)(struct serial_port *, char);
+     /* Flush accumulated characters. */

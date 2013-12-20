@@ -1,0 +1,115 @@
+From 613bb76fd8e503420531bb0eb0992d6e86f637fd Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 26 Nov 2013 20:15:50 +0000
+Subject: [PATCH 1/2] x86/vRTC: Make rtc_mode_{strict,no_ack} a per-domain
+ option
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Keir Fraser <keir@xen.org>
+CC: Jan Beulich <JBeulich@suse.com>
+CC: Tim Deegan <tim@xen.org>
+---
+ xen/arch/x86/hvm/hvm.c          |    4 ++++
+ xen/arch/x86/hvm/rtc.c          |   21 ++++++++-------------
+ xen/include/public/hvm/params.h |   11 ++++++++++-
+ 3 files changed, 22 insertions(+), 14 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index e2ba9de..06e52cb 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -4116,6 +4116,10 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+                 if ( a.value > SHUTDOWN_MAX )
+                     rc = -EINVAL;
+                 break;
++            case HVM_PARAM_RTC_MODE:
++                if ( a.value > 1 )
++                    rc = -EINVAL;
++                break;
+             }
+ 
+             if ( rc == 0 ) 
+diff --git a/xen/arch/x86/hvm/rtc.c b/xen/arch/x86/hvm/rtc.c
+index cdedefe..644a255 100644
+--- a/xen/arch/x86/hvm/rtc.c
++++ b/xen/arch/x86/hvm/rtc.c
+@@ -45,14 +45,9 @@
+ #define epoch_year     1900
+ #define get_year(x)    (x + epoch_year)
+ 
+-enum rtc_mode {
+-   rtc_mode_no_ack,
+-   rtc_mode_strict
+-};
+-
+-/* This must be in sync with how hvmloader sets the ACPI WAET flags. */
+-#define mode_is(d, m) ((void)(d), rtc_mode_##m == rtc_mode_no_ack)
+-#define rtc_mode_is(s, m) mode_is(vrtc_domain(s), m)
++#define rtc_mode_is(s, m) (                                        \
++        vrtc_domain(s)->arch.hvm_domain.params[HVM_PARAM_RTC_MODE] \
++                      == HVM_PARAM_RTC_MODE_ ## m)
+ 
+ static void rtc_copy_date(RTCState *s);
+ static void rtc_set_time(RTCState *s);
+@@ -63,7 +58,7 @@ static void rtc_update_irq(RTCState *s)
+ {
+     ASSERT(spin_is_locked(&s->lock));
+ 
+-    if ( rtc_mode_is(s, strict) && (s->hw.cmos_data[RTC_REG_C] & RTC_IRQF) )
++    if ( rtc_mode_is(s, STRICT) && (s->hw.cmos_data[RTC_REG_C] & RTC_IRQF) )
+         return;
+ 
+     /* IRQ is raised if any source is both raised & enabled */
+@@ -73,7 +68,7 @@ static void rtc_update_irq(RTCState *s)
+         return;
+ 
+     s->hw.cmos_data[RTC_REG_C] |= RTC_IRQF;
+-    if ( rtc_mode_is(s, no_ack) )
++    if ( rtc_mode_is(s, NO_ACK) )
+         hvm_isa_irq_deassert(vrtc_domain(s), RTC_IRQ);
+     hvm_isa_irq_assert(vrtc_domain(s), RTC_IRQ);
+ }
+@@ -84,8 +79,8 @@ bool_t rtc_periodic_interrupt(void *opaque)
+     bool_t ret;
+ 
+     spin_lock(&s->lock);
+-    ret = rtc_mode_is(s, no_ack) || !(s->hw.cmos_data[RTC_REG_C] & RTC_IRQF);
+-    if ( rtc_mode_is(s, no_ack) || !(s->hw.cmos_data[RTC_REG_C] & RTC_PF) )
++    ret = rtc_mode_is(s, NO_ACK) || !(s->hw.cmos_data[RTC_REG_C] & RTC_IRQF);
++    if ( rtc_mode_is(s, NO_ACK) || !(s->hw.cmos_data[RTC_REG_C] & RTC_PF) )
+     {
+         s->hw.cmos_data[RTC_REG_C] |= RTC_PF;
+         rtc_update_irq(s);
+@@ -647,7 +642,7 @@ static uint32_t rtc_ioport_read(RTCState *s, uint32_t addr)
+     case RTC_REG_C:
+         ret = s->hw.cmos_data[s->hw.cmos_index];
+         s->hw.cmos_data[RTC_REG_C] = 0x00;
+-        if ( (ret & RTC_IRQF) && !rtc_mode_is(s, no_ack) )
++        if ( (ret & RTC_IRQF) && !rtc_mode_is(s, NO_ACK) )
+             hvm_isa_irq_deassert(d, RTC_IRQ);
+         rtc_update_irq(s);
+         check_update_timer(s);
+diff --git a/xen/include/public/hvm/params.h b/xen/include/public/hvm/params.h
+index 517a184..23289bd 100644
+--- a/xen/include/public/hvm/params.h
++++ b/xen/include/public/hvm/params.h
+@@ -145,6 +145,15 @@
+ /* SHUTDOWN_* action in case of a triple fault */
+ #define HVM_PARAM_TRIPLE_FAULT_REASON 31
+ 
+-#define HVM_NR_PARAMS          32
++/*
++ * Domains RTC Mode, as informed in the WAET table.
++ * One of HVM_PARAM_RTC_MODE_*
++ */
++#define HVM_PARAM_RTC_MODE 32
++#define HVM_PARAM_RTC_MODE_STRICT 0 /* Normal behaviour */
++#define HVM_PARAM_RTC_MODE_NO_ACK 1 /* No need to ACK RegC */
++
++
++#define HVM_NR_PARAMS          33
+ 
+ #endif /* __XEN_PUBLIC_HVM_PARAMS_H__ */
+-- 
+1.7.10.4
+

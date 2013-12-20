@@ -1,0 +1,91 @@
+# HG changeset patch
+# User David Vrabel <david.vrabel@citrix.com>
+# Date 1381738866 -7200
+# Node ID 19ea645b94cbe72e62614a71a0ac3407d36dc425
+# Parent  5eca7ac001120cb905c6ad2331715261ed54c539
+evtchn: implement EVTCHNOP_set_priority and add the set_priority hook
+
+Implement EVTCHNOP_set_priority.  A new set_priority hook added to
+struct evtchn_port_ops will do the ABI specific validation and setup.
+
+If an ABI does not provide a set_priority hook (as is the case of the
+2-level ABI), the sub-op will return -ENOSYS.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 5eca7ac00112 -r 19ea645b94cb xen/common/event_channel.c
+--- a/xen/common/event_channel.c	Mon Oct 14 10:20:02 2013 +0200
++++ b/xen/common/event_channel.c	Mon Oct 14 10:21:06 2013 +0200
+@@ -955,6 +955,27 @@ out:
+     return rc;
+ }
+ 
++static long evtchn_set_priority(const struct evtchn_set_priority *set_priority)
++{
++    struct domain *d = current->domain;
++    unsigned int port = set_priority->port;
++    long ret;
++
++    spin_lock(&d->event_lock);
++
++    if ( !port_is_valid(d, port) )
++    {
++        spin_unlock(&d->event_lock);
++        return -EINVAL;
++    }
++
++    ret = evtchn_port_set_priority(d, evtchn_from_port(d, port),
++                                   set_priority->priority);
++
++    spin_unlock(&d->event_lock);
++
++    return ret;
++}
+ 
+ long do_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+ {
+@@ -1064,6 +1085,14 @@ long do_event_channel_op(int cmd, XEN_GU
+         break;
+     }
+ 
++    case EVTCHNOP_set_priority: {
++        struct evtchn_set_priority set_priority;
++        if ( copy_from_guest(&set_priority, arg, 1) != 0 )
++            return -EFAULT;
++        rc = evtchn_set_priority(&set_priority);
++        break;
++    }
++
+     default:
+         rc = -ENOSYS;
+         break;
+diff -r 5eca7ac00112 -r 19ea645b94cb xen/include/xen/event.h
+--- a/xen/include/xen/event.h	Mon Oct 14 10:20:02 2013 +0200
++++ b/xen/include/xen/event.h	Mon Oct 14 10:21:06 2013 +0200
+@@ -137,6 +137,8 @@ struct evtchn_port_ops {
+     void (*unmask)(struct domain *d, struct evtchn *evtchn);
+     bool_t (*is_pending)(struct domain *d, const struct evtchn *evtchn);
+     bool_t (*is_masked)(struct domain *d, const struct evtchn *evtchn);
++    int (*set_priority)(struct domain *d, struct evtchn *evtchn,
++                        unsigned int priority);
+     void (*print_state)(struct domain *d, const struct evtchn *evtchn);
+ };
+ 
+@@ -170,6 +172,15 @@ static inline bool_t evtchn_port_is_mask
+     return d->evtchn_port_ops->is_masked(d, evtchn);
+ }
+ 
++static inline int evtchn_port_set_priority(struct domain *d,
++                                           struct evtchn *evtchn,
++                                           unsigned int priority)
++{
++    if ( !d->evtchn_port_ops->set_priority )
++        return -ENOSYS;
++    return d->evtchn_port_ops->set_priority(d, evtchn, priority);
++}
++
+ static inline void evtchn_port_print_state(struct domain *d,
+                                            const struct evtchn *evtchn)
+ {
