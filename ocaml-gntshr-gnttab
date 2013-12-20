@@ -1,0 +1,586 @@
+# HG changeset patch
+# Parent 6cc810a5f50337e7013792a9622bd501a66aa8e8
+
+diff -r 6cc810a5f503 tools/ocaml/libs/Makefile
+--- a/tools/ocaml/libs/Makefile
++++ b/tools/ocaml/libs/Makefile
+@@ -2,6 +2,7 @@
+ include $(XEN_ROOT)/tools/Rules.mk
+ 
+ SUBDIRS= \
++	gnt \
+ 	mmap \
+ 	xentoollog \
+ 	xc eventchn \
+diff -r 6cc810a5f503 tools/ocaml/libs/gnt/META.in
+--- /dev/null
++++ b/tools/ocaml/libs/gnt/META.in
+@@ -0,0 +1,5 @@
++version = "@VERSION@"
++description = "Grant tables interface"
++requires = "bigarray"
++archive(byte) = "gnt.cma"
++archive(native) = "gnt.cmxa"
+diff -r 6cc810a5f503 tools/ocaml/libs/gnt/Makefile
+--- /dev/null
++++ b/tools/ocaml/libs/gnt/Makefile
+@@ -0,0 +1,32 @@
++TOPLEVEL=$(CURDIR)/../..
++XEN_ROOT=$(TOPLEVEL)/../..
++include $(TOPLEVEL)/common.make
++
++CFLAGS += $(CFLAGS_libxenctrl)
++
++OBJS = gnt
++INTF = $(foreach obj, $(OBJS),$(obj).cmi)
++LIBS = gnt.cma gnt.cmxa
++
++LIBS_gnt = $(LDLIBS_libxenctrl)
++
++all: $(INTF) $(LIBS) $(PROGRAMS)
++
++libs: $(LIBS)
++
++gnt_OBJS = $(OBJS)
++gnt_C_OBJS = gntshr_stubs gnttab_stubs
++OCAML_LIBRARY = gnt
++
++.PHONY: install
++install: $(LIBS) META
++	mkdir -p $(OCAMLDESTDIR)
++	$(OCAMLFIND) remove -destdir $(OCAMLDESTDIR) gnt
++	$(OCAMLFIND) install -destdir $(OCAMLDESTDIR) -ldconf ignore gnt META $(INTF) $(LIBS) *.a *.so *.cmx
++
++.PHONY: uninstall
++uninstall:
++	$(OCAMLFIND) remove -destdir $(OCAMLDESTDIR) gnt
++
++include $(TOPLEVEL)/Makefile.rules
++
+diff -r 6cc810a5f503 tools/ocaml/libs/gnt/gnt.ml
+--- /dev/null
++++ b/tools/ocaml/libs/gnt/gnt.ml
+@@ -0,0 +1,108 @@
++(*
++ * Copyright (C) 2012-2013 Citrix Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation; version 2.1 only. with the special
++ * exception on linking described in file LICENSE.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *)
++
++type buf = (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
++
++type gntref = int
++type domid = int
++
++module Gnttab = struct
++	type interface
++
++	external interface_open: unit -> interface = "stub_xc_gnttab_open"
++	external interface_close: interface -> unit = "stub_xc_gnttab_close"
++
++	type grant = {
++		domid: domid;
++		ref: gntref;
++	}
++
++	module Local_mapping = struct
++		type t = buf
++		let to_buf t = t
++	end
++
++	(* Look up the values of PROT_{READ,WRITE} from the C headers. *)
++	type perm = PROT_NONE | PROT_READ | PROT_WRITE | PROT_RDWR
++
++	external map_exn: interface -> domid -> gntref -> perm -> Local_mapping.t =
++		"stub_xc_gnttab_map_grant_ref"
++	external mapv_exn: interface -> int array -> perm -> Local_mapping.t =
++		"stub_xc_gnttab_map_grant_refs"
++	external unmap_exn: interface -> Local_mapping.t -> unit =
++		"stub_xc_gnttab_unmap"
++
++	let map_exn h g p =
++		map_exn h g.domid g.ref (if p then PROT_RDWR else PROT_READ)
++
++	let map h g p = try Some (map_exn h g p) with _ -> None
++
++	let mapv_exn h gs p =
++		let count = List.length gs in
++		let grant_array = Array.create (count * 2) 0 in
++		List.iteri (fun i g ->
++				grant_array.(i * 2 + 0) <- g.domid;
++				grant_array.(i * 2 + 1) <- g.ref;
++			) gs;
++		mapv_exn h grant_array (if p then PROT_RDWR else PROT_READ)
++
++	let mapv h gs p = try Some (mapv_exn h gs p) with _ -> None
++
++	let with_gnttab f =
++		let intf = interface_open () in
++		let result = try
++			f intf
++		with e ->
++			interface_close intf;
++			raise e
++		in
++		interface_close intf;
++		result
++end
++
++module Gntshr = struct
++	type interface
++
++	external interface_open: unit -> interface = "stub_xc_gntshr_open"
++	external interface_close: interface -> unit = "stub_xc_gntshr_close"
++
++	type share = {
++		refs: gntref list;
++		mapping: buf;
++	}
++
++	external share_pages_exn: interface -> int -> int -> bool -> share =
++		"stub_xc_gntshr_share_pages"
++	external munmap_exn: interface -> share -> unit =
++		"stub_xc_gntshr_munmap"
++
++	exception Need_xen_4_2_or_later
++
++	let () = Callback.register_exception "gntshr.missing" Need_xen_4_2_or_later
++
++	let share_pages interface domid count writeable =
++		try Some (share_pages_exn interface domid count writeable)
++		with _ -> None
++
++	let with_gntshr f =
++		let intf = interface_open () in
++		let result = try
++			f intf
++		with e ->
++			interface_close intf;
++			raise e
++		in
++		interface_close intf;
++		result
++end
+diff -r 6cc810a5f503 tools/ocaml/libs/gnt/gnt.mli
+--- /dev/null
++++ b/tools/ocaml/libs/gnt/gnt.mli
+@@ -0,0 +1,122 @@
++(*
++ * Copyright (C) 2012-2013 Citrix Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation; version 2.1 only. with the special
++ * exception on linking described in file LICENSE.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *)
++
++(** Grant tables interface. *)
++
++type buf = (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
++
++type gntref = int
++(** Type of a grant table index, called a grant reference in
++    Xen's terminology. *)
++
++module Gnttab : sig
++  type interface
++  (** A connection to the grant device, needed for mapping/unmapping *)
++
++  val interface_open: unit -> interface
++  (** Open a connection to the grant device. This must be done before any
++      calls to map or unmap. *)
++
++  val interface_close: interface -> unit
++  (** Close a connection to the grant device. Any future calls to map or
++      unmap will fail. *)
++
++  type grant = {
++   domid: int;
++   (** foreign domain who is exporting memory *)
++   ref: gntref;
++   (** id which identifies the specific export in the foreign domain *)
++  }
++  (** A foreign domain must explicitly "grant" us memory and send us the
++      "reference". The pair of (foreign domain id, reference) uniquely
++      identifies the block of memory. This pair ("grant") is transmitted
++      to us out-of-band, usually either via xenstore during device setup or
++      via a shared memory ring structure. *)
++
++  module Local_mapping : sig
++    type t
++    (** Abstract type representing a locally-mapped shared memory page *)
++
++    val to_buf: t -> buf
++  end
++
++  val map_exn : interface -> grant -> bool -> Local_mapping.t
++  (** [map_exn if grant writable] creates a single mapping from
++      [grant] that will be writable if [writable] is [true]. *)
++
++  val map : interface -> grant -> bool -> Local_mapping.t option
++  (** Like the above but wraps the result in an option instead of
++      raising an exception. *)
++
++  val mapv_exn : interface -> grant list -> bool -> Local_mapping.t
++  (** [mapv if grants writable] creates a single contiguous mapping
++      from a list of grants that will be writable if [writable] is
++      [true]. Note the grant list can involve grants from multiple
++      domains. *)
++
++  val mapv: interface -> grant list -> bool -> Local_mapping.t option
++  (** Like the above but wraps the result in an option instead of
++      raising an exception. *)
++
++  val unmap_exn: interface -> Local_mapping.t -> unit
++  (** Unmap a single mapping (which may involve multiple grants) *)
++
++  val with_gnttab : (interface -> 'a) -> 'a
++  (** [with_gnttab f] opens an interface to gnttab, passes it to f, then returns
++   *  the result of f (or re-raises any exceptions) ensuring that the gnttab
++   *  interface is closed before returning. *)
++end
++
++module Gntshr : sig
++  type interface
++  (** A connection to the gntshr device, needed for sharing/unmapping *)
++
++  val interface_open: unit -> interface
++  (** Open a connection to the gntshr device. This must be done before any
++      calls to share or unmap. *)
++
++  val interface_close: interface -> unit
++  (** Close a connection to the gntshr device. Any future calls to share or
++      unmap will fail. *)
++
++  type share = {
++    refs: gntref list;
++    (** List of grant references which have been shared with a foreign domain. *)
++    mapping: buf;
++    (** Mapping of the shared memory. *)
++  }
++  (** When sharing a number of pages with another domain, we receive back both the
++      list of grant references shared and actually mapped page(s). The foreign
++      domain can map the same shared memory, after being notified (e.g. via xenstore)
++      of our domid and list of references. *)
++
++  val share_pages_exn: interface -> int -> int -> bool -> share
++  (** [share_pages_exn if domid count writeable] shares [count] pages with foreign
++      domain [domid]. [writeable] determines whether or not the foreign domain can
++      write to the shared memory. *)
++
++  val share_pages: interface -> int -> int -> bool -> share option
++  (** [share_pages if domid count writeable] shares [count] pages with foreign domain
++     [domid]. [writeable] determines whether or not the foreign domain can write to
++     the shared memory.
++     On error this function returns None. Diagnostic details will be logged. *)
++
++  val munmap_exn : interface -> share -> unit
++  (** Unmap a single mapping (which may involve multiple grants) *)
++
++  val with_gntshr : (interface -> 'a) -> 'a
++  (** [with_gntshr f] opens an interface to gntshr, passes it to f, then returns
++   *  the result of f (or re-raises any exceptions) ensuring that the gntshr
++   *  interface is closed before returning. *)
++end
+diff -r 6cc810a5f503 tools/ocaml/libs/gnt/gntshr_stubs.c
+--- /dev/null
++++ b/tools/ocaml/libs/gnt/gntshr_stubs.c
+@@ -0,0 +1,138 @@
++/*
++ * Copyright (C) 2012-2013 Citrix Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation; version 2.1 only. with the special
++ * exception on linking described in file LICENSE.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ */
++
++#include <stdlib.h>
++#include <errno.h>
++
++#include <caml/alloc.h>
++#include <caml/memory.h>
++#include <caml/signals.h>
++#include <caml/fail.h>
++#include <caml/callback.h>
++#include <caml/bigarray.h>
++
++#include <sys/mman.h>
++#include <stdint.h>
++#include <string.h>
++#include <assert.h>
++
++#include <xenctrl.h>
++
++#define _G(__g) ((xc_gntshr *)(__g))
++
++#define XC_GNTTAB_BIGARRAY (CAML_BA_UINT8 | CAML_BA_C_LAYOUT | CAML_BA_EXTERNAL)
++
++#define ERROR_STRLEN 1024
++static void failwith_xc(xc_interface *xch)
++{
++	static char error_str[ERROR_STRLEN];
++	if (xch) {
++		const xc_error *error = xc_get_last_error(xch);
++		if (XC_ERROR_NONE == error->code)
++			snprintf(error_str, ERROR_STRLEN, "%d: %s", errno, strerror(errno));
++		else
++			snprintf(error_str, ERROR_STRLEN, "%d: %s: %s",
++								error->code,
++								xc_error_code_to_desc(error->code),
++								error->message);
++	} else {
++		snprintf(error_str, ERROR_STRLEN, "Unable to open XC interface");
++	}
++	caml_failwith(error_str);
++}
++
++CAMLprim value stub_xc_gntshr_open(value unit)
++{
++	CAMLparam1(unit);
++	CAMLlocal1(result);
++	xc_gntshr *xgh;
++
++	xgh = xc_gntshr_open(NULL, 0);
++	if (NULL == xgh)
++		failwith_xc(NULL);
++	result = (value)xgh;
++	CAMLreturn(result);
++}
++
++CAMLprim value stub_xc_gntshr_close(value xgh)
++{
++	CAMLparam1(xgh);
++	xc_gntshr_close(_G(xgh));
++	CAMLreturn(Val_unit);
++}
++
++CAMLprim value stub_xc_gntshr_share_pages(
++		value xgh,
++		value domid,
++		value count,
++		value writeable)
++{
++	CAMLparam4(xgh, domid, count, writeable);
++	CAMLlocal4(result, ml_refs, ml_refs_cons, ml_map);
++	void *map;
++	uint32_t *refs;
++	int i, c_count;
++
++	c_count = Int_val(count);
++	result = caml_alloc(2, 0);
++	refs = malloc(c_count * sizeof(uint32_t));
++
++	map = xc_gntshr_share_pages(_G(xgh),
++			Int_val(domid),
++			c_count,
++			refs,
++			Bool_val(writeable));
++
++	if(NULL == map) {
++		free(refs);
++		failwith_xc(_G(xgh));
++	}
++
++	// Construct the list of grant references.
++	ml_refs = Val_emptylist;
++	for(i = c_count - 1; i >= 0; i--) {
++		ml_refs_cons = caml_alloc(2, 0);
++
++		Store_field(ml_refs_cons, 0, Val_int(refs[i]));
++		Store_field(ml_refs_cons, 1, ml_refs);
++
++		ml_refs = ml_refs_cons;
++	}
++
++	ml_map = alloc_bigarray_dims(XC_GNTTAB_BIGARRAY,
++			1,
++			map,
++			(c_count << XC_PAGE_SHIFT));
++
++	Store_field(result, 0, ml_refs);
++	Store_field(result, 1, ml_map);
++
++	free(refs);
++	CAMLreturn(result);
++}
++
++CAMLprim value stub_xc_gntshr_munmap(value xgh, value share)
++{
++	CAMLparam2(xgh, share);
++	CAMLlocal1(ml_map);
++	int size, page_count, result;
++
++	ml_map = Field(share, 1);
++	size = Bigarray_val(ml_map)->dim[0];
++	page_count = size >> XC_PAGE_SHIFT;
++	result = xc_gntshr_munmap(_G(xgh), Data_bigarray_val(ml_map), page_count);
++	if(0 != result)
++		failwith_xc(_G(xgh));
++	CAMLreturn(Val_unit);
++}
+diff -r 6cc810a5f503 tools/ocaml/libs/gnt/gnttab_stubs.c
+--- /dev/null
++++ b/tools/ocaml/libs/gnt/gnttab_stubs.c
+@@ -0,0 +1,143 @@
++/*
++ * Copyright (C) 2012-2013 Citrix Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation; version 2.1 only. with the special
++ * exception on linking described in file LICENSE.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ */
++
++#include <stdlib.h>
++#include <stdint.h>
++#include <string.h>
++#include <errno.h>
++
++/* For PROT_READ | PROT_WRITE */
++#include <sys/mman.h>
++
++#define CAML_NAME_SPACE
++#include <caml/alloc.h>
++#include <caml/memory.h>
++#include <caml/signals.h>
++#include <caml/fail.h>
++#include <caml/callback.h>
++#include <caml/bigarray.h>
++
++#include <xenctrl.h>
++
++#define _G(__g) ((xc_gnttab *)(__g))
++
++CAMLprim value stub_xc_gnttab_open(void)
++{
++	CAMLparam0();
++	xc_gnttab *xgh;
++	xgh = xc_gnttab_open(NULL, 0);
++	if (NULL == xgh)
++		caml_failwith("Failed to open interface");
++	CAMLreturn((value)xgh);
++}
++
++CAMLprim value stub_xc_gnttab_close(value xgh)
++{
++	CAMLparam1(xgh);
++
++	xc_gnttab_close(_G(xgh));
++
++	CAMLreturn(Val_unit);
++}
++
++int caml_perms_to_c_perms(int perm)
++{
++	switch (perm) {
++	case 0:
++		return PROT_NONE;
++	case 1:
++		return PROT_READ;
++	case 2:
++		return PROT_WRITE;
++	case 3:
++		return PROT_READ | PROT_WRITE;
++	}
++
++	return -1;
++}
++
++#define XC_GNTTAB_BIGARRAY (CAML_BA_UINT8 | CAML_BA_C_LAYOUT | CAML_BA_EXTERNAL)
++
++CAMLprim value stub_xc_gnttab_map_grant_ref(
++	value xgh,
++	value domid,
++	value reference,
++	value perms)
++{
++	CAMLparam4(xgh, domid, reference, perms);
++	CAMLlocal1(contents);
++
++	void *map = xc_gnttab_map_grant_ref(_G(xgh),
++			Int_val(domid),
++			Int_val(reference),
++			caml_perms_to_c_perms(Int_val(perms)));
++
++	if(NULL == map) {
++		caml_failwith("Failed to map grant ref");
++	}
++
++	contents = caml_ba_alloc_dims(XC_GNTTAB_BIGARRAY,
++			1,
++			map,
++			1 << XC_PAGE_SHIFT);
++	CAMLreturn(contents);
++}
++
++CAMLprim value stub_xc_gnttab_map_grant_refs(
++	value xgh,
++	value array,
++	value perms)
++{
++	CAMLparam3(xgh, array, perms);
++	CAMLlocal3(domid, reference, contents);
++	int count = Wosize_val(array) / 2;
++	uint32_t domids[count];
++	uint32_t refs[count];
++	int i;
++	void *map;
++
++	for (i = 0; i < count; i++){
++		domids[i] = Int_val(Field(array, i * 2 + 0));
++		refs[i] = Int_val(Field(array, i * 2 + 1));
++	}
++	map = xc_gnttab_map_grant_refs(_G(xgh),
++			count,
++			domids,
++			refs,
++			caml_perms_to_c_perms(Int_val(perms)));
++
++	if(NULL == map) {
++		caml_failwith("Failed to map grant ref");
++	}
++
++	contents = caml_ba_alloc_dims(XC_GNTTAB_BIGARRAY,
++			1,
++			map,
++			count << XC_PAGE_SHIFT);
++	CAMLreturn(contents);
++}
++
++CAMLprim value stub_xc_gnttab_unmap(value xgh, value array) 
++{
++	CAMLparam2(xgh, array);
++
++	int size = Caml_ba_array_val(array)->dim[0];
++	int pages = size >> XC_PAGE_SHIFT;
++	int result = xc_gnttab_munmap(_G(xgh), Caml_ba_data_val(array), pages);
++	if(result!=0) {
++		caml_failwith("Failed to unmap grant");
++	}
++
++	CAMLreturn(Val_unit);
++}
