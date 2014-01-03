@@ -1,10 +1,9 @@
+From 45db9c1d7d61e52493089760c8ff5eabd7e95843 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Mon, 11 Nov 2013 11:32:53 +0000
-
-[PATCH 1/2] x86/hpet: Use singe apic vector rather than irq_descs
-
-From 8f18caf51ae5ddae3ae9694804b735e867916c34 Mon Sep 17 00:00:00 2001
+Date: Fri, 3 Jan 2014 13:42:59 +0000
+Subject: [PATCH 2/3] x86/hpet: Use singe apic vector rather than irq_descs
  for HPET interrupts
+
 This involves rewriting most of the MSI related HPET code, and as a result
 this patch looks very complicated.  It is probably best viewed as an end
 result, with the following notes explaining what is going on.
@@ -17,21 +16,24 @@ The new logic is as follows:
    operation.
  * There is a notion of strict ownership of hpet channels.
  ** A cpu which owns an HPET channel can program it for a desired deadline.
- ** A cpu which can't find a free HPET channel to own may register for being
-    woken up by another in-use HPET which will fire at an appropriate time.
+ ** A cpu which can't find a free HPET channel will have to share.
+ ** If an HPET firing at an appropriate time can be found, a CPU will simply
+    request to be woken up with that HPET.
+ ** If all HPETs are firing too far into the future, a CPU may request to be
+    woken up and reprogram that channel earlier.
  * Some functions have been renamed to be more descriptive.  Some functions
    have parameters changed to be more consistent.
- * Any function with a __hpet prefix expectes the appropriate lock to be held.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 CC: Keir Fraser <keir@xen.org>
 CC: Jan Beulich <JBeulich@suse.com>
-CC: Tim Deegan <tim@xen.org>
+Reviewed-by: Tim Deegan <tim@xen.org>
 ---
- xen/arch/x86/hpet.c |  569 +++++++++++++++++++++++----------------------------
- 1 file changed, 256 insertions(+), 313 deletions(-)
+ xen/arch/x86/hpet.c |  539 ++++++++++++++++++++++-----------------------------
+ 1 file changed, 232 insertions(+), 307 deletions(-)
 
-diff -r a3f786167d13 xen/arch/x86/hpet.c
+diff --git a/xen/arch/x86/hpet.c b/xen/arch/x86/hpet.c
+index 01847fb..d6d6d5d 100644
 --- a/xen/arch/x86/hpet.c
 +++ b/xen/arch/x86/hpet.c
 @@ -4,26 +4,21 @@
@@ -76,7 +78,7 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
      unsigned int idx;   /* physical channel idx */
      unsigned int cpu;   /* msi target */
      struct msi_desc msi;/* msi state */
-@@ -48,8 +41,20 @@ static struct hpet_event_channel *__read
+@@ -48,8 +41,20 @@ static struct hpet_event_channel *__read_mostly hpet_events;
  /* msi hpet channels used for broadcast */
  static unsigned int __read_mostly num_hpets_used;
  
@@ -98,105 +100,31 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
  unsigned long __initdata hpet_address;
  u8 __initdata hpet_blockid;
  
-@@ -94,25 +99,32 @@ static inline unsigned long ns2ticks(uns
-     return (unsigned long) tmp;
- }
- 
--static int hpet_next_event(unsigned long delta, int timer)
-+/*
-+ * Program an HPET channels counter relative to now.  'delta' is specified in
-+ * ticks, and should be calculated with ns2ticks().  The channel lock should
-+ * be taken and interrupts must be disabled.
-+ */
-+static int hpet_set_counter(struct hpet_event_channel *ch, unsigned long delta)
- {
-     uint32_t cnt, cmp;
--    unsigned long flags;
- 
--    local_irq_save(flags);
-+    ASSERT(!local_irq_is_enabled());
-+
-     cnt = hpet_read32(HPET_COUNTER);
-     cmp = cnt + delta;
--    hpet_write32(cmp, HPET_Tn_CMP(timer));
-+    hpet_write32(cmp, HPET_Tn_CMP(ch->idx));
-     cmp = hpet_read32(HPET_COUNTER);
--    local_irq_restore(flags);
- 
-     /* Are we within two ticks of the deadline passing? Then we may miss. */
-     return ((cmp + 2 - cnt) > delta) ? -ETIME : 0;
- }
- 
--static int reprogram_hpet_evt_channel(
--    struct hpet_event_channel *ch,
--    s_time_t expire, s_time_t now, int force)
-+/*
-+ * Set the time at which an HPET channel should fire.  The channel lock should
-+ * be held.
-+ */
-+static int hpet_program_time(struct hpet_event_channel *ch,
-+                             s_time_t expire, s_time_t now, int force)
- {
-     int64_t delta;
-     int ret;
-@@ -143,99 +155,53 @@ static int reprogram_hpet_evt_channel(
-     delta = max_t(int64_t, delta, MIN_DELTA_NS);
-     delta = ns2ticks(delta, ch->shift, ch->mult);
- 
--    ret = hpet_next_event(delta, ch->idx);
-+    ret = hpet_set_counter(ch, delta);
-     while ( ret && force )
-     {
-         delta += delta;
--        ret = hpet_next_event(delta, ch->idx);
-+        ret = hpet_set_counter(ch, delta);
-     }
- 
+@@ -161,89 +166,40 @@ static int hpet_program_time(struct hpet_event_channel *ch,
      return ret;
  }
  
 -static void evt_do_broadcast(cpumask_t *mask)
 +/* Wake up all cpus in the channel mask.  Lock should be held. */
 +static void hpet_wake_cpus(struct hpet_event_channel *ch)
-+{
-+    cpuidle_wakeup_mwait(ch->cpumask);
-+
-+    if ( !cpumask_empty(ch->cpumask) )
-+       cpumask_raise_softirq(ch->cpumask, TIMER_SOFTIRQ);
-+}
-+
-+/* HPET interrupt handler.  Wake all requested cpus.  Lock should be held. */
-+static void hpet_interrupt_handler(struct hpet_event_channel *ch)
-+{
-+    hpet_wake_cpus(ch);
-+    raise_softirq(TIMER_SOFTIRQ);
-+}
-+
-+/* HPET interrupt entry.  This is set up as a high priority vector. */
-+static void do_hpet_irq(struct cpu_user_regs *regs)
  {
-     unsigned int cpu = smp_processor_id();
-+    struct hpet_event_channel *ch = this_cpu(hpet_channel);
- 
+-    unsigned int cpu = smp_processor_id();
+-
 -    if ( cpumask_test_and_clear_cpu(cpu, mask) )
 -        raise_softirq(TIMER_SOFTIRQ);
-+    if ( ch )
-+    {
-+        spin_lock(&ch->lock);
-+        if ( ch->cpu == cpu )
-+            hpet_interrupt_handler(ch);
-+        spin_unlock(&ch->lock);
-+    }
- 
+-
 -    cpuidle_wakeup_mwait(mask);
 -
 -    if ( !cpumask_empty(mask) )
 -       cpumask_raise_softirq(mask, TIMER_SOFTIRQ);
-+    ack_APIC_irq();
++    cpuidle_wakeup_mwait(ch->cpumask);
++    cpumask_raise_softirq(ch->cpumask, TIMER_SOFTIRQ);
  }
  
 -static void handle_hpet_broadcast(struct hpet_event_channel *ch)
--{
++/* HPET interrupt handler.  Wake all requested cpus.  Lock should be held. */
++static void hpet_interrupt_handler(struct hpet_event_channel *ch)
+ {
 -    cpumask_t mask;
 -    s_time_t now, next_event;
 -    unsigned int cpu;
@@ -238,29 +166,40 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 -        spin_lock_irqsave(&ch->lock, flags);
 -
 -        if ( next_event < ch->next_event &&
--             reprogram_hpet_evt_channel(ch, next_event, now, 0) )
+-             hpet_program_time(ch, next_event, now, 0) )
 -            goto again;
 -
 -        spin_unlock_irqrestore(&ch->lock, flags);
 -    }
--}
--
++    hpet_wake_cpus(ch);
++    raise_softirq(TIMER_SOFTIRQ);
+ }
+ 
 -static void hpet_interrupt_handler(int irq, void *data,
 -        struct cpu_user_regs *regs)
--{
++/* HPET interrupt entry.  This is set up as a high priority vector. */
++static void do_hpet_irq(struct cpu_user_regs *regs)
+ {
 -    struct hpet_event_channel *ch = (struct hpet_event_channel *)data;
 -
 -    this_cpu(irq_count)--;
--
++    struct hpet_event_channel *ch = this_cpu(hpet_channel);
+ 
 -    if ( !ch->event_handler )
--    {
++    if ( ch )
+     {
 -        printk(XENLOG_WARNING "Spurious HPET timer interrupt on HPET timer %d\n", ch->idx);
 -        return;
--    }
--
++        spin_lock(&ch->lock);
++        if ( ch->cpu == smp_processor_id() )
++            hpet_interrupt_handler(ch);
++        spin_unlock(&ch->lock);
+     }
+ 
 -    ch->event_handler(ch);
--}
--
++    ack_APIC_irq();
+ }
+ 
 -static void hpet_msi_unmask(struct irq_desc *desc)
 +/* Unmask an HPET MSI channel.  Lock should be held */
 +static void hpet_msi_unmask(struct hpet_event_channel *ch)
@@ -270,7 +209,7 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
  
      cfg = hpet_read32(HPET_Tn_CFG(ch->idx));
      cfg |= HPET_TN_ENABLE;
-@@ -243,10 +209,10 @@ static void hpet_msi_unmask(struct irq_d
+@@ -251,10 +207,10 @@ static void hpet_msi_unmask(struct irq_desc *desc)
      ch->msi.msi_attrib.masked = 0;
  }
  
@@ -283,7 +222,7 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
  
      cfg = hpet_read32(HPET_Tn_CFG(ch->idx));
      cfg &= ~HPET_TN_ENABLE;
-@@ -254,92 +220,36 @@ static void hpet_msi_mask(struct irq_des
+@@ -262,92 +218,36 @@ static void hpet_msi_mask(struct irq_desc *desc)
      ch->msi.msi_attrib.masked = 1;
  }
  
@@ -390,7 +329,7 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
  
      if ( iommu_intremap )
      {
-@@ -350,14 +260,12 @@ static int __init hpet_setup_msi_irq(str
+@@ -358,39 +258,10 @@ static int __init hpet_setup_msi_irq(struct hpet_event_channel *ch)
      }
  
      /* set HPET Tn as oneshot */
@@ -398,20 +337,18 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 +    cfg &= ~(HPET_TN_LEVEL | HPET_TN_PERIODIC | HPET_TN_ENABLE);
      cfg |= HPET_TN_FSB | HPET_TN_32BIT;
      hpet_write32(cfg, HPET_Tn_CFG(ch->idx));
-+    ch->msi.msi_attrib.masked = 1;
- 
+-
 -    desc->handler = &hpet_msi_type;
 -    ret = request_irq(ch->msi.irq, hpet_interrupt_handler, "HPET", ch);
 -    if ( ret >= 0 )
 -        ret = __hpet_setup_msi_irq(desc);
-+    ret = hpet_setup_msi(ch);
-     if ( ret < 0 )
-     {
-         if ( iommu_intremap )
-@@ -365,25 +273,6 @@ static int __init hpet_setup_msi_irq(str
-         return ret;
-     }
- 
+-    if ( ret < 0 )
+-    {
+-        if ( iommu_intremap )
+-            iommu_update_ire_from_msi(&ch->msi, NULL);
+-        return ret;
+-    }
+-
 -    desc->msi_desc = &ch->msi;
 -
 -    return 0;
@@ -430,11 +367,21 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 -        destroy_irq(irq);
 -        return -EINVAL;
 -    }
--
++    ch->msi.msi_attrib.masked = 1;
+ 
      return 0;
  }
+@@ -408,9 +279,7 @@ static void __init hpet_init_channel(struct hpet_event_channel *ch)
+     ch->shift = 32;
+     ch->next_event = STIME_MAX;
+     spin_lock_init(&ch->lock);
+-    ch->event_handler = handle_hpet_broadcast;
  
-@@ -404,6 +293,8 @@ static void __init hpet_fsb_cap_lookup(v
+-    ch->msi.irq = -1;
+     ch->msi.msi_attrib.maskbit = 1;
+     ch->msi.msi_attrib.pos = MSI_TYPE_HPET;
+ }
+@@ -432,6 +301,8 @@ static void __init hpet_fsb_cap_lookup(void)
      if ( !hpet_events )
          return;
  
@@ -443,16 +390,16 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
      for ( i = 0; i < num_chs && num_hpets_used < nr_cpu_ids; i++ )
      {
          struct hpet_event_channel *ch = &hpet_events[num_hpets_used];
-@@ -426,7 +317,7 @@ static void __init hpet_fsb_cap_lookup(v
+@@ -456,7 +327,7 @@ static void __init hpet_fsb_cap_lookup(void)
          ch->flags = 0;
          ch->idx = i;
  
 -        if ( hpet_assign_irq(ch) == 0 )
 +        if ( hpet_init_msi(ch) == 0 )
              num_hpets_used++;
-     }
- 
-@@ -434,102 +325,28 @@ static void __init hpet_fsb_cap_lookup(v
+         else
+             free_cpumask_var(ch->cpumask);
+@@ -466,102 +337,28 @@ static void __init hpet_fsb_cap_lookup(void)
             num_hpets_used, num_chs);
  }
  
@@ -467,19 +414,13 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 -    static unsigned int next_channel;
 -    unsigned int i, next;
 -    struct hpet_event_channel *ch;
-+    unsigned ch, tries;
- 
+-
 -    if ( num_hpets_used == 0 )
 -        return hpet_events;
-+    for ( tries = num_hpets_used; tries; --tries )
-+    {
-+        if ( (ch = ffs(free_channels)) == 0 )
-+            break;
- 
+-
 -    if ( num_hpets_used >= nr_cpu_ids )
 -        return &hpet_events[cpu];
-+        --ch;
-+        ASSERT(ch < num_hpets_used);
++    unsigned ch, tries;
  
 -    do {
 -        next = next_channel;
@@ -489,17 +430,16 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 -
 -    /* try unused channel first */
 -    for ( i = next; i < next + num_hpets_used; i++ )
--    {
++    for ( tries = num_hpets_used; tries; --tries )
+     {
 -        ch = &hpet_events[i % num_hpets_used];
 -        if ( !test_and_set_bit(HPET_EVT_USED_BIT, &ch->flags) )
 -        {
 -            ch->cpu = cpu;
 -            return ch;
 -        }
-+        if ( test_and_clear_bit(ch, &free_channels) )
-+            return &hpet_events[ch];
-     }
- 
+-    }
+-
 -    /* share a in-use channel */
 -    ch = &hpet_events[next];
 -    if ( !test_and_set_bit(HPET_EVT_USED_BIT, &ch->flags) )
@@ -550,9 +490,13 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 -    spin_lock_irq(&ch->lock);
 -
 -    ASSERT(ch == per_cpu(cpu_bc_channel, cpu));
--
++        if ( (ch = ffs(free_channels)) == 0 )
++            break;
+ 
 -    per_cpu(cpu_bc_channel, cpu) = NULL;
--
++        --ch;
++        ASSERT(ch < num_hpets_used);
+ 
 -    if ( cpu != ch->cpu )
 -        spin_unlock_irq(&ch->lock);
 -    else if ( cpumask_empty(ch->cpumask) )
@@ -566,76 +510,23 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 -        ch->cpu = cpumask_first(ch->cpumask);
 -        set_channel_irq_affinity(ch);
 -        local_irq_enable();
--    }
++        if ( test_and_clear_bit(ch, &free_channels) )
++            return &hpet_events[ch];
+     }
++
 +    return NULL;
  }
  
  #include <asm/mc146818rtc.h>
-@@ -566,6 +383,7 @@ void __init hpet_broadcast_init(void)
+@@ -647,6 +444,7 @@ void hpet_broadcast_resume(void)
          /* Stop HPET legacy interrupts */
          cfg &= ~HPET_CFG_LEGACY;
          n = num_hpets_used;
-+        free_channels = (1U << n) - 1;
++        free_channels = (u32)~0 >> (32 - n);
      }
-     else
-     {
-@@ -577,12 +395,13 @@ void __init hpet_broadcast_init(void)
-             hpet_events = xzalloc(struct hpet_event_channel);
-         if ( !hpet_events || !zalloc_cpumask_var(&hpet_events->cpumask) )
-             return;
--        hpet_events->msi.irq = -1;
- 
-         /* Start HPET legacy interrupts */
-         cfg |= HPET_CFG_LEGACY;
-         n = 1;
- 
-+        hpet_events->flags = HPET_EVT_LEGACY;
-+
-         if ( !force_hpet_broadcast )
-             pv_rtc_handler = handle_rtc_once;
-     }
-@@ -591,15 +410,6 @@ void __init hpet_broadcast_init(void)
- 
-     for ( i = 0; i < n; i++ )
-     {
--        if ( i == 0 && (cfg & HPET_CFG_LEGACY) )
--        {
--            /* set HPET T0 as oneshot */
--            cfg = hpet_read32(HPET_Tn_CFG(0));
--            cfg &= ~(HPET_TN_LEVEL | HPET_TN_PERIODIC);
--            cfg |= HPET_TN_ENABLE | HPET_TN_32BIT;
--            hpet_write32(cfg, HPET_Tn_CFG(0));
--        }
--
-         /*
-          * The period is a femto seconds value. We need to calculate the scaled
-          * math multiplication factor for nanosecond to hpet tick conversion.
-@@ -609,15 +419,20 @@ void __init hpet_broadcast_init(void)
-         hpet_events[i].shift = 32;
-         hpet_events[i].next_event = STIME_MAX;
-         spin_lock_init(&hpet_events[i].lock);
--        wmb();
--        hpet_events[i].event_handler = handle_hpet_broadcast;
- 
-+        hpet_events[i].msi.irq = -1;
-         hpet_events[i].msi.msi_attrib.maskbit = 1;
-         hpet_events[i].msi.msi_attrib.pos = MSI_TYPE_HPET;
-     }
- 
--    if ( !num_hpets_used )
--        hpet_events->flags = HPET_EVT_LEGACY;
-+    if ( cfg & HPET_CFG_LEGACY )
-+    {
-+        /* set HPET T0 as oneshot */
-+        cfg = hpet_read32(HPET_Tn_CFG(0));
-+        cfg &= ~(HPET_TN_LEVEL | HPET_TN_PERIODIC);
-+        cfg |= HPET_TN_ENABLE | HPET_TN_32BIT;
-+        hpet_write32(cfg, HPET_Tn_CFG(0));
-+    }
- }
- 
- void hpet_broadcast_resume(void)
-@@ -651,15 +466,24 @@ void hpet_broadcast_resume(void)
+     else if ( hpet_events->flags & HPET_EVT_DISABLE )
+         return;
+@@ -661,15 +459,24 @@ void hpet_broadcast_resume(void)
  
      for ( i = 0; i < n; i++ )
      {
@@ -665,18 +556,18 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
          hpet_write32(cfg, HPET_Tn_CFG(hpet_events[i].idx));
  
          hpet_events[i].next_event = STIME_MAX;
-@@ -696,50 +520,162 @@ void hpet_disable_legacy_broadcast(void)
+@@ -706,50 +513,161 @@ void hpet_disable_legacy_broadcast(void)
  void hpet_broadcast_enter(void)
  {
      unsigned int cpu = smp_processor_id();
 -    struct hpet_event_channel *ch = per_cpu(cpu_bc_channel, cpu);
 +    struct hpet_event_channel *ch = this_cpu(hpet_channel);
 +    s_time_t deadline = this_cpu(timer_deadline);
- 
--    if ( per_cpu(timer_deadline, cpu) == 0 )
++
 +    ASSERT(!local_irq_is_enabled());
 +    ASSERT(ch == NULL);
-+
+ 
+-    if ( per_cpu(timer_deadline, cpu) == 0 )
 +    if ( deadline == 0 )
          return;
  
@@ -691,9 +582,7 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 +        cpumask_set_cpu(cpu, hpet_events->cpumask);
 +        if ( deadline < hpet_events->next_event )
 +            hpet_program_time(hpet_events, deadline, NOW(), 1);
- 
--    if ( !(ch->flags & HPET_EVT_LEGACY) )
--        hpet_attach_channel(cpu, ch);
++
 +        spin_unlock(&hpet_events->lock);
 +        return;
 +    }
@@ -709,8 +598,8 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 +
 +        hpet_msi_mask(ch);
 +
-+        this_cpu(hpet_channel) = ch;
 +        ch->cpu = cpu;
++        this_cpu(hpet_channel) = ch;
 +        cpumask_set_cpu(cpu, ch->cpumask);
 +
 +        hpet_setup_msi(ch);
@@ -721,7 +610,6 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 +    }
 +    else
 +    {
-+        /* TODO - this seems very ugly */
 +        s_time_t fallback_deadline = STIME_MAX;
 +        unsigned int i, fallback_idx = -1;
 +
@@ -736,7 +624,9 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 +            /* This channel is going to expire far too early */
 +            if ( ch->next_event < deadline - MICROSECS(50) )
 +                goto continue_search;
-+
+ 
+-    if ( !(ch->flags & HPET_EVT_LEGACY) )
+-        hpet_attach_channel(cpu, ch);
 +            /* We can deal with being woken with 50us to spare */
 +            if ( ch->next_event <= deadline )
 +                break;
@@ -770,7 +660,7 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 +
 +            spin_lock(&ch->lock);
 +
-+            if ( ch->cpu != -1 && ch->next_event == fallback_deadline )
++            if ( ch->cpu != -1 && ch->next_event <= fallback_deadline )
 +            {
 +                cpumask_set_cpu(cpu, ch->cpumask);
 +                hpet_program_time(ch, deadline, NOW(), 1);
@@ -793,7 +683,7 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 -    spin_lock(&ch->lock);
 -    /* reprogram if current cpu expire time is nearer */
 -    if ( per_cpu(timer_deadline, cpu) < ch->next_event )
--        reprogram_hpet_evt_channel(ch, per_cpu(timer_deadline, cpu), NOW(), 1);
+-        hpet_program_time(ch, per_cpu(timer_deadline, cpu), NOW(), 1);
 -    spin_unlock(&ch->lock);
  }
  
@@ -807,24 +697,30 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 +    ASSERT(local_irq_is_enabled());
 +
 +    if ( this_cpu(timer_deadline) == 0 )
-         return;
- 
++        return;
++
 +    /* If using HPET in legacy timer mode */
 +    if ( num_hpets_used == 0 )
 +    {
 +        /* This is safe without the spinlock, and will reduce contention. */
 +        cpumask_clear_cpu(cpu, hpet_events->cpumask);
-+        return;
+         return;
 +    }
-+
+ 
      if ( !ch )
 -        ch = hpet_get_channel(cpu);
 +        return;
-+
+ 
+-    /* Reprogram the deadline; trigger timer work now if it has passed. */
+-    enable_APIC_timer();
+-    if ( !reprogram_timer(per_cpu(timer_deadline, cpu)) )
+-        raise_softirq(TIMER_SOFTIRQ);
 +    spin_lock_irq(&ch->lock);
-+
-+    cpumask_clear_cpu(cpu, ch->cpumask);
-+
+ 
+     cpumask_clear_cpu(cpu, ch->cpumask);
+ 
+-    if ( !(ch->flags & HPET_EVT_LEGACY) )
+-        hpet_detach_channel(cpu, ch);
 +    /* If we own the channel, detach it */
 +    if ( ch->cpu == cpu )
 +    {
@@ -837,21 +733,15 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
 +    this_cpu(hpet_channel) = NULL;
 +
 +    spin_unlock_irq(&ch->lock);
- 
-     /* Reprogram the deadline; trigger timer work now if it has passed. */
-     enable_APIC_timer();
--    if ( !reprogram_timer(per_cpu(timer_deadline, cpu)) )
++
++    /* Reprogram the deadline; trigger timer work now if it has passed. */
++    enable_APIC_timer();
 +    if ( !reprogram_timer(this_cpu(timer_deadline)) )
-         raise_softirq(TIMER_SOFTIRQ);
--
--    cpumask_clear_cpu(cpu, ch->cpumask);
--
--    if ( !(ch->flags & HPET_EVT_LEGACY) )
--        hpet_detach_channel(cpu, ch);
++        raise_softirq(TIMER_SOFTIRQ);
  }
  
  int hpet_broadcast_is_available(void)
-@@ -756,7 +692,14 @@ int hpet_legacy_irq_tick(void)
+@@ -766,7 +684,14 @@ int hpet_legacy_irq_tick(void)
           (hpet_events->flags & (HPET_EVT_DISABLE|HPET_EVT_LEGACY)) !=
           HPET_EVT_LEGACY )
          return 0;
@@ -867,3 +757,6 @@ diff -r a3f786167d13 xen/arch/x86/hpet.c
      return 1;
  }
  
+-- 
+1.7.10.4
+
