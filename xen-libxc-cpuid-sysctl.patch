@@ -1,0 +1,127 @@
+# HG changeset patch
+# Parent b3baadde58036d1005c80da381d407b69b612925
+SYSCTL subop to execute cpuid on a specified pcpu
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff -r b3baadde5803 tools/libxc/xc_misc.c
+--- a/tools/libxc/xc_misc.c
++++ b/tools/libxc/xc_misc.c
+@@ -714,6 +714,31 @@ int xc_hvm_inject_trap(
+     return rc;
+ }
+ 
++int xc_xen_cpuid(xc_interface *xch, uint32_t cpu, uint32_t *eax,
++                 uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
++{
++    int ret;
++    DECLARE_SYSCTL;
++
++    sysctl.cmd = XEN_SYSCTL_cpuid;
++    sysctl.u.cpuid.cpu = cpu;
++    sysctl.u.cpuid.eax = *eax;
++    sysctl.u.cpuid.ebx = *ebx;
++    sysctl.u.cpuid.ecx = *ecx;
++    sysctl.u.cpuid.edx = *edx;
++
++    ret = do_sysctl(xch, &sysctl);
++    if ( ret )
++        return ret;
++
++    *eax = sysctl.u.cpuid.eax;
++    *ebx = sysctl.u.cpuid.ebx;
++    *ecx = sysctl.u.cpuid.ecx;
++    *edx = sysctl.u.cpuid.edx;
++
++    return 0;
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff -r b3baadde5803 tools/libxc/xenctrl.h
+--- a/tools/libxc/xenctrl.h
++++ b/tools/libxc/xenctrl.h
+@@ -1829,6 +1829,13 @@ int xc_hvm_inject_trap(
+     uint64_t cr2);
+ 
+ /*
++ * Run the cpuid instruction on a specificied physical cpu with the given
++ * parameters.
++ */
++int xc_xen_cpuid(xc_interface *xch, uint32_t cpu, uint32_t *eax,
++                 uint32_t *ebx, uint32_t *ecx, uint32_t *edx);
++
++/*
+  *  LOGGING AND ERROR REPORTING
+  */
+ 
+diff -r b3baadde5803 xen/arch/x86/sysctl.c
+--- a/xen/arch/x86/sysctl.c
++++ b/xen/arch/x86/sysctl.c
+@@ -66,6 +66,20 @@ void arch_do_physinfo(xen_sysctl_physinf
+         pi->capabilities |= XEN_SYSCTL_PHYSCAP_hvm_directio;
+ }
+ 
++long sysctl_cpuid_helper(void *data)
++{
++    struct xen_sysctl_cpuid *cpuid = data;
++
++    ASSERT(smp_processor_id() == cpuid->cpu);
++
++    asm volatile ("cpuid"
++                  : "=a" (cpuid->eax), "=b" (cpuid->ebx),
++                    "=c" (cpuid->ecx), "=d" (cpuid->edx)
++                  : "a" (cpuid->eax), "b" (cpuid->ebx),
++                    "c" (cpuid->ecx), "d" (cpuid->edx) );
++    return 0;
++}
++
+ long arch_do_sysctl(
+     struct xen_sysctl *sysctl, XEN_GUEST_HANDLE_PARAM(xen_sysctl_t) u_sysctl)
+ {
+@@ -101,6 +115,11 @@ long arch_do_sysctl(
+     }
+     break;
+ 
++    case XEN_SYSCTL_cpuid:
++        ret = continue_hypercall_on_cpu(
++            sysctl->u.cpuid.cpu, sysctl_cpuid_helper, &sysctl->u.cpuid);
++        break;
++
+     default:
+         ret = -ENOSYS;
+         break;
+diff -r b3baadde5803 xen/include/public/sysctl.h
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -641,6 +641,13 @@ struct xen_sysctl_consoleringsize {
+ typedef struct xen_sysctl_consoleringsize xen_sysctl_consoleringsize_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_sysctl_consoleringsize_t);
+ 
++struct xen_sysctl_cpuid {
++    uint32_t cpu; /* IN - Pcpu to execute on */
++    uint32_t eax, ebx, ecx, edx; /* IN/OUT - Parameters to `cpuid` */
++};
++typedef struct xen_sysctl_cpuid xen_sysctl_cpuid_t;
++DEFINE_XEN_GUEST_HANDLE(xen_sysctl_cpuid_t);
++
+ struct xen_sysctl {
+     uint32_t cmd;
+ #define XEN_SYSCTL_readconsole                    1
+@@ -663,6 +670,7 @@ struct xen_sysctl {
+ #define XEN_SYSCTL_scheduler_op                  19
+ #define XEN_SYSCTL_coverage_op                   20
+ #define XEN_SYSCTL_consoleringsize               21
++#define XEN_SYSCTL_cpuid                       1000
+     uint32_t interface_version; /* XEN_SYSCTL_INTERFACE_VERSION */
+     union {
+         struct xen_sysctl_readconsole       readconsole;
+@@ -685,6 +693,7 @@ struct xen_sysctl {
+         struct xen_sysctl_scheduler_op      scheduler_op;
+         struct xen_sysctl_coverage_op       coverage_op;
+         struct xen_sysctl_consoleringsize   consoleringsize;
++        struct xen_sysctl_cpuid             cpuid;
+         uint8_t                             pad[128];
+     } u;
+ };
