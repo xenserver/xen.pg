@@ -1,0 +1,96 @@
+# HG changeset patch
+# Parent 7765147fcdcc3c771e1d3ed26c919768a8603bac
+
+diff -r 7765147fcdcc mk/Makefile.uclibc
+--- a/mk/Makefile.uclibc	Wed Jan 22 19:07:30 2014 +0000
++++ b/mk/Makefile.uclibc	Wed Jan 22 19:10:31 2014 +0000
+@@ -1,12 +1,10 @@
+ include $(B_BASE)/common.mk
+ 
+-include $(PROJECT_OUTPUTDIR)/uclibc-toolchain/toolchain.mk
++CROSS_COMPILE := musl-
+ 
+-CROSS_COMPILE := $(UCLIBC_TOOLCHAIN_PATH)/$(UCLIBC_TOOL_PREFIX)
++CROSS_MAKE := PATH=$(MY_OBJ_DIR)/bin:$$PATH $(MAKE) CC=musl-gcc ZLIB= EXTRA_CFLAGS_XEN_TOOLS="-fgnu89-inline" LDFLAGS="--static -s"
+ 
+-CROSS_MAKE := $(MAKE) CROSS_COMPILE=$(CROSS_COMPILE) CROSS_SYS_ROOT=$(UCLIBC_TOOLCHAIN_PATH) ZLIB= EXTRA_CFLAGS_XEN_TOOLS="-fgnu89-inline" LDFLAGS="--static -s"
+-
+-STRIP := $(CROSS_COMPILE)strip --strip-unneeded
++STRIP := strip --strip-unneeded
+ 
+ REPODEP := $(call pq_req,xen-4.3)
+ REPO    := $(call pq_loc,xen-4.3)
+@@ -28,16 +26,20 @@ LIBXC_PKG            := $(MY_OUTPUT_DIR)
+ BINARY_PKG           := $(MY_OUTPUT_DIR)/uclibc-binaries.tar.bz2
+ SOURCE_PKG           := $(MY_OUTPUT_DIR)/uclibc-sources.tar.bz2
+ 
+-INSTALLER_FILES_STAMP:= $(MY_OBJ_DIR)/.installer_stamp
+-
+ XEN_HG_INCLUDE := -I tools/libxc -I tools/xenstore -I tools/misc \
+                   -I tools/include -I tools/check -I tools/Rules.mk \
+                   -I tools/cross-install -I Config.mk -I config \
+                   -I xen/include/public -I xen/common/libelf \
+                   -I xen/include/xen -I COPYING
+ 
++MUSL_SRC	:= $(CARBON_DISTFILES)/musl/musl-0.9.14.tar.gz
++MUSL_STAMP	:= $(MY_OBJ_DIR)/.musl_stamp
++
++ZLIB_SRC	:= $(CARBON_DISTFILES)/musl/zlib-1.2.8.tar.gz
++ZLIB_STAMP	:= $(MY_OBJ_DIR)/.zlib_stamp
++
+ .PHONY: build
+-build: $(LIBXC_PKG) $(BINARY_PKG) $(INSTALLER_FILES_STAMP)
++build: $(LIBXC_PKG) $(BINARY_PKG)
+ 	@ :
+ 
+ .PHONY: clean
+@@ -46,8 +48,7 @@ clean:
+ 	rm -f $(LIBXC_BUILD_STAMP) $(LIBXC_INSTALL_STAMP)
+ 	rm -f $(XENSTORE_BUILD_STAMP)
+ 	rm -f $(BINARY_INSTALL_STAMP)
+-	rm -f $(INSTALLER_FILES_STAMP)
+-	rm -rf $(REPO)
++	rm -f $(MUSL_STAMP) $(ZLIB_STAMP)
+ 	rm -rf $(LIBXC_INSTALL_DIR)
+ 	rm -rf $(BINARY_INSTALL_DIR)
+ 
+@@ -58,7 +59,30 @@ clean:
+ 	tar -C $(MY_OBJ_DIR) --extract --bzip2 --file $<
+ 	touch $@
+ 
+-$(LIBXC_BUILD_STAMP): $(SOURCE_STAMP)
++$(MUSL_STAMP): $(MUSL_SRC)
++	cd $(MY_OBJ_DIR) && rm -rf bin lib include musl-*
++	tar oxf $< -C $(MY_OBJ_DIR)
++	set -e ;\
++	cd $(MY_OBJ_DIR)/musl-* ;\
++	./configure --prefix=$(MY_OBJ_DIR) --disable-shared ;\
++	make -j4 ;\
++	make install
++	rm -rf $(MY_OBJ_DIR)/musl-*
++	sed -ri 's,-isystem include%s,-isystem include -isystem /usr/include%s,' $(MY_OBJ_DIR)/lib/musl-gcc.specs
++	touch $@
++
++$(ZLIB_STAMP): $(ZLIB_SRC) $(MUSL_STAMP)
++	tar oxf $< -C $(MY_OBJ_DIR)
++	set -e ;\
++	cd $(MY_OBJ_DIR)/zlib-* ;\
++	export PATH=$(MY_OBJ_DIR)/bin:$$PATH ;\
++	CC=musl-gcc ./configure --prefix=$(MY_OBJ_DIR) ;\
++	make -j4 ;\
++	make install
++	rm -rf $(MY_OBJ_DIR)/zlib-*
++	touch $@
++
++$(LIBXC_BUILD_STAMP): $(SOURCE_STAMP) $(MUSL_STAMP) $(ZLIB_STAMP)
+ 	$(CROSS_MAKE) -C $(SOURCE_DIR)/tools/include
+ 	$(CROSS_MAKE) -C $(SOURCE_DIR)/tools/libxc LIBXC_SUPPORT_THREADING=no all
+ 	touch $@
+@@ -90,7 +114,3 @@ clean:
+ 
+ $(BINARY_PKG): $(BINARY_INSTALL_STAMP)
+ 	tar --create --bzip2 --file $@ --directory $(BINARY_INSTALL_DIR) .
+-
+-$(INSTALLER_FILES_STAMP): $(BINARY_INSTALL_STAMP)
+-	mkdir -p $(MY_INSTALLER_FILES)/usr/bin
+-	touch $@
