@@ -1,0 +1,88 @@
+commit f25452103bea924dba504f54713a0aac368e3edf
+Author: Rob Hoes <rob.hoes@citrix.com>
+Date:   Wed Nov 6 17:49:41 2013 +0000
+
+    libxl: ocaml: support for KeyedUnion in the bindings generator.
+    
+    A KeyedUnion consists of two fields in the containing struct. First an
+    enum field ("e") used as a descriminator and second a union ("u")
+    containing potentially anonymous structs associated with each enum
+    value.
+    
+    We map the anonymous structs to structs named after the descriminator
+    field ("e") and the specific enum values. We then declare an ocaml
+    variant type name e__union mapping each enum value to its associated
+    struct.
+    
+    So given IDL:
+    
+    foo = Enumeration("foo", [
+        (0, "BAR"),
+        (1, "BAZ"),
+    ])
+    s = Struct("s", [
+        ("u", KeyedUnion(none, foo, "blargle", [
+            ("bar", Struct(...xxx...)),
+            ("baz", Struct(...yyy...)),
+        ])),
+    ])
+    
+    We generate C:
+    
+    enum foo { BAR, BAZ };
+    struct s {
+        enum foo blargle;
+        union {
+            struct { ...xxx... } bar;
+            struct { ...yyy... } baz;
+        } u;
+    }
+    
+    and map this to ocaml
+    
+    type foo = BAR | BAZ;
+    
+    module S = struct
+    
+        type blargle_bar = ...xxx...;
+    
+        type blargle_baz = ...yyy...;
+    
+        type blargle__union = Bar of blargle_bar | Baz of blargle_baz;
+    
+        type t =
+        {
+            blargle : blargle__union;
+        }
+    end
+    
+    These type names are OK because they are already within the namespace
+    associated with the struct "s".
+    
+    If the struct associated with bar is empty then we don't bother with
+    blargle_bar of "of blargle_bar".
+    
+    No actually change in the generated code since we don't generate any
+    KeyedUnions yet.
+    
+    The actual implementation was inspired by
+    http://www.linux-nantes.org/~fmonnier/ocaml/ocaml-wrapping-c.php#ref_constvrnt
+    
+    Signed-off-by: Ian Campbell <ian.campbell@citrix.com>
+    Signed-off-by: Rob Hoes <rob.hoes@citrix.com>
+    Acked-by: David Scott <dave.scott@eu.citrix.com>
+
+diff --git a/tools/libxl/idl.py b/tools/libxl/idl.py
+index 7d95e3f..f4908dd 100644
+--- a/tools/libxl/idl.py
++++ b/tools/libxl/idl.py
+@@ -216,6 +216,9 @@ class Struct(Aggregate):
+         kwargs.setdefault('passby', PASS_BY_REFERENCE)
+         Aggregate.__init__(self, "struct", name, fields, **kwargs)
+ 
++    def has_fields(self):
++        return len(self.fields) != 0
++
+ class Union(Aggregate):
+     def __init__(self, name, fields, **kwargs):
+         # Generally speaking some intelligence is required to free a
