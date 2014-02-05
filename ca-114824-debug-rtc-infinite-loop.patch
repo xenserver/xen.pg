@@ -1,7 +1,7 @@
 # HG changeset patch
-# Parent b3b4f9178c9e53d7e2ef547b10ff24cb1ef36b91
+# Parent dd1a553e4d13857f2e7fb1a8d0a49ba01e4b8d47
 
-diff -r b3b4f9178c9e tools/misc/xen-hvmctx.c
+diff -r dd1a553e4d13 tools/misc/xen-hvmctx.c
 --- a/tools/misc/xen-hvmctx.c
 +++ b/tools/misc/xen-hvmctx.c
 @@ -307,6 +307,7 @@ static void dump_pit(void)
@@ -81,7 +81,7 @@ diff -r b3b4f9178c9e tools/misc/xen-hvmctx.c
  }
  
  static void dump_hpet(void)
-diff -r b3b4f9178c9e xen/arch/x86/hvm/rtc.c
+diff -r dd1a553e4d13 xen/arch/x86/hvm/rtc.c
 --- a/xen/arch/x86/hvm/rtc.c
 +++ b/xen/arch/x86/hvm/rtc.c
 @@ -467,6 +467,9 @@ static int rtc_ioport_write(void *opaque
@@ -94,3 +94,86 @@ diff -r b3b4f9178c9e xen/arch/x86/hvm/rtc.c
          if ( data & RTC_SET )
          {
              /* set mode: reset UIP mode */
+diff -r dd1a553e4d13 xen/arch/x86/hvm/vpt.c
+--- a/xen/arch/x86/hvm/vpt.c
++++ b/xen/arch/x86/hvm/vpt.c
+@@ -585,3 +585,79 @@ void pt_may_unmask_irq(struct domain *d,
+     if ( vlapic_pt )
+         pt_resume(vlapic_pt);
+ }
++
++static void dump_pt(const struct periodic_time *pt)
++{
++    printk("PT(%p) %p(%p) d%dv%d 0x%02x(%u) %c%c%c%c%c "
++           "N%u P%"PRIu64" S%"PRId64" L%"PRIu64"\n",
++           _p(pt),
++           _p(pt->cb),
++           _p(pt->priv),
++
++           pt->vcpu->domain->domain_id,
++           pt->vcpu->vcpu_id,
++
++           pt->irq,
++           pt->source,
++
++           pt->on_list ? 'l' : ' ',
++           pt->one_shot ? '1' : 'p',
++           pt->do_not_freeze ? 'F' : ' ',
++           pt->irq_issued ? 'i' : ' ',
++           pt->warned_timeout_too_short ? 'W' : ' ',
++
++           pt->pending_intr_nr,
++           pt->period,
++           pt->scheduled,
++           pt->last_plt_gtime
++        );
++}
++
++#include <xen/keyhandler.h>
++
++static void dump_all_periodic_timers(unsigned char ch)
++{
++    struct domain *d;
++    struct vcpu *v;
++    struct list_head *head;
++    struct periodic_time *pt;
++
++    printk("'%c' pressed - dumping all HVM domain periodic timers\n", ch);
++
++    rcu_read_lock(&domlist_read_lock);
++
++    for_each_domain ( d )
++    {
++        if ( !is_hvm_domain(d) )
++            continue;
++
++        printk(">>> Domain %d <<<\n", d->domain_id);
++        for_each_vcpu ( d, v )
++        {
++            printk("  VCPU %d\n", v->vcpu_id);
++            spin_lock(&v->arch.hvm_vcpu.tm_lock);
++
++            head = &v->arch.hvm_vcpu.tm_list;
++
++            list_for_each_entry ( pt, head, list )
++                dump_pt(pt);
++
++            spin_unlock(&v->arch.hvm_vcpu.tm_lock);
++        }
++    }
++
++    rcu_read_unlock(&domlist_read_lock);
++}
++
++struct keyhandler dump_periodic_timers_keyhandler = {
++    .diagnostic = 0,
++    .u.fn = dump_all_periodic_timers,
++    .desc = "dump all periodic timers"
++};
++
++static int __init setup_dump_periodic_timers(void)
++{
++    register_keyhandler('1', &dump_periodic_timers_keyhandler);
++    return 0;
++}
++__initcall(setup_dump_periodic_timers);
