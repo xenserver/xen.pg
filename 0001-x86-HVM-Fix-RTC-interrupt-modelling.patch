@@ -1,0 +1,353 @@
+From 8b77435ebe9114f08a1bb60d045afeaaa78b4f5b Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 6 Feb 2014 17:44:50 +0000
+Subject: [PATCH] x86/HVM: Fix RTC interrupt modelling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This reverts large amounts of:
+  9607327abbd3e77bde6cc7b5327f3efd781fc06e
+    "x86/HVM: properly handle RTC periodic timer even when !RTC_PIE"
+  620d5dad54008e40798c4a0c4322aef274c36fa3
+    "x86/HVM: assorted RTC emulation adjustments"
+
+and by extentsion:
+  f3347f520cb4d8aa4566182b013c6758d80cbe88
+    "x86/HVM: adjust IRQ (de-)assertion"
+  c2f79c464849e5f796aa9d1d0f26fe356abd1a1a
+    "x86/HVM: fix processing of RTC REG_B writes"
+  527824f41f5fac9cba3d4441b2e73d3118d98837
+    "x86/hvm: Centralize and simplify the RTC IRQ logic."
+
+The current code has a pathological case, tickled by the access pattern of
+Windows 2003 Server SP2.  Occasonally on boot (which I presume is during a
+time calibration against the RTC Periodic Timer), Windows gets stuck in an
+infinite loop reading RTC REG_C.  This affects 32 and 64 bit guests.
+
+In the pathological case, the VM state looks like this:
+  * RTC: 64Hz period, periodic interrupts enabled
+  * RTC_IRQ in IOAPIC as vector 0xd1, edge triggered, not pending
+  * vector 0xd1 set in LAPIC IRR and ISR, TPR at 0xd0
+  * Reads from REG_C return 'RTC_PF | RTC_IRQF'
+
+With an intstrumented Xen, dumping the periodic timers with a guest in this
+state shows a single timer with pt->irq_issued=1 and pt->pending_intr_nr=2.
+
+Windows is presumably waiting for reads of REG_C to drop to 0, and reading
+REG_C clears the value each time in the emulated RTC.  However:
+
+  * {svm,vmx}_intr_assist() calls pt_update_irq() unconditionally.
+  * pt_update_irq() always finds the RTC as earliest_pt.
+  * rtc_periodic_interrupt() unconditionally sets RTC_PF in no_ack mode.  It
+    returns true, indicating that pt_update_irq() should really inject the
+    interrupt.
+  * pt_update_irq() decides that it doesn't need to fake up part of
+    pt_intr_post() because this is a real interrupt.
+  * {svm,vmx}_intr_assist() can't inject the interrupt as it is already
+    pending, so exits early without calling pt_intr_post().
+
+The underlying problem here comes because the AF and UF bits of RTC interrupt
+state is modelled by the RTC code, but the PF is modelled by the pt code.  The
+root cause of windows infinite loop is that RTC_PF is being re-set on vmentry
+before the interrupt logic has worked out that it can't actually inject an RTC
+interrupt, causing Windows to erroniously read (RTC_PF|RTC_IRQF) when it
+should be reading 0.
+
+This patch reverts the RTC_PF logic handling to its former state, whereby
+rtc_periodic_cb() is called strictly when the periodic timer logic has
+successfully injected a periodic interrupt.  In doing so, it is important that
+the RTC code itself never directly triggers an interrupt for the periodic
+timer (other than the case when setting REG_B.PIE, where the pt code will have
+dropped the interrupt).
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Tim Deegan <tim@xen.org>
+CC: Keir Fraser <keir@xen.org>
+CC: Jan Beulich <JBeulich@suse.com>
+CC: George Dunlap <george.dunlap@eu.citrix.com>
+CC: Roger Pau Monné <roger.pau@citrix.com>
+---
+
+I still dont know exactly what condition causes windows to tickle this
+behavour.  It is seen about 1 or 2 times in 9 tests running a 12 hour VM
+lifecycle test.  Over the weekend, 100 of these tests have passed without a
+single reoccurence of the infinite loop.  The change has also passed a windows
+extended regression test, so it would appear that other versions of windows
+are still fine with the change.
+
+Roger: as this caused issues for FreeBSD, would you mind testing it again
+please?
+
+George: Regarding 4.4 - I request a release ack.  However, this is quite a big
+and complicated patch; it took Tim and myself several hours to write, even
+given an understanding of the pathalogical case.  Having said that, about half
+the patch is just reversions (listed above) with the other half being brand
+new logic.
+
+In sumary:
+  * As Xen currently stands, w2k3 SP2 (still supported) is liable to fall into
+    an infinite loop on boot, because of a bug in Xen's emulation of the RTC.
+    Other guests risk the same infinite loop.
+  * There is a risk that some of the logic is not quite correct; the RTC
+    emulation has proved tricky time and time again.
+  * The results from XenRT suggest that the new emulation is better than the
+    old.
+---
+ xen/arch/x86/hvm/rtc.c |   94 ++++++++++++++++++++++++++++++------------------
+ xen/arch/x86/hvm/vpt.c |   50 +++-----------------------
+ 2 files changed, 63 insertions(+), 81 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/rtc.c b/xen/arch/x86/hvm/rtc.c
+index cdedefe..ebeb674 100644
+--- a/xen/arch/x86/hvm/rtc.c
++++ b/xen/arch/x86/hvm/rtc.c
+@@ -59,48 +59,78 @@ static void rtc_set_time(RTCState *s);
+ static inline int from_bcd(RTCState *s, int a);
+ static inline int convert_hour(RTCState *s, int hour);
+ 
+-static void rtc_update_irq(RTCState *s)
++/*
++ * Send an edge on the RTC ISA IRQ line.  The RTC spec states that it should
++ * be a line level interrupt, but the PIIX3 states that it must be edge
++ * triggered.  We model the RTC using edge semantics.
++ */
++static void rtc_toggle_irq(RTCState *s)
+ {
++    hvm_isa_irq_deassert(vrtc_domain(s), RTC_IRQ);
++    hvm_isa_irq_assert(vrtc_domain(s), RTC_IRQ);
++}
++
++static void rtc_update_regb(RTCState *s, uint8_t new_b)
++{
++    uint8_t new_c = s->hw.cmos_data[RTC_REG_C] & ~RTC_IRQF;
++
+     ASSERT(spin_is_locked(&s->lock));
+ 
+-    if ( rtc_mode_is(s, strict) && (s->hw.cmos_data[RTC_REG_C] & RTC_IRQF) )
+-        return;
++    if ( new_b & new_c & (RTC_PF | RTC_AF | RTC_UF) )
++        new_c |= RTC_IRQF;
+ 
+-    /* IRQ is raised if any source is both raised & enabled */
+-    if ( !(s->hw.cmos_data[RTC_REG_B] &
+-           s->hw.cmos_data[RTC_REG_C] &
+-           (RTC_PF | RTC_AF | RTC_UF)) )
+-        return;
++    s->hw.cmos_data[RTC_REG_B] = new_b;
++    s->hw.cmos_data[RTC_REG_C] = new_c;
+ 
+-    s->hw.cmos_data[RTC_REG_C] |= RTC_IRQF;
+-    if ( rtc_mode_is(s, no_ack) )
+-        hvm_isa_irq_deassert(vrtc_domain(s), RTC_IRQ);
+-    hvm_isa_irq_assert(vrtc_domain(s), RTC_IRQ);
++    if ( new_c & RTC_IRQF )
++        rtc_toggle_irq(s);
++}
++
++/*
++ * Strictly only called when setting REG_C.{AF,UF}.  The logic depend on
++ * knowing that REB_B is unchanged, and REG_C does not have a falling edge.
++ * 'event' should be RTC_AF or RTC_UF.
++ */
++static void rtc_irq_event(RTCState *s, uint8_t event)
++{
++    uint8_t b = s->hw.cmos_data[RTC_REG_B];
++    uint8_t old_c = s->hw.cmos_data[RTC_REG_C];
++    uint8_t new_c = old_c & ~RTC_IRQF;
++
++    ASSERT(spin_is_locked(&s->lock));
++
++    if ( b & new_c & (RTC_PF | RTC_AF | RTC_UF) )
++        new_c |= RTC_IRQF;
++
++    if ( (b & event) &&
++         (rtc_mode_is(s, no_ack) || !(old_c & RTC_IRQF)) )
++        rtc_toggle_irq(s);
++
++    s->hw.cmos_data[RTC_REG_C] = new_c;
+ }
+ 
+-bool_t rtc_periodic_interrupt(void *opaque)
++/*
++ * Callback from the periodic timer state machine, indicating that a periodic
++ * timer interrupt has been injected to the guest on our behalf.
++ */
++static void rtc_periodic_cb(struct vcpu *v, void *opaque)
+ {
+     RTCState *s = opaque;
+-    bool_t ret;
+ 
+     spin_lock(&s->lock);
+-    ret = rtc_mode_is(s, no_ack) || !(s->hw.cmos_data[RTC_REG_C] & RTC_IRQF);
+-    if ( rtc_mode_is(s, no_ack) || !(s->hw.cmos_data[RTC_REG_C] & RTC_PF) )
+-    {
+-        s->hw.cmos_data[RTC_REG_C] |= RTC_PF;
+-        rtc_update_irq(s);
+-    }
+-    else if ( ++(s->pt_dead_ticks) >= 10 )
++
++    if ( !rtc_mode_is(s, no_ack) &&
++         (s->hw.cmos_data[RTC_REG_C] & RTC_PF) &&
++         (++(s->pt_dead_ticks) >= 10) )
+     {
+         /* VM is ignoring its RTC; no point in running the timer */
+         destroy_periodic_time(&s->pt);
+         s->pt_code = 0;
+     }
+-    if ( !(s->hw.cmos_data[RTC_REG_C] & RTC_IRQF) )
+-        ret = 0;
+-    spin_unlock(&s->lock);
+ 
+-    return ret;
++    /* Specifically not raising the irq as it has already been done for us */
++    s->hw.cmos_data[RTC_REG_C] |= RTC_PF | RTC_IRQF;
++    spin_unlock(&s->lock);
+ }
+ 
+ /* Enable/configure/disable the periodic timer based on the RTC_PIE and
+@@ -135,7 +165,7 @@ static void rtc_timer_update(RTCState *s)
+                 else
+                     delta = period - ((NOW() - s->start_time) % period);
+                 create_periodic_time(v, &s->pt, delta, period,
+-                                     RTC_IRQ, NULL, s);
++                                     RTC_IRQ, rtc_periodic_cb, s);
+             }
+             break;
+         }
+@@ -211,9 +241,8 @@ static void rtc_update_timer2(void *opaque)
+     spin_lock(&s->lock);
+     if (!(s->hw.cmos_data[RTC_REG_B] & RTC_SET))
+     {
+-        s->hw.cmos_data[RTC_REG_C] |= RTC_UF;
+         s->hw.cmos_data[RTC_REG_A] &= ~RTC_UIP;
+-        rtc_update_irq(s);
++        rtc_irq_event(s, RTC_UF);
+         check_update_timer(s);
+     }
+     spin_unlock(&s->lock);
+@@ -402,8 +431,7 @@ static void rtc_alarm_cb(void *opaque)
+     spin_lock(&s->lock);
+     if (!(s->hw.cmos_data[RTC_REG_B] & RTC_SET))
+     {
+-        s->hw.cmos_data[RTC_REG_C] |= RTC_AF;
+-        rtc_update_irq(s);
++        rtc_irq_event(s, RTC_AF);
+         alarm_timer_update(s);
+     }
+     spin_unlock(&s->lock);
+@@ -484,12 +512,11 @@ static int rtc_ioport_write(void *opaque, uint32_t addr, uint32_t data)
+             if ( orig & RTC_SET )
+                 rtc_set_time(s);
+         }
+-        s->hw.cmos_data[RTC_REG_B] = data;
+         /*
+          * If the interrupt is already set when the interrupt becomes
+          * enabled, raise an interrupt immediately.
+          */
+-        rtc_update_irq(s);
++        rtc_update_regb(s, data);
+         if ( (data & RTC_PIE) && !(orig & RTC_PIE) )
+             rtc_timer_update(s);
+         if ( (data ^ orig) & RTC_SET )
+@@ -647,9 +674,6 @@ static uint32_t rtc_ioport_read(RTCState *s, uint32_t addr)
+     case RTC_REG_C:
+         ret = s->hw.cmos_data[s->hw.cmos_index];
+         s->hw.cmos_data[RTC_REG_C] = 0x00;
+-        if ( (ret & RTC_IRQF) && !rtc_mode_is(s, no_ack) )
+-            hvm_isa_irq_deassert(d, RTC_IRQ);
+-        rtc_update_irq(s);
+         check_update_timer(s);
+         alarm_timer_update(s);
+         rtc_timer_update(s);
+diff --git a/xen/arch/x86/hvm/vpt.c b/xen/arch/x86/hvm/vpt.c
+index 1961bda..e12e940 100644
+--- a/xen/arch/x86/hvm/vpt.c
++++ b/xen/arch/x86/hvm/vpt.c
+@@ -22,7 +22,6 @@
+ #include <asm/hvm/vpt.h>
+ #include <asm/event.h>
+ #include <asm/apic.h>
+-#include <asm/mc146818rtc.h>
+ 
+ #define mode_is(d, name) \
+     ((d)->arch.hvm_domain.params[HVM_PARAM_TIMER_MODE] == HVMPTM_##name)
+@@ -228,23 +227,17 @@ static void pt_timer_fn(void *data)
+ int pt_update_irq(struct vcpu *v)
+ {
+     struct list_head *head = &v->arch.hvm_vcpu.tm_list;
+-    struct periodic_time *pt, *temp, *earliest_pt;
+-    uint64_t max_lag;
++    struct periodic_time *pt, *temp, *earliest_pt = NULL;
++    uint64_t max_lag = -1ULL;
+     int irq, is_lapic;
+-    void *pt_priv;
+ 
+- rescan:
+     spin_lock(&v->arch.hvm_vcpu.tm_lock);
+ 
+- rescan_locked:
+-    earliest_pt = NULL;
+-    max_lag = -1ULL;
+     list_for_each_entry_safe ( pt, temp, head, list )
+     {
+         if ( pt->pending_intr_nr )
+         {
+-            /* RTC code takes care of disabling the timer itself. */
+-            if ( (pt->irq != RTC_IRQ || !pt->priv) && pt_irq_masked(pt) )
++            if ( pt_irq_masked(pt) )
+             {
+                 /* suspend timer emulation */
+                 list_del(&pt->list);
+@@ -270,47 +263,12 @@ int pt_update_irq(struct vcpu *v)
+     earliest_pt->irq_issued = 1;
+     irq = earliest_pt->irq;
+     is_lapic = (earliest_pt->source == PTSRC_lapic);
+-    pt_priv = earliest_pt->priv;
+ 
+     spin_unlock(&v->arch.hvm_vcpu.tm_lock);
+ 
+     if ( is_lapic )
+-        vlapic_set_irq(vcpu_vlapic(v), irq, 0);
+-    else if ( irq == RTC_IRQ && pt_priv )
+     {
+-        if ( !rtc_periodic_interrupt(pt_priv) )
+-            irq = -1;
+-
+-        pt_lock(earliest_pt);
+-
+-        if ( irq < 0 && earliest_pt->pending_intr_nr )
+-        {
+-            /*
+-             * RTC periodic timer runs without the corresponding interrupt
+-             * being enabled - need to mimic enough of pt_intr_post() to keep
+-             * things going.
+-             */
+-            earliest_pt->pending_intr_nr = 0;
+-            earliest_pt->irq_issued = 0;
+-            set_timer(&earliest_pt->timer, earliest_pt->scheduled);
+-        }
+-        else if ( irq >= 0 && pt_irq_masked(earliest_pt) )
+-        {
+-            if ( earliest_pt->on_list )
+-            {
+-                /* suspend timer emulation */
+-                list_del(&earliest_pt->list);
+-                earliest_pt->on_list = 0;
+-            }
+-            irq = -1;
+-        }
+-
+-        /* Avoid dropping the lock if we can. */
+-        if ( irq < 0 && v == earliest_pt->vcpu )
+-            goto rescan_locked;
+-        pt_unlock(earliest_pt);
+-        if ( irq < 0 )
+-            goto rescan;
++        vlapic_set_irq(vcpu_vlapic(v), irq, 0);
+     }
+     else
+     {
+-- 
+1.7.10.4
+
