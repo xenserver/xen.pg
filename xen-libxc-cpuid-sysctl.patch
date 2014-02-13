@@ -1,13 +1,13 @@
 # HG changeset patch
-# Parent b3baadde58036d1005c80da381d407b69b612925
+# Parent 281c506da7d3429e6cca1593eb3746d7ad7d5aec
 SYSCTL subop to execute cpuid on a specified pcpu
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 
-diff -r b3baadde5803 tools/libxc/xc_misc.c
+diff -r 281c506da7d3 tools/libxc/xc_misc.c
 --- a/tools/libxc/xc_misc.c
 +++ b/tools/libxc/xc_misc.c
-@@ -714,6 +714,31 @@ int xc_hvm_inject_trap(
+@@ -809,6 +809,31 @@ int xc_hvm_inject_trap(
      return rc;
  }
  
@@ -39,10 +39,10 @@ diff -r b3baadde5803 tools/libxc/xc_misc.c
  /*
   * Local variables:
   * mode: C
-diff -r b3baadde5803 tools/libxc/xenctrl.h
+diff -r 281c506da7d3 tools/libxc/xenctrl.h
 --- a/tools/libxc/xenctrl.h
 +++ b/tools/libxc/xenctrl.h
-@@ -1829,6 +1829,13 @@ int xc_hvm_inject_trap(
+@@ -1809,6 +1809,13 @@ int xc_hvm_inject_trap(
      uint64_t cr2);
  
  /*
@@ -56,43 +56,54 @@ diff -r b3baadde5803 tools/libxc/xenctrl.h
   *  LOGGING AND ERROR REPORTING
   */
  
-diff -r b3baadde5803 xen/arch/x86/sysctl.c
+diff -r 281c506da7d3 xen/arch/x86/sysctl.c
 --- a/xen/arch/x86/sysctl.c
 +++ b/xen/arch/x86/sysctl.c
-@@ -66,6 +66,20 @@ void arch_do_physinfo(xen_sysctl_physinf
+@@ -66,6 +66,18 @@ void arch_do_physinfo(xen_sysctl_physinf
          pi->capabilities |= XEN_SYSCTL_PHYSCAP_hvm_directio;
  }
  
-+long sysctl_cpuid_helper(void *data)
++void sysctl_cpuid_helper(void *data)
 +{
 +    struct xen_sysctl_cpuid *cpuid = data;
 +
 +    ASSERT(smp_processor_id() == cpuid->cpu);
-+
 +    asm volatile ("cpuid"
 +                  : "=a" (cpuid->eax), "=b" (cpuid->ebx),
 +                    "=c" (cpuid->ecx), "=d" (cpuid->edx)
 +                  : "a" (cpuid->eax), "b" (cpuid->ebx),
 +                    "c" (cpuid->ecx), "d" (cpuid->edx) );
-+    return 0;
 +}
 +
  long arch_do_sysctl(
      struct xen_sysctl *sysctl, XEN_GUEST_HANDLE_PARAM(xen_sysctl_t) u_sysctl)
  {
-@@ -101,6 +115,11 @@ long arch_do_sysctl(
+@@ -101,6 +113,24 @@ long arch_do_sysctl(
      }
      break;
  
 +    case XEN_SYSCTL_cpuid:
-+        ret = continue_hypercall_on_cpu(
-+            sysctl->u.cpuid.cpu, sysctl_cpuid_helper, &sysctl->u.cpuid);
-+        break;
++    {
++        int cpu = sysctl->u.cpuid.cpu;
++
++        if ( cpu == smp_processor_id() )
++            sysctl_cpuid_helper(&sysctl->u.cpuid);
++        else if ( cpu >= nr_cpu_ids || !cpu_online(cpu) )
++            ret = -EINVAL;
++        else
++            on_selected_cpus(cpumask_of(cpu),
++                             sysctl_cpuid_helper,
++                             &sysctl->u.cpuid, 1);
++
++        if ( !ret && __copy_to_guest(u_sysctl, sysctl, 1) )
++            ret = -EFAULT;
++    }
++    break;
 +
      default:
          ret = -ENOSYS;
          break;
-diff -r b3baadde5803 xen/include/public/sysctl.h
+diff -r 281c506da7d3 xen/include/public/sysctl.h
 --- a/xen/include/public/sysctl.h
 +++ b/xen/include/public/sysctl.h
 @@ -641,6 +641,13 @@ struct xen_sysctl_consoleringsize {
