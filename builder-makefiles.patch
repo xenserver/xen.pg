@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent a0fad80bab772159bd2926ee413d9daa2f1457a7
+# Parent 9d912882ed753c5cc175a9847d5c2519b295ab5e
 
 diff --git a/.hgignore b/.hgignore
 --- a/.hgignore
@@ -17,7 +17,7 @@ diff --git a/mk/Makefile b/mk/Makefile
 new file mode 100644
 --- /dev/null
 +++ b/mk/Makefile
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,130 @@
 +USE_BRANDING := yes
 +IMPORT_BRANDING := yes
 +# makefile for xen component in build system
@@ -69,6 +69,8 @@ new file mode 100644
 +
 +SOURCES := $(RPM_SOURCESDIR)/xen-$(XEN_VERSION).tar.bz2
 +SOURCES += $(RPM_SOURCESDIR)/ipxe.tar.gz
++SOURCES += $(RPM_SOURCESDIR)/sysconfig_kernel-xen
++SOURCES += $(RPM_SOURCESDIR)/xl.conf
 +SOURCES += $(RPM_SPECSDIR)/xen.spec
 +SOURCES += $(RPM_SOURCESDIR)/xen-development.patch
 +
@@ -86,6 +88,9 @@ new file mode 100644
 +	git archive --format=tar --prefix=ipxe/ HEAD | gzip -9 > $@.tmp; \
 +	mv -f $@.tmp $@; \
 +	}
++
++$(RPM_SOURCESDIR)/%: %
++	cp $^ $@
 +
 +$(RPM_SOURCESDIR)/xen-development.patch: $(RPM_SOURCESDIRSTAMP)
 +	{ set -e; set -o pipefail; \
@@ -275,11 +280,22 @@ new file mode 100755
 +    -e s/@XEN_CHANGESET@/"$xen_cset"/g < $xen_spec_in > ./xen.spec.tmp;
 +mv -f ./xen.spec.tmp $xen_repo/xen-$xen_version.spec;
 +echo "Wrote xen-$xen_version.spec to $xen_repo";
+diff --git a/mk/sysconfig_kernel-xen b/mk/sysconfig_kernel-xen
+new file mode 100644
+--- /dev/null
++++ b/mk/sysconfig_kernel-xen
+@@ -0,0 +1,6 @@
++
++# Xen hypervisor
++HYPERVISOR=/boot/xen.gz
++# host-specific configuration belongs in /etc/sysconfig/kernel-xen-args
++[ -e /etc/sysconfig/kernel-xen-args ] && . /etc/sysconfig/kernel-xen-args
++HYPERVISOR_ARGS="$HYPERVISOR_ARGS watchdog"
 diff --git a/mk/xen-4.4.spec.in b/mk/xen-4.4.spec.in
 new file mode 100644
 --- /dev/null
 +++ b/mk/xen-4.4.spec.in
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,544 @@
 +# -*- rpm-spec -*-
 +
 +%{!?python_sitearch: %define python_sitearch %(%{__python} -c "from distutils.sysconfig import get_python_lib; print get_python_lib(1)")}
@@ -310,6 +326,8 @@ new file mode 100644
 +URL:     http://www.xen.org
 +Source0: %{name}-%{version}.tar.bz2
 +Source1: ipxe.tar.gz
++Source2: sysconfig_kernel-xen
++Source3: xl.conf
 +Patch0:  xen-development.patch
 +BuildRoot: %{_tmppath}/%{name}-%{version}-root
 +
@@ -470,7 +488,13 @@ new file mode 100644
 +%{__make} %{TOOLS_OPTIONS} -C tools install
 +%{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
 +
++%{__make} %{TOOLS_OPTIONS} -C tools/tests/mce-test/tools xen-mceinj
++%{__make} %{TOOLS_OPTIONS} -C tools/tests/mce-test/tools install # Install rule lacks dependency
++
 +rm -f %{buildroot}/usr/share/doc/xen/README.xenmon
++
++%{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
++%{__install} -D -m 644 %{SOURCE3} %{buildroot}%{_sysconfdir}/xen/xl.conf
 +
 +# Copy ocaml xenstored to legacy location until we can fix up the init scripts
 +mkdir -p $RPM_BUILD_ROOT/opt/xensource/bin/
@@ -492,6 +516,8 @@ new file mode 100644
 +/boot/%{name}-%{version}%{vendor_version}.map
 +/boot/%{name}-%{version}%{vendor_version}-d.gz
 +/boot/%{name}-%{version}%{vendor_version}-d.map
++%config %{_sysconfdir}/sysconfig/kernel-xen
++%ghost %attr(0644,root,root) %{_sysconfdir}/sysconfig/kernel-xen-args
 +
 +%files hypervisor-debuginfo
 +%defattr(-,root,root,-)
@@ -614,6 +640,7 @@ new file mode 100644
 +%{_sysconfdir}/rc.d/init.d/xen-watchdog
 +%config %{_sysconfdir}/xen/oxenstored.conf
 +%{_sysconfdir}/xen/scripts/hotplugpath.sh
++%config %{_sysconfdir}/xen/xl.conf
 +/opt/xensource/bin/xenstored
 +%{_bindir}/pygrub
 +%{_bindir}/xen-detect
@@ -651,6 +678,7 @@ new file mode 100644
 +%{_sbindir}/xen-hvmcrash
 +%{_sbindir}/xen-hvmctx
 +%{_sbindir}/xen-lowmemd
++%{_sbindir}/xen-mceinj
 +%{_sbindir}/xen-mfndump
 +%{_sbindir}/xen-ringwatch
 +%{_sbindir}/xenbaked
@@ -801,10 +829,20 @@ new file mode 100644
 +%doc
 +
 +%post hypervisor
-+ln -sf /boot/%{name}-%{version}%{vendor_version}-d.gz /boot/xen-debug.gz
-+ln -sf /boot/%{name}-%{version}%{vendor_version}.gz /boot/xen.gz
++ln -sf %{name}-%{version}%{vendor_version}-d.gz /boot/xen-debug.gz
++ln -sf %{name}-%{version}%{vendor_version}.gz /boot/xen.gz
 +
 +# HACK - use debug hypervisor by default for development
-+ln -sf /boot/%{name}-%{version}%{vendor_version}-d.gz /boot/xen.gz
++ln -sf xen-debug.gz /boot/xen.gz
++
++if [ -e %{_sysconfdir}/sysconfig/kernel ] && ! grep -q '^HYPERVISOR' %{_sysconfdir}/sysconfig/kernel ; then
++  cat %{_sysconfdir}/sysconfig/kernel-xen >> %{_sysconfdir}/sysconfig/kernel
++fi
 +
 +%changelog
+diff --git a/mk/xl.conf b/mk/xl.conf
+new file mode 100644
+--- /dev/null
++++ b/mk/xl.conf
+@@ -0,0 +1,1 @@
++autoballoon = 0
