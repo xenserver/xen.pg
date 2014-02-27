@@ -1,15 +1,15 @@
 # HG changeset patch
-# Parent d6b723927a80874db55356d7f503f87ba0050e18
+# Parent 74764cb49c1f38b61e56de50221a11c9ddce33aa
 capture CPUID boot parameters when Intel CPUID faulting is used.
 
 The CPUID boot parameters used for the non upstream XENPF_get_cpu_features hypervcall where only captured in the Intel CPUID masking code path. Intel Ivy Bridge CPU's use CPUID faulting instead of CPUID masking and this resulted in the XENPF_get_cpu_features hypercall returning all zero's for CPUID fields.
 
 This patch has been implemented in a way to result in minimal change to other code due to the proximity to Tampa release. The capturing of pre masking CPUID field should be performed in a common location and the functionality should be upstreamed.
 
-diff -r d6b723927a80 xen/arch/x86/cpu/intel.c
+diff -r 74764cb49c1f xen/arch/x86/cpu/intel.c
 --- a/xen/arch/x86/cpu/intel.c
 +++ b/xen/arch/x86/cpu/intel.c
-@@ -18,10 +18,22 @@
+@@ -18,11 +18,23 @@
  
  #define select_idle_routine(x) ((void)0)
  
@@ -17,10 +17,11 @@ diff -r d6b723927a80 xen/arch/x86/cpu/intel.c
 +static unsigned int probe_intel_cpuid_faulting(struct cpuinfo_x86 *c)
  {
  	uint64_t x;
--	return !rdmsr_safe(MSR_INTEL_PLATFORM_INFO, x) && (x & (1u<<31));
+-	return !rdmsr_safe(MSR_INTEL_PLATFORM_INFO, x) &&
 +	unsigned int result;
 +	u32 eax, ebx;
-+	result = !rdmsr_safe(MSR_INTEL_PLATFORM_INFO, x) && (x & (1u<<31));
++	result = !rdmsr_safe(MSR_INTEL_PLATFORM_INFO, x) &&
+ 		(x & MSR_PLATFORM_INFO_CPUID_FAULTING);
 +	if (result) {
 +		cpuid(0x1, &eax, &ebx, &c->boot_base_ecx, &c->boot_base_edx);
 +		cpuid(0x80000001, &eax, &ebx, &c->boot_ext_ecx, &c->boot_ext_edx);
@@ -34,7 +35,7 @@ diff -r d6b723927a80 xen/arch/x86/cpu/intel.c
  }
  
  static DEFINE_PER_CPU(bool_t, cpuid_faulting_enabled);
-@@ -207,10 +219,10 @@ static void __devinit init_intel(struct 
+@@ -208,10 +220,10 @@ static void __devinit init_intel(struct 
  	}
  
  	if (c == &boot_cpu_data && c->x86 == 6) {
@@ -47,12 +48,12 @@ diff -r d6b723927a80 xen/arch/x86/cpu/intel.c
  		set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
  	}
  
-diff -r d6b723927a80 xen/include/asm-x86/processor.h
+diff -r 74764cb49c1f xen/include/asm-x86/processor.h
 --- a/xen/include/asm-x86/processor.h
 +++ b/xen/include/asm-x86/processor.h
-@@ -163,6 +163,10 @@ struct cpuinfo_x86 {
-     __u8 x86_mask;
+@@ -164,6 +164,10 @@ struct cpuinfo_x86 {
      int  cpuid_level;    /* Maximum supported CPUID level, -1=no CPUID */
+     __u32 extended_cpuid_level; /* Maximum supported CPUID extended level */
      unsigned int x86_capability[NCAPINTS];
 +    unsigned int boot_base_ecx, boot_base_edx;
 +    unsigned int boot_ext_ecx, boot_ext_edx;

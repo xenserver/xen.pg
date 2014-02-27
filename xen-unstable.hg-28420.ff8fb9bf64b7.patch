@@ -1,7 +1,29 @@
 # HG changeset patch
-# Parent f5de309832b4479c2d0b1ad6c219943292c3b80f
-diff --git a/xen/drivers/char/ns16550.c b/xen/drivers/char/ns16550.c
-index 9c2cded..932d643 100644
+# User Aravind Gopalakrishnan <Aravind.Gopalakrishnan@amd.com>
+# Date 1393431904 -3600
+# Node ID ff8fb9bf64b710dc831544407f8c6dbbc0e2094b
+# Parent  87fe64d5560790af8612d1f664c6b8a675b57282
+ns16550: Add support for UART present in Broadcom TruManage capable NetXtreme chips
+
+Since it is an MMIO device, the code has been modified to accept MMIO based
+devices as well. MMIO device settings are populated in the 'uart_config' table.
+It also advertises 64 bit BAR. Therefore, code is reworked to account for 64
+bit BAR and 64 bit MMIO lengths.
+
+Some more quirks are - the need to shift the register offset by a specific
+value and we also need to verify (UART_LSR_THRE && UART_LSR_TEMT) bits before
+transmitting data.
+
+While testing, include com1=115200,8n1,pci,0 on the xen cmdline to observe
+output on console using SoL.
+
+Signed-off-by: Aravind Gopalakrishnan <Aravind.Gopalakrishnan@amd.com>
+Signed-off-by: Suravee Suthikulpanit <Suravee.Suthikulpanit@amd.com>
+Signed-off-by: Thomas Lendacky <Thomas.Lendacky@amd.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 87fe64d55607 -r ff8fb9bf64b7 xen/drivers/char/ns16550.c
 --- a/xen/drivers/char/ns16550.c
 +++ b/xen/drivers/char/ns16550.c
 @@ -46,13 +46,14 @@ string_param("com2", opt_com2);
@@ -80,7 +102,7 @@ index 9c2cded..932d643 100644
              serial_tx_interrupt(port, regs);
          if ( lsr & UART_LSR_DR )
              serial_rx_interrupt(port, regs);
-@@ -160,7 +197,7 @@ static void __ns16550_poll(struct cpu_user_regs *regs)
+@@ -160,7 +197,7 @@ static void __ns16550_poll(struct cpu_us
          serial_rx_interrupt(port, regs);
      }
  
@@ -89,7 +111,7 @@ index 9c2cded..932d643 100644
          serial_tx_interrupt(port, regs);
  
  out:
-@@ -183,7 +220,9 @@ static int ns16550_tx_ready(struct serial_port *port)
+@@ -183,7 +220,9 @@ static int ns16550_tx_ready(struct seria
  
      if ( ns16550_ioport_invalid(uart) )
          return -EIO;
@@ -100,7 +122,7 @@ index 9c2cded..932d643 100644
  }
  
  static void ns16550_putc(struct serial_port *port, char c)
-@@ -354,8 +393,24 @@ static void __init ns16550_init_postirq(struct serial_port *port)
+@@ -354,8 +393,24 @@ static void __init ns16550_init_postirq(
  
  #ifdef HAS_PCI
      if ( uart->bar || uart->ps_bdf_enable )
@@ -127,7 +149,7 @@ index 9c2cded..932d643 100644
  #endif
  }
  
-@@ -381,6 +436,13 @@ static void _ns16550_resume(struct serial_port *port)
+@@ -381,6 +436,13 @@ static void _ns16550_resume(struct seria
      {
         pci_conf_write32(0, uart->ps_bdf[0], uart->ps_bdf[1], uart->ps_bdf[2],
                          PCI_BASE_ADDRESS_0 + uart->bar_idx*4, uart->bar);
@@ -141,7 +163,7 @@ index 9c2cded..932d643 100644
         pci_conf_write16(0, uart->ps_bdf[0], uart->ps_bdf[1], uart->ps_bdf[2],
                          PCI_COMMAND, uart->cr);
      }
-@@ -546,11 +608,13 @@ static int __init check_existence(struct ns16550 *uart)
+@@ -546,11 +608,13 @@ static int __init check_existence(struct
  }
  
  #ifdef HAS_PCI
@@ -158,7 +180,7 @@ index 9c2cded..932d643 100644
  
      /* NB. Start at bus 1 to avoid AMT: a plug-in card cannot be on bus 0. */
      for ( b = skip_amt ? 1 : 0; b < 0x100; b++ )
-@@ -579,24 +643,98 @@ pci_uart_config (struct ns16550 *uart, int skip_amt, int bar_idx)
+@@ -579,24 +643,98 @@ pci_uart_config (struct ns16550 *uart, i
                  bar = pci_conf_read32(0, b, d, f,
                                        PCI_BASE_ADDRESS_0 + bar_idx*4);
  
@@ -166,24 +188,22 @@ index 9c2cded..932d643 100644
 +                /* MMIO based */
                  if ( !(bar & PCI_BASE_ADDRESS_SPACE_IO) )
 -                    continue;
--
--                pci_conf_write32(0, b, d, f, PCI_BASE_ADDRESS_0, ~0u);
--                len = pci_conf_read32(0, b, d, f, PCI_BASE_ADDRESS_0);
--                pci_conf_write32(0, b, d, f, PCI_BASE_ADDRESS_0 + bar_idx*4, bar);
--
--                /* Not 8 bytes */
--                if ( (len & 0xffff) != 0xfff9 )
--                    continue;
 +                {
 +                    vendor = pci_conf_read16(0, b, d, f, PCI_VENDOR_ID);
 +                    device = pci_conf_read16(0, b, d, f, PCI_DEVICE_ID);
-+
+ 
+-                pci_conf_write32(0, b, d, f, PCI_BASE_ADDRESS_0, ~0u);
+-                len = pci_conf_read32(0, b, d, f, PCI_BASE_ADDRESS_0);
+-                pci_conf_write32(0, b, d, f, PCI_BASE_ADDRESS_0 + bar_idx*4, bar);
 +                    pci_conf_write32(0, b, d, f,
 +                                     PCI_BASE_ADDRESS_0 + bar_idx*4, ~0u);
 +                    len = pci_conf_read32(0, b, d, f, PCI_BASE_ADDRESS_0 + bar_idx*4);
 +                    pci_conf_write32(0, b, d, f,
 +                                     PCI_BASE_ADDRESS_0 + bar_idx*4, bar);
-+
+ 
+-                /* Not 8 bytes */
+-                if ( (len & 0xffff) != 0xfff9 )
+-                    continue;
 +                    /* Handle 64 bit BAR if found */
 +                    if ( bar & PCI_BASE_ADDRESS_MEM_TYPE_64 )
 +                    {
@@ -260,16 +280,16 @@ index 9c2cded..932d643 100644
                  uart->ps_bdf[0] = b;
                  uart->ps_bdf[1] = d;
                  uart->ps_bdf[2] = f;
--                uart->bar = bar;
-                 uart->bar_idx = bar_idx;
++                uart->bar_idx = bar_idx;
+                 uart->bar = bar;
+-                uart->bar_idx = bar_idx;
 -                uart->io_base = bar & ~PCI_BASE_ADDRESS_SPACE_IO;
-+                uart->bar = bar;
 +                uart->bar64 = bar_64;
 +                uart->io_size = size;
                  uart->irq = pci_conf_read8(0, b, d, f, PCI_INTERRUPT_PIN) ?
                      pci_conf_read8(0, b, d, f, PCI_INTERRUPT_LINE) : 0;
  
-@@ -743,9 +881,16 @@ void __init ns16550_init(int index, struct ns16550_defaults *defaults)
+@@ -743,9 +881,16 @@ void __init ns16550_init(int index, stru
      uart->reg_width = 1;
      uart->reg_shift = 0;
  
@@ -285,3 +305,4 @@ index 9c2cded..932d643 100644
 +
      ns16550_parse_port_config(uart, (index == 0) ? opt_com1 : opt_com2);
  }
+ 
