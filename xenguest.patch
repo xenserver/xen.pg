@@ -1,7 +1,7 @@
 # HG changeset patch
-# Parent eb75b6f1bcbb20919f402b20ff3b5de19ae4e701
+# Parent 111e64daf897facded04984f07fa4849b853ac91
 
-diff -r eb75b6f1bcbb .hgignore
+diff -r 111e64daf897 .hgignore
 --- a/.hgignore
 +++ b/.hgignore
 @@ -243,6 +243,7 @@
@@ -12,10 +12,10 @@ diff -r eb75b6f1bcbb .hgignore
  ^tools/xcutils/lsevtchn$
  ^tools/xcutils/xc_restore$
  ^tools/xcutils/xc_save$
-diff -r eb75b6f1bcbb mk/xen-4.4.spec.in
+diff -r 111e64daf897 mk/xen-4.4.spec.in
 --- a/mk/xen-4.4.spec.in
 +++ b/mk/xen-4.4.spec.in
-@@ -351,6 +351,7 @@ rm -rf $RPM_BUILD_ROOT
+@@ -385,6 +385,7 @@ rm -rf $RPM_BUILD_ROOT
  %{_libdir}/%{name}/bin/readnotes
  %{_libdir}/%{name}/bin/xenconsole
  %{_libdir}/%{name}/bin/xenctx
@@ -23,7 +23,7 @@ diff -r eb75b6f1bcbb mk/xen-4.4.spec.in
  %{_libdir}/%{name}/bin/xenpaging
  %{_libdir}/%{name}/bin/xenpvnetboot
  
-diff -r eb75b6f1bcbb tools/Makefile
+diff -r 111e64daf897 tools/Makefile
 --- a/tools/Makefile
 +++ b/tools/Makefile
 @@ -22,6 +22,7 @@ SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
@@ -34,7 +34,7 @@ diff -r eb75b6f1bcbb tools/Makefile
  
  # do not recurse in to a dir we are about to delete
  ifneq "$(MAKECMDGOALS)" "distclean"
-diff -r eb75b6f1bcbb tools/xenguest/Makefile
+diff -r 111e64daf897 tools/xenguest/Makefile
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,29 @@
@@ -67,7 +67,7 @@ diff -r eb75b6f1bcbb tools/xenguest/Makefile
 +clean:
 +	$(RM) *.o $(ALL_TARGETS)
 +	$(RM) $(DEPS)
-diff -r eb75b6f1bcbb tools/xenguest/xenguest.c
+diff -r 111e64daf897 tools/xenguest/xenguest.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
 @@ -0,0 +1,535 @@
@@ -606,10 +606,10 @@ diff -r eb75b6f1bcbb tools/xenguest/xenguest.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r eb75b6f1bcbb tools/xenguest/xenguest_stubs.c
+diff -r 111e64daf897 tools/xenguest/xenguest_stubs.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,580 @@
+@@ -0,0 +1,607 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -731,19 +731,23 @@ diff -r eb75b6f1bcbb tools/xenguest/xenguest_stubs.c
 +}
 +
 +static int
-+xenstore_putsv(xs_handle *xsh, int domid, const char *val, const char *fmt, va_list ap)
++xenstore_putsv(xs_handle *xsh, int domid, const char *_key, const char *fmt, ...)
 +{
 +    int n, m, rc = -1;
-+    char *path, key[1024] = { 0 };
++    char *path, key[512], val[512];
++    va_list ap;
 +
 +    path = xs_get_domain_path(xsh, domid);
 +    if (path == NULL)
 +        goto out;
 +
-+    n = snprintf(key, sizeof(key), "%s/", path);
++    n = snprintf(key, sizeof(key), "%s/%s", path, _key);
 +    if (n < 0)
 +        goto out;
-+    m = vsnprintf(key + n, sizeof(key) - n, fmt, ap);
++
++    va_start(ap, fmt);
++    m = vsnprintf(val, sizeof(val), fmt, ap);
++    va_end(ap);
 +    if (m < 0)
 +        goto out;
 +
@@ -754,15 +758,35 @@ diff -r eb75b6f1bcbb tools/xenguest/xenguest_stubs.c
 +}
 +
 +static int
-+xenstore_puts(xs_handle *xsh, int domid, const char *val, const char *fmt, ...)
++xenstore_puts(xs_handle *xsh, int domid, const char *key, const char *val)
 +{
-+    int rc;
-+    va_list ap;
++    return xenstore_putsv(xsh, domid, key, "%s", val);
++}
 +
-+    va_start(ap, fmt);
-+    rc = xenstore_putsv(xsh, domid, val, fmt, ap);
-+    va_end(ap);
-+    return rc;
++static int hvmloader_flag(xs_handle *xsh, int domid, const char *key)
++{
++    /* Params going to hvmloader need to convert "true" -> '1' as Xapi gets
++     * this wrong when migrating from older hosts. */
++
++    char *val = xenstore_gets(xsh, domid, key);
++    int ret = -1;
++
++    if ( val )
++    {
++        if ( !strcasecmp(val, "true") )
++            ret = 1;
++        else
++        {
++            errno = 0;
++            ret = strtol(val, NULL, 0);
++            if ( errno )
++                ret = 0;
++        }
++
++        xenstore_putsv(xsh, domid, "platform/acpi", "%d", !!ret);
++    }
++
++    return ret;
 +}
 +
 +static void
@@ -782,12 +806,15 @@ diff -r eb75b6f1bcbb tools/xenguest/xenguest_stubs.c
 +    f->nx       = xenstore_get(xsh, domid, "platform/nx");
 +    f->viridian = xenstore_get(xsh, domid, "platform/viridian");
 +    f->apic     = xenstore_get(xsh, domid, "platform/apic");
-+    f->acpi     = xenstore_get(xsh, domid, "platform/acpi");
 +    f->pae      = xenstore_get(xsh, domid, "platform/pae");
-+    f->acpi_s4  = xenstore_get(xsh, domid, "platform/acpi_s4");
-+    f->acpi_s3  = xenstore_get(xsh, domid, "platform/acpi_s3");
 +    f->tsc_mode = xenstore_get(xsh, domid, "platform/tsc_mode");
 +    f->nested_hvm = xenstore_get(xsh, domid, "platform/exp-nested-hvm");
++
++    /* Params going to hvmloader - need to convert "true" -> '1' as Xapi gets
++     * this wrong when migrating from older hosts. */
++    f->acpi    = hvmloader_flag(xsh, domid, "platform/acpi");
++    f->acpi_s4 = hvmloader_flag(xsh, domid, "platform/acpi_s4");
++    f->acpi_s3 = hvmloader_flag(xsh, domid, "platform/acpi_s3");
 +
 +    /*
 +     * HACK - Migrated VMs wont have this xs key set, so the naive action
@@ -1126,8 +1153,8 @@ diff -r eb75b6f1bcbb tools/xenguest/xenguest_stubs.c
 +        return -1;
 +    }
 +
-+    if ( xenstore_puts(rcbd->xsh, domid, genid_addr_str,
-+                       "hvmloader/generation-id-address") != 1 )
++    if ( xenstore_puts(rcbd->xsh, domid, "hvmloader/generation-id-address",
++                       genid_addr_str) != 1 )
 +    {
 +        err("Failed to write generation id to xenstore");
 +        free(genid_addr_str);
@@ -1190,7 +1217,7 @@ diff -r eb75b6f1bcbb tools/xenguest/xenguest_stubs.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r eb75b6f1bcbb tools/xenguest/xg_internal.h
+diff -r 111e64daf897 tools/xenguest/xg_internal.h
 --- /dev/null
 +++ b/tools/xenguest/xg_internal.h
 @@ -0,0 +1,42 @@
