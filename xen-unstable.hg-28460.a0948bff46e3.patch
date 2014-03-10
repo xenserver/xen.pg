@@ -1,0 +1,56 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1394446685 -3600
+# Node ID a0948bff46e3c60f2bafff8ea28cbe1bb9807b45
+# Parent  fc3682977aca70a0c4edb4d8b0e3962dfa675d53
+x86/schedule: remove noreturn from schedule_tail() function pointer
+
+XenServer has recently had a support case where this bugframe in
+context_switch() was hit, presumably from a corrupt function pointer as the
+vcpu pointer was fine.
+
+On balance, it is better to leave the bugframe around for peace of mind in
+exceptional circumstances, than to use the optimisations provided by noreturn.
+
+At any meaningful levels of optimisation, the noreturn causes the bugframe to
+be optimised out, meaning that any exceptional returns fall into unlikely
+branches, which will result in very weird behaviour.
+
+The unreachable() in BUG() does the useful part of noreturn for us, allowing
+the compiler not to mess about restoring stack frames etc, but causes a ud2
+instruction to be present.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff -r fc3682977aca -r a0948bff46e3 xen/include/asm-x86/current.h
+--- a/xen/include/asm-x86/current.h
++++ b/xen/include/asm-x86/current.h
+@@ -67,7 +67,15 @@ static inline struct cpu_info *get_cpu_i
+         unreachable();                                                  \
+     })
+ 
+-#define schedule_tail(vcpu) (((vcpu)->arch.schedule_tail)(vcpu))
++/*
++ * Schedule tail *should* be a terminal function pointer, but leave a bugframe
++ * around just incase it returns, to save going back into the context
++ * switching code and leaving a far more subtle crash to diagnose.
++ */
++#define schedule_tail(vcpu) do {                \
++        (((vcpu)->arch.schedule_tail)(vcpu));   \
++        BUG();                                  \
++    } while (0)
+ 
+ /*
+  * Which VCPU's state is currently running on each CPU?
+diff -r fc3682977aca -r a0948bff46e3 xen/include/asm-x86/domain.h
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -395,7 +395,7 @@ struct arch_vcpu
+ 
+     unsigned long      flags; /* TF_ */
+ 
+-    void noreturn (*schedule_tail) (struct vcpu *);
++    void (*schedule_tail) (struct vcpu *);
+ 
+     void (*ctxt_switch_from) (struct vcpu *);
+     void (*ctxt_switch_to) (struct vcpu *);

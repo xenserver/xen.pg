@@ -1,0 +1,140 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1393928147 -3600
+# Node ID e7f183d5719566a3f090bb75b95c59f04699e6ee
+# Parent  c5c99c73d1989babc4f44227e8d73e82d8e4ea47
+compiler: replace opencoded __attribute__((noreturn))
+
+Make a formal define for noreturn in compiler.h, and fix up opencoded uses of
+__attribute__((noreturn)).  This includes removing redundant uses with
+function definitions which have a public declaration.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+Acked-by: Tim Deegan <tim@xen.org>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r c5c99c73d198 -r e7f183d57195 xen/arch/arm/early_printk.c
+--- a/xen/arch/arm/early_printk.c
++++ b/xen/arch/arm/early_printk.c
+@@ -52,7 +52,7 @@ void __init early_printk(const char *fmt
+     va_end(args);
+ }
+ 
+-void __attribute__((noreturn)) __init
++void __init
+ early_panic(const char *fmt, ...)
+ {
+     va_list args;
+diff -r c5c99c73d198 -r e7f183d57195 xen/arch/x86/efi/boot.c
+--- a/xen/arch/x86/efi/boot.c
++++ b/xen/arch/x86/efi/boot.c
+@@ -183,7 +183,7 @@ static bool_t __init match_guid(const EF
+            !memcmp(guid1->Data4, guid2->Data4, sizeof(guid1->Data4));
+ }
+ 
+-static void __init __attribute__((__noreturn__)) blexit(const CHAR16 *str)
++static void __init noreturn blexit(const CHAR16 *str)
+ {
+     if ( str )
+         PrintStr((CHAR16 *)str);
+@@ -762,7 +762,7 @@ static void __init relocate_trampoline(u
+         *(u16 *)(*trampoline_ptr + (long)trampoline_ptr) = phys >> 4;
+ }
+ 
+-void EFIAPI __init __attribute__((__noreturn__))
++void EFIAPI __init noreturn
+ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+ {
+     static EFI_GUID __initdata loaded_image_guid = LOADED_IMAGE_PROTOCOL;
+diff -r c5c99c73d198 -r e7f183d57195 xen/arch/x86/shutdown.c
+--- a/xen/arch/x86/shutdown.c
++++ b/xen/arch/x86/shutdown.c
+@@ -85,7 +85,7 @@ static inline void kb_wait(void)
+             break;
+ }
+ 
+-static void __attribute__((noreturn)) __machine_halt(void *unused)
++static void noreturn __machine_halt(void *unused)
+ {
+     local_irq_disable();
+     for ( ; ; )
+diff -r c5c99c73d198 -r e7f183d57195 xen/include/asm-arm/early_printk.h
+--- a/xen/include/asm-arm/early_printk.h
++++ b/xen/include/asm-arm/early_printk.h
+@@ -26,7 +26,7 @@
+ 
+ void early_printk(const char *fmt, ...)
+     __attribute__((format (printf, 1, 2)));
+-void early_panic(const char *fmt, ...) __attribute__((noreturn))
++void noreturn early_panic(const char *fmt, ...)
+     __attribute__((format (printf, 1, 2)));
+ 
+ #else
+@@ -35,7 +35,7 @@ static inline  __attribute__((format (pr
+ early_printk(const char *fmt, ...)
+ {}
+ 
+-static inline void  __attribute__((noreturn))
++static inline void noreturn
+ __attribute__((format (printf, 1, 2))) early_panic(const char *fmt, ...)
+ {while(1);}
+ 
+diff -r c5c99c73d198 -r e7f183d57195 xen/include/asm-x86/processor.h
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -550,7 +550,7 @@ DECLARE_TRAP_HANDLER(spurious_interrupt_
+ 
+ void trap_nop(void);
+ void enable_nmis(void);
+-void __attribute__((noreturn)) do_nmi_crash(struct cpu_user_regs *regs);
++void noreturn do_nmi_crash(struct cpu_user_regs *regs);
+ 
+ void syscall_enter(void);
+ void sysenter_entry(void);
+diff -r c5c99c73d198 -r e7f183d57195 xen/include/xen/compiler.h
+--- a/xen/include/xen/compiler.h
++++ b/xen/include/xen/compiler.h
+@@ -14,6 +14,8 @@
+ #define always_inline __inline__ __attribute__ ((always_inline))
+ #define noinline      __attribute__((noinline))
+ 
++#define noreturn      __attribute__((noreturn))
++
+ #if (!defined(__clang__) && (__GNUC__ == 4) && (__GNUC_MINOR__ < 5))
+ #define unreachable() do {} while (1)
+ #else
+diff -r c5c99c73d198 -r e7f183d57195 xen/include/xen/lib.h
+--- a/xen/include/xen/lib.h
++++ b/xen/include/xen/lib.h
+@@ -8,7 +8,7 @@
+ #include <xen/string.h>
+ #include <asm/bug.h>
+ 
+-void __bug(char *file, int line) __attribute__((noreturn));
++void noreturn __bug(char *file, int line);
+ void __warn(char *file, int line);
+ 
+ #define BUG_ON(p)  do { if (unlikely(p)) BUG();  } while (0)
+diff -r c5c99c73d198 -r e7f183d57195 xen/include/xen/sched.h
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -580,7 +580,7 @@ void __domain_crash(struct domain *d);
+  * Mark current domain as crashed and synchronously deschedule from the local
+  * processor. This function never returns.
+  */
+-void __domain_crash_synchronous(void) __attribute__((noreturn));
++void noreturn __domain_crash_synchronous(void);
+ #define domain_crash_synchronous() do {                                   \
+     printk("domain_crash_sync called from %s:%d\n", __FILE__, __LINE__);  \
+     __domain_crash_synchronous();                                         \
+@@ -591,7 +591,7 @@ void __domain_crash_synchronous(void) __
+  * the crash occured.  If addr is 0, look up address from last extable
+  * redirection.
+  */
+-void asm_domain_crash_synchronous(unsigned long addr) __attribute__((noreturn));
++void noreturn asm_domain_crash_synchronous(unsigned long addr);
+ 
+ #define set_current_state(_s) do { current->state = (_s); } while (0)
+ void scheduler_init(void);

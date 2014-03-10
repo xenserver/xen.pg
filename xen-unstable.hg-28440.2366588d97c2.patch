@@ -1,0 +1,124 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1393928223 -3600
+# Node ID 2366588d97c23e96fa023815275d496a5a59d08e
+# Parent  e7f183d5719566a3f090bb75b95c59f04699e6ee
+identify panic and reboot/halt functions as noreturn
+
+On an x86 build (GCC Debian 4.7.2-5), this substantially reduces the size of
+.text and .init.text sections.
+
+Experimentally, even in a non-debug build, GCC uses `call` rather than `jmp`
+so there should be no impact on any stack trace generation.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Tim Deegan <tim@xen.org>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r e7f183d57195 -r 2366588d97c2 xen/arch/arm/shutdown.c
+--- a/xen/arch/arm/shutdown.c
++++ b/xen/arch/arm/shutdown.c
+@@ -11,7 +11,7 @@ static void raw_machine_reset(void)
+     platform_reset();
+ }
+ 
+-static void halt_this_cpu(void *arg)
++static void noreturn halt_this_cpu(void *arg)
+ {
+     stop_cpu();
+ }
+diff -r e7f183d57195 -r 2366588d97c2 xen/arch/x86/cpu/mcheck/mce.h
+--- a/xen/arch/x86/cpu/mcheck/mce.h
++++ b/xen/arch/x86/cpu/mcheck/mce.h
+@@ -57,7 +57,7 @@ int mce_available(struct cpuinfo_x86 *c)
+ unsigned int mce_firstbank(struct cpuinfo_x86 *c);
+ /* Helper functions used for collecting error telemetry */
+ struct mc_info *x86_mcinfo_getptr(void);
+-void mc_panic(char *s);
++void noreturn mc_panic(char *s);
+ void x86_mc_get_cpu_info(unsigned, uint32_t *, uint16_t *, uint16_t *,
+ 			 uint32_t *, uint32_t *, uint32_t *, uint32_t *);
+ 
+diff -r e7f183d57195 -r 2366588d97c2 xen/arch/x86/shutdown.c
+--- a/xen/arch/x86/shutdown.c
++++ b/xen/arch/x86/shutdown.c
+@@ -452,7 +452,7 @@ static int __init reboot_init(void)
+ }
+ __initcall(reboot_init);
+ 
+-static void __machine_restart(void *pdelay)
++static void noreturn __machine_restart(void *pdelay)
+ {
+     machine_restart(*(unsigned int *)pdelay);
+ }
+diff -r e7f183d57195 -r 2366588d97c2 xen/common/shutdown.c
+--- a/xen/common/shutdown.c
++++ b/xen/common/shutdown.c
+@@ -17,7 +17,7 @@
+ bool_t __read_mostly opt_noreboot;
+ boolean_param("noreboot", opt_noreboot);
+ 
+-static void maybe_reboot(void)
++static void noreturn maybe_reboot(void)
+ {
+     if ( opt_noreboot )
+     {
+diff -r e7f183d57195 -r 2366588d97c2 xen/include/asm-arm/smp.h
+--- a/xen/include/asm-arm/smp.h
++++ b/xen/include/asm-arm/smp.h
+@@ -15,7 +15,7 @@ DECLARE_PER_CPU(cpumask_var_t, cpu_core_
+ 
+ #define raw_smp_processor_id() (get_processor_id())
+ 
+-extern void stop_cpu(void);
++extern void noreturn stop_cpu(void);
+ 
+ extern int arch_smp_init(void);
+ extern int arch_cpu_init(int cpu, struct dt_device_node *dn);
+diff -r e7f183d57195 -r 2366588d97c2 xen/include/asm-x86/processor.h
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -515,7 +515,7 @@ void show_registers(struct cpu_user_regs
+ void show_execution_state(struct cpu_user_regs *regs);
+ #define dump_execution_state() run_in_exception_handler(show_execution_state)
+ void show_page_walk(unsigned long addr);
+-void fatal_trap(int trapnr, struct cpu_user_regs *regs);
++void noreturn fatal_trap(int trapnr, struct cpu_user_regs *regs);
+ 
+ void compat_show_guest_stack(struct vcpu *, struct cpu_user_regs *, int lines);
+ 
+diff -r e7f183d57195 -r 2366588d97c2 xen/include/xen/lib.h
+--- a/xen/include/xen/lib.h
++++ b/xen/include/xen/lib.h
+@@ -87,7 +87,7 @@ extern void printk(const char *format, .
+     __attribute__ ((format (printf, 1, 2)));
+ extern void guest_printk(const struct domain *d, const char *format, ...)
+     __attribute__ ((format (printf, 2, 3)));
+-extern void panic(const char *format, ...)
++extern void noreturn panic(const char *format, ...)
+     __attribute__ ((format (printf, 1, 2)));
+ extern long vm_assist(struct domain *, unsigned int, unsigned int);
+ extern int __printk_ratelimit(int ratelimit_ms, int ratelimit_burst);
+diff -r e7f183d57195 -r 2366588d97c2 xen/include/xen/shutdown.h
+--- a/xen/include/xen/shutdown.h
++++ b/xen/include/xen/shutdown.h
+@@ -1,13 +1,15 @@
+ #ifndef __XEN_SHUTDOWN_H__
+ #define __XEN_SHUTDOWN_H__
+ 
++#include <xen/compiler.h>
++
+ /* opt_noreboot: If true, machine will need manual reset on error. */
+ extern bool_t opt_noreboot;
+ 
+-void dom0_shutdown(u8 reason);
++void noreturn dom0_shutdown(u8 reason);
+ 
+-void machine_restart(unsigned int delay_millisecs);
+-void machine_halt(void);
++void noreturn machine_restart(unsigned int delay_millisecs);
++void noreturn machine_halt(void);
+ void machine_power_off(void);
+ 
+ #endif /* __XEN_SHUTDOWN_H__ */
