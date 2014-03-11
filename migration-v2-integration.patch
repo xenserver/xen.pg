@@ -1,0 +1,161 @@
+# HG changeset patch
+# Parent 55cc0e00054b21e4ddf6c2764292a74317c84be3
+
+diff -r 55cc0e00054b tools/libxc/Makefile
+--- a/tools/libxc/Makefile
++++ b/tools/libxc/Makefile
+@@ -44,6 +44,7 @@ GUEST_SRCS-y :=
+ GUEST_SRCS-y += xg_private.c xc_suspend.c
+ ifeq ($(CONFIG_MIGRATE),y)
+ GUEST_SRCS-y += xc_domain_restore.c xc_domain_save.c
++GUEST_SRCS-y += xc_domain_restore2.c xc_domain_save2.c xc_save_restore2_common.c
+ GUEST_SRCS-y += xc_offline_page.c xc_compression.c
+ else
+ GUEST_SRCS-y += xc_nomigrate.c
+diff -r 55cc0e00054b tools/libxc/xc_domain_restore.c
+--- a/tools/libxc/xc_domain_restore.c
++++ b/tools/libxc/xc_domain_restore.c
+@@ -1515,6 +1515,14 @@ int xc_domain_restore(xc_interface *xch,
+     struct restore_ctx *ctx = &_ctx;
+     struct domain_info_context *dinfo = &ctx->dinfo;
+ 
++    if ( getenv("XG_MIGRATION_V2") )
++    {
++        return xc_domain_restore2(
++            xch, io_fd, dom, store_evtchn, store_mfn,
++            store_domid, console_evtchn, console_mfn, console_domid,
++            hvm,  pae,  superpages, checkpointed_stream, callbacks);
++    }
++
+     DPRINTF("%s: starting restore of new domid %u", __func__, dom);
+ 
+     pagebuf_init(&pagebuf);
+diff -r 55cc0e00054b tools/libxc/xc_domain_restore2.c
+--- /dev/null
++++ b/tools/libxc/xc_domain_restore2.c
+@@ -0,0 +1,22 @@
++#include "xg_private.h"
++
++int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
++                       unsigned int store_evtchn, unsigned long *store_mfn,
++                       domid_t store_domid, unsigned int console_evtchn,
++                       unsigned long *console_mfn, domid_t console_domid,
++                       unsigned int hvm, unsigned int pae, int superpages,
++                       int checkpointed_stream,
++                       struct restore_callbacks *callbacks)
++{
++    return 1;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff -r 55cc0e00054b tools/libxc/xc_domain_save.c
+--- a/tools/libxc/xc_domain_save.c
++++ b/tools/libxc/xc_domain_save.c
+@@ -893,6 +893,13 @@ int xc_domain_save(xc_interface *xch, in
+ 
+     int completed = 0;
+ 
++    if ( getenv("XG_MIGRATION_V2") )
++    {
++        return xc_domain_save2(xch, io_fd, dom, max_iters,
++                               max_factor, flags, callbacks, hvm,
++                               vm_generationid_addr);
++    }
++
+     DPRINTF("%s: starting save of domid %u", __func__, dom);
+ 
+     if ( hvm && !callbacks->switch_qemu_logdirty )
+diff -r 55cc0e00054b tools/libxc/xc_domain_save2.c
+--- /dev/null
++++ b/tools/libxc/xc_domain_save2.c
+@@ -0,0 +1,19 @@
++#include "xg_private.h"
++
++int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_iters,
++                    uint32_t max_factor, uint32_t flags,
++                    struct save_callbacks* callbacks, int hvm,
++                    unsigned long vm_generationid_addr)
++{
++    return 1;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff -r 55cc0e00054b tools/libxc/xc_save_restore2_common.c
+--- /dev/null
++++ b/tools/libxc/xc_save_restore2_common.c
+@@ -0,0 +1,11 @@
++#include "xg_save_restore2.h"
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff -r 55cc0e00054b tools/libxc/xenguest.h
+--- a/tools/libxc/xenguest.h
++++ b/tools/libxc/xenguest.h
+@@ -89,6 +89,11 @@ int xc_domain_save(xc_interface *xch, in
+                    struct save_callbacks* callbacks, int hvm,
+                    unsigned long vm_generationid_addr);
+ 
++/* Domain Save v2 */
++int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_iters,
++                    uint32_t max_factor, uint32_t flags,
++                    struct save_callbacks* callbacks, int hvm,
++                    unsigned long vm_generationid_addr);
+ 
+ /* callbacks provided by xc_domain_restore */
+ struct restore_callbacks {
+@@ -144,6 +149,15 @@ int xc_domain_restore(xc_interface *xch,
+                       unsigned int hvm, unsigned int pae, int superpages,
+                       int checkpointed_stream,
+                       struct restore_callbacks *callbacks);
++
++/* Domain Restore v2 */
++int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
++                       unsigned int store_evtchn, unsigned long *store_mfn,
++                       domid_t store_domid, unsigned int console_evtchn,
++                       unsigned long *console_mfn, domid_t console_domid,
++                       unsigned int hvm, unsigned int pae, int superpages,
++                       int checkpointed_stream,
++                       struct restore_callbacks *callbacks);
+ /**
+  * xc_domain_restore writes a file to disk that contains the device
+  * model saved state.
+diff -r 55cc0e00054b tools/libxc/xg_save_restore2.h
+--- /dev/null
++++ b/tools/libxc/xg_save_restore2.h
+@@ -0,0 +1,13 @@
++#ifndef __XG_SAVE_RESTORE2__H
++#define __XG_SAVE_RESTORE2__H
++
++#endif
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */

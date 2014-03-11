@@ -1,0 +1,233 @@
+# HG changeset patch
+# Parent 4d7b1abc284e6d4c1a4904f2bd9e3d73f46f8756
+
+diff -r 4d7b1abc284e tools/libxc/xc_domain_restore2.c
+--- a/tools/libxc/xc_domain_restore2.c
++++ b/tools/libxc/xc_domain_restore2.c
+@@ -1,4 +1,190 @@
++#include <unistd.h>
++#include <arpa/inet.h>
++
+ #include "xg_private.h"
++#include "xg_save_restore2.h"
++
++// TODO: Find a better place to put this...
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
++
++/*
++ * State local to this instance of restore.
++ */
++struct restore_state
++{
++    xc_interface *xch;
++    uint32_t domid;
++    int fd;
++
++    /* Information from Image Header */
++    uint32_t format_version;
++
++    /* Information from Domain Header */
++    uint32_t guest_type;
++    uint32_t guest_page_size;
++};
++
++typedef int (*record_handler)(struct restore_state *rs,
++                              const void *data, size_t size);
++
++static int read_ihdr(struct restore_state *rs)
++{
++    xc_interface *xch = rs->xch;
++    struct ihdr ihdr;
++
++    if ( read_exact(rs->fd, &ihdr, sizeof ihdr) )
++    {
++        PERROR("Failed to read Image Header from stream");
++        return -1;
++    }
++
++    if ( ihdr.marker != IHDR_MARKER )
++    {
++        ERROR("Invalid marker: Got 0x%016"PRIx64, ihdr.marker);
++        return -1;
++    }
++
++    ihdr.id      = ntohl(ihdr.id);
++    ihdr.version = ntohl(ihdr.version);
++    ihdr.options = ntohs(ihdr.options);
++
++    if ( ihdr.id != IHDR_ID )
++    {
++        ERROR("Invalid ID: Expected 0x%08"PRIx32", Got 0x%08"PRIx32,
++              IHDR_ID, ihdr.id);
++        return -1;
++    }
++
++    if ( ihdr.version != IHDR_VERSION )
++    {
++        ERROR("Invalid Version: Expected %d, Got %d", ihdr.version, IHDR_VERSION);
++        return -1;
++    }
++
++    if ( ihdr.options & IHDR_OPT_LITTLE_ENDIAN )
++    {
++        ERROR("Unable to handle big endian streams");
++        return -1;
++    }
++
++    rs->format_version = ihdr.version;
++
++    return 0;
++}
++
++static int read_dhdr(struct restore_state *rs)
++{
++    xc_interface *xch = rs->xch;
++    struct dhdr dhdr;
++
++    if ( read_exact(rs->fd, &dhdr, sizeof dhdr) )
++    {
++        PERROR("Failed to read Domain Header from stream");
++        return -1;
++    }
++
++    if ( dhdr.type != DHDR_TYPE_x86_pv )
++    {
++        ERROR("Unable to handle non PV guests (yet)");
++        return -1;
++    }
++
++    if ( dhdr.page_shift != 12 )
++    {
++        ERROR("Unable to handle guests with non-4K pages (yet)");
++        return -1;
++    }
++
++    IPRINTF("Found %s domain from Xen %d.%d",
++            dhdr_type_to_str(dhdr.type), dhdr.xen_major, dhdr.xen_minor);
++
++    rs->guest_type = dhdr.type;
++    rs->guest_page_size = (1U << dhdr.page_shift);
++
++    return 0;
++}
++
++static int record_end(struct restore_state *rs, const void *data, size_t size)
++{
++    return 0;
++}
++
++static const record_handler record_handlers[] =
++{
++    [REC_TYPE_end] = record_end,
++};
++
++static int read_record(struct restore_state *rs, uint32_t *type)
++{
++    xc_interface *xch = rs->xch;
++    struct rhdr rhdr;
++    size_t datasz;
++    void *data = NULL;
++    int rc;
++
++    if ( read_exact(rs->fd, &rhdr, sizeof rhdr) )
++    {
++        PERROR("Failed to read Record Header from stream");
++        return -1;
++    }
++
++    if ( rhdr.length > REC_LENGTH_MAX )
++    {
++        ERROR("Record (0x%08"PRIx32", %s) length 0x%"PRIx32" exceeds max (0x%"PRIx32")",
++              rhdr.type, rec_type_to_str(rhdr.type), rhdr.length, REC_LENGTH_MAX);
++        return -1;
++    }
++
++    datasz = (rhdr.length + 7) & ~7U;
++
++    if ( datasz )
++    {
++        data = malloc(datasz);
++
++        if ( !data )
++        {
++            ERROR("Unable to allocate %zu bytes for record data (0x%08"PRIx32", %s)",
++                  datasz, rhdr.type, rec_type_to_str(rhdr.type));
++            rc = -1;
++            goto out;
++        }
++
++        if ( read_exact(rs->fd, data, datasz) )
++        {
++            PERROR("Failed to read %zu bytes of data for record (0x%08"PRIx32", %s)",
++                   datasz, rhdr.type, rec_type_to_str(rhdr.type));
++            rc = -1;
++            goto out;
++        }
++    }
++
++    if ( rhdr.type & REC_TYPE_optional )
++    {
++        IPRINTF("Ignoring unrecognised optional record (0x%08"PRIx32", %s)",
++                rhdr.type, rec_type_to_str(rhdr.type));
++        rc = 0;
++    }
++    else
++    {
++        if ( rhdr.type >= ARRAY_SIZE(record_handlers) ||
++             !record_handlers[rhdr.type] )
++        {
++            ERROR("No handler for record type 0x%08"PRIx32" (%s)",
++                  rhdr.type, rec_type_to_str(rhdr.type));
++            rc = -1;
++            goto out;
++        }
++        else
++            rc = record_handlers[rhdr.type](rs, data, datasz);
++    }
++
++ out:
++    free(data);
++    if ( !rc )
++        *type = rhdr.type;
++
++    return rc;
++}
+ 
+ int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
+                        unsigned int store_evtchn, unsigned long *store_mfn,
+@@ -8,7 +194,34 @@ int xc_domain_restore2(xc_interface *xch
+                        int checkpointed_stream,
+                        struct restore_callbacks *callbacks)
+ {
+-    return 1;
++    int rc;
++    uint32_t record_type;
++    struct restore_state rs = {
++        .xch = xch,
++        .domid = dom,
++        .fd = io_fd,
++    };
++
++    IPRINTF("In %s", __func__);
++
++    rc = read_ihdr(&rs);
++    if ( rc )
++        return rc;
++
++    rc = read_dhdr(&rs);
++    if ( rc )
++        return rc;
++
++    do {
++        rc = read_record(&rs, &record_type);
++        if ( rc )
++            return rc;
++
++        DPRINTF("Record %s processed", rec_type_to_str(record_type));
++
++    } while ( record_type != REC_TYPE_end );
++
++    return 0;
+ }
+ 
+ /*
