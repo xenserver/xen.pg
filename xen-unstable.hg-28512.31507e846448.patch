@@ -1,0 +1,125 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1394717917 -3600
+# Node ID 31507e846448f6bd832437ab80a2c213a9908273
+# Parent  1607344f3cae929d5b322b894cfb2828788c4a59
+console: Traditional console timestamps including milliseconds
+
+Suggested-by: Don Slutz <dslutz@verizon.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 1607344f3cae -r 31507e846448 docs/misc/xen-command-line.markdown
+--- a/docs/misc/xen-command-line.markdown
++++ b/docs/misc/xen-command-line.markdown
+@@ -275,7 +275,7 @@ cleared.  This allows a single port to b
+ makes sense on its own.
+ 
+ ### console\_timestamps
+-> `= none | date | boot`
++> `= none | date | datems | boot`
+ 
+ > Default: `none`
+ 
+@@ -284,6 +284,8 @@ Specify which timestamp format Xen shoul
+ * `none`: No timestamps
+ * `date`: Date and time information
+     * `[YYYY-MM-DD HH:MM:SS]`
++* `datems`: Date and time, with milliseconds
++    * `[YYYY-MM-DD HH:MM:SS.mmm]`
+ * `boot`: Seconds and microseconds since boot
+     * `[SSSSSS.uuuuuu]`
+ 
+diff -r 1607344f3cae -r 31507e846448 xen/arch/arm/time.c
+--- a/xen/arch/arm/time.c
++++ b/xen/arch/arm/time.c
+@@ -282,7 +282,7 @@ void domain_set_time_offset(struct domai
+     /* XXX update guest visible wallclock time */
+ }
+ 
+-struct tm wallclock_time(void)
++struct tm wallclock_time(uint64_t *ns)
+ {
+     return (struct tm) { 0 };
+ }
+diff -r 1607344f3cae -r 31507e846448 xen/arch/x86/time.c
+--- a/xen/arch/x86/time.c
++++ b/xen/arch/x86/time.c
+@@ -1646,15 +1646,19 @@ int dom0_pit_access(struct ioreq *ioreq)
+     return 0;
+ }
+ 
+-struct tm wallclock_time(void)
++struct tm wallclock_time(uint64_t *ns)
+ {
+-    uint64_t seconds;
++    uint64_t seconds, nsec;
+ 
+     if ( !wc_sec )
+         return (struct tm) { 0 };
+ 
+     seconds = NOW() + SECONDS(wc_sec) + wc_nsec;
+-    do_div(seconds, 1000000000);
++    nsec = do_div(seconds, 1000000000);
++
++    if ( ns )
++        *ns = nsec;
++
+     return gmtime(seconds);
+ }
+ 
+diff -r 1607344f3cae -r 31507e846448 xen/drivers/char/console.c
+--- a/xen/drivers/char/console.c
++++ b/xen/drivers/char/console.c
+@@ -53,6 +53,7 @@ enum con_timestamp_mode
+ {
+     TSM_NONE,          /* No timestamps */
+     TSM_DATE,          /* [YYYY-MM-DD HH:MM:SS] */
++    TSM_DATE_MS,       /* [YYYY-MM-DD HH:MM:SS.mmm] */
+     TSM_BOOT           /* [SSSSSS.uuuuuu] */
+ };
+ 
+@@ -560,6 +561,8 @@ static void __init parse_console_timesta
+     if ( *s == '\0' || /* Compat for old booleanparam() */
+          !strcmp(s, "date") )
+         opt_con_timestamp_mode = TSM_DATE;
++    else if ( !strcmp(s, "datems") )
++        opt_con_timestamp_mode = TSM_DATE_MS;
+     else if ( !strcmp(s, "boot") )
+         opt_con_timestamp_mode = TSM_BOOT;
+     else if ( !strcmp(s, "none") )
+@@ -577,7 +580,8 @@ static void printk_start_of_line(const c
+     switch ( opt_con_timestamp_mode )
+     {
+     case TSM_DATE:
+-        tm = wallclock_time();
++    case TSM_DATE_MS:
++        tm = wallclock_time(&nsec);
+ 
+         if ( tm.tm_mday == 0 )
+             return;
+@@ -586,6 +590,11 @@ static void printk_start_of_line(const c
+             snprintf(tstr, sizeof(tstr), "[%04u-%02u-%02u %02u:%02u:%02u] ",
+                      1900 + tm.tm_year, tm.tm_mon + 1, tm.tm_mday,
+                      tm.tm_hour, tm.tm_min, tm.tm_sec);
++        else
++            snprintf(tstr, sizeof(tstr),
++                     "[%04u-%02u-%02u %02u:%02u:%02u.%03"PRIu64"] ",
++                     1900 + tm.tm_year, tm.tm_mon + 1, tm.tm_mday,
++                     tm.tm_hour, tm.tm_min, tm.tm_sec, nsec / 1000000);
+         break;
+ 
+     case TSM_BOOT:
+diff -r 1607344f3cae -r 31507e846448 xen/include/xen/time.h
+--- a/xen/include/xen/time.h
++++ b/xen/include/xen/time.h
+@@ -48,7 +48,7 @@ struct tm {
+     int     tm_isdst;       /* daylight saving time */
+ };
+ struct tm gmtime(unsigned long t);
+-struct tm wallclock_time(void);
++struct tm wallclock_time(uint64_t *ns);
+ 
+ #define SYSTEM_TIME_HZ  1000000000ULL
+ #define NOW()           ((s_time_t)get_s_time())

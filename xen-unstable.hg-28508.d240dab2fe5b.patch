@@ -1,0 +1,190 @@
+# HG changeset patch
+# User Jan Beulich <jbeulich@suse.com>
+# Date 1394717271 -3600
+# Node ID d240dab2fe5b2e024a16b4284188fa151fee517e
+# Parent  471ad07cf29d572f7cd187595d5be79840364b69
+x86: make hypercall preemption checks consistent
+
+- never preempt on the first iteration (ensure forward progress)
+- never preempt on the last iteration (pointless/wasteful)
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Tim Deegan <tim@xen.org>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 471ad07cf29d -r d240dab2fe5b xen/arch/x86/mm.c
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -2934,7 +2934,7 @@ long do_mmuext_op(
+ 
+     for ( i = 0; i < count; i++ )
+     {
+-        if ( curr->arch.old_guest_table || hypercall_preempt_check() )
++        if ( curr->arch.old_guest_table || (i && hypercall_preempt_check()) )
+         {
+             rc = -EAGAIN;
+             break;
+@@ -3481,7 +3481,7 @@ long do_mmu_update(
+ 
+     for ( i = 0; i < count; i++ )
+     {
+-        if ( curr->arch.old_guest_table || hypercall_preempt_check() )
++        if ( curr->arch.old_guest_table || (i && hypercall_preempt_check()) )
+         {
+             rc = -EAGAIN;
+             break;
+diff -r 471ad07cf29d -r d240dab2fe5b xen/arch/x86/mm/hap/hap.c
+--- a/xen/arch/x86/mm/hap/hap.c
++++ b/xen/arch/x86/mm/hap/hap.c
+@@ -326,7 +326,7 @@ hap_set_allocation(struct domain *d, uns
+     else
+         pages -= d->arch.paging.hap.p2m_pages;
+ 
+-    while ( d->arch.paging.hap.total_pages != pages )
++    for ( ; ; )
+     {
+         if ( d->arch.paging.hap.total_pages < pages )
+         {
+@@ -355,6 +355,8 @@ hap_set_allocation(struct domain *d, uns
+             d->arch.paging.hap.total_pages--;
+             free_domheap_page(pg);
+         }
++        else
++            break;
+ 
+         /* Check to see if we need to yield and try again */
+         if ( preempted && hypercall_preempt_check() )
+diff -r 471ad07cf29d -r d240dab2fe5b xen/arch/x86/mm/p2m-pod.c
+--- a/xen/arch/x86/mm/p2m-pod.c
++++ b/xen/arch/x86/mm/p2m-pod.c
+@@ -242,7 +242,8 @@ p2m_pod_set_cache_target(struct p2m_doma
+ 
+         p2m_pod_cache_add(p2m, page, order);
+ 
+-        if ( hypercall_preempt_check() && preemptible )
++        if ( preemptible && pod_target != p2m->pod.count &&
++             hypercall_preempt_check() )
+         {
+             ret = -EAGAIN;
+             goto out;
+@@ -286,7 +287,8 @@ p2m_pod_set_cache_target(struct p2m_doma
+ 
+             put_page(page+i);
+ 
+-            if ( hypercall_preempt_check() && preemptible )
++            if ( preemptible && pod_target != p2m->pod.count &&
++                 hypercall_preempt_check() )
+             {
+                 ret = -EAGAIN;
+                 goto out;
+diff -r 471ad07cf29d -r d240dab2fe5b xen/arch/x86/mm/shadow/common.c
+--- a/xen/arch/x86/mm/shadow/common.c
++++ b/xen/arch/x86/mm/shadow/common.c
+@@ -1672,7 +1672,7 @@ static unsigned int sh_set_allocation(st
+     SHADOW_PRINTK("current %i target %i\n", 
+                    d->arch.paging.shadow.total_pages, pages);
+ 
+-    while ( d->arch.paging.shadow.total_pages != pages ) 
++    for ( ; ; )
+     {
+         if ( d->arch.paging.shadow.total_pages < pages ) 
+         {
+@@ -1707,6 +1707,8 @@ static unsigned int sh_set_allocation(st
+             d->arch.paging.shadow.total_pages--;
+             free_domheap_page(sp);
+         }
++        else
++            break;
+ 
+         /* Check to see if we need to yield and try again */
+         if ( preempted && hypercall_preempt_check() )
+diff -r 471ad07cf29d -r d240dab2fe5b xen/arch/x86/traps.c
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -3596,33 +3596,33 @@ long do_set_trap_table(XEN_GUEST_HANDLE_
+ 
+     for ( ; ; )
+     {
++        if ( copy_from_guest(&cur, traps, 1) )
++        {
++            rc = -EFAULT;
++            break;
++        }
++
++        if ( cur.address == 0 )
++            break;
++
++        if ( !is_canonical_address(cur.address) )
++            return -EINVAL;
++
++        fixup_guest_code_selector(curr->domain, cur.cs);
++
++        memcpy(&dst[cur.vector], &cur, sizeof(cur));
++
++        if ( cur.vector == 0x80 )
++            init_int80_direct_trap(curr);
++
++        guest_handle_add_offset(traps, 1);
++
+         if ( hypercall_preempt_check() )
+         {
+             rc = hypercall_create_continuation(
+                 __HYPERVISOR_set_trap_table, "h", traps);
+             break;
+         }
+-
+-        if ( copy_from_guest(&cur, traps, 1) )
+-        {
+-            rc = -EFAULT;
+-            break;
+-        }
+-
+-        if ( cur.address == 0 )
+-            break;
+-
+-        if ( !is_canonical_address(cur.address) )
+-            return -EINVAL;
+-
+-        fixup_guest_code_selector(curr->domain, cur.cs);
+-
+-        memcpy(&dst[cur.vector], &cur, sizeof(cur));
+-
+-        if ( cur.vector == 0x80 )
+-            init_int80_direct_trap(curr);
+-
+-        guest_handle_add_offset(traps, 1);
+     }
+ 
+     return rc;
+diff -r 471ad07cf29d -r d240dab2fe5b xen/arch/x86/x86_64/compat/traps.c
+--- a/xen/arch/x86/x86_64/compat/traps.c
++++ b/xen/arch/x86/x86_64/compat/traps.c
+@@ -329,13 +329,6 @@ int compat_set_trap_table(XEN_GUEST_HAND
+ 
+     for ( ; ; )
+     {
+-        if ( hypercall_preempt_check() )
+-        {
+-            rc = hypercall_create_continuation(
+-                __HYPERVISOR_set_trap_table, "h", traps);
+-            break;
+-        }
+-
+         if ( copy_from_guest(&cur, traps, 1) )
+         {
+             rc = -EFAULT;
+@@ -353,6 +346,13 @@ int compat_set_trap_table(XEN_GUEST_HAND
+             init_int80_direct_trap(current);
+ 
+         guest_handle_add_offset(traps, 1);
++
++        if ( hypercall_preempt_check() )
++        {
++            rc = hypercall_create_continuation(
++                __HYPERVISOR_set_trap_table, "h", traps);
++            break;
++        }
+     }
+ 
+     return rc;

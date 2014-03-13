@@ -1,0 +1,91 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1394634203 0
+# Node ID b4593c67eace47e41536b40f3fe0171327f5650e
+# Parent  ef0932b362f85f2378f01444589d16a4c30f5ff3
+tools/libxl: Don't read off the end of tinfo[]
+
+It is very common for BIOSes to advertise more cpus than are actually present
+on the system, and mark some of them as offline.  This is what Xen does to
+allow for later CPU hotplug, and what BIOSes common to multiple different
+systems do to to save fully rewriting the MADT in memory.
+
+An excerpt from `xl info` might look like:
+
+...
+nr_cpus                : 2
+max_cpu_id             : 3
+...
+
+Which shows 4 CPUs in the MADT, but only 2 online (as this particular box is
+the dual-core rather than the quad-core SKU of its particular brand)
+
+Because of the way Xen exposes this information, a libxl_cputopology array is
+bounded by 'nr_cpus', while cpu bitmaps are bounded by 'max_cpu_id + 1'.
+
+The current libxl code has two places which erroneously assume that a
+libxl_cputopology array is as long as the number of bits found in a cpu
+bitmap, and valgrind complains:
+
+==14961== Invalid read of size 4
+==14961==    at 0x407AB7F: libxl__get_numa_candidate (libxl_numa.c:230)
+==14961==    by 0x407030B: libxl__build_pre (libxl_dom.c:167)
+==14961==    by 0x406246F: libxl__domain_build (libxl_create.c:371)
+...
+==14961==  Address 0x4324788 is 8 bytes after a block of size 24 alloc'd
+==14961==    at 0x402669D: calloc (in/usr/lib/valgrind/vgpreload_memcheck-x86-linux.so)
+==14961==    by 0x4075BB9: libxl__zalloc (libxl_internal.c:83)
+==14961==    by 0x4052F87: libxl_get_cpu_topology (libxl.c:4408)
+==14961==    by 0x407A899: libxl__get_numa_candidate (libxl_numa.c:342)
+...
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Dario Faggioli <dario.faggioli@citrix.com>
+Acked-by: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+
+diff -r ef0932b362f8 -r b4593c67eace tools/libxl/libxl_numa.c
+--- a/tools/libxl/libxl_numa.c
++++ b/tools/libxl/libxl_numa.c
+@@ -180,6 +180,7 @@ static int nodemap_to_nr_vcpus(libxl__gc
+ /* Number of vcpus able to run on the cpus of the various nodes
+  * (reported by filling the array vcpus_on_node[]). */
+ static int nr_vcpus_on_nodes(libxl__gc *gc, libxl_cputopology *tinfo,
++                             size_t tinfo_elements,
+                              const libxl_bitmap *suitable_cpumap,
+                              int vcpus_on_node[])
+ {
+@@ -222,6 +223,8 @@ static int nr_vcpus_on_nodes(libxl__gc *
+              */
+             libxl_bitmap_set_none(&nodes_counted);
+             libxl_for_each_set_bit(k, vinfo[j].cpumap) {
++                if (k >= tinfo_elements)
++                    break;
+                 int node = tinfo[k].node;
+ 
+                 if (libxl_bitmap_test(suitable_cpumap, k) &&
+@@ -364,7 +367,7 @@ int libxl__get_numa_candidate(libxl__gc 
+      * all we have to do later is summing up the right elements of the
+      * vcpus_on_node array.
+      */
+-    rc = nr_vcpus_on_nodes(gc, tinfo, suitable_cpumap, vcpus_on_node);
++    rc = nr_vcpus_on_nodes(gc, tinfo, nr_cpus, suitable_cpumap, vcpus_on_node);
+     if (rc)
+         goto out;
+ 
+diff -r ef0932b362f8 -r b4593c67eace tools/libxl/libxl_utils.c
+--- a/tools/libxl/libxl_utils.c
++++ b/tools/libxl/libxl_utils.c
+@@ -762,8 +762,11 @@ int libxl_cpumap_to_nodemap(libxl_ctx *c
+     }
+ 
+     libxl_bitmap_set_none(nodemap);
+-    libxl_for_each_set_bit(i, *cpumap)
++    libxl_for_each_set_bit(i, *cpumap) {
++        if (i >= nr_cpus)
++            break;
+         libxl_bitmap_set(nodemap, tinfo[i].node);
++    }
+  out:
+     libxl_cputopology_list_free(tinfo, nr_cpus);
+     return rc;

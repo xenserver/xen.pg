@@ -1,0 +1,85 @@
+# HG changeset patch
+# User Jan Beulich <jbeulich@suse.com>
+# Date 1394717195 -3600
+# Node ID 471ad07cf29d572f7cd187595d5be79840364b69
+# Parent  3dd0cf9e37a555b5ea88fd905a577fa44eeb0eac
+common: make hypercall preemption checks consistent
+
+- never preempt on the first iteration (ensure forward progress)
+- do cheap checks first
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Tim Deegan <tim@xen.org>
+Acked-by: Keir Fraser <keir@xen.org>
+
+diff -r 3dd0cf9e37a5 -r 471ad07cf29d xen/common/memory.c
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -63,7 +63,7 @@ static void increase_reservation(struct 
+ 
+     for ( i = a->nr_done; i < a->nr_extents; i++ )
+     {
+-        if ( hypercall_preempt_check() )
++        if ( i != a->nr_done && hypercall_preempt_check() )
+         {
+             a->preempted = 1;
+             goto out;
+@@ -109,7 +109,7 @@ static void populate_physmap(struct memo
+ 
+     for ( i = a->nr_done; i < a->nr_extents; i++ )
+     {
+-        if ( hypercall_preempt_check() )
++        if ( i != a->nr_done && hypercall_preempt_check() )
+         {
+             a->preempted = 1;
+             goto out;
+@@ -268,7 +268,7 @@ static void decrease_reservation(struct 
+ 
+     for ( i = a->nr_done; i < a->nr_extents; i++ )
+     {
+-        if ( hypercall_preempt_check() && i != a->nr_done )
++        if ( i != a->nr_done && hypercall_preempt_check() )
+         {
+             a->preempted = 1;
+             goto out;
+@@ -398,7 +398,8 @@ static long memory_exchange(XEN_GUEST_HA
+           i < (exch.in.nr_extents >> in_chunk_order);
+           i++ )
+     {
+-        if ( hypercall_preempt_check() )
++        if ( i != (exch.nr_exchanged >> in_chunk_order) &&
++             hypercall_preempt_check() )
+         {
+             exch.nr_exchanged = i << in_chunk_order;
+             rcu_unlock_domain(d);
+diff -r 3dd0cf9e37a5 -r 471ad07cf29d xen/common/multicall.c
+--- a/xen/common/multicall.c
++++ b/xen/common/multicall.c
+@@ -52,7 +52,7 @@ do_multicall(
+ 
+     for ( i = 0; !rc && i < nr_calls; i++ )
+     {
+-        if ( hypercall_preempt_check() )
++        if ( i && hypercall_preempt_check() )
+             goto preempted;
+ 
+         if ( unlikely(__copy_from_guest(&mcs->call, call_list, 1)) )
+diff -r 3dd0cf9e37a5 -r 471ad07cf29d xen/drivers/char/console.c
+--- a/xen/drivers/char/console.c
++++ b/xen/drivers/char/console.c
+@@ -375,12 +375,12 @@ static DECLARE_SOFTIRQ_TASKLET(notify_do
+ static long guest_console_write(XEN_GUEST_HANDLE_PARAM(char) buffer, int count)
+ {
+     char kbuf[128];
+-    int kcount;
++    int kcount = 0;
+     struct domain *cd = current->domain;
+ 
+     while ( count > 0 )
+     {
+-        if ( hypercall_preempt_check() )
++        if ( kcount && hypercall_preempt_check() )
+             return hypercall_create_continuation(
+                 __HYPERVISOR_console_io, "iih",
+                 CONSOLEIO_write, count, buffer);

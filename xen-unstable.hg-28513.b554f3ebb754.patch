@@ -1,0 +1,34 @@
+# HG changeset patch
+# User Ian Jackson <ian.jackson@eu.citrix.com>
+# Date 1394715007 0
+# Node ID b554f3ebb7543c03db9d7b6d3cde93037ef32b2a
+# Parent  f5af81ba2e645a8cdcf8dccd3bbc58ff1e3564b7
+libxl: Hold the atfork lock while closing carefd
+
+This avoids the process being forked while a carefd is recorded in the
+list but the actual fd has been closed.  If that happened, a
+subsequent libxl_postfork_child_noexec would attempt to close the fd
+again.  If we are lucky that results in a harmless warning; but if we
+are unlucky the fd number has been reused and we close an unrelated
+fd.
+
+This race has not been observed anywhere as far as we are aware.
+
+Signed-off-by: Ian Jackson <Ian.Jackson@eu.citrix.com>
+Acked-by: Ian Campbell <Ian.Campbell@citrix.com>
+CC: George Dunlap <george.dunlap@eu.citrix.com>
+
+diff -r f5af81ba2e64 -r b554f3ebb754 tools/libxl/libxl_fork.c
+--- a/tools/libxl/libxl_fork.c
++++ b/tools/libxl/libxl_fork.c
+@@ -184,9 +184,9 @@ void libxl_postfork_child_noexec(libxl_c
+ int libxl__carefd_close(libxl__carefd *cf)
+ {
+     if (!cf) return 0;
++    atfork_lock();
+     int r = cf->fd < 0 ? 0 : close(cf->fd);
+     int esave = errno;
+-    atfork_lock();
+     LIBXL_LIST_REMOVE(cf, entry);
+     atfork_unlock();
+     free(cf);
