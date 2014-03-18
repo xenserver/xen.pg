@@ -1,0 +1,537 @@
+From f97391622d8e11651e249baaf76a8f13621e85ef Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 6 Mar 2014 00:03:18 +0000
+Subject: [PATCH 3/5] Scripts for inspection/valdiation of legacy and new
+ streams
+
+---
+ tools/libxc/saverestore/scripts/generate.py        |   59 ++++++
+ .../libxc/saverestore/scripts/inspect-legacy32.py  |  167 ++++++++++++++++
+ tools/libxc/saverestore/scripts/streamspec.py      |   59 ++++++
+ tools/libxc/saverestore/scripts/verify.py          |  208 ++++++++++++++++++++
+ 4 files changed, 493 insertions(+)
+ create mode 100755 tools/libxc/saverestore/scripts/generate.py
+ create mode 100755 tools/libxc/saverestore/scripts/inspect-legacy32.py
+ create mode 100644 tools/libxc/saverestore/scripts/streamspec.py
+ create mode 100755 tools/libxc/saverestore/scripts/verify.py
+
+diff --git a/tools/libxc/saverestore/scripts/generate.py b/tools/libxc/saverestore/scripts/generate.py
+new file mode 100755
+index 0000000..3b01e65
+--- /dev/null
++++ b/tools/libxc/saverestore/scripts/generate.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++from streamspec import *
++import struct, sys
++
++ihdr = struct.pack(IHDR_FORMAT,
++                   0xffffffffffffffff, # Marker
++                   IHDR_IDENT,         # "XENF" in ASCII
++                   1,                  # Version
++                   IHDR_OPT_LE,        # Options
++                   0, 0                # Reserved
++                   )
++
++def emit_record(type, data):
++    length = len(data)
++
++    r = struct.pack(RH_FORMAT, type, length)
++    r += data
++
++    padding_len = (8 - (length & 7)) & 7
++    r += '\x00' * padding_len
++
++    sys.stdout.write(r)
++
++
++def emit_pv():
++
++    dhdr = struct.pack(DHDR_FORMAT,
++                       DHDR_TYPE_x86_pv,  # Type
++                       12, # Page size
++                       0,  # Reserved
++                       4,  # Xen major
++                       5   # Xen minor
++                       )
++
++    sys.stdout.write(ihdr)
++    sys.stdout.write(dhdr)
++
++    x86_pv_info = struct.pack(X86_PV_INFO_FORMAT,
++                              8, # Guest width
++                              4, # Guest levels
++                              0  # Options
++                              )
++
++    emit_record(REC_TYPE_x86_pv_info, x86_pv_info)
++    emit_record(REC_TYPE_end, "")
++    return 0
++
++
++def main(argv = sys.argv):
++
++    if len(argv) == 0 or argv[0] == "pv":
++        return emit_pv()
++    else:
++        return 1
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/tools/libxc/saverestore/scripts/inspect-legacy32.py b/tools/libxc/saverestore/scripts/inspect-legacy32.py
+new file mode 100755
+index 0000000..e20a8f2
+--- /dev/null
++++ b/tools/libxc/saverestore/scripts/inspect-legacy32.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++import sys
++import struct
++
++fin = None
++guest_width = 0
++guest_levels = 0
++
++class StreamError(StandardError):
++    pass
++
++def rdexact(n):
++    _ = fin.read(n)
++    if len(_) != n:
++        raise IOError("Stream truncated")
++    #print"> read 0x%x bytes" % (n, )
++    return _
++
++def unpack_exact(fmt):
++    l = struct.calcsize(fmt)
++    return struct.unpack(fmt, rdexact(l))
++
++def read_extended_info():
++    global guest_width, guest_level
++
++    sig, rem_length = struct.unpack("II", rdexact(8))
++
++    if sig != 0xffffffff:
++        raise StreamError("Bad extended info signature 0x%08x" % (sig,))
++    else:
++        print "Endended Info: length 0x%x" % (rem_length,)
++
++    so_far = 0
++    while so_far < rem_length:
++
++        blkid, datasz = struct.unpack("4sI", rdexact(8))
++        so_far += 8
++
++        print "  Record type: %s, size 0x%x" % (blkid, datasz)
++
++        # Eww, but this is how it is done :(
++        if blkid == "vcpu":
++            if datasz == 0x1430:
++                guest_width = 8
++                guest_levels = 4
++                print "    64bit domain, 4 levels"
++            else:
++                raise StreamError("Unable to determine guest width/level")
++
++        rdexact(datasz)
++        so_far += datasz
++
++    if so_far != rem_length:
++        raise StreamError("Overshot total Extended Info size. Consumed 0x%x bytes" % (so_far,))
++
++def read_chunks():
++
++    while True:
++
++        chunk_type, = struct.unpack("i", rdexact(4))
++        print "Chunk: type 0x%x" % (chunk_type,)
++
++        if chunk_type == 0:
++            print "  End"
++            return
++
++        elif chunk_type > 0:
++            print "  Page Batch"
++            pfn_array = rdexact(chunk_type * 4)
++            page_data = rdexact(chunk_type * 4096)
++
++        elif chunk_type == -2:
++            max_id, = unpack_exact("i")
++            bitmap = rdexact(((max_id/64) + 1) * 8)
++            print "  Vcpu info: max_id %d" % (max_id, )
++
++        elif chunk_type == -7:
++            mode, nsec, khz, incarn = unpack_exact("IQII")
++            print "  TSC_INFO: mode %s, %d ns, %d khz, %d incarn" % ( mode, nsec, khz, incarn)
++
++        elif chunk_type == -9:
++            print "  Last Checkpoint"
++
++        elif chunk_type == -12:
++            sz, = unpack_exact("I")
++            data = rdexact(sz)
++            print "  Compressed Data: sz 0x%x" % (sz, )
++
++        elif chunk_type == -18:
++            sz, = unpack_exact("I")
++            data = rdexact(sz)
++            print "  Toolstack Data: sz 0x%x" % (sz, )
++
++        else:
++            raise StreamError("Unrecognised chunk")
++
++def main(argv = sys.argv):
++    global fin
++
++    if len(argv) == 2:
++        fin = open(argv[1], "rb")
++    else:
++        fin = sys.stdin
++
++    try:
++        # Skip Xl header
++        if "Xen saved domain, xl format\n \0 \r" != rdexact(32):
++            raise StreamError("No xl header")
++
++        _, _, _, optlen = struct.unpack("=IIII", rdexact(16))
++        rdexact(optlen)
++        print "xl header skipped"
++
++        # P2M size
++        p2m_size, = struct.unpack("I", rdexact(4))
++        print "P2M Size: 0x%x" % (p2m_size,)
++
++        # Extended info
++        read_extended_info()
++
++        # P2M list
++
++        fpp = 4096/guest_width
++        p2m_len = (p2m_size + fpp - 1) / fpp
++
++        print "Reading p2m frames.  fpp: %d, p2m_len: %d" % (fpp, p2m_len)
++
++        p2m_frames = rdexact(p2m_len * 4)
++        if p2m_len < 20:
++            print list(struct.unpack("I" * p2m_len, p2m_frames))
++
++        read_chunks()
++
++        unmapped_pfn_count, = unpack_exact("I")
++        unmapped_pfn_list = rdexact(unmapped_pfn_count * 4)
++        print "Unmapped PFN count: 0x%x" % (unmapped_pfn_count, )
++
++        # VCPU Context fudge
++        _ = rdexact(0x1430)
++        _ = rdexact(128)
++        xfeature_mask, xsize = unpack_exact("QQ")
++        _ = rdexact(xsize)
++        print "Got VCPU information"
++
++        shared_info = rdexact(4096)
++        print "Got shinfo"
++
++        if fin.read(1) != "":
++            raise StreamError("Junk found on the end of the stream")
++
++    except (IOError, StreamError, ) as e:
++        print "Error: ", e
++        return 1
++
++    except RuntimeError as e:
++        print "Script error", e
++        print "Please fix me"
++        return 2
++
++    print "Done"
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
+diff --git a/tools/libxc/saverestore/scripts/streamspec.py b/tools/libxc/saverestore/scripts/streamspec.py
+new file mode 100644
+index 0000000..57508e2
+--- /dev/null
++++ b/tools/libxc/saverestore/scripts/streamspec.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++# Image Header
++IHDR_FORMAT = "!QIIHHI"
++
++IHDR_IDENT = 0x58454E46 # "XENF" in ASCII
++
++IHDR_OPT_ENDIAN_ = 0
++IHDR_OPT_LE = (0 << IHDR_OPT_ENDIAN_)
++IHDR_OPT_BE = (1 << IHDR_OPT_ENDIAN_)
++
++IHDR_OPT_RESZ_MASK = 0xfffe
++
++# Domain Header
++DHDR_FORMAT = "=IHHII"
++
++DHDR_TYPE_x86_pv  = 0x00000001
++DHDR_TYPE_x86_hvm = 0x00000002
++DHDR_TYPE_x86_pvh = 0x00000003
++DHDR_TYPE_arm     = 0x00000004
++
++dhdr_type_to_str = {
++    DHDR_TYPE_x86_pv  : "x86 PV",
++    DHDR_TYPE_x86_hvm : "x86 HVM",
++    DHDR_TYPE_x86_pvh : "x86 PVH",
++    DHDR_TYPE_arm     : "ARM",
++}
++
++RH_FORMAT = "=II"
++
++REC_TYPE_end               = 0x00000000
++REC_TYPE_page_data         = 0x00000001
++REC_TYPE_vcpu_count        = 0x00000002
++REC_TYPE_vcpu_context      = 0x00000003
++REC_TYPE_vcpu_context_x1   = 0x00000004
++REC_TYPE_vcpu_context_x2   = 0x00000005
++REC_TYPE_x86_pv_info       = 0x00000006
++REC_TYPE_x86_pv_p2m_frames = 0x00000007
++
++rec_type_to_str = {
++    REC_TYPE_end               : "End",
++    REC_TYPE_page_data         : "Page data",
++    REC_TYPE_vcpu_count        : "Vcpu count",
++    REC_TYPE_vcpu_context      : "Vcpu context",
++    REC_TYPE_vcpu_context_x1   : "Vcpu context 1",
++    REC_TYPE_vcpu_context_x2   : "Vcpu context 2",
++    REC_TYPE_x86_pv_info       : "x86 PV info",
++    REC_TYPE_x86_pv_p2m_frames : "x86 PV P2M frames",
++}
++
++
++# x86_pv_info
++X86_PV_INFO_FORMAT        = "=BBB"
++
++X86_PV_INFO_OPT_VMASST_   = 0
++X86_PV_INFO_OPT_VMASST    = (1 << X86_PV_INFO_OPT_VMASST_)
++
++X86_PV_INFO_OPT_RESZ_MASK = 0xfe
+diff --git a/tools/libxc/saverestore/scripts/verify.py b/tools/libxc/saverestore/scripts/verify.py
+new file mode 100755
+index 0000000..5bf03ab
+--- /dev/null
++++ b/tools/libxc/saverestore/scripts/verify.py
+@@ -0,0 +1,208 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++import sys
++import struct
++
++from streamspec import *
++
++class StreamError(StandardError):
++    pass
++
++class RecordError(StandardError):
++    pass
++
++def skip_xl_header(stream):
++
++    magic = stream.read(8)
++    if magic != "mat\n \0 \r":
++        return False
++
++    header = stream.read(16)
++    if len(header) != 16:
++        return False
++
++    _, _, _, optlen = struct.unpack("=IIII", header)
++
++    optdata = stream.read(optlen)
++    if len(optdata) != optlen:
++        return False
++
++    return True
++
++
++def verify_ihdr(stream):
++    """ Verify an image header """
++
++    datasz = struct.calcsize(IHDR_FORMAT)
++    data = stream.read(datasz)
++
++    # xl header record?
++    if data == "Xen saved domain, xl for":
++        if skip_xl_header(stream):
++            data = stream.read(datasz)
++        else:
++            raise StreamError("Invalid looking xl header on the stream")
++
++    if len(data) != datasz:
++        raise IOError("Truncated stream")
++
++    marker, id, version, options, res1, res2 = struct.unpack(IHDR_FORMAT, data)
++
++    if marker != 0xffffffffffffffff:
++        raise StreamError("Bad image marker: Expected 0xffffffffffffffff, got 0x%x" % (marker, ))
++
++    if id != 0x58454e46:
++        raise StreamError("Bad image id: Expected 0x0x58454e46, got 0x%x" % (id, ))
++
++    if version != 1:
++        raise StreamError("Unknown image version: Expected 1, got %d" % (version, ))
++
++    if options & IHDR_OPT_RESZ_MASK:
++        raise StreamError("Reserved bits set in image options field: 0x%x" % (options & IHDR_OPT_RESZ_MASK))
++
++    if res1 != 0 or res2 != 0:
++        raise StreamError("Reserved bits set in image header: 0x%04x:0x%08x" % (res1, res2))
++
++    if ( sys.byteorder == "little" and
++         (options & IHDR_OPT_ENDIAN_) != IHDR_OPT_LE ):
++        raise StreamError("Stream is not native endianess - unable to validate")
++
++    print "Valid Image Header:",
++    if options & IHDR_OPT_BE:
++        print "big endian"
++    else:
++        print "little endian"
++
++def verify_dhdr(stream):
++    """ Verify a domain header """
++
++    datasz = struct.calcsize(DHDR_FORMAT)
++    data = stream.read(datasz)
++
++    if len(data) != datasz:
++        raise IOError("Truncated stream")
++
++    type, page_shift, res1, major, minor = struct.unpack(DHDR_FORMAT, data)
++
++    if type not in dhdr_type_to_str:
++        raise StreamError("Unrecognised domain type 0x%x" % (type, ))
++
++    if res1 != 0:
++        raise StreamError("Reserved bits set in domain header 0x%04x" % (res1, ))
++
++    if page_shift != 12:
++        raise StreamError("Page shift expected to be 12.  Got %d" % (page_shift, ))
++
++    print "Valid Domain Header: %s from Xen %d.%d (page sz %d)" \
++        % (dhdr_type_to_str[type], major, minor, 2**page_shift)
++
++
++def verify_record_end(content):
++
++    if len(content) != 0:
++        raise RecordError("End record with non-zero length")
++
++def verify_x86_pv_info(content):
++
++    if len(content) != 3:
++        raise RecordError("x86_pf_info: expected length of 3, got %d" % (len(content), ))
++
++    width, levels, options = struct.unpack(X86_PV_INFO_FORMAT, content)
++
++    if width not in (4, 8):
++        raise RecordError("Expected width of 4 or 8, got %d" % (width, ))
++
++    if levels not in (4, 8):
++        raise RecordError("Expected levels of 3 or 4, got %d" % (levels, ))
++
++    if (options & X86_PV_INFO_OPT_RESZ_MASK) != 0:
++        raise StreamError("Reserved bits set in X86_PV_INFO options: 0x%02"
++                          % (options & X86_PV_INFO_OPT_RESZ_MASK, ))
++
++    bitness = {4:32, 8:64}[width]
++
++    print "  %sbit guest, %d levels of pagetables" % (bitness, levels)
++
++def verify_x86_pv_p2m_frames(content):
++
++    if len(content) % 8 != 0:
++        raise RecordError("Length expected to be a multiple of 8, not %d"
++                          % (len(content), ))
++
++    start, end = struct.unpack_from("=II", content)
++
++    print "  Start gfn 0x%x, End 0x%x" % (start, end)
++
++record_verifiers = {
++    REC_TYPE_end : verify_record_end,
++    REC_TYPE_x86_pv_info: verify_x86_pv_info,
++    REC_TYPE_x86_pv_p2m_frames: verify_x86_pv_p2m_frames,
++}
++
++def verify_record(stream):
++    """ Verify a record """
++
++    datasz = struct.calcsize(RH_FORMAT)
++    data = stream.read(datasz)
++
++    if len(data) != datasz:
++        raise IOError("Truncated stream")
++
++    type, length = struct.unpack(RH_FORMAT, data)
++
++    if type not in rec_type_to_str:
++        raise StreamError("Unrecognised record type %x" % (type, ))
++
++    contentsz = (length + 7) & ~7
++    content = stream.read(contentsz)
++
++    if len(content) != contentsz:
++        raise IOError("Truncated stream")
++
++    padding = content[length:]
++    if padding != "\x00" * len(padding):
++        raise StreamError("Padding containging non0 bytes found")
++
++    print "Valid Record Header: %s, length %d" % (rec_type_to_str[type], length)
++
++    if type not in record_verifiers:
++        raise RuntimeError("No verification function")
++    else:
++        record_verifiers[type](content[:length])
++
++    return type
++
++
++def main(argv = sys.argv):
++
++    if len(argv) == 2:
++        fin = open(argv[1], "rb")
++    else:
++        fin = sys.stdin
++
++    try:
++        verify_ihdr(fin)
++        verify_dhdr(fin)
++
++        while verify_record(fin) != REC_TYPE_end:
++            pass
++
++        if fin.read(1) != "":
++            raise StreamError("Junk found on the end of the stream")
++
++    except (IOError, StreamError, RecordError) as e:
++        print "Error: ", e
++        return 1
++
++    except RuntimeError as e:
++        print "Script error", e
++        print "Please fix me"
++        return 2
++
++    print "Done"
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
+-- 
+1.7.10.4
+

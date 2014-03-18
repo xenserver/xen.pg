@@ -1,0 +1,661 @@
+From ef61297489d3f97205a5f56407db47772417c3cb Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Sat, 15 Mar 2014 21:13:16 +0000
+Subject: [PATCH 4/5] x86_pv save
+
+---
+ tools/libxc/saverestore/common.c      |   30 +++
+ tools/libxc/saverestore/common.h      |   64 +++++
+ tools/libxc/saverestore/save.c        |   29 +-
+ tools/libxc/saverestore/save_x86_pv.c |  471 +++++++++++++++++++++++++++++++++
+ 4 files changed, 593 insertions(+), 1 deletion(-)
+ create mode 100644 tools/libxc/saverestore/save_x86_pv.c
+
+diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
+index 48f22d0..6dfc47b 100644
+--- a/tools/libxc/saverestore/common.c
++++ b/tools/libxc/saverestore/common.c
+@@ -1,3 +1,5 @@
++#include <assert.h>
++
+ #include "common.h"
+ 
+ static const char *dhdr_types[] =
+@@ -47,6 +49,34 @@ const char *rec_type_to_str(uint32_t type)
+     return "Reserved";
+ }
+ 
++int write_record(struct save_ctx *ctx, struct record *rec)
++{
++    static const char zeroes[7] = { 0 };
++    xc_interface *xch = ctx->xch;
++    size_t record_length = (rec->length + 7) & ~7UL;
++
++    if ( rec->length > REC_LENGTH_MAX )
++    {
++        ERROR("Record (0x%08"PRIx32", %s) length 0x%"PRIx32
++              " exceeds max (0x%"PRIx32")", rec->type,
++              rec_type_to_str(rec->type), rec->length, REC_LENGTH_MAX);
++        return -1;
++    }
++    else if ( rec->length )
++        assert(rec->data);
++
++    if ( write_exact(ctx->fd, &rec->type, sizeof rec->type) ||
++         write_exact(ctx->fd, &rec->length, sizeof rec->length) ||
++         (rec->length && write_exact(ctx->fd, rec->data, rec->length)) ||
++         write_exact(ctx->fd, zeroes, record_length - rec->length) )
++    {
++        PERROR("Unable to write record to stream");
++        return -1;
++    }
++
++    return 0;
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
+index fff0a39..9d13603 100644
+--- a/tools/libxc/saverestore/common.h
++++ b/tools/libxc/saverestore/common.h
+@@ -2,6 +2,7 @@
+ #define __COMMON__H
+ 
+ #include "../xg_private.h"
++#include "../xg_save_restore.h"
+ 
+ #include "stream_format.h"
+ 
+@@ -11,6 +12,69 @@
+ const char *dhdr_type_to_str(uint32_t type);
+ const char *rec_type_to_str(uint32_t type);
+ 
++struct save_ctx
++{
++    xc_interface *xch;
++    uint32_t domid;
++    int fd;
++
++    xc_dominfo_t dominfo;
++
++    union
++    {
++        struct
++        {
++            unsigned int width; /* 4 or 8; 32 or 64 bit domain */
++            unsigned int levels; /* 3 or 4 pagetable levels */
++
++            /* Read-only mapping of guests shared info page */
++            shared_info_any_t *shinfo;
++
++            /* Maximum system frame */
++            unsigned long max_mfn;
++            /* Read-only machine to phys map */
++            xen_pfn_t *m2p;
++
++            /* Maximum guest frame */
++            unsigned long max_gfn;
++            /* Frames per page in guest p2m */
++            unsigned int fpp;
++
++            /* Number of frames making up the p2m */
++            unsigned int p2m_frames;
++            /* Read-only guests phys to machine map */
++            xen_pfn_t *p2m;
++            /* The guest pfns containing the p2m leaves */
++            xen_pfn_t *p2m_pfns;
++
++        } x86_pv;
++    };
++};
++
++#define SHINFO_GET(_c, _f)                        \
++    ({ (_c)->x86_pv.width == 8 ?                  \
++            (_c)->x86_pv.shinfo->x64._f:          \
++            (_c)->x86_pv.shinfo->x32._f;          \
++    })                                            \
++
++int save_x86_pv(struct save_ctx *ctx);
++
++struct record
++{
++    uint32_t type;
++    uint32_t length;
++    void *data;
++};
++
++/*
++ * Writes a record to the stream, applying correct padding where appropriate.
++ * Records with a non-zero length must provide a valid data field; records
++ * with a 0 length shall have their data field ignored.
++ *
++ * Returns 0 on success and non0 on failure.
++ */
++int write_record(struct save_ctx *ctx, struct record *rec);
++
+ #endif
+ /*
+  * Local variables:
+diff --git a/tools/libxc/saverestore/save.c b/tools/libxc/saverestore/save.c
+index c013e62..422fdf8 100644
+--- a/tools/libxc/saverestore/save.c
++++ b/tools/libxc/saverestore/save.c
+@@ -5,8 +5,35 @@ int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_ite
+                     struct save_callbacks* callbacks, int hvm,
+                     unsigned long vm_generationid_addr)
+ {
++    struct save_ctx ctx =
++        {
++            .xch = xch,
++            .fd = io_fd,
++        };
++
+     IPRINTF("In experimental %s", __func__);
+-    return -1;
++
++    if ( xc_domain_getinfo(xch, dom, 1, &ctx.dominfo) != 1 )
++    {
++        PERROR("Failed to get domain info");
++        return -1;
++    }
++
++    if ( ctx.dominfo.domid != dom )
++    {
++        ERROR("Domain %d does not exist", dom);
++        return -1;
++    }
++
++    ctx.domid = dom;
++
++    if ( ctx.dominfo.hvm )
++    {
++        ERROR("HVM Save not supported yet");
++        return -1;
++    }
++    else
++        return save_x86_pv(&ctx);
+ }
+ 
+ /*
+diff --git a/tools/libxc/saverestore/save_x86_pv.c b/tools/libxc/saverestore/save_x86_pv.c
+new file mode 100644
+index 0000000..cbfbc0e
+--- /dev/null
++++ b/tools/libxc/saverestore/save_x86_pv.c
+@@ -0,0 +1,471 @@
++#include <assert.h>
++#include <stdbool.h>
++#include <arpa/inet.h>
++
++#define mfn_to_pfn __UNUSED_mfn_to_pfn
++#define pfn_to_mfn __UNUSED_pfn_to_mfn
++
++#include "common.h"
++
++#undef mfn_to_pfn
++#undef pfn_to_mfn
++
++static xen_pfn_t mfn_to_pfn(struct save_ctx *ctx, xen_pfn_t mfn)
++{
++    assert(mfn <= ctx->x86_pv.max_mfn);
++    return ctx->x86_pv.m2p[mfn];
++}
++
++static xen_pfn_t pfn_to_mfn(struct save_ctx *ctx, xen_pfn_t pfn)
++{
++    assert(pfn <= ctx->x86_pv.max_gfn);
++
++    if ( ctx->x86_pv.width == sizeof (unsigned long) )
++        return ctx->x86_pv.p2m[pfn];
++    else
++    {
++#ifdef __x86_64__
++        /* 64bit toolstack, 32bit guest.  Extend MFN_INVALID to 64 bits */
++        if ( ((uint32_t*)ctx->x86_pv.p2m)[pfn] == ~0U )
++            return -1ULL;
++        else
++            return ((uint32_t*)ctx->x86_pv.p2m)[pfn];
++#else
++        /* 32bit toolstack, 64bit guest.  Reduce their pointers */
++        return ((uint64_t*)ctx->x86_pv.p2m)[pfn];
++#endif
++    }
++}
++
++static bool mfn_in_pseudophys_map(struct save_ctx *ctx, xen_pfn_t mfn)
++{
++    return ( (mfn <= ctx->x86_pv.max_mfn) &&
++             (mfn_to_pfn(ctx, mfn) <= ctx->x86_pv.max_gfn) &&
++             (pfn_to_mfn(ctx, mfn_to_pfn(ctx, mfn) == mfn)) );
++}
++
++static int write_headers(struct save_ctx *ctx)
++{
++    struct ihdr ihdr = { 0 };
++    struct dhdr dhdr = { 0 };
++    xc_interface *xch = ctx->xch;
++    int32_t xen_version = xc_version(xch, XENVER_version, NULL);
++
++    ihdr.marker  = IHDR_MARKER;
++    ihdr.id      = htonl(IHDR_ID);
++    ihdr.version = htonl(IHDR_VERSION);
++    ihdr.options = htons(IHDR_OPT_LITTLE_ENDIAN);
++
++    if ( write_exact(ctx->fd, &ihdr, sizeof ihdr) )
++    {
++        PERROR("Unable to write Image Header to stream");
++        return -1;
++    }
++
++    dhdr.type       = DHDR_TYPE_x86_pv;
++    dhdr.page_shift = 12;
++    dhdr.xen_major  = (xen_version >> 16) & 0xffff;
++    dhdr.xen_minor  = (xen_version)       & 0xffff;
++
++    if ( write_exact(ctx->fd, &dhdr, sizeof dhdr) )
++    {
++        PERROR("Unable to write Domain Header to stream");
++        return -1;
++    }
++
++    return 0;
++}
++
++static int map_m2p(struct save_ctx *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    long max_page = xc_maximum_ram_page(xch);
++    unsigned long m2p_chunks, m2p_size;
++    privcmd_mmap_entry_t *entries = NULL;
++    xen_pfn_t *extents_start = NULL;
++    int rc = -1, i;
++
++    if ( max_page < 0 )
++    {
++        PERROR("Failed to get maximum ram page");
++        goto err;
++    }
++
++    ctx->x86_pv.max_mfn = max_page;
++    DPRINTF("Maximum MFN: %#lx", ctx->x86_pv.max_mfn);
++    m2p_size   = M2P_SIZE(ctx->x86_pv.max_mfn);
++    m2p_chunks = M2P_CHUNKS(ctx->x86_pv.max_mfn);
++
++    extents_start = calloc(m2p_chunks, sizeof(xen_pfn_t));
++    if ( !extents_start )
++    {
++        ERROR("Unable to allocate %zu bytes for m2p mfns",
++              m2p_chunks * sizeof(xen_pfn_t));
++        goto err;
++    }
++
++    if ( xc_machphys_mfn_list(xch, m2p_chunks, extents_start) )
++    {
++        PERROR("Failed to get m2p mfn list");
++        goto err;
++    }
++
++    entries = calloc(m2p_chunks, sizeof(privcmd_mmap_entry_t));
++    if ( !entries )
++    {
++        ERROR("Unable to allocate %zu bytes for m2p mapping mfns",
++              m2p_chunks * sizeof(xen_pfn_t));
++        goto err;
++    }
++
++    for ( i = 0; i < m2p_chunks; ++i )
++        entries[i].mfn = extents_start[i];
++
++    ctx->x86_pv.m2p = xc_map_foreign_ranges(
++        xch, DOMID_XEN, m2p_size, PROT_READ,
++        M2P_CHUNK_SIZE, entries, m2p_chunks);
++
++    if ( !ctx->x86_pv.m2p )
++    {
++        PERROR("Failed to mmap m2p ranges");
++        goto err;
++    }
++
++    rc = 0;
++    DPRINTF("Mapped m2p");
++err:
++    free(entries);
++    free(extents_start);
++
++    return rc;
++}
++
++static int map_p2m(struct save_ctx *ctx)
++{
++    /* Terminology:
++     *
++     * fll   - frame list list, top level p2m, list of fl mfns
++     * fl    - frame list, mid level p2m, list of leaf mfns
++     * local - own allocated buffers, adjusted for bitness
++     * guest - mappings into the domain
++     */
++    xc_interface *xch = ctx->xch;
++    int rc = -1, tries = 100, fpp, x;
++    int fll_entries, fl_entries;
++    xen_pfn_t fll_mfn;
++
++    xen_pfn_t *guest_fll = NULL, *local_fll = NULL;
++    size_t local_fll_size;
++
++    xen_pfn_t *guest_fl = NULL, *local_fl = NULL;
++    size_t local_fl_size;
++
++    fpp = ctx->x86_pv.fpp = PAGE_SIZE / ctx->x86_pv.width;
++    fll_entries = (ctx->x86_pv.max_gfn + (fpp * fpp) - 1) / (fpp * fpp);
++    fl_entries  = (ctx->x86_pv.max_gfn + fpp) / fpp;
++
++    fll_mfn = SHINFO_GET(ctx, arch.pfn_to_mfn_frame_list_list);
++    if ( !fll_mfn )
++        IPRINTF("Waiting for domain to set up its p2m frame list list");
++
++    while ( tries-- && !fll_mfn )
++    {
++        usleep(10000);
++        fll_mfn = SHINFO_GET(ctx, arch.pfn_to_mfn_frame_list_list);
++    }
++
++    if ( !fll_mfn )
++    {
++        ERROR("Timed out waiting for p2m frame list list to be updated");
++        goto err;
++    }
++
++    /* Map the guest top p2m */
++    guest_fll = xc_map_foreign_range(xch, ctx->domid, PAGE_SIZE,
++                                     PROT_READ, fll_mfn);
++    if ( !guest_fll )
++    {
++        PERROR("Failed to map p2m frame list list at %#lx", fll_mfn);
++        goto err;
++    }
++
++    local_fll_size = fll_entries * sizeof(unsigned long);
++    local_fll = malloc(local_fll_size);
++    if ( !local_fll )
++    {
++        ERROR("Cannot allocate %zu bytes for local p2m frame list list",
++              local_fll_size);
++        goto err;
++    }
++
++    if ( ctx->x86_pv.width == sizeof(unsigned long) )
++        memcpy(local_fll, guest_fll, local_fll_size);
++    else
++    {
++        for ( x = 0; x < fll_entries; ++x )
++#ifdef __x86_64__
++            /* 64bit toolstack, 32bit guest.  Expand their pointers */
++            local_fll[x] = ((uint32_t*)guest_fll)[x];
++#else
++            /* 32bit toolstack, 64bit guest.  Reduce their pointers */
++            local_fll[x] = ((uint64_t*)guest_fll)[x];
++#endif
++    }
++
++
++    /* Map the guest mid p2m frames */
++    guest_fl = xc_map_foreign_pages(xch, ctx->domid, PROT_READ,
++                                    local_fll, fll_entries);
++    if ( !guest_fl )
++    {
++        PERROR("Failed to map p2m frame list");
++        goto err;
++    }
++
++    local_fl_size = fl_entries * sizeof(unsigned long);
++    local_fl = malloc(local_fl_size);
++    if ( !local_fl )
++    {
++        ERROR("Cannot allocate %zu bytes for local p2m frame list",
++              local_fl_size);
++        goto err;
++    }
++
++    if ( ctx->x86_pv.width == sizeof(unsigned long) )
++        memcpy(local_fl, guest_fl, local_fl_size);
++    else
++    {
++        for ( x = 0; x < fl_entries; ++x )
++#ifdef __x86_64__
++            /* 64bit toolstack, 32bit guest.  Expand their pointers */
++            local_fl[x] = ((uint32_t*)guest_fl)[x];
++#else
++            /* 32bit toolstack, 64bit guest.  Reduce their pointers */
++            local_fl[x] = ((uint64_t*)guest_fl)[x];
++#endif
++    }
++
++
++    /* Map the p2m leaves themselves */
++    ctx->x86_pv.p2m = xc_map_foreign_pages(xch, ctx->domid, PROT_READ,
++                                           local_fl, fl_entries);
++    if ( !ctx->x86_pv.p2m )
++    {
++        PERROR("Failed to map p2m frames");
++        goto err;
++    }
++
++    ctx->x86_pv.p2m_frames = fl_entries;
++    ctx->x86_pv.p2m_pfns = malloc(local_fl_size);
++    if ( !ctx->x86_pv.p2m_pfns )
++    {
++        ERROR("Cannot allocate %zu bytes for p2m pfns list",
++              local_fl_size);
++        goto err;
++    }
++
++    /* Convert leaf frames from mfns to pfns */
++    for ( x = 0; x < fl_entries; ++x )
++        if ( !mfn_in_pseudophys_map(ctx, local_fl[x]) )
++        {
++            ERROR("Frame# in pfn-to-mfn frame list is not in pseudophys");
++            ERROR("p2m_frame_list[%d] is %#lx, max_mfn %#lx",
++                  x, local_fl[x], ctx->x86_pv.max_mfn);
++
++            if ( local_fl[x] <= ctx->x86_pv.max_mfn )
++                ERROR("m2p[%#lx] = %#lx, max_gfn %#lx",
++                      local_fl[x], ctx->x86_pv.m2p[local_fl[x]],
++                      ctx->x86_pv.max_gfn);
++
++            if ( ctx->x86_pv.m2p[local_fl[x]] <= ctx->x86_pv.max_gfn )
++                ERROR("p2m[%#lx] = %#lx",
++                      ctx->x86_pv.m2p[local_fl[x]],
++                      pfn_to_mfn(ctx, mfn_to_pfn(ctx, local_fl[x])));
++            goto err;
++        }
++        else
++            ctx->x86_pv.p2m_pfns[x] = mfn_to_pfn(ctx, local_fl[x]);
++
++    rc = 0;
++err:
++
++    free(local_fl);
++    if ( guest_fl )
++        munmap(guest_fll, fll_entries * PAGE_SIZE);
++
++    free(local_fll);
++    if ( guest_fll )
++        munmap(guest_fll, PAGE_SIZE);
++
++    return rc;
++}
++
++static int get_domain_information(struct save_ctx *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    unsigned int guest_width;
++    int max_gfn;
++
++    if ( xc_domain_get_guest_width(xch, ctx->domid, &guest_width) )
++    {
++        PERROR("Unable to determine dom%d's width", ctx->domid);
++        return -1;
++    }
++    ctx->x86_pv.width = guest_width;
++
++    if ( ctx->x86_pv.width == 4 )
++        ctx->x86_pv.levels = 3;
++    else if ( ctx->x86_pv.width == 8 )
++        ctx->x86_pv.levels = 4;
++    else
++    {
++        ERROR("Invalid guest width %d.  Expected 32 or 64", ctx->x86_pv.width);
++        return -1;
++    }
++
++    ctx->x86_pv.shinfo = xc_map_foreign_range(
++        xch, ctx->domid, PAGE_SIZE, PROT_READ, ctx->dominfo.shared_info_frame);
++    if ( !ctx->x86_pv.shinfo )
++    {
++        PERROR("Failed to map shared info frame at gfn %#lx",
++               ctx->dominfo.shared_info_frame);
++        return -1;
++    }
++
++    max_gfn = xc_domain_maximum_gpfn(xch, ctx->domid);
++    if ( max_gfn <= 0 )
++    {
++        PERROR("Unable to obtain guests max gfn");
++        return -1;
++    }
++    else if ( max_gfn >= ~XEN_DOMCTL_PFINFO_LTAB_MASK )
++    {
++        errno = E2BIG;
++        PERROR("Cannot save a guest this large %#x");
++        return -1;
++    }
++    ctx->x86_pv.max_gfn = max_gfn;
++    DPRINTF("Guest max gfn: %#lx", ctx->x86_pv.max_gfn);
++
++    return 0;
++}
++
++static int write_x86_pv_info(struct save_ctx *ctx)
++{
++    struct x86_pv_info info =
++        {
++            .guest_width = ctx->x86_pv.width,
++            .pt_levels = ctx->x86_pv.levels,
++        };
++    struct record rec =
++        {
++            .type = REC_TYPE_x86_pv_info,
++            .length = sizeof info,
++            .data = &info
++        };
++
++    return write_record(ctx, &rec);
++}
++
++static int write_x86_pv_p2m_frames(struct save_ctx *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc; unsigned i;
++    struct record rec =
++        {
++            .type = REC_TYPE_x86_pv_p2m_frames,
++            .length = sizeof(struct x86_pv_p2m_frames) +
++            (ctx->x86_pv.p2m_frames  * sizeof(uint64_t)),
++        };
++    struct x86_pv_p2m_frames *data = malloc(rec.length);
++
++    if ( !data )
++    {
++        ERROR("Cannot allocate %zu bytes for X86_PV_P2M_FRAMES data",
++              rec.length);
++        return -1;
++    }
++
++    data->start_gfn = 0;
++    data->end_gfn = ctx->x86_pv.max_gfn;
++
++    for ( i = 0; i < ctx->x86_pv.p2m_frames; ++i )
++        data->p2m_gfns[i] = ctx->x86_pv.p2m_pfns[i];
++
++    rec.data = data;
++
++    rc = write_record(ctx, &rec);
++    free(data);
++
++    return rc;
++}
++
++int save_x86_pv(struct save_ctx *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++    struct record end = { REC_TYPE_end, 0, NULL };
++
++    IPRINTF("In experimental %s", __func__);
++
++    /* Write Image and Domain headers to the stream */
++    rc = write_headers(ctx);
++    if ( rc )
++        goto err;
++
++    /* Query some properties, and stash in the save context */
++    rc = get_domain_information(ctx);
++    if ( rc )
++        goto err;
++
++    /* Write an X86_PV_INFO record into the stream */
++    rc = write_x86_pv_info(ctx);
++    if ( rc )
++        goto err;
++
++    /* Map various structures */
++    rc = map_m2p(ctx) ?: map_p2m(ctx);
++    if ( rc )
++        goto err;
++
++    /* Write a full X86_PV_P2M_FRAMES record into the stream */
++    rc = write_x86_pv_p2m_frames(ctx);
++    if ( rc )
++        goto err;
++
++    /* Write an END record */
++    rc = write_record(ctx, &end);
++    if ( rc )
++        goto err;
++
++    /* all done */
++    assert(!rc);
++    goto cleanup;
++
++ err:
++    assert(rc);
++ cleanup:
++
++    free(ctx->x86_pv.p2m_pfns);
++
++    if ( ctx->x86_pv.p2m )
++        munmap(ctx->x86_pv.p2m, ctx->x86_pv.p2m_frames * PAGE_SIZE);
++
++    if ( ctx->x86_pv.m2p )
++        munmap(ctx->x86_pv.m2p, M2P_SIZE(ctx->x86_pv.max_mfn));
++
++    if ( ctx->x86_pv.shinfo )
++        munmap(ctx->x86_pv.shinfo, PAGE_SIZE);
++
++    return rc;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+-- 
+1.7.10.4
+

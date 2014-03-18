@@ -1,0 +1,201 @@
+From 88f33dfc47b379e52ea2388e84b85cad7f6fe853 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Sat, 15 Mar 2014 20:18:45 +0000
+Subject: [PATCH 2/5] Stream specification and some common code
+
+---
+ tools/libxc/saverestore/common.c        |   58 +++++++++++++++++++
+ tools/libxc/saverestore/common.h        |    8 +++
+ tools/libxc/saverestore/stream_format.h |   96 +++++++++++++++++++++++++++++++
+ 3 files changed, 162 insertions(+)
+ create mode 100644 tools/libxc/saverestore/common.c
+ create mode 100644 tools/libxc/saverestore/stream_format.h
+
+diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
+new file mode 100644
+index 0000000..48f22d0
+--- /dev/null
++++ b/tools/libxc/saverestore/common.c
+@@ -0,0 +1,58 @@
++#include "common.h"
++
++static const char *dhdr_types[] =
++{
++    [DHDR_TYPE_x86_pv]  = "x86 PV",
++    [DHDR_TYPE_x86_hvm] = "x86 HVM",
++    [DHDR_TYPE_x86_pvh] = "x86 PVH",
++    [DHDR_TYPE_arm]     = "ARM",
++};
++
++const char *dhdr_type_to_str(uint32_t type)
++{
++    if ( type < ARRAY_SIZE(dhdr_types) && dhdr_types[type] )
++        return dhdr_types[type];
++
++    return "Reserved";
++}
++
++static const char *mandatory_rec_types[] =
++{
++    [REC_TYPE_end]               = "End",
++    [REC_TYPE_page_data]         = "Page data",
++    [REC_TYPE_vcpu_count]        = "Vcpu count",
++    [REC_TYPE_vcpu_context]      = "Vcpu context",
++    [REC_TYPE_vcpu_context_x1]   = "Vcpu context 1",
++    [REC_TYPE_vcpu_context_x2]   = "Vcpu context 2",
++    [REC_TYPE_x86_pv_info]       = "x86 PV info",
++    [REC_TYPE_x86_pv_p2m_frames] = "x86 PV P2M frames",
++};
++
++/*
++static const char *optional_rec_types[] =
++{
++};
++*/
++
++const char *rec_type_to_str(uint32_t type)
++{
++    if ( type & REC_TYPE_optional )
++        return "Reserved";
++
++    if ( ((type & REC_TYPE_optional) == 0 ) &&
++         (type < ARRAY_SIZE(mandatory_rec_types)) &&
++         (mandatory_rec_types[type]) )
++        return mandatory_rec_types[type];
++
++    return "Reserved";
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
+index f1aff44..fff0a39 100644
+--- a/tools/libxc/saverestore/common.h
++++ b/tools/libxc/saverestore/common.h
+@@ -3,6 +3,14 @@
+ 
+ #include "../xg_private.h"
+ 
++#include "stream_format.h"
++
++// TODO: Find a better place to put this...
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
++
++const char *dhdr_type_to_str(uint32_t type);
++const char *rec_type_to_str(uint32_t type);
++
+ #endif
+ /*
+  * Local variables:
+diff --git a/tools/libxc/saverestore/stream_format.h b/tools/libxc/saverestore/stream_format.h
+new file mode 100644
+index 0000000..79ed65d
+--- /dev/null
++++ b/tools/libxc/saverestore/stream_format.h
+@@ -0,0 +1,96 @@
++#ifndef __STREAM_FORMAT__H
++#define __STREAM_FORMAT__H
++
++#include <inttypes.h>
++
++/*
++ * Image Header
++ */
++struct ihdr
++{
++    uint64_t marker;
++    uint32_t id;
++    uint32_t version;
++    uint16_t options;
++    uint16_t _res1;
++    uint32_t _res2;
++};
++
++#define IHDR_MARKER  0xffffffffffffffffULL
++#define IHDR_ID      0x58454E46U
++#define IHDR_VERSION 1
++
++#define _IHDR_OPT_ENDIAN 0
++#define IHDR_OPT_LITTLE_ENDIAN (0 << _IHDR_OPT_ENDIAN)
++#define IHDR_OPT_BIG_ENDIAN    (1 << _IHDR_OPT_ENDIAN)
++
++/*
++ * Domain Header
++ */
++struct dhdr
++{
++    uint32_t type;
++    uint16_t page_shift;
++    uint16_t _res1;
++    uint32_t xen_major;
++    uint32_t xen_minor;
++};
++
++#define DHDR_TYPE_x86_pv  0x00000001U
++#define DHDR_TYPE_x86_hvm 0x00000002U
++#define DHDR_TYPE_x86_pvh 0x00000003U
++#define DHDR_TYPE_arm     0x00000004U
++
++/*
++ * Record Header
++ */
++struct rhdr
++{
++    uint32_t type;
++    uint32_t length;
++};
++
++/* Somewhat arbitrary - 8MB */
++#define REC_LENGTH_MAX             (8U << 20)
++
++#define REC_TYPE_end               0x00000000U
++#define REC_TYPE_page_data         0x00000001U
++#define REC_TYPE_vcpu_count        0x00000002U
++#define REC_TYPE_vcpu_context      0x00000003U
++#define REC_TYPE_vcpu_context_x1   0x00000004U
++#define REC_TYPE_vcpu_context_x2   0x00000005U
++#define REC_TYPE_x86_pv_info       0x00000006U
++#define REC_TYPE_x86_pv_p2m_frames 0x00000007U
++
++#define REC_TYPE_optional          0x80000000U
++
++/*
++ * X86_PV_INFO
++ */
++struct x86_pv_info
++{
++    uint8_t guest_width;
++    uint8_t pt_levels;
++    uint8_t options;
++};
++
++/*
++ * X86_PV_P2M_FRAMES
++ */
++struct x86_pv_p2m_frames
++{
++    uint32_t start_gfn;
++    uint32_t end_gfn;
++    uint64_t p2m_gfns[0];
++};
++
++#endif
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+-- 
+1.7.10.4
+
