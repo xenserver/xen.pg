@@ -1,0 +1,260 @@
+# HG changeset patch
+# User Jan Beulich <jbeulich@suse.com>
+# Date 1395071104 -3600
+# Node ID 77e698a554c3a916a991a4eff53689cf27cd2d10
+# Parent d50a94c85f14bc88e6ddd2989f0e9c1ffdc9c501
+VT-d: fix RMRR handling
+
+Removing mapped RMRR tracking structures in dma_pte_clear_one() is
+wrong for two reasons: First, these regions may cover more than a
+single page. And second, multiple devices (and hence multiple devices
+assigned to any particular guest) may share a single RMRR (whether
+assigning such devices to distinct guests is a safe thing to do is
+another question).
+
+Therefore move the removal of the tracking structures into the
+counterpart function to the one doing the insertion -
+intel_iommu_remove_device(), and add a reference count to the tracking
+structure.
+
+Further, for the handling of the mappings of the respective memory
+regions to be correct, RMRRs must not overlap. Add a respective check
+to acpi_parse_one_rmrr().
+
+And finally, with all of this being VT-d specific, move the cleanup
+of the list as well as the structure type definition where it belongs -
+in VT-d specific rather than IOMMU generic code.
+
+Note that this doesn't address yet another issue associated with RMRR
+handling: The purpose of the RMRRs as well as the way the respective
+IOMMU page table mappings get inserted both suggest that these regions
+would need to be marked E820_RESERVED in all (HVM?) guests' memory
+maps, yet nothing like this is being done in hvmloader. (For PV guests
+this would also seem to be necessary, but may conflict with PV guests
+possibly assuming there to be just a single E820 entry representing all
+of its RAM.)
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Xiantao Zhang <xiantao.zhang@intel.com>
+
+diff -r d50a94c85f14 xen/drivers/passthrough/iommu.c
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -412,9 +412,8 @@ static int iommu_populate_page_table(str
+ void iommu_domain_destroy(struct domain *d)
+ {
+     struct hvm_iommu *hd  = domain_hvm_iommu(d);
+-    struct list_head *ioport_list, *rmrr_list, *tmp;
++    struct list_head *ioport_list, *tmp;
+     struct g2m_ioport *ioport;
+-    struct mapped_rmrr *mrmrr;
+ 
+     if ( !iommu_enabled || !hd->platform_ops )
+         return;
+@@ -428,13 +427,6 @@ void iommu_domain_destroy(struct domain 
+         list_del(&ioport->list);
+         xfree(ioport);
+     }
+-
+-    list_for_each_safe ( rmrr_list, tmp, &hd->mapped_rmrrs )
+-    {
+-        mrmrr = list_entry(rmrr_list, struct mapped_rmrr, list);
+-        list_del(&mrmrr->list);
+-        xfree(mrmrr);
+-    }
+ }
+ 
+ int iommu_map_page(struct domain *d, unsigned long gfn, unsigned long mfn,
+diff -r d50a94c85f14 xen/drivers/passthrough/vtd/dmar.c
+--- a/xen/drivers/passthrough/vtd/dmar.c
++++ b/xen/drivers/passthrough/vtd/dmar.c
+@@ -580,6 +580,16 @@ acpi_parse_one_rmrr(struct acpi_dmar_hea
+     if ( (ret = acpi_dmar_check_length(header, sizeof(*rmrr))) != 0 )
+         return ret;
+ 
++    list_for_each_entry(rmrru, &acpi_rmrr_units, list)
++       if ( base_addr <= rmrru->end_address && rmrru->base_address <= end_addr )
++       {
++           printk(XENLOG_ERR VTDPREFIX
++                  "Overlapping RMRRs [%"PRIx64",%"PRIx64"] and [%"PRIx64",%"PRIx64"]\n",
++                  rmrru->base_address, rmrru->end_address,
++                  base_addr, end_addr);
++           return -EEXIST;
++       }
++
+     /* This check is here simply to detect when RMRR values are
+      * not properly represented in the system memory map and
+      * inform the user
+diff -r d50a94c85f14 xen/drivers/passthrough/vtd/iommu.c
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -42,6 +42,12 @@
+ #include "vtd.h"
+ #include "../ats.h"
+ 
++struct mapped_rmrr {
++    struct list_head list;
++    u64 base, end;
++    unsigned int count;
++};
++
+ /* Possible unfiltered LAPIC/MSI messages from untrusted sources? */
+ bool_t __read_mostly untrusted_msi;
+ 
+@@ -619,7 +625,6 @@ static void dma_pte_clear_one(struct dom
+     struct hvm_iommu *hd = domain_hvm_iommu(domain);
+     struct dma_pte *page = NULL, *pte = NULL;
+     u64 pg_maddr;
+-    struct mapped_rmrr *mrmrr;
+ 
+     spin_lock(&hd->mapping_lock);
+     /* get last level pte */
+@@ -648,21 +653,6 @@ static void dma_pte_clear_one(struct dom
+         __intel_iommu_iotlb_flush(domain, addr >> PAGE_SHIFT_4K, 1, 1);
+ 
+     unmap_vtd_domain_page(page);
+-
+-    /* if the cleared address is between mapped RMRR region,
+-     * remove the mapped RMRR
+-     */
+-    spin_lock(&hd->mapping_lock);
+-    list_for_each_entry ( mrmrr, &hd->mapped_rmrrs, list )
+-    {
+-        if ( addr >= mrmrr->base && addr <= mrmrr->end )
+-        {
+-            list_del(&mrmrr->list);
+-            xfree(mrmrr);
+-            break;
+-        }
+-    }
+-    spin_unlock(&hd->mapping_lock);
+ }
+ 
+ static void iommu_free_pagetable(u64 pt_maddr, int level)
+@@ -1700,10 +1690,17 @@ static int reassign_device_ownership(
+ void iommu_domain_teardown(struct domain *d)
+ {
+     struct hvm_iommu *hd = domain_hvm_iommu(d);
++    struct mapped_rmrr *mrmrr, *tmp;
+ 
+     if ( list_empty(&acpi_drhd_units) )
+         return;
+ 
++    list_for_each_entry_safe ( mrmrr, tmp, &hd->mapped_rmrrs, list )
++    {
++        list_del(&mrmrr->list);
++        xfree(mrmrr);
++    }
++
+     if ( iommu_use_hap_pt(d) )
+         return;
+ 
+@@ -1848,14 +1845,17 @@ static int rmrr_identity_mapping(struct 
+     ASSERT(rmrr->base_address < rmrr->end_address);
+ 
+     /*
+-     * No need to acquire hd->mapping_lock, as the only theoretical race is
+-     * with the insertion below (impossible due to holding pcidevs_lock).
++     * No need to acquire hd->mapping_lock: Both insertion and removal
++     * get done while holding pcidevs_lock.
+      */
+     list_for_each_entry( mrmrr, &hd->mapped_rmrrs, list )
+     {
+         if ( mrmrr->base == rmrr->base_address &&
+              mrmrr->end == rmrr->end_address )
++        {
++            ++mrmrr->count;
+             return 0;
++        }
+     }
+ 
+     base = rmrr->base_address & PAGE_MASK_4K;
+@@ -1876,9 +1876,8 @@ static int rmrr_identity_mapping(struct 
+         return -ENOMEM;
+     mrmrr->base = rmrr->base_address;
+     mrmrr->end = rmrr->end_address;
+-    spin_lock(&hd->mapping_lock);
++    mrmrr->count = 1;
+     list_add_tail(&mrmrr->list, &hd->mapped_rmrrs);
+-    spin_unlock(&hd->mapping_lock);
+ 
+     return 0;
+ }
+@@ -1940,17 +1939,52 @@ static int intel_iommu_remove_device(u8 
+     if ( !pdev->domain )
+         return -EINVAL;
+ 
+-    /* If the device belongs to dom0, and it has RMRR, don't remove it
+-     * from dom0, because BIOS may use RMRR at booting time.
+-     */
+-    if ( pdev->domain->domain_id == 0 )
++    for_each_rmrr_device ( rmrr, bdf, i )
+     {
+-        for_each_rmrr_device ( rmrr, bdf, i )
++        struct hvm_iommu *hd;
++        struct mapped_rmrr *mrmrr, *tmp;
++
++        if ( rmrr->segment != pdev->seg ||
++             PCI_BUS(bdf) != pdev->bus ||
++             PCI_DEVFN2(bdf) != devfn )
++            continue;
++
++        /*
++         * If the device belongs to dom0, and it has RMRR, don't remove
++         * it from dom0, because BIOS may use RMRR at booting time.
++         */
++        if ( is_hardware_domain(pdev->domain) )
++            return 0;
++
++        hd = domain_hvm_iommu(pdev->domain);
++
++        /*
++         * No need to acquire hd->mapping_lock: Both insertion and removal
++         * get done while holding pcidevs_lock.
++         */
++        ASSERT(spin_is_locked(&pcidevs_lock));
++        list_for_each_entry_safe ( mrmrr, tmp, &hd->mapped_rmrrs, list )
+         {
+-            if ( rmrr->segment == pdev->seg &&
+-                 PCI_BUS(bdf) == pdev->bus &&
+-                 PCI_DEVFN2(bdf) == devfn )
+-                return 0;
++            unsigned long base_pfn, end_pfn;
++
++            if ( rmrr->base_address != mrmrr->base ||
++                 rmrr->end_address != mrmrr->end )
++                continue;
++
++            if ( --mrmrr->count )
++                break;
++
++            base_pfn = (mrmrr->base & PAGE_MASK_4K) >> PAGE_SHIFT_4K;
++            end_pfn = PAGE_ALIGN_4K(mrmrr->end) >> PAGE_SHIFT_4K;
++            while ( base_pfn < end_pfn )
++            {
++                if ( intel_iommu_unmap_page(pdev->domain, base_pfn) )
++                    return -ENXIO;
++                base_pfn++;
++            }
++
++            list_del(&mrmrr->list);
++            xfree(mrmrr);
+         }
+     }
+ 
+diff -r d50a94c85f14 xen/include/xen/hvm/iommu.h
+--- a/xen/include/xen/hvm/iommu.h
++++ b/xen/include/xen/hvm/iommu.h
+@@ -29,12 +29,6 @@ struct g2m_ioport {
+     unsigned int np;
+ };
+ 
+-struct mapped_rmrr {
+-    struct list_head list;
+-    u64 base;
+-    u64 end;
+-};
+-
+ struct hvm_iommu {
+     u64 pgd_maddr;                 /* io page directory machine address */
+     spinlock_t mapping_lock;       /* io page table lock */
