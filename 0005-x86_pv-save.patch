@@ -1,18 +1,18 @@
-From 563c8b4887848e97b6996aafd5e9ea1c4e61a868 Mon Sep 17 00:00:00 2001
+From 06977c55e6ceaf0effc1dbc7f53927c2ee7627a8 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 19 Mar 2014 12:39:25 +0000
 Subject: [PATCH 5/6] x86_pv save
 
 ---
- tools/libxc/saverestore/common.c      |   30 +++
- tools/libxc/saverestore/common.h      |   27 +++
- tools/libxc/saverestore/save.c        |   30 ++-
- tools/libxc/saverestore/save_x86_pv.c |  332 +++++++++++++++++++++++++++++++++
- 4 files changed, 418 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/common.c      |   35 ++
+ tools/libxc/saverestore/common.h      |   53 +++
+ tools/libxc/saverestore/save.c        |   33 +-
+ tools/libxc/saverestore/save_x86_pv.c |  809 +++++++++++++++++++++++++++++++++
+ 4 files changed, 929 insertions(+), 1 deletion(-)
  create mode 100644 tools/libxc/saverestore/save_x86_pv.c
 
 diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
-index 48f22d0..2b70bfe 100644
+index d2dfd5a..1d2a0cd 100644
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
 @@ -1,3 +1,5 @@
@@ -21,15 +21,17 @@ index 48f22d0..2b70bfe 100644
  #include "common.h"
  
  static const char *dhdr_types[] =
-@@ -47,6 +49,34 @@ const char *rec_type_to_str(uint32_t type)
+@@ -48,6 +50,39 @@ const char *rec_type_to_str(uint32_t type)
      return "Reserved";
  }
  
-+int write_record(struct context *ctx, struct record *rec)
++int write_split_record(struct context *ctx, struct record *rec,
++                       void *buf, size_t sz)
 +{
 +    static const char zeroes[7] = { 0 };
 +    xc_interface *xch = ctx->xch;
-+    size_t record_length = (rec->length + 7) & ~7UL;
++    uint32_t combined_length = rec->length + sz;
++    size_t record_length = (combined_length + 7) & ~7UL;
 +
 +    if ( rec->length > REC_LENGTH_MAX )
 +    {
@@ -40,11 +42,14 @@ index 48f22d0..2b70bfe 100644
 +    }
 +    else if ( rec->length )
 +        assert(rec->data);
++    else if ( sz )
++        assert(buf);
 +
 +    if ( write_exact(ctx->fd, &rec->type, sizeof rec->type) ||
-+         write_exact(ctx->fd, &rec->length, sizeof rec->length) ||
++         write_exact(ctx->fd, &combined_length, sizeof rec->length) ||
 +         (rec->length && write_exact(ctx->fd, rec->data, rec->length)) ||
-+         write_exact(ctx->fd, zeroes, record_length - rec->length) )
++         (sz && write_exact(ctx->fd, buf, sz)) ||
++         write_exact(ctx->fd, zeroes, record_length - combined_length) )
 +    {
 +        PERROR("Unable to write record to stream");
 +        return -1;
@@ -57,18 +62,21 @@ index 48f22d0..2b70bfe 100644
   * Local variables:
   * mode: C
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index 0628fd5..36c7b87 100644
+index f6183bf..5093c35 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -6,6 +6,7 @@
+@@ -6,7 +6,10 @@
  #define pfn_to_mfn __UNUSED_pfn_to_mfn
  
  #include "../xg_private.h"
 +#include "../xg_save_restore.h"
  
++#undef GET_FIELD
++#undef SET_FIELD
  #undef mfn_to_pfn
  #undef pfn_to_mfn
-@@ -76,6 +77,32 @@ struct context
+ 
+@@ -87,6 +90,56 @@ struct context
      };
  };
  
@@ -82,12 +90,33 @@ index 0628fd5..36c7b87 100644
 +    void *data;
 +};
 +
-+/* Gets a field in the shared info, based on guest width */
-+#define SHINFO_GET(_c, _f)                        \
-+    ({ (_c)->x86_pv.width == 8 ?                  \
-+            (_c)->x86_pv.shinfo->x64._f:          \
-+            (_c)->x86_pv.shinfo->x32._f;          \
-+    })                                            \
++/* Gets a field from an *_any union */
++#define GET_FIELD(_c, _p, _f)                   \
++    ({ (_c)->x86_pv.width == 8 ?                \
++            (_p)->x64._f:                       \
++            (_p)->x32._f;                       \
++    })                                          \
++
++/* Gets a field from an *_any union */
++#define SET_FIELD(_c, _p, _f, _v)               \
++    ({ if ( (_c)->x86_pv.width == 8 )           \
++            (_p)->x64._f = (_v);                \
++        else                                    \
++            (_p)->x32._f = (_v);                \
++    })
++
++/*
++ * Writes a split record to the stream, applying correct padding where
++ * appropriate.  It is common when sending records containing blobs from Xen
++ * that the header and blob data are separate.  This function accepts a second
++ * buffer and length, and will merge it with the main record when sending.
++ *
++ * Records with a non-zero length must provide a valid data field; records
++ * with a 0 length shall have their data field ignored.
++ *
++ * Returns 0 on success and non0 on failure.
++ */
++int write_split_record(struct context *ctx, struct record *rec, void *buf, size_t sz);
 +
 +/*
 + * Writes a record to the stream, applying correct padding where appropriate.
@@ -96,16 +125,19 @@ index 0628fd5..36c7b87 100644
 + *
 + * Returns 0 on success and non0 on failure.
 + */
-+int write_record(struct context *ctx, struct record *rec);
++static inline int write_record(struct context *ctx, struct record *rec)
++{
++    return write_split_record(ctx, rec, NULL, 0);
++}
 +
  #endif
  /*
   * Local variables:
 diff --git a/tools/libxc/saverestore/save.c b/tools/libxc/saverestore/save.c
-index c013e62..4fea756 100644
+index c013e62..e86e5fc 100644
 --- a/tools/libxc/saverestore/save.c
 +++ b/tools/libxc/saverestore/save.c
-@@ -5,8 +5,36 @@ int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_ite
+@@ -5,8 +5,39 @@ int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_ite
                      struct save_callbacks* callbacks, int hvm,
                      unsigned long vm_generationid_addr)
  {
@@ -114,6 +146,9 @@ index c013e62..4fea756 100644
 +            .xch = xch,
 +            .fd = io_fd,
 +        };
++
++    /* Older GCC cant initialise anonymous unions */
++    ctx.save.callbacks = callbacks;
 +
      IPRINTF("In experimental %s", __func__);
 -    return -1;
@@ -145,10 +180,10 @@ index c013e62..4fea756 100644
  /*
 diff --git a/tools/libxc/saverestore/save_x86_pv.c b/tools/libxc/saverestore/save_x86_pv.c
 new file mode 100644
-index 0000000..70a7296
+index 0000000..5d2cec6
 --- /dev/null
 +++ b/tools/libxc/saverestore/save_x86_pv.c
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,809 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -156,26 +191,34 @@ index 0000000..70a7296
 +
 +static int write_headers(struct context *ctx)
 +{
-+    struct ihdr ihdr = { 0 };
-+    struct dhdr dhdr = { 0 };
 +    xc_interface *xch = ctx->xch;
 +    int32_t xen_version = xc_version(xch, XENVER_version, NULL);
++    struct ihdr ihdr =
++        {
++            .marker  = IHDR_MARKER,
++            .id      = htonl(IHDR_ID),
++            .version = htonl(IHDR_VERSION),
++            .options = htons(IHDR_OPT_LITTLE_ENDIAN),
++        };
++    struct dhdr dhdr =
++        {
++            .type       = DHDR_TYPE_x86_pv,
++            .page_shift = 12,
++            .xen_major  = (xen_version >> 16) & 0xffff,
++            .xen_minor  = (xen_version)       & 0xffff,
++        };
 +
-+    ihdr.marker  = IHDR_MARKER;
-+    ihdr.id      = htonl(IHDR_ID);
-+    ihdr.version = htonl(IHDR_VERSION);
-+    ihdr.options = htons(IHDR_OPT_LITTLE_ENDIAN);
++    if ( xen_version < 0 )
++    {
++        PERROR("Unable to obtain Xen Version");
++        return -1;
++    }
 +
 +    if ( write_exact(ctx->fd, &ihdr, sizeof ihdr) )
 +    {
 +        PERROR("Unable to write Image Header to stream");
 +        return -1;
 +    }
-+
-+    dhdr.type       = DHDR_TYPE_x86_pv;
-+    dhdr.page_shift = 12;
-+    dhdr.xen_major  = (xen_version >> 16) & 0xffff;
-+    dhdr.xen_minor  = (xen_version)       & 0xffff;
 +
 +    if ( write_exact(ctx->fd, &dhdr, sizeof dhdr) )
 +    {
@@ -194,7 +237,7 @@ index 0000000..70a7296
 +        xch, ctx->domid, PAGE_SIZE, PROT_READ, ctx->dominfo.shared_info_frame);
 +    if ( !ctx->x86_pv.shinfo )
 +    {
-+        PERROR("Failed to map shared info frame at gfn %#lx",
++        PERROR("Failed to map shared info frame at pfn %#lx",
 +               ctx->dominfo.shared_info_frame);
 +        return -1;
 +    }
@@ -223,17 +266,18 @@ index 0000000..70a7296
 +    size_t local_fl_size;
 +
 +    fpp = ctx->x86_pv.fpp = PAGE_SIZE / ctx->x86_pv.width;
-+    fll_entries = (ctx->x86_pv.max_gfn + (fpp * fpp) - 1) / (fpp * fpp);
-+    fl_entries  = (ctx->x86_pv.max_gfn + fpp) / fpp;
++    fll_entries = (ctx->x86_pv.max_pfn + (fpp * fpp) - 1) / (fpp * fpp);
++    fl_entries  = (ctx->x86_pv.max_pfn + fpp) / fpp;
 +
-+    fll_mfn = SHINFO_GET(ctx, arch.pfn_to_mfn_frame_list_list);
++    fll_mfn = GET_FIELD(ctx, ctx->x86_pv.shinfo, arch.pfn_to_mfn_frame_list_list);
 +    if ( !fll_mfn )
 +        IPRINTF("Waiting for domain to set up its p2m frame list list");
 +
 +    while ( tries-- && !fll_mfn )
 +    {
 +        usleep(10000);
-+        fll_mfn = SHINFO_GET(ctx, arch.pfn_to_mfn_frame_list_list);
++        fll_mfn = GET_FIELD(ctx, ctx->x86_pv.shinfo,
++                            arch.pfn_to_mfn_frame_list_list);
 +    }
 +
 +    if ( !fll_mfn )
@@ -328,21 +372,11 @@ index 0000000..70a7296
 +
 +    /* Convert leaf frames from mfns to pfns */
 +    for ( x = 0; x < fl_entries; ++x )
-+        if ( !mfn_in_pseudophys_map(ctx, local_fl[x]) )
++        if ( !mfn_in_pseudophysmap(ctx, local_fl[x]) )
 +        {
-+            ERROR("Frame# in pfn-to-mfn frame list is not in pseudophys");
-+            ERROR("p2m_frame_list[%d] is %#lx, max_mfn %#lx",
-+                  x, local_fl[x], ctx->x86_pv.max_mfn);
-+
-+            if ( local_fl[x] <= ctx->x86_pv.max_mfn )
-+                ERROR("m2p[%#lx] = %#lx, max_gfn %#lx",
-+                      local_fl[x], ctx->x86_pv.m2p[local_fl[x]],
-+                      ctx->x86_pv.max_gfn);
-+
-+            if ( ctx->x86_pv.m2p[local_fl[x]] <= ctx->x86_pv.max_gfn )
-+                ERROR("p2m[%#lx] = %#lx",
-+                      ctx->x86_pv.m2p[local_fl[x]],
-+                      pfn_to_mfn(ctx, mfn_to_pfn(ctx, local_fl[x])));
++            ERROR("Bad MFN in p2m_frame_list[%d]", x);
++            pseudophysmap_walk(ctx, local_fl[x]);
++            errno = ERANGE;
 +            goto err;
 +        }
 +        else
@@ -362,9 +396,398 @@ index 0000000..70a7296
 +    return rc;
 +}
 +
++static int write_one_vcpu_basic(struct context *ctx, uint32_t id)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t mfn, pfn;
++    unsigned i;
++    int rc = -1;
++    vcpu_guest_context_any_t vcpu;
++    struct rec_x86_pv_vcpu vhdr = { .vcpu_id = id };
++    struct record rec =
++    {
++        .type = REC_TYPE_x86_pv_vcpu_basic,
++        .length = sizeof vhdr,
++        .data = &vhdr,
++    };
++
++    if ( xc_vcpu_getcontext(xch, ctx->domid, id, &vcpu) )
++    {
++        PERROR("Failed to get vcpu%u context", id);
++        goto err;
++    }
++
++    /* Vcpu 0 is special: Convert the suspend record to a PFN */
++    if ( id == 0 )
++    {
++        mfn = GET_FIELD(ctx, &vcpu, user_regs.edx);
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("Bad MFN for suspend record");
++            pseudophysmap_walk(ctx, mfn);
++            errno = ERANGE;
++            goto err;
++        }
++        SET_FIELD(ctx, &vcpu, user_regs.edx, mfn_to_pfn(ctx, mfn));
++    }
++
++    /* Convert GDT frames to PFNs */
++    for ( i = 0; (i * 512) < GET_FIELD(ctx, &vcpu, gdt_ents); ++i )
++    {
++        mfn = GET_FIELD(ctx, &vcpu, gdt_frames[i]);
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("Bad MFN for frame %u of vcpu%u's GDT", i, id);
++            pseudophysmap_walk(ctx, mfn);
++            errno = ERANGE;
++            goto err;
++        }
++        SET_FIELD(ctx, &vcpu, gdt_frames[i], mfn_to_pfn(ctx, mfn));
++    }
++
++    /* Convert CR3 to a PFN */
++    mfn = cr3_to_mfn(ctx, GET_FIELD(ctx, &vcpu, ctrlreg[3]));
++    if ( !mfn_in_pseudophysmap(ctx, mfn) )
++    {
++        ERROR("Bad MFN for vcpu%u's cr3", id);
++        pseudophysmap_walk(ctx, mfn);
++        errno = ERANGE;
++        goto err;
++    }
++    pfn = mfn_to_pfn(ctx, mfn);
++    SET_FIELD(ctx, &vcpu, ctrlreg[3], mfn_to_cr3(ctx, pfn));
++
++    /* 64bit guests: Convert CR1 (guest pagetables) to PFN */
++    if ( ctx->x86_pv.levels == 4 && vcpu.x64.ctrlreg[1] )
++    {
++        mfn = vcpu.x64.ctrlreg[1] >> PAGE_SHIFT;
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("Bad MFN for vcpu%u's cr1", id);
++            pseudophysmap_walk(ctx, mfn);
++            errno = ERANGE;
++            goto err;
++        }
++
++        pfn = mfn_to_pfn(ctx, mfn);
++        vcpu.x64.ctrlreg[1] = 1 | ((uint64_t)pfn << PAGE_SHIFT);
++    }
++
++    if ( ctx->x86_pv.width == 8 )
++        rc = write_split_record(ctx, &rec, &vcpu, sizeof vcpu.x64);
++    else
++        rc = write_split_record(ctx, &rec, &vcpu, sizeof vcpu.x32);
++
++    if ( rc )
++        goto err;
++
++    DPRINTF("Writing vcpu%u basic context", id);
++    rc = 0;
++ err:
++
++    return rc;
++}
++
++static int write_one_vcpu_extended(struct context *ctx, uint32_t id)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++    struct rec_x86_pv_vcpu vhdr = { .vcpu_id = id };
++    struct record rec =
++    {
++        .type = REC_TYPE_x86_pv_vcpu_extended,
++        .length = sizeof vhdr,
++        .data = &vhdr,
++    };
++    DECLARE_DOMCTL;
++
++    domctl.cmd = XEN_DOMCTL_get_ext_vcpucontext;
++    domctl.domain = ctx->domid;
++    domctl.u.ext_vcpucontext.vcpu = id;
++
++    if ( xc_domctl(xch, &domctl) < 0 )
++    {
++        PERROR("Unable to get vcpu%u extended context", id);
++        return -1;
++    }
++
++    rc = write_split_record(ctx, &rec, &domctl.u.ext_vcpucontext,
++                            domctl.u.ext_vcpucontext.size);
++    if ( rc )
++        return rc;
++
++    DPRINTF("Writing vcpu%u extended context", id);
++
++    return 0;
++}
++
++static int write_one_vcpu_xsave(struct context *ctx, uint32_t id)
++{
++    xc_interface *xch = ctx->xch;
++    int rc = -1;
++    DECLARE_DOMCTL;
++    DECLARE_HYPERCALL_BUFFER(void, buffer);
++    struct rec_x86_pv_vcpu_xsave vhdr = { .vcpu_id = id };
++    struct record rec =
++    {
++        .type = REC_TYPE_x86_pv_vcpu_xsave,
++        .length = sizeof vhdr,
++        .data = &vhdr,
++    };
++
++    domctl.cmd = XEN_DOMCTL_getvcpuextstate;
++    domctl.domain = ctx->domid;
++    domctl.u.vcpuextstate.vcpu = id;
++    domctl.u.vcpuextstate.xfeature_mask = 0;
++    domctl.u.vcpuextstate.size = 0;
++
++    if ( xc_domctl(xch, &domctl) < 0 )
++    {
++        PERROR("Unable to get vcpu%u's xsave context", id);
++        goto err;
++    }
++
++    if ( !domctl.u.vcpuextstate.xfeature_mask )
++    {
++        DPRINTF("vcpu%u has no xsave context - skipping", id);
++        goto out;
++    }
++
++    buffer = xc_hypercall_buffer_alloc(xch, buffer, domctl.u.vcpuextstate.size);
++    if ( !buffer )
++    {
++        ERROR("Unable to allocate %"PRIx64" bytes for vcpu%u's xsave context",
++              domctl.u.vcpuextstate.size, id);
++        goto err;
++    }
++
++    set_xen_guest_handle(domctl.u.vcpuextstate.buffer, buffer);
++    if ( xc_domctl(xch, &domctl) < 0 )
++    {
++        PERROR("Unable to get vcpu%u's xsave context", id);
++        goto err;
++    }
++
++    vhdr.xfeature_mask = domctl.u.vcpuextstate.xfeature_mask;
++
++    rc = write_split_record(ctx, &rec, buffer, domctl.u.vcpuextstate.size);
++    if ( rc )
++        goto err;
++
++    DPRINTF("Writing vcpu%u xsave context", id);
++
++ out:
++    rc = 0;
++
++ err:
++    xc_hypercall_buffer_free(xch, buffer);
++
++    return rc;
++}
++
++static int write_all_vcpu_information(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    xc_vcpuinfo_t vinfo;
++    unsigned int i;
++    int rc;
++
++    for ( i = 0; i <= ctx->dominfo.max_vcpu_id; ++i )
++    {
++        rc = xc_vcpu_getinfo(xch, ctx->domid, i, &vinfo);
++        if ( rc )
++        {
++            PERROR("Failed to get vcpu%u information", i);
++            return rc;
++        }
++
++        if ( !vinfo.online )
++        {
++            DPRINTF("vcpu%u offline - skipping", i);
++            continue;
++        }
++
++        rc = write_one_vcpu_basic(ctx, i) ?:
++            write_one_vcpu_extended(ctx, i) ?:
++            write_one_vcpu_xsave(ctx, i);
++        if ( rc )
++            return rc;
++    };
++
++    return 0;
++}
++
++static int normalise_pagetable(struct context *ctx, const uint64_t *src,
++                               uint64_t *dst, unsigned long type)
++{
++    xc_interface *xch = ctx->xch;
++    uint64_t pte;
++    unsigned i, xen_first = -1, xen_last = -1; /* Indicies of Xen mappings */
++
++    type &= XEN_DOMCTL_PFINFO_LTABTYPE_MASK;
++
++    if ( ctx->x86_pv.levels == 4 )
++    {
++        /* 64bit guests only have Xen mappings in their L4 tables */
++        if ( type == XEN_DOMCTL_PFINFO_L4TAB )
++        {
++            xen_first = 256;
++            xen_last = 271;
++        }
++    }
++    /* TODO: Support compat guests */
++    else
++    {
++        ERROR("Don't know how to normalise the pagetables of a %d level guest",
++              ctx->x86_pv.levels);
++        return -1;
++    }
++
++    for ( i = 0; i < (PAGE_SIZE / sizeof(uint64_t)); ++i )
++    {
++        xen_pfn_t mfn, pfn;
++
++        pte = src[i];
++
++        /* Remove Xen mappings: Xen will reconstruct on the other side */
++        if ( i >= xen_first && i <= xen_last )
++            pte = 0;
++
++        if ( pte & _PAGE_PRESENT )
++        {
++            mfn = pte_to_frame(ctx, pte);
++
++            if ( !mfn_in_pseudophysmap(ctx, mfn) )
++            {
++                ERROR("Bad MFN for L%lu[%u]",
++                      type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT, i);
++                pseudophysmap_walk(ctx, mfn);
++                errno = ERANGE;
++                return -1;
++            }
++            else
++                pfn = mfn_to_pfn(ctx, mfn);
++
++            update_pte(ctx, &pte, pfn);
++        }
++
++        dst[i] = pte;
++    }
++
++    return 0;
++}
++
++static int write_all_memory(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t x = 0, mfn, type;
++    int rc = -1, err;
++    void *guest_page = NULL;
++    void *local_page = malloc(PAGE_SIZE);
++
++    struct
++    {
++        struct rec_page_data_header h;
++        uint64_t pfn;
++    } page_data = { { 1, 0 } , 0 };
++
++    struct record rec =
++    {
++        .type = REC_TYPE_page_data,
++        .length = sizeof page_data,
++        .data = &page_data,
++    };
++
++    XC_BUILD_BUG_ON(sizeof page_data != 16);
++
++    if ( !local_page )
++    {
++        ERROR("Unable to allocate local scratch page");
++        goto err;
++    }
++
++    for ( x = 0; x <= ctx->x86_pv.max_pfn; ++x )
++    {
++        type = mfn = pfn_to_mfn(ctx, x);
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("Bad pfn %#lx", x);
++            pseudophysmap_walk(ctx, mfn);
++            goto err;
++        }
++
++        guest_page = xc_map_foreign_bulk(
++            xch, ctx->domid, PROT_READ, &mfn, &err, 1);
++        if ( !guest_page || err )
++        {
++            PERROR("Unable to map mfn %#lx (err %d)", mfn, err);
++            goto err;
++        }
++
++        if ( xc_get_pfn_type_batch(xch, ctx->domid, 1, &type) )
++        {
++            PERROR("Unable to get mfn %#lx type", mfn);
++            goto err;
++        }
++
++        /* Write a record */
++#ifdef __x86_64__
++        page_data.pfn = (type << 32) | x;
++#else
++        page_data.pfn = (((uint64_t)type) << 32) | x;
++#endif
++
++        switch (type)
++        {
++        case XEN_DOMCTL_PFINFO_BROKEN:
++        case XEN_DOMCTL_PFINFO_XALLOC:
++        case XEN_DOMCTL_PFINFO_XTAB:
++            if ( write_record(ctx, &rec) )
++                goto err;
++            break;
++
++        case XEN_DOMCTL_PFINFO_L1TAB:
++        case XEN_DOMCTL_PFINFO_L1TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++        case XEN_DOMCTL_PFINFO_L2TAB:
++        case XEN_DOMCTL_PFINFO_L2TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++        case XEN_DOMCTL_PFINFO_L3TAB:
++        case XEN_DOMCTL_PFINFO_L3TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++        case XEN_DOMCTL_PFINFO_L4TAB:
++        case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++            if ( normalise_pagetable(ctx, guest_page, local_page, type) ||
++                 write_split_record(ctx, &rec, local_page, PAGE_SIZE) )
++                goto err;
++            break;
++
++        case XEN_DOMCTL_PFINFO_NOTAB:
++            if ( write_split_record(ctx, &rec, guest_page, PAGE_SIZE) )
++                goto err;
++            break;
++
++        default:
++            IPRINTF("Bad mfn %#lx, type %#lx", mfn, type);
++            goto err;
++        }
++
++        munmap(guest_page, PAGE_SIZE);
++        guest_page = NULL;
++    }
++
++
++    DPRINTF("Finished All Memory");
++    rc = 0;
++
++ err:
++    if ( guest_page )
++        munmap(guest_page, PAGE_SIZE);
++    free(local_page);
++
++    return rc;
++}
++
 +static int write_x86_pv_info(struct context *ctx)
 +{
-+    struct x86_pv_info info =
++    struct rec_x86_pv_info info =
 +        {
 +            .guest_width = ctx->x86_pv.width,
 +            .pt_levels = ctx->x86_pv.levels,
@@ -383,33 +806,74 @@ index 0000000..70a7296
 +{
 +    xc_interface *xch = ctx->xch;
 +    int rc; unsigned i;
++    size_t datasz = ctx->x86_pv.p2m_frames * sizeof(uint64_t);
++    uint64_t *data = NULL;
++    struct rec_x86_pv_p2m_frames hdr =
++        {
++            .start_pfn = 0,
++            .end_pfn = ctx->x86_pv.max_pfn,
++        };
 +    struct record rec =
 +        {
 +            .type = REC_TYPE_x86_pv_p2m_frames,
-+            .length = sizeof(struct x86_pv_p2m_frames) +
-+            (ctx->x86_pv.p2m_frames  * sizeof(uint64_t)),
++            .length = sizeof hdr,
++            .data = &hdr,
 +        };
-+    struct x86_pv_p2m_frames *data = malloc(rec.length);
 +
-+    if ( !data )
++    /* No need to translate if sizeof(uint64_t) == sizeof(xen_pfn_t) */
++    if ( sizeof(uint64_t) != sizeof(*ctx->x86_pv.p2m_pfns) )
 +    {
-+        ERROR("Cannot allocate %zu bytes for X86_PV_P2M_FRAMES data",
-+              rec.length);
++        if ( !(data = malloc(datasz)) )
++        {
++            ERROR("Cannot allocate %zu bytes for X86_PV_P2M_FRAMES data", datasz);
++            return -1;
++        }
++
++        for ( i = 0; i < ctx->x86_pv.p2m_frames; ++i )
++            data[i] = ctx->x86_pv.p2m_pfns[i];
++    }
++    else
++        data = (uint64_t *)ctx->x86_pv.p2m_pfns;
++
++    rc = write_split_record(ctx, &rec, data, datasz);
++
++    if ( data != (uint64_t *)ctx->x86_pv.p2m_pfns )
++        free(data);
++
++    return rc;
++}
++
++static int write_x86_pv_shared_info(struct context *ctx)
++{
++    struct record rec =
++    {
++        .type = REC_TYPE_x86_pv_shared_info,
++        .length = PAGE_SIZE,
++        .data = &ctx->x86_pv.shinfo,
++    };
++
++    return write_record(ctx, &rec);
++}
++
++static int write_tsc_info(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    struct rec_tsc_info tsc = { 0 };
++    struct record rec =
++    {
++        .type = REC_TYPE_tsc_info,
++        .length = sizeof tsc,
++        .data = &tsc
++    };
++
++    if ( xc_domain_get_tsc_info(xch, ctx->domid, &tsc.mode,
++                                &tsc.nsec, &tsc.khz, &tsc.incarnation) < 0 )
++    {
++        PERROR("Unable to obtain TSC information");
 +        return -1;
 +    }
 +
-+    data->start_gfn = 0;
-+    data->end_gfn = ctx->x86_pv.max_gfn;
-+
-+    for ( i = 0; i < ctx->x86_pv.p2m_frames; ++i )
-+        data->p2m_gfns[i] = ctx->x86_pv.p2m_pfns[i];
-+
-+    rec.data = data;
-+
-+    rc = write_record(ctx, &rec);
-+    free(data);
-+
-+    return rc;
++    return write_record(ctx, &rec);
 +}
 +
 +int save_x86_pv(struct context *ctx)
@@ -419,6 +883,17 @@ index 0000000..70a7296
 +    struct record end = { REC_TYPE_end, 0, NULL };
 +
 +    IPRINTF("In experimental %s", __func__);
++
++    /* TODO - make this a little more live... */
++    if ( !ctx->dominfo.paused )
++    {
++        rc = (ctx->save.callbacks->suspend(ctx->save.callbacks->data) != 1);
++        if ( rc )
++        {
++            ERROR("Failed to suspend domain");
++            goto err;
++        }
++    }
 +
 +    /* Write Image and Domain headers to the stream */
 +    rc = write_headers(ctx);
@@ -442,6 +917,43 @@ index 0000000..70a7296
 +
 +    /* Write a full X86_PV_P2M_FRAMES record into the stream */
 +    rc = write_x86_pv_p2m_frames(ctx);
++    if ( rc )
++        goto err;
++
++    /* DOMAIN MUST BE PAUSED FROM THIS POINT ONWARDS */
++
++
++    rc = write_all_memory(ctx); /* TODO: only valid for non-live migrate */
++    if ( rc )
++        goto err;
++
++    rc = write_tsc_info(ctx);
++    if ( rc )
++        goto err;
++
++    rc = write_x86_pv_shared_info(ctx);
++    if ( rc )
++        goto err;
++
++    /* Refresh domain information now it has paused */
++    if ( (xc_domain_getinfo(xch, ctx->domid, 1, &ctx->dominfo) != 1) ||
++         (ctx->dominfo.domid != ctx->domid) )
++    {
++        PERROR("Unable to refresh domain information");
++        rc = -1;
++        goto err;
++    }
++    else if ( (!ctx->dominfo.shutdown ||
++               ctx->dominfo.shutdown_reason != SHUTDOWN_suspend ) &&
++              !ctx->dominfo.paused )
++    {
++        ERROR("Domain has not been suspended");
++        rc = -1;
++        goto err;
++    }
++
++    /* Write all the vcpu information */
++    rc = write_all_vcpu_information(ctx);
 +    if ( rc )
 +        goto err;
 +
