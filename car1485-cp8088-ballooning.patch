@@ -1,0 +1,145 @@
+# HG changeset patch
+# Parent ea4151d878b579147b381a6bda74b030ab2f3183
+
+diff -r ea4151d878b5 tools/libxc/saverestore/restore_x86_pv.c
+--- a/tools/libxc/saverestore/restore_x86_pv.c	Fri Mar 21 21:26:01 2014 +0000
++++ b/tools/libxc/saverestore/restore_x86_pv.c	Fri Apr 04 13:02:44 2014 +0100
+@@ -338,22 +338,32 @@ static int handle_page_data(struct conte
+     {
+         ERROR("PAGE_DATA record trucated: length %"PRIu32", min %zu",
+               rec->length, sizeof *page);
+-        goto err;
++        goto cleanup;
+     }
+     else if ( page->count != 1 )
+     {
+         // TODO
+         ERROR("Unable to handle batched pages (yet)");
+-        goto err;
++        goto cleanup;
+     }
+ 
+     pfn  =  page->pfn[0] & 0x0fffffffffffULL;
+     type = (page->pfn[0] & 0xf000000000000000ULL) >> 32;
+     ctx->x86_pv.pfn_types[pfn] = type;
+ 
++    /* skip invalid pages to support ballooning */
++    switch(type)
++    {
++        case XEN_DOMCTL_PFINFO_XTAB:
++        case XEN_DOMCTL_PFINFO_XALLOC:
++        case XEN_DOMCTL_PFINFO_BROKEN:
++            rc = 0;
++            goto cleanup;
++    }
++ 
+     rc = populate_pfn(ctx, pfn);
+     if ( rc )
+-        goto err;
++        goto cleanup;
+ 
+     mfn = pfn_to_mfn(ctx, pfn);
+ 
+@@ -362,7 +372,7 @@ static int handle_page_data(struct conte
+     if ( !guest_page || err )
+     {
+         PERROR("Unable to map mfn %#lx (err %d)", mfn, err);
+-        goto err;
++        goto cleanup;
+     }
+ 
+     memcpy(guest_page, &page->pfn[1], PAGE_SIZE);
+@@ -379,12 +389,12 @@ static int handle_page_data(struct conte
+         case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
+             rc = localise_pagetable(ctx, guest_page, type);
+             if ( rc )
+-                goto err;
++                goto cleanup;
+     }
+ 
+     rc = 0;
+ 
+- err:
++ cleanup:
+     if ( guest_page )
+         munmap(guest_page, PAGE_SIZE);
+ 
+diff -r ea4151d878b5 tools/libxc/saverestore/save_x86_pv.c
+--- a/tools/libxc/saverestore/save_x86_pv.c	Fri Mar 21 21:26:01 2014 +0000
++++ b/tools/libxc/saverestore/save_x86_pv.c	Fri Apr 04 13:02:44 2014 +0100
+@@ -523,16 +523,10 @@ static int write_all_memory(struct conte
+     for ( x = 0; x <= ctx->x86_pv.max_pfn; ++x )
+     {
+         type = mfn = pfn_to_mfn(ctx, x);
+-        if ( !mfn_in_pseudophysmap(ctx, mfn) )
+-        {
+-            ERROR("Bad pfn %#lx", x);
+-            pseudophysmap_walk(ctx, mfn);
+-            goto err;
+-        }
+ 
+         guest_page = xc_map_foreign_bulk(
+             xch, ctx->domid, PROT_READ, &mfn, &err, 1);
+-        if ( !guest_page || err )
++        if ( !guest_page )
+         {
+             PERROR("Unable to map mfn %#lx (err %d)", mfn, err);
+             goto err;
+@@ -568,12 +562,20 @@ static int write_all_memory(struct conte
+         case XEN_DOMCTL_PFINFO_L3TAB | XEN_DOMCTL_PFINFO_LPINTAB:
+         case XEN_DOMCTL_PFINFO_L4TAB:
+         case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++            if ( err ) {
++                ERROR("Invalid pfn %#lx mfn %#lx type %#lx", x, mfn, type);
++                goto err;
++            }
+             if ( normalise_pagetable(ctx, guest_page, local_page, type) ||
+                  write_split_record(ctx, &rec, local_page, PAGE_SIZE) )
+                 goto err;
+             break;
+ 
+         case XEN_DOMCTL_PFINFO_NOTAB:
++            if ( err ) {
++                ERROR("Invalid pfn %#lx mfn %#lx type %#lx", x, mfn, type);
++                goto err;
++            }
+             if ( write_split_record(ctx, &rec, guest_page, PAGE_SIZE) )
+                 goto err;
+             break;
+diff -r ea4151d878b5 tools/libxc/saverestore/scripts/streamspec.py
+--- a/tools/libxc/saverestore/scripts/streamspec.py	Fri Mar 21 21:26:01 2014 +0000
++++ b/tools/libxc/saverestore/scripts/streamspec.py	Fri Apr 04 13:02:44 2014 +0100
+@@ -70,3 +70,19 @@ X86_PV_VCPU_XSAVE_FORMAT  = "=IIQ"
+ 
+ # tsc_info
+ TSC_INFO_FORMAT           = "=IIQI"
++
++# page type flags
++# these flags came from XEN_DOMCTL_PFINFO_* ones shifted by 32 bit
++PAGE_DATA_TYPE_SHIFT         = 60
++PAGE_DATA_TYPE_NOTAB         = (0x0 << PAGE_DATA_TYPE_SHIFT)
++PAGE_DATA_TYPE_L1TAB         = (0x1 << PAGE_DATA_TYPE_SHIFT)
++PAGE_DATA_TYPE_L2TAB         = (0x2 << PAGE_DATA_TYPE_SHIFT)
++PAGE_DATA_TYPE_L3TAB         = (0x3 << PAGE_DATA_TYPE_SHIFT)
++PAGE_DATA_TYPE_L4TAB         = (0x4 << PAGE_DATA_TYPE_SHIFT)
++PAGE_DATA_TYPE_LTABTYPE_MASK = (0x7 << PAGE_DATA_TYPE_SHIFT)
++PAGE_DATA_TYPE_LPINTAB       = (0x8 << PAGE_DATA_TYPE_SHIFT)
++PAGE_DATA_TYPE_XTAB          = (0xf << PAGE_DATA_TYPE_SHIFT) # invalid page
++PAGE_DATA_TYPE_XALLOC        = (0xe << PAGE_DATA_TYPE_SHIFT) # allocate-only page
++PAGE_DATA_TYPE_BROKEN        = (0xd << PAGE_DATA_TYPE_SHIFT) # broken page
++PAGE_DATA_TYPE_LTAB_MASK     = (0xf << PAGE_DATA_TYPE_SHIFT)
++
+diff -r ea4151d878b5 tools/libxc/saverestore/scripts/verify.py
+--- a/tools/libxc/saverestore/scripts/verify.py	Fri Mar 21 21:26:01 2014 +0000
++++ b/tools/libxc/saverestore/scripts/verify.py	Fri Apr 04 13:02:44 2014 +0100
+@@ -130,6 +130,10 @@ def verify_page_data(content):
+ 
+     pfns = list(struct.unpack_from("=%dQ" % (count,), content, minsz))
+ 
++    # do not take in account invalid pages
++    # PAGE_DATA_TYPE_BROKEN is the smaller type that represent an invalid type
++    count = len([x for x in pfns if (x & PAGE_DATA_TYPE_LTAB_MASK) < PAGE_DATA_TYPE_BROKEN])
++
+     pagesz = count * 4096
+     if len(content) != minsz + pfnsz + pagesz:
+         raise RecordError("Wrong size")
