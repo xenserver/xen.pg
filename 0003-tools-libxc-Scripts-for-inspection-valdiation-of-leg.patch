@@ -1,15 +1,17 @@
-From d6aba4568780254fc342db6d5a89f19f654051d9 Mon Sep 17 00:00:00 2001
+From 11ecca4d987d6b92e8fb9ba981a1fd5b7edd5123 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 6 Mar 2014 00:03:18 +0000
-Subject: [PATCH 3/6] Scripts for inspection/valdiation of legacy and new
- streams
+Subject: [PATCH 3/6] tools/libxc: Scripts for inspection/valdiation of legacy
+ and new streams
 
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 ---
  tools/libxc/saverestore/scripts/generate.py        |   59 ++++
- .../libxc/saverestore/scripts/inspect-legacy32.py  |  167 +++++++++++
- tools/libxc/saverestore/scripts/streamspec.py      |   72 +++++
- tools/libxc/saverestore/scripts/verify.py          |  315 ++++++++++++++++++++
- 4 files changed, 613 insertions(+)
+ .../libxc/saverestore/scripts/inspect-legacy32.py  |  167 ++++++++++
+ tools/libxc/saverestore/scripts/streamspec.py      |   89 ++++++
+ tools/libxc/saverestore/scripts/verify.py          |  330 ++++++++++++++++++++
+ 4 files changed, 645 insertions(+)
  create mode 100755 tools/libxc/saverestore/scripts/generate.py
  create mode 100755 tools/libxc/saverestore/scripts/inspect-legacy32.py
  create mode 100644 tools/libxc/saverestore/scripts/streamspec.py
@@ -255,10 +257,10 @@ index 0000000..e20a8f2
 +    sys.exit(main(sys.argv))
 diff --git a/tools/libxc/saverestore/scripts/streamspec.py b/tools/libxc/saverestore/scripts/streamspec.py
 new file mode 100644
-index 0000000..5e903e2
+index 0000000..12b351e
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/streamspec.py
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,89 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -313,7 +315,24 @@ index 0000000..5e903e2
 +}
 +
 +# page_data
-+PAGE_DATA_FORMAT          = "=II"
++PAGE_DATA_FORMAT             = "=II"
++PAGE_DATA_PFN_MASK           = (1L << 52) - 1
++PAGE_DATA_PFN_RESZ_MASK      = ((1L << 60) - 1) & ~((1L << 52) - 1)
++
++# flags from xen/public/domctl.h: XEN_DOMCTL_PFINFO_* shifted by 32 bits
++PAGE_DATA_TYPE_SHIFT         = 60
++PAGE_DATA_TYPE_LTABTYPE_MASK = (0x7L << PAGE_DATA_TYPE_SHIFT)
++PAGE_DATA_TYPE_LTAB_MASK     = (0xfL << PAGE_DATA_TYPE_SHIFT)
++PAGE_DATA_TYPE_LPINTAB       = (0x8L << PAGE_DATA_TYPE_SHIFT) # Pinned pagetable
++
++PAGE_DATA_TYPE_NOTAB         = (0x0L << PAGE_DATA_TYPE_SHIFT) # Regular page
++PAGE_DATA_TYPE_L1TAB         = (0x1L << PAGE_DATA_TYPE_SHIFT) # L1 pagetable
++PAGE_DATA_TYPE_L2TAB         = (0x2L << PAGE_DATA_TYPE_SHIFT) # L2 pagetable
++PAGE_DATA_TYPE_L3TAB         = (0x3L << PAGE_DATA_TYPE_SHIFT) # L3 pagetable
++PAGE_DATA_TYPE_L4TAB         = (0x4L << PAGE_DATA_TYPE_SHIFT) # L4 pagetable
++PAGE_DATA_TYPE_BROKEN        = (0xdL << PAGE_DATA_TYPE_SHIFT) # Broken
++PAGE_DATA_TYPE_XALLOC        = (0xeL << PAGE_DATA_TYPE_SHIFT) # Allocate-only
++PAGE_DATA_TYPE_XTAB          = (0xfL << PAGE_DATA_TYPE_SHIFT) # Invalid
 +
 +# x86_pv_info
 +X86_PV_INFO_FORMAT        = "=BBB"
@@ -333,10 +352,10 @@ index 0000000..5e903e2
 +TSC_INFO_FORMAT           = "=IIQI"
 diff --git a/tools/libxc/saverestore/scripts/verify.py b/tools/libxc/saverestore/scripts/verify.py
 new file mode 100755
-index 0000000..d25877f
+index 0000000..0b1ec14
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/verify.py
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,330 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -469,7 +488,22 @@ index 0000000..d25877f
 +
 +    pfns = list(struct.unpack_from("=%dQ" % (count,), content, minsz))
 +
-+    pagesz = count * 4096
++    nr_pages = 0
++    for idx, pfn in enumerate(pfns):
++
++        if pfn & PAGE_DATA_PFN_RESZ_MASK:
++            raise RecordError("Reserved bits set in pfn[%d]: 0x%016x",
++                              idx, pfn & PAGE_DATA_PFN_RESZ_MASK)
++
++        if pfn >> PAGE_DATA_TYPE_SHIFT in (5, 6, 7, 8):
++            raise RecordError("Invalid type value in pfn[%d]: 0x%016x",
++                              idx, pfn & PAGE_DATA_TYPE_LTAB_MASK)
++
++        # We expect page data for each normal page or pagetable
++        if PAGE_DATA_TYPE_NOTAB <= (pfn & PAGE_DATA_TYPE_LTABTYPE_MASK) <= PAGE_DATA_TYPE_L4TAB:
++            nr_pages += 1
++
++    pagesz = nr_pages * 4096
 +    if len(content) != minsz + pfnsz + pagesz:
 +        raise RecordError("Wrong size")
 +

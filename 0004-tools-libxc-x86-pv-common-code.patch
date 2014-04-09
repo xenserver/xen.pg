@@ -1,18 +1,20 @@
-From d70c0cdcc7e5f2f1710d5aecdf15a5b1cbf30fe6 Mon Sep 17 00:00:00 2001
+From 8761fd5438976d6628925f330313c7af24668ef8 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 19 Mar 2014 12:17:02 +0000
-Subject: [PATCH 4/6] x86 common
+Subject: [PATCH 4/6] tools/libxc: x86 pv common code
 
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 ---
- tools/libxc/saverestore/common.h        |   76 +++++++++++
- tools/libxc/saverestore/common_x86_pv.c |  221 +++++++++++++++++++++++++++++++
- tools/libxc/saverestore/common_x86_pv.h |  105 +++++++++++++++
- 3 files changed, 402 insertions(+)
+ tools/libxc/saverestore/common.h        |   79 ++++++++++++
+ tools/libxc/saverestore/common_x86_pv.c |  208 +++++++++++++++++++++++++++++++
+ tools/libxc/saverestore/common_x86_pv.h |  105 ++++++++++++++++
+ 3 files changed, 392 insertions(+)
  create mode 100644 tools/libxc/saverestore/common_x86_pv.c
  create mode 100644 tools/libxc/saverestore/common_x86_pv.h
 
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index fff0a39..f6183bf 100644
+index fff0a39..4220c18 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
 @@ -1,8 +1,16 @@
@@ -32,7 +34,7 @@ index fff0a39..f6183bf 100644
  #include "stream_format.h"
  
  // TODO: Find a better place to put this...
-@@ -11,6 +19,74 @@
+@@ -11,6 +19,77 @@
  const char *dhdr_type_to_str(uint32_t type);
  const char *rec_type_to_str(uint32_t type);
  
@@ -80,6 +82,8 @@ index fff0a39..f6183bf 100644
 +            unsigned long max_mfn;
 +            /* Read-only machine to phys map */
 +            xen_pfn_t *m2p;
++            /* firtst m2p mfn. Incorrectly based on toolstack bitness - FIXME */
++            xen_pfn_t m2p_mfn0;
 +            /* Number of m2p frames mapped */
 +            unsigned long nr_m2p_frames;
 +
@@ -91,12 +95,13 @@ index fff0a39..f6183bf 100644
 +
 +            /* Number of frames making up the p2m */
 +            unsigned int p2m_frames;
-+            /* Read-only guests phys to machine map */
-+            xen_pfn_t *p2m;
++            /* Guest's phys to machine map.  Mapped read-only (save) or
++             * allocated locally (restore).  Uses guest unsigned longs. */
++            void *p2m;
 +            /* The guest pfns containing the p2m leaves */
 +            xen_pfn_t *p2m_pfns;
 +            /* Types for each page */
-+            xen_pfn_t *pfn_types;
++            uint32_t *pfn_types;
 +
 +            /* Read-only mapping of guests shared info page */
 +            shared_info_any_t *shinfo;
@@ -109,10 +114,10 @@ index fff0a39..f6183bf 100644
   * Local variables:
 diff --git a/tools/libxc/saverestore/common_x86_pv.c b/tools/libxc/saverestore/common_x86_pv.c
 new file mode 100644
-index 0000000..d0cfafa
+index 0000000..71fb13d
 --- /dev/null
 +++ b/tools/libxc/saverestore/common_x86_pv.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,208 @@
 +#include <assert.h>
 +
 +#include "common_x86_pv.h"
@@ -127,20 +132,15 @@ index 0000000..d0cfafa
 +{
 +    assert(pfn <= ctx->x86_pv.max_pfn);
 +
-+    if ( ctx->x86_pv.width == sizeof (unsigned long) )
-+        return ctx->x86_pv.p2m[pfn];
++    if ( ctx->x86_pv.width == sizeof (uint64_t) )
++        /* 64 bit guest.  Need to truncate their pfns for 32 bit toolstacks */
++        return ((uint64_t *)ctx->x86_pv.p2m)[pfn];
 +    else
 +    {
-+#ifdef __x86_64__
-+        /* 64bit toolstack, 32bit guest.  Extend MFN_INVALID to 64 bits */
-+        if ( ((uint32_t*)ctx->x86_pv.p2m)[pfn] == ~0U )
-+            return -1ULL;
-+        else
-+            return ((uint32_t*)ctx->x86_pv.p2m)[pfn];
-+#else
-+        /* 32bit toolstack, 64bit guest.  Reduce their pointers */
-+        return ((uint64_t*)ctx->x86_pv.p2m)[pfn];
-+#endif
++        /* 32 bit guest.  Need to expand INVALID_MFN fot 64 bit toolstacks */
++        uint32_t mfn = ((uint32_t *)ctx->x86_pv.p2m)[pfn];
++
++        return mfn == ~0U ? INVALID_MFN : mfn;
 +    }
 +}
 +
@@ -148,21 +148,12 @@ index 0000000..d0cfafa
 +{
 +    assert(pfn <= ctx->x86_pv.max_pfn);
 +
-+    if ( ctx->x86_pv.width == sizeof (unsigned long) )
-+        ctx->x86_pv.p2m[pfn] = mfn;
++    if ( ctx->x86_pv.width == sizeof (uint64_t) )
++        /* 64 bit guest.  Need to expand INVALID_MFN for 32 bit toolstacks */
++        ((uint64_t *)ctx->x86_pv.p2m)[pfn] = mfn == INVALID_MFN ? ~0ULL : mfn;
 +    else
-+    {
-+#ifdef __x86_64__
-+        /* 64bit toolstack, 32bit guest.  Discard top 32 bits of mfn */
-+        ((uint32_t*)ctx->x86_pv.p2m)[pfn] = (uint32_t)mfn;
-+#else
-+        /* 32bit toolstack, 64bit guest.  Extend MFN_INVALID */
-+        if ( mfn == INVALID_MFN )
-+            ((uint64_t*)ctx->x86_pv.p2m)[pfn] = -1ULL;
-+        else
-+            ((uint64_t*)ctx->x86_pv.p2m)[pfn] = (uint64_t)mfn;
-+#endif
-+    }
++        /* 32 bit guest.  Can safely truncate INVALID_MFN fot 64 bit toolstacks */
++        ((uint32_t *)ctx->x86_pv.p2m)[pfn] = mfn;
 +}
 +
 +bool mfn_in_pseudophysmap(struct context *ctx, xen_pfn_t mfn)
@@ -188,7 +179,7 @@ index 0000000..d0cfafa
 +
 +    if ( (pfn != ~0UL) && (pfn <= ctx->x86_pv.max_pfn) )
 +        ERROR("  p2m[%#lx] = %#lx",
-+              pfn, ctx->x86_pv.p2m[pfn]);
++              pfn, pfn_to_mfn(ctx, pfn));
 +}
 +
 +xen_pfn_t cr3_to_mfn(struct context *ctx, uint64_t cr3)
@@ -313,6 +304,7 @@ index 0000000..d0cfafa
 +    }
 +
 +    ctx->x86_pv.nr_m2p_frames = (M2P_CHUNK_SIZE >> PAGE_SHIFT) * m2p_chunks;
++    ctx->x86_pv.m2p_mfn0 = entries[0].mfn;
 +
 +    /* All Done */
 +    rc = 0;

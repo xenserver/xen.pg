@@ -1,21 +1,23 @@
-From a42972c04d8494249af6ddab57052180fb0347b0 Mon Sep 17 00:00:00 2001
+From 0913cb40d89c82a3eb0ac75cc0f85292ba276318 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Fri, 21 Mar 2014 21:26:01 +0000
-Subject: [PATCH 6/6] x86_pv restore
+Subject: [PATCH 6/6] tools/libxc: x86 pv restore implementation
 
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 ---
  tools/libxc/saverestore/common.c         |   51 ++
  tools/libxc/saverestore/common.h         |   35 ++
  tools/libxc/saverestore/restore.c        |  112 +++-
- tools/libxc/saverestore/restore_x86_pv.c |  935 ++++++++++++++++++++++++++++++
- 4 files changed, 1132 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/restore_x86_pv.c |  977 ++++++++++++++++++++++++++++++
+ 4 files changed, 1174 insertions(+), 1 deletion(-)
  create mode 100644 tools/libxc/saverestore/restore_x86_pv.c
 
 diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
-index 1d2a0cd..ae5b98e 100644
+index df18447..dbfae21 100644
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
-@@ -83,6 +83,57 @@ int write_split_record(struct context *ctx, struct record *rec,
+@@ -84,6 +84,57 @@ int write_split_record(struct context *ctx, struct record *rec,
      return 0;
  }
  
@@ -74,7 +76,7 @@ index 1d2a0cd..ae5b98e 100644
   * Local variables:
   * mode: C
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index 5093c35..bb8ebd6 100644
+index a2c8cee..249e18f 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
 @@ -7,9 +7,12 @@
@@ -90,7 +92,7 @@ index 5093c35..bb8ebd6 100644
  #undef mfn_to_pfn
  #undef pfn_to_mfn
  
-@@ -92,6 +95,8 @@ struct context
+@@ -95,6 +98,8 @@ struct context
  
  /* Saves an x86 PV domain. */
  int save_x86_pv(struct context *ctx);
@@ -99,7 +101,7 @@ index 5093c35..bb8ebd6 100644
  
  struct record
  {
-@@ -115,6 +120,22 @@ struct record
+@@ -118,6 +123,22 @@ struct record
              (_p)->x32._f = (_v);                \
      })
  
@@ -122,7 +124,7 @@ index 5093c35..bb8ebd6 100644
  /*
   * Writes a split record to the stream, applying correct padding where
   * appropriate.  It is common when sending records containing blobs from Xen
-@@ -140,6 +161,20 @@ static inline int write_record(struct context *ctx, struct record *rec)
+@@ -143,6 +164,20 @@ static inline int write_record(struct context *ctx, struct record *rec)
      return write_split_record(ctx, rec, NULL, 0);
  }
  
@@ -144,7 +146,7 @@ index 5093c35..bb8ebd6 100644
  /*
   * Local variables:
 diff --git a/tools/libxc/saverestore/restore.c b/tools/libxc/saverestore/restore.c
-index 6624baa..3c09d12 100644
+index 6624baa..6937aec 100644
 --- a/tools/libxc/saverestore/restore.c
 +++ b/tools/libxc/saverestore/restore.c
 @@ -1,5 +1,62 @@
@@ -184,7 +186,7 @@ index 6624baa..3c09d12 100644
 +        ERROR("Invalid Version: Expected %d, Got %d", ihdr.version, IHDR_VERSION);
 +        return -1;
 +    }
-+    else if ( ihdr.options & IHDR_OPT_LITTLE_ENDIAN )
++    else if ( ihdr.options & IHDR_OPT_BIG_ENDIAN )
 +    {
 +        ERROR("Unable to handle big endian streams");
 +        return -1;
@@ -275,10 +277,10 @@ index 6624baa..3c09d12 100644
  /*
 diff --git a/tools/libxc/saverestore/restore_x86_pv.c b/tools/libxc/saverestore/restore_x86_pv.c
 new file mode 100644
-index 0000000..0bbb2dd
+index 0000000..0659244
 --- /dev/null
 +++ b/tools/libxc/saverestore/restore_x86_pv.c
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,977 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -290,7 +292,8 @@ index 0000000..0bbb2dd
 +    unsigned long old_max = ctx->x86_pv.max_pfn, i;
 +    unsigned long end_frame = (max_pfn + ctx->x86_pv.fpp) / ctx->x86_pv.fpp;
 +    unsigned long old_end_frame = (old_max + ctx->x86_pv.fpp) / ctx->x86_pv.fpp;
-+    xen_pfn_t *p2m = NULL, *p2m_pfns = NULL, *pfn_types = NULL;
++    xen_pfn_t *p2m = NULL, *p2m_pfns = NULL;
++    uint32_t *pfn_types = NULL;
 +    size_t p2msz, p2m_pfnsz, pfn_typesz;
 +
 +    /* We expect expand_p2m to be called exactly once, expanding from 0 the
@@ -315,7 +318,7 @@ index 0000000..0bbb2dd
 +    }
 +    ctx->x86_pv.pfn_types = pfn_types;
 +
-+    p2m_pfnsz = (end_frame + 1) * sizeof *p2m;
++    p2m_pfnsz = (end_frame + 1) * sizeof *p2m_pfns;
 +    p2m_pfns = realloc(ctx->x86_pv.p2m_pfns, p2m_pfnsz);
 +    if ( !p2m_pfns )
 +    {
@@ -459,12 +462,13 @@ index 0000000..0bbb2dd
 +
 +    ctx->restore.console_mfn = mfn;
 +    SET_FIELD(ctx, guest_start_info, console.domU.mfn, mfn);
-+    SET_FIELD(ctx, guest_start_info, console.domU.mfn, ctx->restore.console_evtchn);
++    SET_FIELD(ctx, guest_start_info, console.domU.evtchn, ctx->restore.console_evtchn);
 +
 +    /* Set other information */
 +    SET_FIELD(ctx, guest_start_info, nr_pages, ctx->x86_pv.max_pfn + 1);
 +    SET_FIELD(ctx, guest_start_info, shared_info,
 +              ctx->dominfo.shared_info_frame << PAGE_SHIFT);
++    SET_FIELD(ctx, guest_start_info, flags, 0);
 +
 +    SET_FIELD(ctx, vcpu, user_regs.edx, mfn);
 +    rc = 0;
@@ -619,22 +623,45 @@ index 0000000..0bbb2dd
 +    {
 +        ERROR("PAGE_DATA record trucated: length %"PRIu32", min %zu",
 +              rec->length, sizeof *page);
-+        goto err;
++        goto cleanup;
 +    }
 +    else if ( page->count != 1 )
 +    {
 +        // TODO
 +        ERROR("Unable to handle batched pages (yet)");
-+        goto err;
++        goto cleanup;
 +    }
 +
-+    pfn  =  page->pfn[0] & 0x0fffffffffffULL;
-+    type = (page->pfn[0] & 0xf000000000000000ULL) >> 32;
++    pfn = page->pfn[0] & PAGE_DATA_PFN_MASK;
++    if ( pfn > ctx->x86_pv.max_pfn )
++    {
++        ERROR("pfn %#lx outside domain maximum (%#lx)", pfn, ctx->x86_pv.max_pfn);
++        goto cleanup;
++    }
++
++    type = (page->pfn[0] & PAGE_DATA_TYPE_MASK) >> 32;
++    if ( ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) >= 5) &&
++         ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) <= 8) )
++    {
++        ERROR("Invalid type %#lx for pfn %#lx", type, pfn);
++        goto cleanup;
++    }
++
 +    ctx->x86_pv.pfn_types[pfn] = type;
 +
++    switch ( type )
++    {
++        case XEN_DOMCTL_PFINFO_XTAB:
++        case XEN_DOMCTL_PFINFO_BROKEN:
++            /* No page data - leave alone */
++            rc = 0;
++            goto cleanup;
++    }
++
++    /* All other page types, need to allocate */
 +    rc = populate_pfn(ctx, pfn);
 +    if ( rc )
-+        goto err;
++        goto cleanup;
 +
 +    mfn = pfn_to_mfn(ctx, pfn);
 +
@@ -643,29 +670,26 @@ index 0000000..0bbb2dd
 +    if ( !guest_page || err )
 +    {
 +        PERROR("Unable to map mfn %#lx (err %d)", mfn, err);
-+        goto err;
++        rc = -1;
++        goto cleanup;
 +    }
 +
-+    memcpy(guest_page, &page->pfn[1], PAGE_SIZE);
++    /* XALLOC also has no page data */
++    if ( type != XEN_DOMCTL_PFINFO_XALLOC )
++        memcpy(guest_page, &page->pfn[1], PAGE_SIZE);
 +
-+    switch(type)
++    /* Pagetables need to be localised */
++    if ( ((type & XEN_DOMCTL_PFINFO_LTABTYPE_MASK) >= XEN_DOMCTL_PFINFO_L1TAB &&
++          (type & XEN_DOMCTL_PFINFO_LTABTYPE_MASK) <= XEN_DOMCTL_PFINFO_L4TAB) )
 +    {
-+        case XEN_DOMCTL_PFINFO_L1TAB:
-+        case XEN_DOMCTL_PFINFO_L1TAB | XEN_DOMCTL_PFINFO_LPINTAB:
-+        case XEN_DOMCTL_PFINFO_L2TAB:
-+        case XEN_DOMCTL_PFINFO_L2TAB | XEN_DOMCTL_PFINFO_LPINTAB:
-+        case XEN_DOMCTL_PFINFO_L3TAB:
-+        case XEN_DOMCTL_PFINFO_L3TAB | XEN_DOMCTL_PFINFO_LPINTAB:
-+        case XEN_DOMCTL_PFINFO_L4TAB:
-+        case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
-+            rc = localise_pagetable(ctx, guest_page, type);
-+            if ( rc )
-+                goto err;
++        rc = localise_pagetable(ctx, guest_page, type);
++        if ( rc )
++            goto cleanup;
 +    }
 +
 +    rc = 0;
 +
-+ err:
++ cleanup:
 +    if ( guest_page )
 +        munmap(guest_page, PAGE_SIZE);
 +
@@ -692,10 +716,30 @@ index 0000000..0bbb2dd
 +    }
 +    else if ( info->guest_width != ctx->x86_pv.width )
 +    {
-+        ERROR("Width of guest in stream (%"PRIu32
-+              " bits) differs with existing domain (%"PRIu32" bits)",
-+              info->guest_width * 8, ctx->x86_pv.width * 8);
-+        return -1;
++        int rc;
++        struct xen_domctl domctl;
++
++        /* try to set address size, domain is always created 64 bit */
++        memset(&domctl, 0, sizeof(domctl));
++        domctl.domain = ctx->domid;
++        domctl.cmd    = XEN_DOMCTL_set_address_size;
++        domctl.u.address_size.size = info->guest_width * 8;
++        rc = do_domctl(xch, &domctl);
++        if ( rc != 0 )
++        {
++            ERROR("Width of guest in stream (%"PRIu32
++                  " bits) differs with existing domain (%"PRIu32" bits)",
++                  info->guest_width * 8, ctx->x86_pv.width * 8);
++            return -1;
++        }
++
++        /* domain informations changed, better to refresh */
++        rc = x86_pv_domain_info(ctx);
++        if ( rc != 0 )
++        {
++            ERROR("Unable to refresh guest informations");
++            return -1;
++        }
 +    }
 +    else if ( info->pt_levels != 3 &&
 +              info->pt_levels != 4 )
@@ -738,7 +782,7 @@ index 0000000..0bbb2dd
 +    }
 +
 +    start =  data->start_pfn / ctx->x86_pv.fpp;
-+    end = (data->end_pfn + ctx->x86_pv.fpp) / ctx->x86_pv.fpp;
++    end = data->end_pfn / ctx->x86_pv.fpp + 1;
 +
 +    if ( rec->length != sizeof *data + ((end - start) * sizeof (uint64_t)) )
 +    {
@@ -782,7 +826,7 @@ index 0000000..0bbb2dd
 +              rec->length, sizeof *vhdr + 1);
 +        goto err;
 +    }
-+    else if ( rec->length != sizeof *vhdr + vcpusz)
++    else if ( rec->length != sizeof *vhdr + vcpusz )
 +    {
 +        ERROR("X86_PV_VCPU_EXTENDED record wrong size: length %"PRIu32
 +              ", expected %zu", rec->length, sizeof *vhdr + vcpusz);
@@ -902,7 +946,7 @@ index 0000000..0bbb2dd
 +
 +    if ( xc_vcpu_setcontext(xch, ctx->domid, vhdr->vcpu_id, &vcpu) )
 +    {
-+        PERROR("Failed to set vcpu%"PRIu32"'s basic info - IGNORING", vhdr->vcpu_id);
++        PERROR("Failed to set vcpu%"PRIu32"'s basic info", vhdr->vcpu_id);
 +        goto err;
 +    }
 +
