@@ -1,15 +1,15 @@
-From f97391622d8e11651e249baaf76a8f13621e85ef Mon Sep 17 00:00:00 2001
+From d6aba4568780254fc342db6d5a89f19f654051d9 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 6 Mar 2014 00:03:18 +0000
-Subject: [PATCH 3/5] Scripts for inspection/valdiation of legacy and new
+Subject: [PATCH 3/6] Scripts for inspection/valdiation of legacy and new
  streams
 
 ---
- tools/libxc/saverestore/scripts/generate.py        |   59 ++++++
- .../libxc/saverestore/scripts/inspect-legacy32.py  |  167 ++++++++++++++++
- tools/libxc/saverestore/scripts/streamspec.py      |   59 ++++++
- tools/libxc/saverestore/scripts/verify.py          |  208 ++++++++++++++++++++
- 4 files changed, 493 insertions(+)
+ tools/libxc/saverestore/scripts/generate.py        |   59 ++++
+ .../libxc/saverestore/scripts/inspect-legacy32.py  |  167 +++++++++++
+ tools/libxc/saverestore/scripts/streamspec.py      |   72 +++++
+ tools/libxc/saverestore/scripts/verify.py          |  315 ++++++++++++++++++++
+ 4 files changed, 613 insertions(+)
  create mode 100755 tools/libxc/saverestore/scripts/generate.py
  create mode 100755 tools/libxc/saverestore/scripts/inspect-legacy32.py
  create mode 100644 tools/libxc/saverestore/scripts/streamspec.py
@@ -255,10 +255,10 @@ index 0000000..e20a8f2
 +    sys.exit(main(sys.argv))
 diff --git a/tools/libxc/saverestore/scripts/streamspec.py b/tools/libxc/saverestore/scripts/streamspec.py
 new file mode 100644
-index 0000000..57508e2
+index 0000000..5e903e2
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/streamspec.py
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,72 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -290,26 +290,30 @@ index 0000000..57508e2
 +
 +RH_FORMAT = "=II"
 +
-+REC_TYPE_end               = 0x00000000
-+REC_TYPE_page_data         = 0x00000001
-+REC_TYPE_vcpu_count        = 0x00000002
-+REC_TYPE_vcpu_context      = 0x00000003
-+REC_TYPE_vcpu_context_x1   = 0x00000004
-+REC_TYPE_vcpu_context_x2   = 0x00000005
-+REC_TYPE_x86_pv_info       = 0x00000006
-+REC_TYPE_x86_pv_p2m_frames = 0x00000007
++REC_TYPE_end                  = 0x00000000
++REC_TYPE_page_data            = 0x00000001
++REC_TYPE_x86_pv_info          = 0x00000002
++REC_TYPE_x86_pv_p2m_frames    = 0x00000003
++REC_TYPE_x86_pv_vcpu_basic    = 0x00000004
++REC_TYPE_x86_pv_vcpu_extended = 0x00000005
++REC_TYPE_x86_pv_vcpu_xsave    = 0x00000006
++REC_TYPE_x86_pv_shared_info   = 0x00000007
++REC_TYPE_tsc_info             = 0x00000008
 +
 +rec_type_to_str = {
-+    REC_TYPE_end               : "End",
-+    REC_TYPE_page_data         : "Page data",
-+    REC_TYPE_vcpu_count        : "Vcpu count",
-+    REC_TYPE_vcpu_context      : "Vcpu context",
-+    REC_TYPE_vcpu_context_x1   : "Vcpu context 1",
-+    REC_TYPE_vcpu_context_x2   : "Vcpu context 2",
-+    REC_TYPE_x86_pv_info       : "x86 PV info",
-+    REC_TYPE_x86_pv_p2m_frames : "x86 PV P2M frames",
++    REC_TYPE_end                  : "End",
++    REC_TYPE_page_data            : "Page data",
++    REC_TYPE_x86_pv_info          : "x86 PV info",
++    REC_TYPE_x86_pv_p2m_frames    : "x86 PV P2M frames",
++    REC_TYPE_x86_pv_vcpu_basic    : "x86 PV vcpu basic",
++    REC_TYPE_x86_pv_vcpu_extended : "x86 PV vcpu extended",
++    REC_TYPE_x86_pv_vcpu_xsave    : "x86 PV vcpu xsave",
++    REC_TYPE_x86_pv_shared_info   : "x86 PV shared info",
++    REC_TYPE_tsc_info             : "TSC info",
 +}
 +
++# page_data
++PAGE_DATA_FORMAT          = "=II"
 +
 +# x86_pv_info
 +X86_PV_INFO_FORMAT        = "=BBB"
@@ -318,12 +322,21 @@ index 0000000..57508e2
 +X86_PV_INFO_OPT_VMASST    = (1 << X86_PV_INFO_OPT_VMASST_)
 +
 +X86_PV_INFO_OPT_RESZ_MASK = 0xfe
++
++# x86_pv_vcpu_{basic,extended}
++X86_PV_VCPU_FORMAT        = "=II"
++
++# x86_pv_vcpu_xsave
++X86_PV_VCPU_XSAVE_FORMAT  = "=IIQ"
++
++# tsc_info
++TSC_INFO_FORMAT           = "=IIQI"
 diff --git a/tools/libxc/saverestore/scripts/verify.py b/tools/libxc/saverestore/scripts/verify.py
 new file mode 100755
-index 0000000..5bf03ab
+index 0000000..d25877f
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/verify.py
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,315 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -376,19 +389,24 @@ index 0000000..5bf03ab
 +    marker, id, version, options, res1, res2 = struct.unpack(IHDR_FORMAT, data)
 +
 +    if marker != 0xffffffffffffffff:
-+        raise StreamError("Bad image marker: Expected 0xffffffffffffffff, got 0x%x" % (marker, ))
++        raise StreamError("Bad image marker: Expected 0xffffffffffffffff, "
++                          "got 0x%x" % (marker, ))
 +
 +    if id != 0x58454e46:
-+        raise StreamError("Bad image id: Expected 0x0x58454e46, got 0x%x" % (id, ))
++        raise StreamError("Bad image id: Expected 0x0x58454e46, got 0x%x"
++                          % (id, ))
 +
 +    if version != 1:
-+        raise StreamError("Unknown image version: Expected 1, got %d" % (version, ))
++        raise StreamError("Unknown image version: Expected 1, got %d"
++                          % (version, ))
 +
 +    if options & IHDR_OPT_RESZ_MASK:
-+        raise StreamError("Reserved bits set in image options field: 0x%x" % (options & IHDR_OPT_RESZ_MASK))
++        raise StreamError("Reserved bits set in image options field: 0x%x"
++                          % (options & IHDR_OPT_RESZ_MASK))
 +
 +    if res1 != 0 or res2 != 0:
-+        raise StreamError("Reserved bits set in image header: 0x%04x:0x%08x" % (res1, res2))
++        raise StreamError("Reserved bits set in image header: 0x%04x:0x%08x"
++                          % (res1, res2))
 +
 +    if ( sys.byteorder == "little" and
 +         (options & IHDR_OPT_ENDIAN_) != IHDR_OPT_LE ):
@@ -415,10 +433,12 @@ index 0000000..5bf03ab
 +        raise StreamError("Unrecognised domain type 0x%x" % (type, ))
 +
 +    if res1 != 0:
-+        raise StreamError("Reserved bits set in domain header 0x%04x" % (res1, ))
++        raise StreamError("Reserved bits set in domain header 0x%04x"
++                          % (res1, ))
 +
 +    if page_shift != 12:
-+        raise StreamError("Page shift expected to be 12.  Got %d" % (page_shift, ))
++        raise StreamError("Page shift expected to be 12.  Got %d"
++                          % (page_shift, ))
 +
 +    print "Valid Domain Header: %s from Xen %d.%d (page sz %d)" \
 +        % (dhdr_type_to_str[type], major, minor, 2**page_shift)
@@ -429,10 +449,69 @@ index 0000000..5bf03ab
 +    if len(content) != 0:
 +        raise RecordError("End record with non-zero length")
 +
++def verify_page_data(content):
++    minsz = struct.calcsize(PAGE_DATA_FORMAT)
++
++    if len(content) <= minsz:
++        raise RecordError("PAGE_DATA record must be at least %d bytes long"
++                          % (minsz, ))
++
++    count, res1 = struct.unpack_from(PAGE_DATA_FORMAT, content)
++
++    if res1 != 0:
++        raise StreamError("Reserved bits set in PAGE_DATA record 0x%04x"
++                          % (res1, ))
++
++    pfnsz = count * 8
++    if (len(content) - minsz) < pfnsz:
++        raise RecordError("PAGE_DATA record must contain a pfn record for "
++                          "each count")
++
++    pfns = list(struct.unpack_from("=%dQ" % (count,), content, minsz))
++
++    pagesz = count * 4096
++    if len(content) != minsz + pfnsz + pagesz:
++        raise RecordError("Wrong size")
++
++
++def verify_record_x86_pv_vcpu_generic(content, name):
++    # Generic for both REC_TYPE_x86_pv_vcpu_{basic,extended}
++    minsz = struct.calcsize(X86_PV_VCPU_FORMAT)
++
++    if len(content) <= minsz:
++        raise RecordError("X86_PV_VCPU_%s record length must be at least %d"
++                          " bytes long" % (name, minsz))
++
++    vcpuid, res1 = struct.unpack_from(X86_PV_VCPU_FORMAT, content)
++
++    if res1 != 0:
++        raise StreamError("Reserved bits set in x86_pv_vcpu_%s record 0x%04x"
++                          % (name, res1))
++
++    print "  vcpu%d %s context, %d bytes" % (vcpuid, name, len(content) - minsz)
++
++def verify_record_x86_pv_vcpu_xsave(content):
++    minsz = struct.calcsize(X86_PV_VCPU_XSAVE_FORMAT)
++
++    if len(content) <= minsz:
++        raise RecordError("X86_PV_VCPU_XSAVE record length must be at least %d"
++                          " bytes long" % (minsz, ))
++
++    vcpuid, res1, xmask = struct.unpack_from(X86_PV_VCPU_XSAVE_FORMAT,
++                                             content)
++
++    if res1 != 0:
++        raise StreamError("Reserved bits set in X86_PV_VCPU_XSAVE record "
++                          "0x%04x" % (res1, ))
++
++    print "  vcpu%d xsave context, mask 0x%x" % (vcpuid, xmask)
++
++
 +def verify_x86_pv_info(content):
 +
 +    if len(content) != 3:
-+        raise RecordError("x86_pf_info: expected length of 3, got %d" % (len(content), ))
++        raise RecordError("x86_pf_info: expected length of 3, got %d"
++                          % (len(content), ))
 +
 +    width, levels, options = struct.unpack(X86_PV_INFO_FORMAT, content)
 +
@@ -443,7 +522,7 @@ index 0000000..5bf03ab
 +        raise RecordError("Expected levels of 3 or 4, got %d" % (levels, ))
 +
 +    if (options & X86_PV_INFO_OPT_RESZ_MASK) != 0:
-+        raise StreamError("Reserved bits set in X86_PV_INFO options: 0x%02"
++        raise StreamError("Reserved bits set in X86_PV_INFO options: 0x%02x"
 +                          % (options & X86_PV_INFO_OPT_RESZ_MASK, ))
 +
 +    bitness = {4:32, 8:64}[width]
@@ -458,16 +537,46 @@ index 0000000..5bf03ab
 +
 +    start, end = struct.unpack_from("=II", content)
 +
-+    print "  Start gfn 0x%x, End 0x%x" % (start, end)
++    print "  Start pfn 0x%x, End 0x%x" % (start, end)
++
++def verify_record_x86_pv_shared_info(content):
++
++    if len(content) != 4096:
++        raise RecordError("Length expected to be 4906 bytes, not %d"
++                          % (len(content), ))
++
++def verify_record_tsc_info(content):
++
++    sz = struct.calcsize(TSC_INFO_FORMAT)
++
++    if len(content) != sz:
++        raise RecordError("Length should be %u bytes" % (sz, ))
++
++    mode, khz, nsec, incarn = struct.unpack(TSC_INFO_FORMAT, content)
++    print ("  Mode %u, %u kHz, %u ns, incarnation %d"
++           % (mode, khz, nsec, incarn))
 +
 +record_verifiers = {
 +    REC_TYPE_end : verify_record_end,
++    REC_TYPE_page_data : verify_page_data,
++
 +    REC_TYPE_x86_pv_info: verify_x86_pv_info,
 +    REC_TYPE_x86_pv_p2m_frames: verify_x86_pv_p2m_frames,
++
++    REC_TYPE_x86_pv_vcpu_basic :
++        lambda x: verify_record_x86_pv_vcpu_generic(x, "basic"),
++    REC_TYPE_x86_pv_vcpu_extended :
++        lambda x: verify_record_x86_pv_vcpu_generic(x, "extended"),
++    REC_TYPE_x86_pv_vcpu_xsave : verify_record_x86_pv_vcpu_xsave,
++
++    REC_TYPE_x86_pv_shared_info: verify_record_x86_pv_shared_info,
++    REC_TYPE_tsc_info: verify_record_tsc_info,
 +}
 +
++_squahsed_data_records = 0
 +def verify_record(stream):
 +    """ Verify a record """
++    global _squahsed_data_records
 +
 +    datasz = struct.calcsize(RH_FORMAT)
 +    data = stream.read(datasz)
@@ -490,7 +599,18 @@ index 0000000..5bf03ab
 +    if padding != "\x00" * len(padding):
 +        raise StreamError("Padding containging non0 bytes found")
 +
-+    print "Valid Record Header: %s, length %d" % (rec_type_to_str[type], length)
++    if type != REC_TYPE_page_data:
++
++        if _squahsed_data_records > 0:
++            print ("Squashed %d valid Page Data records together"
++                   % (_squahsed_data_records, ))
++            _squahsed_data_records = 0
++
++        print ("Valid Record Header: %s, length %d"
++               % (rec_type_to_str[type], length))
++
++    else:
++        _squahsed_data_records += 1
 +
 +    if type not in record_verifiers:
 +        raise RuntimeError("No verification function")

@@ -1,21 +1,21 @@
-From 77aa84d25e369973c6306f8dd1f6255b3165eef2 Mon Sep 17 00:00:00 2001
+From a42972c04d8494249af6ddab57052180fb0347b0 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Sun, 16 Mar 2014 02:09:17 +0000
+Date: Fri, 21 Mar 2014 21:26:01 +0000
 Subject: [PATCH 6/6] x86_pv restore
 
 ---
- tools/libxc/saverestore/common.c         |   51 ++++++++
- tools/libxc/saverestore/common.h         |   16 +++
- tools/libxc/saverestore/restore.c        |   90 +++++++++++++-
- tools/libxc/saverestore/restore_x86_pv.c |  193 ++++++++++++++++++++++++++++++
- 4 files changed, 349 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/common.c         |   51 ++
+ tools/libxc/saverestore/common.h         |   35 ++
+ tools/libxc/saverestore/restore.c        |  112 +++-
+ tools/libxc/saverestore/restore_x86_pv.c |  935 ++++++++++++++++++++++++++++++
+ 4 files changed, 1132 insertions(+), 1 deletion(-)
  create mode 100644 tools/libxc/saverestore/restore_x86_pv.c
 
 diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
-index 2b70bfe..a28596f 100644
+index 1d2a0cd..ae5b98e 100644
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
-@@ -77,6 +77,57 @@ int write_record(struct context *ctx, struct record *rec)
+@@ -83,6 +83,57 @@ int write_split_record(struct context *ctx, struct record *rec,
      return 0;
  }
  
@@ -74,10 +74,23 @@ index 2b70bfe..a28596f 100644
   * Local variables:
   * mode: C
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index 36c7b87..79cbd94 100644
+index 5093c35..bb8ebd6 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -79,6 +79,8 @@ struct context
+@@ -7,9 +7,12 @@
+ 
+ #include "../xg_private.h"
+ #include "../xg_save_restore.h"
++#include "../xc_dom.h"
+ 
+ #undef GET_FIELD
+ #undef SET_FIELD
++#undef MEMCPY_FIELD
++#undef MEMSET_ARRAY_FIELD
+ #undef mfn_to_pfn
+ #undef pfn_to_mfn
+ 
+@@ -92,6 +95,8 @@ struct context
  
  /* Saves an x86 PV domain. */
  int save_x86_pv(struct context *ctx);
@@ -86,9 +99,32 @@ index 36c7b87..79cbd94 100644
  
  struct record
  {
-@@ -103,6 +105,20 @@ struct record
-  */
- int write_record(struct context *ctx, struct record *rec);
+@@ -115,6 +120,22 @@ struct record
+             (_p)->x32._f = (_v);                \
+     })
+ 
++/* memcpy field _f from _s to _d, of an *_any union */
++#define MEMCPY_FIELD(_c, _d, _s, _f)                                    \
++    ({ if ( (_c)->x86_pv.width == 8 )                                   \
++            memcpy(&(_d)->x64._f, &(_s)->x64._f, sizeof((_d)->x64._f)); \
++        else                                                            \
++            memcpy(&(_d)->x32._f, &(_s)->x32._f, sizeof((_d)->x32._f)); \
++    })
++
++/* memset array field _f with value _v, from an *_any union */
++#define MEMSET_ARRAY_FIELD(_c, _d, _f, _v)                              \
++    ({ if ( (_c)->x86_pv.width == 8 )                                   \
++           memset(&(_d)->x64._f[0], (_v), sizeof((_d)->x64._f));        \
++       else                                                             \
++           memset(&(_d)->x32._f[0], (_v), sizeof((_d)->x32._f));        \
++    })
++
+ /*
+  * Writes a split record to the stream, applying correct padding where
+  * appropriate.  It is common when sending records containing blobs from Xen
+@@ -140,6 +161,20 @@ static inline int write_record(struct context *ctx, struct record *rec)
+     return write_split_record(ctx, rec, NULL, 0);
+ }
  
 +/*
 + * Reads a record from the stream, and fills in the record structure.
@@ -108,7 +144,7 @@ index 36c7b87..79cbd94 100644
  /*
   * Local variables:
 diff --git a/tools/libxc/saverestore/restore.c b/tools/libxc/saverestore/restore.c
-index 6624baa..5f6dcbe 100644
+index 6624baa..3c09d12 100644
 --- a/tools/libxc/saverestore/restore.c
 +++ b/tools/libxc/saverestore/restore.c
 @@ -1,5 +1,62 @@
@@ -174,7 +210,7 @@ index 6624baa..5f6dcbe 100644
  int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
                         unsigned int store_evtchn, unsigned long *store_mfn,
                         domid_t store_domid, unsigned int console_evtchn,
-@@ -8,8 +65,39 @@ int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
+@@ -8,8 +65,61 @@ int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
                         int checkpointed_stream,
                         struct restore_callbacks *callbacks)
  {
@@ -183,6 +219,11 @@ index 6624baa..5f6dcbe 100644
 +            .xch = xch,
 +            .fd = io_fd,
 +        };
++
++    ctx.restore.console_evtchn = console_evtchn;
++    ctx.restore.console_domid = console_domid;
++    ctx.restore.xenstore_evtchn = store_evtchn;
++    ctx.restore.xenstore_domid = store_domid;
 +
      IPRINTF("In experimental %s", __func__);
 -    return -1;
@@ -211,20 +252,352 @@ index 6624baa..5f6dcbe 100644
 +        return -1;
 +    }
 +    else
-+        return restore_x86_pv(&ctx);
++    {
++        if ( restore_x86_pv(&ctx) )
++            return -1;
++
++        DPRINTF("XenStore: mfn %#lx, dom %d, evt %u",
++                ctx.restore.xenstore_mfn,
++                ctx.restore.xenstore_domid,
++                ctx.restore.xenstore_evtchn);
++
++        DPRINTF("Console: mfn %#lx, dom %d, evt %u",
++                ctx.restore.console_mfn,
++                ctx.restore.console_domid,
++                ctx.restore.console_evtchn);
++
++        *console_mfn = ctx.restore.console_mfn;
++        *store_mfn = ctx.restore.xenstore_mfn;
++        return 0;
++    }
  }
  
  /*
 diff --git a/tools/libxc/saverestore/restore_x86_pv.c b/tools/libxc/saverestore/restore_x86_pv.c
 new file mode 100644
-index 0000000..594b5c7
+index 0000000..0bbb2dd
 --- /dev/null
 +++ b/tools/libxc/saverestore/restore_x86_pv.c
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,935 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
 +#include "common_x86_pv.h"
++
++static int expand_p2m(struct context *ctx, unsigned long max_pfn)
++{
++    xc_interface *xch = ctx->xch;
++    unsigned long old_max = ctx->x86_pv.max_pfn, i;
++    unsigned long end_frame = (max_pfn + ctx->x86_pv.fpp) / ctx->x86_pv.fpp;
++    unsigned long old_end_frame = (old_max + ctx->x86_pv.fpp) / ctx->x86_pv.fpp;
++    xen_pfn_t *p2m = NULL, *p2m_pfns = NULL, *pfn_types = NULL;
++    size_t p2msz, p2m_pfnsz, pfn_typesz;
++
++    /* We expect expand_p2m to be called exactly once, expanding from 0 the
++     * domains max, but assert some sanity */
++    assert(max_pfn > old_max);
++
++    p2msz = (max_pfn + 1) * ctx->x86_pv.width;
++    p2m = realloc(ctx->x86_pv.p2m, p2msz);
++    if ( !p2m )
++    {
++        ERROR("Failed to (re)alloc %zu bytes for p2m", p2msz);
++        return -1;
++    }
++    ctx->x86_pv.p2m = p2m;
++
++    pfn_typesz = (max_pfn + 1) * sizeof *pfn_types;
++    pfn_types = realloc(ctx->x86_pv.pfn_types, pfn_typesz);
++    if ( !pfn_types )
++    {
++        ERROR("Failed to (re)alloc %zu bytes for pfn_types", pfn_typesz);
++        return -1;
++    }
++    ctx->x86_pv.pfn_types = pfn_types;
++
++    p2m_pfnsz = (end_frame + 1) * sizeof *p2m;
++    p2m_pfns = realloc(ctx->x86_pv.p2m_pfns, p2m_pfnsz);
++    if ( !p2m_pfns )
++    {
++        ERROR("Failed to (re)alloc %zu bytes for p2m frame list", p2m_pfnsz);
++        return -1;
++    }
++    ctx->x86_pv.p2m_frames = end_frame;
++    ctx->x86_pv.p2m_pfns = p2m_pfns;
++
++    ctx->x86_pv.max_pfn = max_pfn;
++    for ( i = (old_max ? old_max + 1 : 0); i <= max_pfn; ++i )
++    {
++        set_p2m(ctx, i, INVALID_MFN);
++        ctx->x86_pv.pfn_types[i] = 0;
++    }
++
++    for ( i = (old_end_frame ? old_end_frame + 1 : 0); i <= end_frame; ++i )
++        ctx->x86_pv.p2m_pfns[i] = INVALID_MFN;
++
++    DPRINTF("Expanded p2m from %#lx to %#lx", old_max, max_pfn);
++    return 0;
++}
++
++static int pin_pagetables(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    unsigned long i;
++    struct mmuext_op pin;
++
++    DPRINTF("Pinning pagetables");
++
++    for ( i = 0; i <= ctx->x86_pv.max_pfn; ++i )
++    {
++        if ( (ctx->x86_pv.pfn_types[i] & XEN_DOMCTL_PFINFO_LPINTAB) == 0 )
++            continue;
++
++        switch ( ctx->x86_pv.pfn_types[i] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK )
++        {
++        case XEN_DOMCTL_PFINFO_L1TAB:
++            pin.cmd = MMUEXT_PIN_L1_TABLE;
++            break;
++        case XEN_DOMCTL_PFINFO_L2TAB:
++            pin.cmd = MMUEXT_PIN_L2_TABLE;
++            break;
++        case XEN_DOMCTL_PFINFO_L3TAB:
++            pin.cmd = MMUEXT_PIN_L3_TABLE;
++            break;
++        case XEN_DOMCTL_PFINFO_L4TAB:
++            pin.cmd = MMUEXT_PIN_L4_TABLE;
++            break;
++        default:
++            continue;
++        }
++
++        pin.arg1.mfn = pfn_to_mfn(ctx, i);
++
++        if ( xc_mmuext_op(xch, &pin, 1, ctx->domid) != 0 )
++        {
++            PERROR("Failed to pin page table for pfn %#lx", i);
++            return -1;
++        }
++
++    }
++
++    return 0;
++}
++
++static int process_start_info(struct context *ctx, vcpu_guest_context_any_t *vcpu)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t pfn, mfn;
++    start_info_any_t *guest_start_info = NULL;
++    int rc = -1;
++
++    pfn = GET_FIELD(ctx, vcpu, user_regs.edx);
++
++    if ( pfn > ctx->x86_pv.max_pfn )
++    {
++        ERROR("Start Info pfn %#lx out of range", pfn);
++        goto err;
++    }
++    else if ( ctx->x86_pv.pfn_types[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
++    {
++        ERROR("Start Info pfn %#lx has bad type %lu", pfn,
++              ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
++        goto err;
++    }
++
++    mfn = pfn_to_mfn(ctx, pfn);
++    if ( !mfn_in_pseudophysmap(ctx, mfn) )
++    {
++        ERROR("Start Info has bad MFN");
++        pseudophysmap_walk(ctx, mfn);
++        goto err;
++    }
++
++    guest_start_info = xc_map_foreign_range(
++        xch, ctx->domid, PAGE_SIZE, PROT_READ | PROT_WRITE, mfn);
++    if ( !guest_start_info )
++    {
++        PERROR("Failed to map Start Info at mfn %#lx", mfn);
++        goto err;
++    }
++
++    /* Deal with xenstore stuff */
++    pfn = GET_FIELD(ctx, guest_start_info, store_mfn);
++    if ( pfn > ctx->x86_pv.max_pfn )
++    {
++        ERROR("XenStore pfn %#lx out of range", pfn);
++        goto err;
++    }
++
++    mfn = pfn_to_mfn(ctx, pfn);
++    if ( !mfn_in_pseudophysmap(ctx, mfn) )
++    {
++        ERROR("XenStore pfn has bad MFN");
++        pseudophysmap_walk(ctx, mfn);
++        goto err;
++    }
++
++    ctx->restore.xenstore_mfn = mfn;
++    SET_FIELD(ctx, guest_start_info, store_mfn, mfn);
++    SET_FIELD(ctx, guest_start_info, store_evtchn, ctx->restore.xenstore_evtchn);
++
++
++    /* Deal with console stuff */
++    pfn = GET_FIELD(ctx, guest_start_info, console.domU.mfn);
++    if ( pfn > ctx->x86_pv.max_pfn )
++    {
++        ERROR("Console pfn %#lx out of range", pfn);
++        goto err;
++    }
++
++    mfn = pfn_to_mfn(ctx, pfn);
++    if ( !mfn_in_pseudophysmap(ctx, mfn) )
++    {
++        ERROR("Console pfn has bad MFN");
++        pseudophysmap_walk(ctx, mfn);
++        goto err;
++    }
++
++    ctx->restore.console_mfn = mfn;
++    SET_FIELD(ctx, guest_start_info, console.domU.mfn, mfn);
++    SET_FIELD(ctx, guest_start_info, console.domU.mfn, ctx->restore.console_evtchn);
++
++    /* Set other information */
++    SET_FIELD(ctx, guest_start_info, nr_pages, ctx->x86_pv.max_pfn + 1);
++    SET_FIELD(ctx, guest_start_info, shared_info,
++              ctx->dominfo.shared_info_frame << PAGE_SHIFT);
++
++    SET_FIELD(ctx, vcpu, user_regs.edx, mfn);
++    rc = 0;
++
++err:
++    if ( guest_start_info )
++        munmap(guest_start_info, PAGE_SIZE);
++
++    return rc;
++}
++
++static int update_guest_p2m(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t mfn, pfn, *guest_p2m = NULL;
++    unsigned i;
++    int rc = -1;
++
++    for ( i = 0; i < ctx->x86_pv.p2m_frames; ++i )
++    {
++        pfn = ctx->x86_pv.p2m_pfns[i];
++
++        if ( pfn > ctx->x86_pv.max_pfn )
++        {
++            ERROR("pfn (%#lx) for p2m_frame_list[%u] out of range",
++                  pfn, i);
++            goto err;
++        }
++        else if ( ctx->x86_pv.pfn_types[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
++        {
++            ERROR("pfn (%#lx) for p2m_frame_list[%u] has bad type %lu", pfn, i,
++                  ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
++            goto err;
++        }
++
++        mfn = pfn_to_mfn(ctx, pfn);
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("p2m_frame_list[%u] has bad MFN", i);
++            pseudophysmap_walk(ctx, mfn);
++            goto err;
++        }
++
++        ctx->x86_pv.p2m_pfns[i] = mfn;
++    }
++
++    guest_p2m = xc_map_foreign_pages(xch, ctx->domid, PROT_WRITE,
++                                     ctx->x86_pv.p2m_pfns,
++                                     ctx->x86_pv.p2m_frames );
++    if ( !guest_p2m )
++    {
++        PERROR("Failed to map p2m frames");
++        goto err;
++    }
++
++    memcpy(guest_p2m, ctx->x86_pv.p2m,
++           (ctx->x86_pv.max_pfn + 1) * ctx->x86_pv.width);
++    rc = 0;
++ err:
++    if ( guest_p2m )
++        munmap(guest_p2m, ctx->x86_pv.p2m_frames * PAGE_SIZE);
++
++    return rc;
++}
++
++static int populate_pfn(struct context *ctx, xen_pfn_t pfn)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t mfn = pfn;
++    int rc;
++
++    if ( pfn_to_mfn(ctx, pfn) != INVALID_MFN )
++        return 0;
++
++    rc = xc_domain_populate_physmap_exact(xch, ctx->domid, 1, 0, 0, &mfn);
++    if ( rc )
++    {
++        ERROR("Failed to populate physmap");
++        return rc;
++    }
++
++    set_p2m(ctx, pfn, mfn);
++
++    /* This *really* should be true by now, or something has gone very wrong */
++    assert(mfn_in_pseudophysmap(ctx, mfn));
++
++    return 0;
++}
++
++static int localise_pagetable(struct context *ctx, uint64_t *table, xen_pfn_t type)
++{
++    xc_interface *xch = ctx->xch;
++    uint64_t pte;
++    unsigned i;
++
++    type &= XEN_DOMCTL_PFINFO_LTABTYPE_MASK;
++
++    for ( i = 0; i < (PAGE_SIZE / sizeof(uint64_t)); ++i )
++    {
++        pte = table[i];
++
++        if ( pte & _PAGE_PRESENT )
++        {
++            xen_pfn_t mfn, pfn;
++
++            pfn = pte_to_frame(ctx, pte);
++            mfn = pfn_to_mfn(ctx, pfn);
++
++            if ( mfn == INVALID_MFN )
++            {
++                if ( populate_pfn(ctx, pfn) )
++                    return -1;
++
++                mfn = pfn_to_mfn(ctx, pfn);
++            }
++
++            if ( !mfn_in_pseudophysmap(ctx, mfn) )
++            {
++                ERROR("Bad MFN for L%lu[%u]",
++                      type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT, i);
++                pseudophysmap_walk(ctx, mfn);
++                errno = ERANGE;
++                return -1;
++            }
++
++            update_pte(ctx, &pte, mfn);
++
++            table[i] = pte;
++        }
++    }
++
++    return 0;
++}
 +
 +static int handle_end(struct context *ctx, struct record *rec)
 +{
@@ -234,43 +607,110 @@ index 0000000..594b5c7
 +    return 0;
 +}
 +
++static int handle_page_data(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    struct rec_page_data_header *page = rec->data;
++    xen_pfn_t mfn, pfn, type;
++    void *guest_page = NULL;
++    int rc = -1, err;
++
++    if ( rec->length < sizeof *page )
++    {
++        ERROR("PAGE_DATA record trucated: length %"PRIu32", min %zu",
++              rec->length, sizeof *page);
++        goto err;
++    }
++    else if ( page->count != 1 )
++    {
++        // TODO
++        ERROR("Unable to handle batched pages (yet)");
++        goto err;
++    }
++
++    pfn  =  page->pfn[0] & 0x0fffffffffffULL;
++    type = (page->pfn[0] & 0xf000000000000000ULL) >> 32;
++    ctx->x86_pv.pfn_types[pfn] = type;
++
++    rc = populate_pfn(ctx, pfn);
++    if ( rc )
++        goto err;
++
++    mfn = pfn_to_mfn(ctx, pfn);
++
++    guest_page = xc_map_foreign_bulk(
++        xch, ctx->domid, PROT_READ | PROT_WRITE, &mfn, &err, 1);
++    if ( !guest_page || err )
++    {
++        PERROR("Unable to map mfn %#lx (err %d)", mfn, err);
++        goto err;
++    }
++
++    memcpy(guest_page, &page->pfn[1], PAGE_SIZE);
++
++    switch(type)
++    {
++        case XEN_DOMCTL_PFINFO_L1TAB:
++        case XEN_DOMCTL_PFINFO_L1TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++        case XEN_DOMCTL_PFINFO_L2TAB:
++        case XEN_DOMCTL_PFINFO_L2TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++        case XEN_DOMCTL_PFINFO_L3TAB:
++        case XEN_DOMCTL_PFINFO_L3TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++        case XEN_DOMCTL_PFINFO_L4TAB:
++        case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++            rc = localise_pagetable(ctx, guest_page, type);
++            if ( rc )
++                goto err;
++    }
++
++    rc = 0;
++
++ err:
++    if ( guest_page )
++        munmap(guest_page, PAGE_SIZE);
++
++    return rc;
++}
++
 +static int handle_x86_pv_info(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct x86_pv_info *info = rec->data;
++    struct rec_x86_pv_info *info = rec->data;
 +
-+    if ( info->guest_width != 4 &&
-+         info->guest_width != 8 )
++    if ( rec->length < sizeof *info )
++    {
++        ERROR("X86_PV_INFO record trucated: length %"PRIu32", expected %zu",
++              rec->length, sizeof *info);
++        return -1;
++    }
++    else if ( info->guest_width != 4 &&
++              info->guest_width != 8 )
 +    {
 +        ERROR("Unexpected guest width %"PRIu32", Expected 4 or 8",
 +              info->guest_width);
 +        return -1;
 +    }
-+
-+    if ( info->guest_width != ctx->x86_pv.width )
++    else if ( info->guest_width != ctx->x86_pv.width )
 +    {
 +        ERROR("Width of guest in stream (%"PRIu32
 +              " bits) differs with existing domain (%"PRIu32" bits)",
 +              info->guest_width * 8, ctx->x86_pv.width * 8);
 +        return -1;
 +    }
-+
-+    if ( info->pt_levels != 3 &&
-+         info->pt_levels != 4 )
++    else if ( info->pt_levels != 3 &&
++              info->pt_levels != 4 )
 +    {
 +        ERROR("Unexpected guest levels %"PRIu32", Expected 3 or 4",
 +              info->pt_levels);
 +        return -1;
 +    }
-+
-+    if ( info->pt_levels != ctx->x86_pv.levels )
++    else if ( info->pt_levels != ctx->x86_pv.levels )
 +    {
 +        ERROR("Levels of guest in stream (%"PRIu32
 +              ") differs with existing domain (%"PRIu32")",
 +              info->pt_levels, ctx->x86_pv.levels);
 +        return -1;
 +    }
-+
 +
 +    DPRINTF("X86_PV_INFO record: %d bits, %d levels",
 +            ctx->x86_pv.width * 8, ctx->x86_pv.levels);
@@ -280,41 +720,355 @@ index 0000000..594b5c7
 +static int handle_x86_pv_p2m_frames(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct x86_pv_p2m_frames *data = rec->data;
++    struct rec_x86_pv_p2m_frames *data = rec->data;
 +    unsigned start, end, x;
++    int rc;
 +
-+    if ( !ctx->x86_pv.p2m_pfns )
++    if ( rec->length < sizeof *data )
 +    {
-+        ctx->x86_pv.p2m_pfns = malloc(ctx->x86_pv.p2m_frames * sizeof(xen_pfn_t));
-+        if ( !ctx->x86_pv.p2m_pfns )
-+        {
-+            ERROR("Cannot allocate %zu bytes for p2m pfns list",
-+                  ctx->x86_pv.p2m_frames * sizeof(xen_pfn_t));
-+            return -1;
-+        }
-+    }
-+
-+    if ( data->end_gfn > ctx->x86_pv.max_gfn )
-+    {
-+        ERROR("End gfn in stream (%#"PRIx32") exceeds domain max (%#lx)",
-+              data->end_gfn, ctx->x86_pv.max_gfn);
++        ERROR("X86_PV_P2M_FRAMES record trucated: length %"PRIu32", min %zu",
++              rec->length, sizeof *data + sizeof(uint64_t));
 +        return -1;
 +    }
-+    else if ( data->start_gfn > data->end_gfn )
++    else if ( data->start_pfn > data->end_pfn )
 +    {
-+        ERROR("End gfn in stream (%#"PRIx32") exceeds Start (%#"PRIx32")",
-+              data->end_gfn, data->start_gfn);
++        ERROR("End pfn in stream (%#"PRIx32") exceeds Start (%#"PRIx32")",
++              data->end_pfn, data->start_pfn);
 +        return -1;
 +    }
 +
-+    start = data->start_gfn / ctx->x86_pv.fpp;
-+    end = (data->end_gfn + ctx->x86_pv.fpp) / ctx->x86_pv.fpp;
++    start =  data->start_pfn / ctx->x86_pv.fpp;
++    end = (data->end_pfn + ctx->x86_pv.fpp) / ctx->x86_pv.fpp;
 +
-+    for ( x = 0; x < (end - start); ++x )
-+        ctx->x86_pv.p2m_pfns[start + x] = data->p2m_gfns[x];
++    if ( rec->length != sizeof *data + ((end - start) * sizeof (uint64_t)) )
++    {
++        ERROR("X86_PV_P2M_FRAMES record wrong size: start_pfn %#"PRIx32
++              ", end_pfn %#"PRIx32", length %"PRIu32
++              ", expected %zu + (%u - %u) * %zu",
++              data->start_pfn, data->end_pfn, rec->length,
++              sizeof *data, end, start, sizeof(uint64_t));
++        return -1;
++    }
++
++    if ( data->end_pfn > ctx->x86_pv.max_pfn )
++    {
++        rc = expand_p2m(ctx, data->end_pfn);
++        if ( rc )
++            return rc;
++    }
++
++    for ( x = 0; x <= (end - start); ++x )
++        ctx->x86_pv.p2m_pfns[start + x] = data->p2m_pfns[x];
 +
 +    DPRINTF("X86_PV_P2M_FRAMES record: GFNs %#"PRIx32"->%#"PRIx32,
-+            data->start_gfn, data->end_gfn);
++            data->start_pfn, data->end_pfn);
++    return 0;
++}
++
++static int handle_x86_pv_vcpu_basic(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    struct rec_x86_pv_vcpu *vhdr = rec->data;
++    vcpu_guest_context_any_t vcpu;
++    size_t vcpusz = ctx->x86_pv.width == 8 ? sizeof vcpu.x64 : sizeof vcpu.x32;
++    xen_pfn_t pfn, mfn;
++    unsigned long tmp;
++    unsigned i;
++    int rc = -1;
++
++    if ( rec->length <= sizeof *vhdr )
++    {
++        ERROR("X86_PV_VCPU_BASIC record trucated: length %"PRIu32", min %zu",
++              rec->length, sizeof *vhdr + 1);
++        goto err;
++    }
++    else if ( rec->length != sizeof *vhdr + vcpusz)
++    {
++        ERROR("X86_PV_VCPU_EXTENDED record wrong size: length %"PRIu32
++              ", expected %zu", rec->length, sizeof *vhdr + vcpusz);
++        goto err;
++    }
++    else if ( vhdr->vcpu_id > ctx->dominfo.max_vcpu_id )
++    {
++        ERROR("X86_PV_VCPU_BASIC record vcpu_id (%"PRIu32
++              ") exceeds domain max (%u)",
++              vhdr->vcpu_id, ctx->dominfo.max_vcpu_id);
++        goto err;
++    }
++
++    memcpy(&vcpu, &vhdr->context, vcpusz);
++
++    SET_FIELD(ctx, &vcpu, flags, GET_FIELD(ctx, &vcpu, flags) | VGCF_online);
++
++    /* Vcpu 0 is special: Convert the suspend record to an MFN */
++    if ( vhdr->vcpu_id == 0 )
++    {
++        rc = process_start_info(ctx, &vcpu);
++        if ( rc )
++            return rc;
++        rc = -1;
++    }
++
++    tmp = GET_FIELD(ctx, &vcpu, gdt_ents);
++    if ( tmp > 8192 )
++    {
++        ERROR("GDT entry count (%lu) out of range", tmp);
++        errno = ERANGE;
++        goto err;
++    }
++
++    /* Convert GDT frames to MFNs */
++    for ( i = 0; (i * 512) < tmp; ++i )
++    {
++        pfn = GET_FIELD(ctx, &vcpu, gdt_frames[i]);
++        if ( pfn >= ctx->x86_pv.max_pfn )
++        {
++            ERROR("GDT frame %u (pfn %#lx) out of range", i, pfn);
++            goto err;
++        }
++        else if ( ctx->x86_pv.pfn_types[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
++        {
++            ERROR("GDT frame %u (pfn %#lx) has bad type %lu", i, pfn,
++                  ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
++            goto err;
++        }
++
++        mfn = pfn_to_mfn(ctx, pfn);
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("GDT frame %u has bad MFN", i);
++            pseudophysmap_walk(ctx, mfn);
++            goto err;
++        }
++
++        SET_FIELD(ctx, &vcpu, gdt_frames[i], mfn);
++    }
++
++    /* Convert CR3 to an MFN */
++    pfn = cr3_to_mfn(ctx, GET_FIELD(ctx, &vcpu, ctrlreg[3]));
++    if ( pfn >= ctx->x86_pv.max_pfn )
++    {
++        ERROR("cr3 (pfn %#lx) out of range", pfn);
++        goto err;
++    }
++    else if ( (ctx->x86_pv.pfn_types[pfn] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK ) !=
++              (((xen_pfn_t)ctx->x86_pv.levels) << XEN_DOMCTL_PFINFO_LTAB_SHIFT) )
++    {
++        ERROR("cr3 (pfn %#lx) has bad type %lu, expected %lu", pfn,
++              ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT,
++              ctx->x86_pv.levels);
++        goto err;
++    }
++
++    mfn = pfn_to_mfn(ctx, pfn);
++    if ( !mfn_in_pseudophysmap(ctx, mfn) )
++    {
++        ERROR("cr3 has bad MFN");
++        pseudophysmap_walk(ctx, mfn);
++        goto err;
++    }
++
++    SET_FIELD(ctx, &vcpu, ctrlreg[3], mfn_to_cr3(ctx, mfn));
++
++    /* 64bit guests: Convert CR1 (guest pagetables) to MFN */
++    if ( ctx->x86_pv.levels == 4 && (vcpu.x64.ctrlreg[1] & 1) )
++    {
++        pfn = vcpu.x64.ctrlreg[1] >> PAGE_SHIFT;
++
++        if ( pfn >= ctx->x86_pv.max_pfn )
++        {
++            ERROR("cr1 (pfn %#lx) out of range", pfn);
++            goto err;
++        }
++        else if ( (ctx->x86_pv.pfn_types[pfn] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK) !=
++                  (((xen_pfn_t)ctx->x86_pv.levels) << XEN_DOMCTL_PFINFO_LTAB_SHIFT) )
++        {
++            ERROR("cr1 (pfn %#lx) has bad type %lu, expected %lu", pfn,
++                  ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT,
++                  ctx->x86_pv.levels);
++            goto err;
++        }
++
++        mfn = pfn_to_mfn(ctx, pfn);
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("cr1 has bad MFN");
++            pseudophysmap_walk(ctx, mfn);
++            goto err;
++        }
++
++        vcpu.x64.ctrlreg[1] = (uint64_t)mfn << PAGE_SHIFT;
++    }
++
++    if ( xc_vcpu_setcontext(xch, ctx->domid, vhdr->vcpu_id, &vcpu) )
++    {
++        PERROR("Failed to set vcpu%"PRIu32"'s basic info - IGNORING", vhdr->vcpu_id);
++        goto err;
++    }
++
++    rc = 0;
++    DPRINTF("vcpu%d X86_PV_VCPU_BASIC record", vhdr->vcpu_id);
++ err:
++    return rc;
++}
++
++static int handle_x86_pv_vcpu_extended(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    struct rec_x86_pv_vcpu *vcpu = rec->data;
++    DECLARE_DOMCTL;
++
++    if ( rec->length <= sizeof *vcpu )
++    {
++        ERROR("X86_PV_VCPU_EXTENDED record trucated: length %"PRIu32", min %zu",
++              rec->length, sizeof *vcpu + 1);
++        return -1;
++    }
++    else if ( rec->length > sizeof *vcpu + 128 )
++    {
++        ERROR("X86_PV_VCPU_EXTENDED record too long: length %"PRIu32", max %zu",
++              rec->length, sizeof *vcpu + 128);
++        return -1;
++    }
++    else if ( vcpu->vcpu_id > ctx->dominfo.max_vcpu_id )
++    {
++        ERROR("X86_PV_VCPU_EXTENDED record vcpu_id (%"PRIu32
++              ") exceeds domain max (%u)",
++              vcpu->vcpu_id, ctx->dominfo.max_vcpu_id);
++        return -1;
++    }
++
++    domctl.cmd = XEN_DOMCTL_set_ext_vcpucontext;
++    domctl.domain = ctx->domid;
++    memcpy(&domctl.u.ext_vcpucontext, &vcpu->context, rec->length - sizeof *vcpu);
++
++    if ( xc_domctl(xch, &domctl) != 0 )
++    {
++        PERROR("Failed to set vcpu%"PRIu32"'s extended info", vcpu->vcpu_id);
++        return -1;
++    }
++
++    DPRINTF("vcpu%d X86_PV_VCPU_EXTENDED record", vcpu->vcpu_id);
++    return 0;
++}
++
++static int handle_x86_pv_vcpu_xsave(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    struct rec_x86_pv_vcpu_xsave *vcpu = rec->data;
++    int rc;
++    DECLARE_DOMCTL;
++    DECLARE_HYPERCALL_BUFFER(void, buffer);
++    size_t buffersz;
++
++    if ( rec->length <= sizeof *vcpu )
++    {
++        ERROR("X86_PV_VCPU_XSAVE record trucated: length %"PRIu32", min %zu",
++              rec->length, sizeof *vcpu + 1);
++        return -1;
++    }
++    else if ( vcpu->vcpu_id > ctx->dominfo.max_vcpu_id )
++    {
++        ERROR("X86_PV_VCPU_EXTENDED record vcpu_id (%"PRIu32
++              ") exceeds domain max (%u)",
++              vcpu->vcpu_id, ctx->dominfo.max_vcpu_id);
++        return -1;
++    }
++
++    buffersz = rec->length - sizeof *vcpu;
++    buffer = xc_hypercall_buffer_alloc(xch, buffer, buffersz);
++    if ( !buffer )
++    {
++        ERROR("Unable to allocate %"PRIu64" bytes for xsave hypercall buffer",
++              buffersz);
++        return -1;
++    }
++
++    domctl.cmd = XEN_DOMCTL_setvcpuextstate;
++    domctl.domain = ctx->domid;
++    domctl.u.vcpuextstate.vcpu = vcpu->vcpu_id;
++    domctl.u.vcpuextstate.xfeature_mask = vcpu->xfeature_mask;
++    domctl.u.vcpuextstate.size = buffersz;
++    set_xen_guest_handle(domctl.u.vcpuextstate.buffer, buffer);
++
++    rc = xc_domctl(xch, &domctl);
++
++    xc_hypercall_buffer_free(xch, buffer);
++
++    if ( rc )
++    {
++        PERROR("Failed to set vcpu%"PRIu32"'s xsave info", vcpu->vcpu_id);
++        return rc;
++    }
++    else
++    {
++        DPRINTF("vcpu%d X86_PV_VCPU_XSAVE record", vcpu->vcpu_id);
++        return 0;
++    }
++}
++
++static int handle_x86_pv_shared_info(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    unsigned i;
++    int rc = -1;
++    shared_info_any_t *guest_shared_info = NULL;
++    shared_info_any_t *stream_shared_info = rec->data;
++
++    if ( rec->length != PAGE_SIZE )
++    {
++        ERROR("X86_PV_SHARED_INFO record wrong size: length %"PRIu32
++              ", expected %u", rec->length, PAGE_SIZE);
++        goto err;
++    }
++
++    guest_shared_info = xc_map_foreign_range(
++        xch, ctx->domid, PAGE_SIZE, PROT_READ | PROT_WRITE,
++        ctx->dominfo.shared_info_frame);
++    if ( !guest_shared_info )
++    {
++        PERROR("Failed to map Shared Info at mfn %#lx",
++               ctx->dominfo.shared_info_frame);
++        goto err;
++    }
++
++    MEMCPY_FIELD(ctx, guest_shared_info, stream_shared_info, vcpu_info);
++    MEMCPY_FIELD(ctx, guest_shared_info, stream_shared_info, arch);
++
++    SET_FIELD(ctx, guest_shared_info, arch.pfn_to_mfn_frame_list_list, 0);
++
++    MEMSET_ARRAY_FIELD(ctx, guest_shared_info, evtchn_pending, 0);
++    for ( i = 0; i < XEN_LEGACY_MAX_VCPUS; i++ )
++        SET_FIELD(ctx, guest_shared_info, vcpu_info[i].evtchn_pending_sel, 0);
++
++    MEMSET_ARRAY_FIELD(ctx, guest_shared_info, evtchn_mask, 0xff);
++
++    rc = 0;
++ err:
++
++    if ( guest_shared_info )
++        munmap(guest_shared_info, PAGE_SIZE);
++
++    return rc;
++}
++static int handle_tsc_info(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    struct rec_tsc_info *tsc = rec->data;
++
++    if ( rec->length != sizeof *tsc )
++    {
++        ERROR("TSC_INFO record wrong size: length %"PRIu32", expected %zu",
++              rec->length, sizeof *tsc);
++        return -1;
++    }
++
++    if ( xc_domain_set_tsc_info(xch, ctx->domid, tsc->mode,
++                                tsc->nsec, tsc->khz, tsc->incarnation) )
++    {
++        PERROR("Unable to set TSC information");
++        return -1;
++    }
 +
 +    return 0;
 +}
@@ -360,12 +1114,36 @@ index 0000000..594b5c7
 +            rc = handle_end(ctx, &rec);
 +            break;
 +
++        case REC_TYPE_page_data:
++            rc = handle_page_data(ctx, &rec);
++            break;
++
 +        case REC_TYPE_x86_pv_info:
 +            rc = handle_x86_pv_info(ctx, &rec);
 +            break;
 +
 +        case REC_TYPE_x86_pv_p2m_frames:
 +            rc = handle_x86_pv_p2m_frames(ctx, &rec);
++            break;
++
++        case REC_TYPE_x86_pv_vcpu_basic:
++            rc = handle_x86_pv_vcpu_basic(ctx, &rec);
++            break;
++
++        case REC_TYPE_x86_pv_vcpu_extended:
++            rc = handle_x86_pv_vcpu_extended(ctx, &rec);
++            break;
++
++        case REC_TYPE_x86_pv_vcpu_xsave:
++            rc = handle_x86_pv_vcpu_xsave(ctx, &rec);
++            break;
++
++        case REC_TYPE_x86_pv_shared_info:
++            rc = handle_x86_pv_shared_info(ctx, &rec);
++            break;
++
++        case REC_TYPE_tsc_info:
++            rc = handle_tsc_info(ctx, &rec);
 +            break;
 +
 +        default:
@@ -389,7 +1167,29 @@ index 0000000..594b5c7
 +
 +    } while ( rec.type != REC_TYPE_end );
 +
++    IPRINTF("Finished reading records");
++
++    rc = pin_pagetables(ctx);
++    if ( rc )
++        goto err;
++
++    rc = update_guest_p2m(ctx);
++    if ( rc )
++        goto err;
++
++    rc = xc_dom_gnttab_seed(xch, ctx->domid,
++                            ctx->restore.console_mfn,
++                            ctx->restore.xenstore_mfn,
++                            ctx->restore.console_domid,
++                            ctx->restore.xenstore_domid);
++    if ( rc )
++    {
++        PERROR("Failed to seed grant table");
++        goto err;
++    }
++
 +    /* all done */
++    IPRINTF("All Done");
 +    assert(!rc);
 +    goto cleanup;
 +

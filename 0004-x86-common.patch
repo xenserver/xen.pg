@@ -1,18 +1,18 @@
-From aa0f9713d9199da3ab6fc13a2d61c021bdbe3e3a Mon Sep 17 00:00:00 2001
+From d70c0cdcc7e5f2f1710d5aecdf15a5b1cbf30fe6 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 19 Mar 2014 12:17:02 +0000
 Subject: [PATCH 4/6] x86 common
 
 ---
- tools/libxc/saverestore/common.h        |   65 +++++++++++++
- tools/libxc/saverestore/common_x86_pv.c |  162 +++++++++++++++++++++++++++++++
- tools/libxc/saverestore/common_x86_pv.h |   62 ++++++++++++
- 3 files changed, 289 insertions(+)
+ tools/libxc/saverestore/common.h        |   76 +++++++++++
+ tools/libxc/saverestore/common_x86_pv.c |  221 +++++++++++++++++++++++++++++++
+ tools/libxc/saverestore/common_x86_pv.h |  105 +++++++++++++++
+ 3 files changed, 402 insertions(+)
  create mode 100644 tools/libxc/saverestore/common_x86_pv.c
  create mode 100644 tools/libxc/saverestore/common_x86_pv.h
 
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index fff0a39..0628fd5 100644
+index fff0a39..f6183bf 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
 @@ -1,8 +1,16 @@
@@ -32,7 +32,7 @@ index fff0a39..0628fd5 100644
  #include "stream_format.h"
  
  // TODO: Find a better place to put this...
-@@ -11,6 +19,63 @@
+@@ -11,6 +19,74 @@
  const char *dhdr_type_to_str(uint32_t type);
  const char *rec_type_to_str(uint32_t type);
  
@@ -54,7 +54,16 @@ index fff0a39..0628fd5 100644
 +            /* From Domain Header */
 +            uint32_t guest_type;
 +            uint32_t guest_page_size;
++
++            unsigned long xenstore_mfn, console_mfn;
++            unsigned int xenstore_evtchn, console_evtchn;
++            domid_t xenstore_domid, console_domid;
 +        } restore;
++
++        struct
++        {
++            struct save_callbacks *callbacks;
++        } save;
 +    };
 +
 +    union
@@ -76,7 +85,7 @@ index fff0a39..0628fd5 100644
 +
 +
 +            /* Maximum guest frame */
-+            unsigned long max_gfn;
++            unsigned long max_pfn;
 +            /* Frames per page in guest p2m */
 +            unsigned int fpp;
 +
@@ -86,6 +95,8 @@ index fff0a39..0628fd5 100644
 +            xen_pfn_t *p2m;
 +            /* The guest pfns containing the p2m leaves */
 +            xen_pfn_t *p2m_pfns;
++            /* Types for each page */
++            xen_pfn_t *pfn_types;
 +
 +            /* Read-only mapping of guests shared info page */
 +            shared_info_any_t *shinfo;
@@ -98,10 +109,10 @@ index fff0a39..0628fd5 100644
   * Local variables:
 diff --git a/tools/libxc/saverestore/common_x86_pv.c b/tools/libxc/saverestore/common_x86_pv.c
 new file mode 100644
-index 0000000..6cf752a
+index 0000000..d0cfafa
 --- /dev/null
 +++ b/tools/libxc/saverestore/common_x86_pv.c
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,221 @@
 +#include <assert.h>
 +
 +#include "common_x86_pv.h"
@@ -114,7 +125,7 @@ index 0000000..6cf752a
 +
 +xen_pfn_t pfn_to_mfn(struct context *ctx, xen_pfn_t pfn)
 +{
-+    assert(pfn <= ctx->x86_pv.max_gfn);
++    assert(pfn <= ctx->x86_pv.max_pfn);
 +
 +    if ( ctx->x86_pv.width == sizeof (unsigned long) )
 +        return ctx->x86_pv.p2m[pfn];
@@ -133,18 +144,74 @@ index 0000000..6cf752a
 +    }
 +}
 +
-+bool mfn_in_pseudophys_map(struct context *ctx, xen_pfn_t mfn)
++void set_p2m(struct context *ctx, xen_pfn_t pfn, xen_pfn_t mfn)
++{
++    assert(pfn <= ctx->x86_pv.max_pfn);
++
++    if ( ctx->x86_pv.width == sizeof (unsigned long) )
++        ctx->x86_pv.p2m[pfn] = mfn;
++    else
++    {
++#ifdef __x86_64__
++        /* 64bit toolstack, 32bit guest.  Discard top 32 bits of mfn */
++        ((uint32_t*)ctx->x86_pv.p2m)[pfn] = (uint32_t)mfn;
++#else
++        /* 32bit toolstack, 64bit guest.  Extend MFN_INVALID */
++        if ( mfn == INVALID_MFN )
++            ((uint64_t*)ctx->x86_pv.p2m)[pfn] = -1ULL;
++        else
++            ((uint64_t*)ctx->x86_pv.p2m)[pfn] = (uint64_t)mfn;
++#endif
++    }
++}
++
++bool mfn_in_pseudophysmap(struct context *ctx, xen_pfn_t mfn)
 +{
 +    return ( (mfn <= ctx->x86_pv.max_mfn) &&
-+             (mfn_to_pfn(ctx, mfn) <= ctx->x86_pv.max_gfn) &&
++             (mfn_to_pfn(ctx, mfn) <= ctx->x86_pv.max_pfn) &&
 +             (pfn_to_mfn(ctx, mfn_to_pfn(ctx, mfn) == mfn)) );
++}
++
++void pseudophysmap_walk(struct context *ctx, xen_pfn_t mfn)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t pfn = ~0UL;
++
++    ERROR("mfn %#lx, max %#lx", mfn, ctx->x86_pv.max_mfn);
++
++    if ( (mfn != ~0UL) && (mfn <= ctx->x86_pv.max_mfn) )
++    {
++        pfn = ctx->x86_pv.m2p[mfn];
++        ERROR("  m2p[%#lx] = %#lx, max_pfn %#lx",
++              mfn, pfn, ctx->x86_pv.max_pfn);
++    }
++
++    if ( (pfn != ~0UL) && (pfn <= ctx->x86_pv.max_pfn) )
++        ERROR("  p2m[%#lx] = %#lx",
++              pfn, ctx->x86_pv.p2m[pfn]);
++}
++
++xen_pfn_t cr3_to_mfn(struct context *ctx, uint64_t cr3)
++{
++    if ( ctx->x86_pv.width == 8 )
++        return cr3 >> 12;
++    else
++        return (((uint32_t)cr3 >> 12) | ((uint32_t)cr3 << 20));
++}
++
++uint64_t mfn_to_cr3(struct context *ctx, xen_pfn_t mfn)
++{
++    if ( ctx->x86_pv.width == 8 )
++        return ((uint64_t)mfn) << 12;
++    else
++        return (((uint32_t)mfn << 12) | ((uint32_t)mfn >> 20));
 +}
 +
 +int x86_pv_domain_info(struct context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
 +    unsigned int guest_width, guest_levels, fpp;
-+    int max_gfn;
++    int max_pfn;
 +
 +    /* Get the domain width */
 +    if ( xc_domain_get_guest_width(xch, ctx->domid, &guest_width) )
@@ -167,23 +234,26 @@ index 0000000..6cf752a
 +
 +    DPRINTF("%d bits, %d levels", guest_width * 8, guest_levels);
 +
-+    /* Get the domains maximum gfn */
-+    max_gfn = xc_domain_maximum_gpfn(xch, ctx->domid);
-+    if ( max_gfn <= 0 )
++    /* Get the domains maximum pfn */
++    max_pfn = xc_domain_maximum_gpfn(xch, ctx->domid);
++    if ( max_pfn < 0 )
 +    {
-+        PERROR("Unable to obtain guests max gfn");
++        PERROR("Unable to obtain guests max pfn");
 +        return -1;
 +    }
-+    else if ( max_gfn >= ~XEN_DOMCTL_PFINFO_LTAB_MASK )
++    else if ( max_pfn >= ~XEN_DOMCTL_PFINFO_LTAB_MASK )
 +    {
 +        errno = E2BIG;
 +        PERROR("Cannot save a guest this large %#x");
 +        return -1;
 +    }
-+    ctx->x86_pv.max_gfn = max_gfn;
-+    ctx->x86_pv.p2m_frames = (ctx->x86_pv.max_gfn + fpp) / fpp;
++    else if ( max_pfn > 0 )
++    {
++        ctx->x86_pv.max_pfn = max_pfn;
++        ctx->x86_pv.p2m_frames = (ctx->x86_pv.max_pfn + fpp) / fpp;
 +
-+    DPRINTF("max_gfn %#x, p2m_frames %d", max_gfn, ctx->x86_pv.p2m_frames);
++        DPRINTF("max_pfn %#x, p2m_frames %d", max_pfn, ctx->x86_pv.p2m_frames);
++    }
 +
 +    return 0;
 +}
@@ -266,10 +336,10 @@ index 0000000..6cf752a
 + */
 diff --git a/tools/libxc/saverestore/common_x86_pv.h b/tools/libxc/saverestore/common_x86_pv.h
 new file mode 100644
-index 0000000..572361f
+index 0000000..ba1b60f
 --- /dev/null
 +++ b/tools/libxc/saverestore/common_x86_pv.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,105 @@
 +#ifndef __COMMON_X86_PV_H
 +#define __COMMON_X86_PV_H
 +
@@ -291,9 +361,52 @@ index 0000000..572361f
 +xen_pfn_t pfn_to_mfn(struct context *ctx, xen_pfn_t pfn);
 +
 +/*
++ * Set a mapping in the p2m table.
++ *
++ * Caller must ensure that the requested pfn is in range.
++ */
++void set_p2m(struct context *ctx, xen_pfn_t pfn, xen_pfn_t mfn);
++
++/*
 + * Query whether a particular mfn is valid in the physmap of a guest.
 + */
-+bool mfn_in_pseudophys_map(struct context *ctx, xen_pfn_t mfn);
++bool mfn_in_pseudophysmap(struct context *ctx, xen_pfn_t mfn);
++
++/*
++ * Debug a particular mfn by walking the p2m and m2p.
++ */
++void pseudophysmap_walk(struct context *ctx, xen_pfn_t mfn);
++
++/*
++ * Convert a PV cr3 field to an mfn.
++ */
++xen_pfn_t cr3_to_mfn(struct context *ctx, uint64_t cr3);
++
++/*
++ * Convert an mfn to a PV cr3 field.
++ */
++uint64_t mfn_to_cr3(struct context *ctx, xen_pfn_t mfn);
++
++/*
++ * Extract an MFN from a Pagetable Entry.
++ */
++static inline xen_pfn_t pte_to_frame(struct context *ctx, uint64_t pte)
++{
++    if ( ctx->x86_pv.width == 8 )
++        return (pte >> PAGE_SHIFT) & ((1ULL << (52 - PAGE_SHIFT)) - 1);
++    else
++        return (pte >> PAGE_SHIFT) & ((1ULL << (44 - PAGE_SHIFT)) - 1);
++}
++
++static inline void update_pte(struct context *ctx, uint64_t *pte, xen_pfn_t pfn)
++{
++    if ( ctx->x86_pv.width == 8 )
++        *pte &= ~(((1ULL << (52 - PAGE_SHIFT)) - 1) << PAGE_SHIFT);
++    else
++        *pte &= ~(((1ULL << (44 - PAGE_SHIFT)) - 1) << PAGE_SHIFT);
++
++    *pte |= (uint64_t)pfn << PAGE_SHIFT;
++}
 +
 +/*
 + * Get current domain information.
