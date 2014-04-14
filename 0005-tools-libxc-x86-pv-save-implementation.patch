@@ -1,4 +1,4 @@
-From 7da0e9c78958516eae3ae8351fc5cbe0a326bec0 Mon Sep 17 00:00:00 2001
+From 97279539572f6a575abf5a3b0b29486503e91be9 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 19 Mar 2014 12:39:25 +0000
 Subject: [PATCH 5/6] tools/libxc: x86 pv save implementation
@@ -7,14 +7,13 @@ Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 ---
  tools/libxc/saverestore/common.c      |   36 ++
- tools/libxc/saverestore/common.h      |   53 +++
+ tools/libxc/saverestore/common.h      |   52 ++
  tools/libxc/saverestore/save.c        |   33 +-
- tools/libxc/saverestore/save_x86_pv.c |  843 +++++++++++++++++++++++++++++++++
- 4 files changed, 964 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/save_x86_pv.c |  941 +++++++++++++++++++++++++++++++++
+ 4 files changed, 1061 insertions(+), 1 deletion(-)
  create mode 100644 tools/libxc/saverestore/save_x86_pv.c
 
-diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
-index d2dfd5a..df18447 100644
+diff -r 209b814641d0 tools/libxc/saverestore/common.c
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
 @@ -1,3 +1,5 @@
@@ -23,7 +22,7 @@ index d2dfd5a..df18447 100644
  #include "common.h"
  
  static const char *dhdr_types[] =
-@@ -48,6 +50,40 @@ const char *rec_type_to_str(uint32_t type)
+@@ -48,6 +50,40 @@ const char *rec_type_to_str(uint32_t typ
      return "Reserved";
  }
  
@@ -64,22 +63,19 @@ index d2dfd5a..df18447 100644
  /*
   * Local variables:
   * mode: C
-diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index 4220c18..a2c8cee 100644
+diff -r 209b814641d0 tools/libxc/saverestore/common.h
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -6,7 +6,10 @@
- #define pfn_to_mfn __UNUSED_pfn_to_mfn
- 
- #include "../xg_private.h"
-+#include "../xg_save_restore.h"
+@@ -10,6 +10,8 @@
+ #include "../xc_dom.h"
+ #include "../xc_bitops.h"
  
 +#undef GET_FIELD
 +#undef SET_FIELD
  #undef mfn_to_pfn
  #undef pfn_to_mfn
  
-@@ -90,6 +93,56 @@ struct context
+@@ -93,6 +95,56 @@ struct context
      };
  };
  
@@ -136,11 +132,10 @@ index 4220c18..a2c8cee 100644
  #endif
  /*
   * Local variables:
-diff --git a/tools/libxc/saverestore/save.c b/tools/libxc/saverestore/save.c
-index c013e62..e86e5fc 100644
+diff -r 209b814641d0 tools/libxc/saverestore/save.c
 --- a/tools/libxc/saverestore/save.c
 +++ b/tools/libxc/saverestore/save.c
-@@ -5,8 +5,39 @@ int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_ite
+@@ -5,8 +5,39 @@ int xc_domain_save2(xc_interface *xch, i
                      struct save_callbacks* callbacks, int hvm,
                      unsigned long vm_generationid_addr)
  {
@@ -181,12 +176,10 @@ index c013e62..e86e5fc 100644
  }
  
  /*
-diff --git a/tools/libxc/saverestore/save_x86_pv.c b/tools/libxc/saverestore/save_x86_pv.c
-new file mode 100644
-index 0000000..9f6703d
+diff -r 209b814641d0 tools/libxc/saverestore/save_x86_pv.c
 --- /dev/null
 +++ b/tools/libxc/saverestore/save_x86_pv.c
-@@ -0,0 +1,843 @@
+@@ -0,0 +1,941 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -503,11 +496,12 @@ index 0000000..9f6703d
 +        .length = sizeof vhdr,
 +        .data = &vhdr,
 +    };
-+    DECLARE_DOMCTL;
-+
-+    domctl.cmd = XEN_DOMCTL_get_ext_vcpucontext;
-+    domctl.domain = ctx->domid;
-+    domctl.u.ext_vcpucontext.vcpu = id;
++    struct xen_domctl domctl =
++    {
++        .cmd = XEN_DOMCTL_get_ext_vcpucontext,
++        .domain = ctx->domid,
++        .u.ext_vcpucontext.vcpu = id,
++    };
 +
 +    if ( xc_domctl(xch, &domctl) < 0 )
 +    {
@@ -529,7 +523,6 @@ index 0000000..9f6703d
 +{
 +    xc_interface *xch = ctx->xch;
 +    int rc = -1;
-+    DECLARE_DOMCTL;
 +    DECLARE_HYPERCALL_BUFFER(void, buffer);
 +    struct rec_x86_pv_vcpu_xsave vhdr = { .vcpu_id = id };
 +    struct record rec =
@@ -538,12 +531,12 @@ index 0000000..9f6703d
 +        .length = sizeof vhdr,
 +        .data = &vhdr,
 +    };
-+
-+    domctl.cmd = XEN_DOMCTL_getvcpuextstate;
-+    domctl.domain = ctx->domid;
-+    domctl.u.vcpuextstate.vcpu = id;
-+    domctl.u.vcpuextstate.xfeature_mask = 0;
-+    domctl.u.vcpuextstate.size = 0;
++    struct xen_domctl domctl =
++    {
++        .cmd = XEN_DOMCTL_getvcpuextstate,
++        .domain = ctx->domid,
++        .u.vcpuextstate.vcpu = id,
++    };
 +
 +    if ( xc_domctl(xch, &domctl) < 0 )
 +    {
@@ -622,7 +615,7 @@ index 0000000..9f6703d
 +}
 +
 +static int normalise_pagetable(struct context *ctx, const uint64_t *src,
-+                               uint64_t *dst, unsigned long type)
++                               uint64_t *dst, unsigned long type, bool live)
 +{
 +    xc_interface *xch = ctx->xch;
 +    uint64_t pte;
@@ -697,10 +690,19 @@ index 0000000..9f6703d
 +
 +            if ( !mfn_in_pseudophysmap(ctx, mfn) )
 +            {
-+                ERROR("Bad MFN for L%lu[%u]",
-+                      type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT, i);
-+                pseudophysmap_walk(ctx, mfn);
-+                errno = ERANGE;
++                /* This is expected during the live part of migration given
++                 * split pagetable updates, active grant mappings etc.  The
++                 * pagetable will need to be resent after pausing.  It is
++                 * however fatal if we have already paused the domain. */
++                if ( live )
++                    errno = EAGAIN;
++                else
++                {
++                    ERROR("Bad MFN for L%lu[%u]",
++                          type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT, i);
++                    pseudophysmap_walk(ctx, mfn);
++                    errno = ERANGE;
++                }
 +                return -1;
 +            }
 +            else
@@ -715,20 +717,18 @@ index 0000000..9f6703d
 +    return 0;
 +}
 +
-+static int write_all_memory(struct context *ctx)
++static int write_one_page(struct context *ctx, xen_pfn_t pfn, bool live)
 +{
 +    xc_interface *xch = ctx->xch;
-+    xen_pfn_t x = 0, mfn, type;
++    xen_pfn_t mfn, type;
 +    int rc = -1, err;
-+    void *guest_page = NULL;
-+    void *local_page = malloc(PAGE_SIZE);
++    void *local_page = NULL, *guest_page = NULL;
 +
 +    struct
 +    {
 +        struct rec_page_data_header h;
 +        uint64_t pfn;
-+    } page_data = { { 1, 0 } , 0 };
-+
++    } page_data = { { 1, 0 } , ~0ULL };
 +    struct record rec =
 +    {
 +        .type = REC_TYPE_page_data,
@@ -736,82 +736,74 @@ index 0000000..9f6703d
 +        .data = &page_data,
 +    };
 +
-+    XC_BUILD_BUG_ON(sizeof page_data != 16);
++    type = mfn = pfn_to_mfn(ctx, pfn);
 +
-+    if ( !local_page )
++    if ( xc_get_pfn_type_batch(xch, ctx->domid, 1, &type) )
 +    {
-+        ERROR("Unable to allocate local scratch page");
++        PERROR("Unable to get mfn %#lx type", mfn);
 +        goto err;
 +    }
 +
-+    for ( x = 0; x <= ctx->x86_pv.max_pfn; ++x )
++    if ( (type & ~XEN_DOMCTL_PFINFO_LTAB_MASK) ||
++         (((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) >= 5) &&
++          ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) <= 8)) )
 +    {
-+        type = mfn = pfn_to_mfn(ctx, x);
-+
-+        if ( xc_get_pfn_type_batch(xch, ctx->domid, 1, &type) )
-+        {
-+            PERROR("Unable to get mfn %#lx type", mfn);
-+            goto err;
-+        }
-+
-+        if ( (type & ~XEN_DOMCTL_PFINFO_LTAB_MASK) ||
-+             (((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) >= 5) &&
-+              ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) <= 8)) )
-+        {
-+            ERROR("Invalid type %#lx for mfn %#lx", type, mfn);
-+            goto err;
-+        }
-+
-+        page_data.pfn = (((uint64_t)type) << 32) | x;
-+
-+        switch (type)
-+        {
-+        case XEN_DOMCTL_PFINFO_BROKEN:
-+        case XEN_DOMCTL_PFINFO_XALLOC:
-+        case XEN_DOMCTL_PFINFO_XTAB:
-+            if ( write_record(ctx, &rec) )
-+                goto err;
-+            continue;
-+        }
-+
-+        if ( !mfn_in_pseudophysmap(ctx, mfn) )
-+        {
-+            ERROR("Bad pfn %#lx", x);
-+            pseudophysmap_walk(ctx, mfn);
-+            goto err;
-+        }
-+
-+        guest_page = xc_map_foreign_bulk(
-+            xch, ctx->domid, PROT_READ, &mfn, &err, 1);
-+        if ( !guest_page || err )
-+        {
-+            PERROR("Unable to map mfn %#lx (err %d)", mfn, err);
-+            goto err;
-+        }
-+
-+        switch (type & XEN_DOMCTL_PFINFO_LTABTYPE_MASK)
-+        {
-+        case XEN_DOMCTL_PFINFO_L1TAB:
-+        case XEN_DOMCTL_PFINFO_L2TAB:
-+        case XEN_DOMCTL_PFINFO_L3TAB:
-+        case XEN_DOMCTL_PFINFO_L4TAB:
-+            if ( normalise_pagetable(ctx, guest_page, local_page, type) ||
-+                 write_split_record(ctx, &rec, local_page, PAGE_SIZE) )
-+                goto err;
-+            break;
-+
-+        case XEN_DOMCTL_PFINFO_NOTAB:
-+            if ( write_split_record(ctx, &rec, guest_page, PAGE_SIZE) )
-+                goto err;
-+            break;
-+        }
-+
-+        munmap(guest_page, PAGE_SIZE);
-+        guest_page = NULL;
++        ERROR("Invalid type %#lx for mfn %#lx", type, mfn);
++        goto err;
 +    }
 +
++    page_data.pfn = (((uint64_t)type) << 32) | pfn;
 +
-+    DPRINTF("Finished All Memory");
++    switch (type)
++    {
++    case XEN_DOMCTL_PFINFO_BROKEN:
++    case XEN_DOMCTL_PFINFO_XALLOC:
++    case XEN_DOMCTL_PFINFO_XTAB:
++        if ( write_record(ctx, &rec) )
++            goto err;
++        goto done;
++    }
++
++    if ( !mfn_in_pseudophysmap(ctx, mfn) )
++    {
++        ERROR("Bad pfn %#lx", pfn);
++        pseudophysmap_walk(ctx, mfn);
++        goto err;
++    }
++
++    guest_page = xc_map_foreign_bulk(
++        xch, ctx->domid, PROT_READ, &mfn, &err, 1);
++    if ( !guest_page || err )
++    {
++        PERROR("Unable to map mfn %#lx (err %d)", mfn, err);
++        goto err;
++    }
++
++    switch (type & XEN_DOMCTL_PFINFO_LTABTYPE_MASK)
++    {
++    case XEN_DOMCTL_PFINFO_L1TAB:
++    case XEN_DOMCTL_PFINFO_L2TAB:
++    case XEN_DOMCTL_PFINFO_L3TAB:
++    case XEN_DOMCTL_PFINFO_L4TAB:
++        local_page = malloc(PAGE_SIZE);
++        if ( !local_page )
++        {
++            ERROR("Unable to allocate scratch page");
++            goto err;
++        }
++
++        if ( normalise_pagetable(ctx, guest_page, local_page, type, live) ||
++             write_split_record(ctx, &rec, local_page, PAGE_SIZE) )
++            goto err;
++        break;
++
++    case XEN_DOMCTL_PFINFO_NOTAB:
++        if ( write_split_record(ctx, &rec, guest_page, PAGE_SIZE) )
++            goto err;
++        break;
++    }
++
++ done:
 +    rc = 0;
 +
 + err:
@@ -880,11 +872,11 @@ index 0000000..9f6703d
 +    return rc;
 +}
 +
-+static int write_x86_pv_shared_info(struct context *ctx)
++static int write_shared_info(struct context *ctx)
 +{
 +    struct record rec =
 +    {
-+        .type = REC_TYPE_x86_pv_shared_info,
++        .type = REC_TYPE_shared_info,
 +        .length = PAGE_SIZE,
 +        .data = ctx->x86_pv.shinfo,
 +    };
@@ -918,19 +910,14 @@ index 0000000..9f6703d
 +    xc_interface *xch = ctx->xch;
 +    int rc;
 +    struct record end = { REC_TYPE_end, 0, NULL };
++    xc_shadow_op_stats_t shadow_stats;
++
++    DECLARE_HYPERCALL_BUFFER(unsigned long, to_send);
++    unsigned long *to_fix = NULL;
++    unsigned x, max_iter = 5, dirty_threshold = 50;
++    xen_pfn_t p;
 +
 +    IPRINTF("In experimental %s", __func__);
-+
-+    /* TODO - make this a little more live... */
-+    if ( !ctx->dominfo.paused )
-+    {
-+        rc = (ctx->save.callbacks->suspend(ctx->save.callbacks->data) != 1);
-+        if ( rc )
-+        {
-+            ERROR("Failed to suspend domain");
-+            goto err;
-+        }
-+    }
 +
 +    /* Write Image and Domain headers to the stream */
 +    rc = write_headers(ctx);
@@ -957,18 +944,115 @@ index 0000000..9f6703d
 +    if ( rc )
 +        goto err;
 +
-+    /* DOMAIN MUST BE PAUSED FROM THIS POINT ONWARDS */
++    to_send = xc_hypercall_buffer_alloc_pages(
++        xch, to_send, NRPAGES(bitmap_size(ctx->x86_pv.max_pfn + 1)));
++    to_fix = calloc(1, bitmap_size(ctx->x86_pv.max_pfn + 1));
 +
-+
-+    rc = write_all_memory(ctx); /* TODO: only valid for non-live migrate */
-+    if ( rc )
++    if ( !to_send || !to_fix )
++    {
++        ERROR("Unable to allocate memory for to_{send,fix} bitmaps");
 +        goto err;
++    }
++
++    memset(to_send, 0xff, bitmap_size(ctx->x86_pv.max_pfn + 1));
++
++    if ( (xc_shadow_control(xch, ctx->domid,
++                            XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
++                            NULL, 0, NULL, 0, NULL) < 0) )
++    {
++        PERROR("Failed to enable logdirty");
++        goto err;
++    }
++
++    for ( x = 0; x < max_iter ; ++x )
++    {
++        unsigned written = 0;
++        DPRINTF("Iteration %u", x);
++
++        for ( p = 0 ; p <= ctx->x86_pv.max_pfn; ++p )
++        {
++            if ( test_bit(p, to_send) || test_bit(p, to_fix) )
++            {
++                if ( write_one_page(ctx, p, true) )
++                {
++                    if ( errno == EAGAIN )
++                        set_bit(p, to_fix);
++                    else
++                    {
++                        ERROR("Fatal write error :s");
++                        goto err;
++                    }
++                }
++                else
++                {
++                    clear_bit(p, to_fix);
++                    ++written;
++                }
++            }
++        }
++
++        if ( xc_shadow_control(xch, ctx->domid,
++                               XEN_DOMCTL_SHADOW_OP_CLEAN,
++                               HYPERCALL_BUFFER(to_send),
++                               ctx->x86_pv.max_pfn + 1,
++                               NULL, 0, &shadow_stats) != ctx->x86_pv.max_pfn + 1)
++        {
++            PERROR("Failed to retrieve logdirty bitmap");
++            goto err;
++        }
++        else
++        {
++            DPRINTF("  Wrote %u pages; stats: faults %"PRIu32", dirty %"PRIu32,
++                    written, shadow_stats.fault_count, shadow_stats.dirty_count);
++        }
++
++        if ( shadow_stats.dirty_count < dirty_threshold )
++            break;
++    }
++
++    if ( !ctx->dominfo.paused )
++    {
++        rc = (ctx->save.callbacks->suspend(ctx->save.callbacks->data) != 1);
++        if ( rc )
++        {
++            ERROR("Failed to suspend domain");
++            goto err;
++        }
++    }
++
++    IPRINTF("Domain now paused");
++
++    if ( xc_shadow_control(xch, ctx->domid,
++                           XEN_DOMCTL_SHADOW_OP_CLEAN,
++                           HYPERCALL_BUFFER(to_send),
++                           ctx->x86_pv.max_pfn + 1,
++                           NULL, 0, &shadow_stats) != ctx->x86_pv.max_pfn + 1)
++    {
++        PERROR("Failed to retrieve logdirty bitmap");
++        goto err;
++    }
++
++    /*
++     * Domain must be paused from this point onwards.
++     */
++
++    for ( p = 0 ; p <= ctx->x86_pv.max_pfn; ++p )
++    {
++        if ( test_bit(p, to_send) || test_bit(p, to_fix) )
++        {
++            if ( write_one_page(ctx, p, false) )
++            {
++                PERROR("Fatal error for pfn %lx", p);
++                goto err;
++            }
++        }
++    }
 +
 +    rc = write_tsc_info(ctx);
 +    if ( rc )
 +        goto err;
 +
-+    rc = write_x86_pv_shared_info(ctx);
++    rc = write_shared_info(ctx);
 +    if ( rc )
 +        goto err;
 +
@@ -1007,6 +1091,13 @@ index 0000000..9f6703d
 +    assert(rc);
 + cleanup:
 +
++    xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
++                      NULL, 0, NULL, 0, NULL);
++
++    free(to_fix);
++    xc_hypercall_buffer_free_pages(
++        xch, to_send, NRPAGES(bitmap_size(ctx->x86_pv.max_pfn + 1)));
++
 +    free(ctx->x86_pv.p2m_pfns);
 +
 +    if ( ctx->x86_pv.p2m )
@@ -1030,6 +1121,3 @@ index 0000000..9f6703d
 + * indent-tabs-mode: nil
 + * End:
 + */
--- 
-1.7.10.4
-

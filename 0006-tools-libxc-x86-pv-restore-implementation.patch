@@ -1,4 +1,4 @@
-From 0913cb40d89c82a3eb0ac75cc0f85292ba276318 Mon Sep 17 00:00:00 2001
+From 78628f33131a9b7724c497231924a99ac5945d4e Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Fri, 21 Mar 2014 21:26:01 +0000
 Subject: [PATCH 6/6] tools/libxc: x86 pv restore implementation
@@ -7,17 +7,16 @@ Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 ---
  tools/libxc/saverestore/common.c         |   51 ++
- tools/libxc/saverestore/common.h         |   35 ++
- tools/libxc/saverestore/restore.c        |  112 +++-
- tools/libxc/saverestore/restore_x86_pv.c |  977 ++++++++++++++++++++++++++++++
- 4 files changed, 1174 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/common.h         |   34 +
+ tools/libxc/saverestore/restore.c        |  112 ++-
+ tools/libxc/saverestore/restore_x86_pv.c | 1092 ++++++++++++++++++++++++++++++
+ 4 files changed, 1288 insertions(+), 1 deletion(-)
  create mode 100644 tools/libxc/saverestore/restore_x86_pv.c
 
-diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
-index df18447..dbfae21 100644
+diff -r a4df41c06583 tools/libxc/saverestore/common.c
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
-@@ -84,6 +84,57 @@ int write_split_record(struct context *ctx, struct record *rec,
+@@ -84,6 +84,57 @@ int write_split_record(struct context *c
      return 0;
  }
  
@@ -75,15 +74,10 @@ index df18447..dbfae21 100644
  /*
   * Local variables:
   * mode: C
-diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index a2c8cee..249e18f 100644
+diff -r a4df41c06583 tools/libxc/saverestore/common.h
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -7,9 +7,12 @@
- 
- #include "../xg_private.h"
- #include "../xg_save_restore.h"
-+#include "../xc_dom.h"
+@@ -12,6 +12,8 @@
  
  #undef GET_FIELD
  #undef SET_FIELD
@@ -92,7 +86,7 @@ index a2c8cee..249e18f 100644
  #undef mfn_to_pfn
  #undef pfn_to_mfn
  
-@@ -95,6 +98,8 @@ struct context
+@@ -97,6 +99,8 @@ struct context
  
  /* Saves an x86 PV domain. */
  int save_x86_pv(struct context *ctx);
@@ -101,7 +95,7 @@ index a2c8cee..249e18f 100644
  
  struct record
  {
-@@ -118,6 +123,22 @@ struct record
+@@ -120,6 +124,22 @@ struct record
              (_p)->x32._f = (_v);                \
      })
  
@@ -124,7 +118,7 @@ index a2c8cee..249e18f 100644
  /*
   * Writes a split record to the stream, applying correct padding where
   * appropriate.  It is common when sending records containing blobs from Xen
-@@ -143,6 +164,20 @@ static inline int write_record(struct context *ctx, struct record *rec)
+@@ -145,6 +165,20 @@ static inline int write_record(struct co
      return write_split_record(ctx, rec, NULL, 0);
  }
  
@@ -145,8 +139,7 @@ index a2c8cee..249e18f 100644
  #endif
  /*
   * Local variables:
-diff --git a/tools/libxc/saverestore/restore.c b/tools/libxc/saverestore/restore.c
-index 6624baa..6937aec 100644
+diff -r a4df41c06583 tools/libxc/saverestore/restore.c
 --- a/tools/libxc/saverestore/restore.c
 +++ b/tools/libxc/saverestore/restore.c
 @@ -1,5 +1,62 @@
@@ -212,7 +205,7 @@ index 6624baa..6937aec 100644
  int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
                         unsigned int store_evtchn, unsigned long *store_mfn,
                         domid_t store_domid, unsigned int console_evtchn,
-@@ -8,8 +65,61 @@ int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
+@@ -8,8 +65,61 @@ int xc_domain_restore2(xc_interface *xch
                         int checkpointed_stream,
                         struct restore_callbacks *callbacks)
  {
@@ -275,12 +268,10 @@ index 6624baa..6937aec 100644
  }
  
  /*
-diff --git a/tools/libxc/saverestore/restore_x86_pv.c b/tools/libxc/saverestore/restore_x86_pv.c
-new file mode 100644
-index 0000000..0659244
+diff -r a4df41c06583 tools/libxc/saverestore/restore_x86_pv.c
 --- /dev/null
 +++ b/tools/libxc/saverestore/restore_x86_pv.c
-@@ -0,0 +1,977 @@
+@@ -0,0 +1,1092 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -534,31 +525,54 @@ index 0000000..0659244
 +    return rc;
 +}
 +
-+static int populate_pfn(struct context *ctx, xen_pfn_t pfn)
++static int populate_pfns(struct context *ctx, unsigned count,
++                         const xen_pfn_t *original_pfns, const uint32_t *types)
 +{
 +    xc_interface *xch = ctx->xch;
-+    xen_pfn_t mfn = pfn;
-+    int rc;
++    xen_pfn_t *mfns = malloc(count * sizeof *mfns),
++        *pfns = malloc(count * sizeof *pfns);
++    unsigned i, nr_pfns = 0;
++    int rc = -1;
 +
-+    if ( pfn_to_mfn(ctx, pfn) != INVALID_MFN )
-+        return 0;
-+
-+    rc = xc_domain_populate_physmap_exact(xch, ctx->domid, 1, 0, 0, &mfn);
-+    if ( rc )
++    if ( !mfns || !pfns )
 +    {
-+        ERROR("Failed to populate physmap");
-+        return rc;
++        ERROR("Failed to allocate %zu bytes for populating the physmap",
++              2 * count * sizeof *mfns);
++        goto err;
 +    }
 +
-+    set_p2m(ctx, pfn, mfn);
++    for ( i = 0; i < count; ++i )
++        if ( types[i] != XEN_DOMCTL_PFINFO_XTAB &&
++             types[i] != XEN_DOMCTL_PFINFO_BROKEN &&
++             pfn_to_mfn(ctx, original_pfns[i]) == INVALID_MFN )
++        {
++            pfns[nr_pfns] = mfns[nr_pfns] = original_pfns[i];
++            ++nr_pfns;
++        }
 +
-+    /* This *really* should be true by now, or something has gone very wrong */
-+    assert(mfn_in_pseudophysmap(ctx, mfn));
++    if ( nr_pfns )
++    {
++        rc = xc_domain_populate_physmap_exact(xch, ctx->domid, nr_pfns, 0, 0, mfns);
++        if ( rc )
++        {
++            PERROR("Failed to populate physmap");
++            goto err;
++        }
 +
-+    return 0;
++        for ( i = 0; i < nr_pfns; ++i )
++            set_p2m(ctx, pfns[i], mfns[i]);
++    }
++
++    rc = 0;
++
++ err:
++    free(pfns);
++    free(mfns);
++
++    return rc;
 +}
 +
-+static int localise_pagetable(struct context *ctx, uint64_t *table, xen_pfn_t type)
++static int localise_pagetable(struct context *ctx, uint64_t *table, uint32_t type)
 +{
 +    xc_interface *xch = ctx->xch;
 +    uint64_t pte;
@@ -579,7 +593,7 @@ index 0000000..0659244
 +
 +            if ( mfn == INVALID_MFN )
 +            {
-+                if ( populate_pfn(ctx, pfn) )
++                if ( populate_pfns(ctx, 1, &pfn, &type) )
 +                    return -1;
 +
 +                mfn = pfn_to_mfn(ctx, pfn);
@@ -611,87 +625,177 @@ index 0000000..0659244
 +    return 0;
 +}
 +
-+static int handle_page_data(struct context *ctx, struct record *rec)
++static int process_page_data(struct context *ctx, unsigned count,
++                             xen_pfn_t *pfns, uint32_t *types, void *page_data)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_page_data_header *page = rec->data;
-+    xen_pfn_t mfn, pfn, type;
-+    void *guest_page = NULL;
-+    int rc = -1, err;
++    xen_pfn_t *mfns = malloc(count * sizeof *mfns);
++    int *map_errs = malloc(count * sizeof *map_errs);
++    int rc = -1;
++    void *mapping = NULL, *guest_page;
++    unsigned i;
 +
-+    if ( rec->length < sizeof *page )
++    if ( !mfns || !map_errs )
 +    {
-+        ERROR("PAGE_DATA record trucated: length %"PRIu32", min %zu",
-+              rec->length, sizeof *page);
-+        goto cleanup;
-+    }
-+    else if ( page->count != 1 )
-+    {
-+        // TODO
-+        ERROR("Unable to handle batched pages (yet)");
-+        goto cleanup;
++        ERROR("Failed to allocate %zu bytes to process page data",
++              count * (sizeof *mfns + sizeof *map_errs));
++        goto err;
 +    }
 +
-+    pfn = page->pfn[0] & PAGE_DATA_PFN_MASK;
-+    if ( pfn > ctx->x86_pv.max_pfn )
++    rc = populate_pfns(ctx, count, pfns, types);
++    if ( rc )
 +    {
-+        ERROR("pfn %#lx outside domain maximum (%#lx)", pfn, ctx->x86_pv.max_pfn);
-+        goto cleanup;
++        ERROR("Failed to populate pfns for batch of %u pages", count);
++        goto err;
++    }
++    rc = -1;
++
++    for ( i = 0; i < count; ++i )
++    {
++        ctx->x86_pv.pfn_types[pfns[i]] = types[i];
++        mfns[i] = pfn_to_mfn(ctx, pfns[i]);
 +    }
 +
-+    type = (page->pfn[0] & PAGE_DATA_TYPE_MASK) >> 32;
-+    if ( ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) >= 5) &&
-+         ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) <= 8) )
++    mapping = guest_page = xc_map_foreign_bulk(xch, ctx->domid,
++                                               PROT_READ | PROT_WRITE,
++                                               mfns, map_errs, count);
++    if ( !mapping )
 +    {
-+        ERROR("Invalid type %#lx for pfn %#lx", type, pfn);
-+        goto cleanup;
++        PERROR("Unable to map %u mfns for page data", count);
++        goto err;
 +    }
 +
-+    ctx->x86_pv.pfn_types[pfn] = type;
-+
-+    switch ( type )
++    for ( i = 0; i < count; ++i )
 +    {
++        switch ( types[i] )
++        {
 +        case XEN_DOMCTL_PFINFO_XTAB:
 +        case XEN_DOMCTL_PFINFO_BROKEN:
-+            /* No page data - leave alone */
-+            rc = 0;
-+            goto cleanup;
-+    }
++            /* Nothing at all to do */
++        case XEN_DOMCTL_PFINFO_XALLOC:
++            /* Nothing futher to do */
++            continue;
++        }
 +
-+    /* All other page types, need to allocate */
-+    rc = populate_pfn(ctx, pfn);
-+    if ( rc )
-+        goto cleanup;
++        if ( map_errs[i] )
++        {
++            ERROR("Mapping pfn %lx (mfn %lx, type %#"PRIx32")failed with %d",
++                  pfns[i], mfns[i], types[i], map_errs[i]);
++            goto err;
++        }
 +
-+    mfn = pfn_to_mfn(ctx, pfn);
++        memcpy(guest_page, page_data, PAGE_SIZE);
 +
-+    guest_page = xc_map_foreign_bulk(
-+        xch, ctx->domid, PROT_READ | PROT_WRITE, &mfn, &err, 1);
-+    if ( !guest_page || err )
-+    {
-+        PERROR("Unable to map mfn %#lx (err %d)", mfn, err);
-+        rc = -1;
-+        goto cleanup;
-+    }
++        /* Pagetables need to be localised */
++        if ( ((types[i] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK) >= XEN_DOMCTL_PFINFO_L1TAB &&
++              (types[i] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK) <= XEN_DOMCTL_PFINFO_L4TAB) )
++        {
++            rc = localise_pagetable(ctx, guest_page, types[i]);
++            if ( rc )
++            {
++                DPRINTF("Failed to localise");
++                goto err;
++            }
++            rc = -1;
++        }
 +
-+    /* XALLOC also has no page data */
-+    if ( type != XEN_DOMCTL_PFINFO_XALLOC )
-+        memcpy(guest_page, &page->pfn[1], PAGE_SIZE);
-+
-+    /* Pagetables need to be localised */
-+    if ( ((type & XEN_DOMCTL_PFINFO_LTABTYPE_MASK) >= XEN_DOMCTL_PFINFO_L1TAB &&
-+          (type & XEN_DOMCTL_PFINFO_LTABTYPE_MASK) <= XEN_DOMCTL_PFINFO_L4TAB) )
-+    {
-+        rc = localise_pagetable(ctx, guest_page, type);
-+        if ( rc )
-+            goto cleanup;
++        guest_page += PAGE_SIZE;
++        page_data += PAGE_SIZE;
 +    }
 +
 +    rc = 0;
 +
-+ cleanup:
-+    if ( guest_page )
-+        munmap(guest_page, PAGE_SIZE);
++ err:
++    if ( mapping )
++        munmap(mapping, count * PAGE_SIZE);
++
++    free(map_errs);
++    free(mfns);
++
++    return rc;
++}
++
++static int handle_page_data(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    struct rec_page_data_header *pages = rec->data;
++    unsigned i, pages_of_data = 0;
++    int rc = -1;
++
++    xen_pfn_t *pfns = NULL, pfn;
++    uint32_t *types = NULL, type;
++
++    static unsigned pg_count;
++    pg_count++;
++
++    if ( rec->length < sizeof *pages )
++    {
++        ERROR("PAGE_DATA record trucated: length %"PRIu32", min %zu",
++              rec->length, sizeof *pages);
++        goto err;
++    }
++    else if ( pages->count < 1 )
++    {
++        ERROR("Expected at least 1 pfn in PAGE_DATA record");
++        goto err;
++    }
++    else if ( rec->length < sizeof *pages + (pages->count * sizeof (uint64_t)) )
++    {
++        ERROR("PAGE_DATA record (length %"PRIu32") too short to contain %"
++              PRIu32" pfns worth of information", rec->length, pages->count);
++        goto err;
++    }
++
++    pfns = malloc(pages->count * sizeof *pfns);
++    types = malloc(pages->count * sizeof *types);
++    if ( !pfns || !types )
++    {
++        ERROR("Unable to allocate enough memory for %"PRIu32" pfns",
++              pages->count);
++        goto err;
++    }
++
++    for ( i = 0; i < pages->count; ++i )
++    {
++        pfn = pages->pfn[i] & PAGE_DATA_PFN_MASK;
++        if ( pfn > ctx->x86_pv.max_pfn )
++        {
++            ERROR("pfn %#lx (index %u) outside domain maximum (%#lx)",
++                  pfn, i, ctx->x86_pv.max_pfn);
++            goto err;
++        }
++
++        type = (pages->pfn[i] & PAGE_DATA_TYPE_MASK) >> 32;
++        if ( ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) >= 5) &&
++             ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) <= 8) )
++        {
++            ERROR("Invalid type %#lx for pfn %#lx (index %u)", type, pfn, i);
++            goto err;
++        }
++        else if ( type < XEN_DOMCTL_PFINFO_BROKEN )
++            /* NOTAB and all L1 thru L4 tables (including pinned) should have
++             * a page worth of data in the record. */
++            pages_of_data++;
++
++        pfns[i] = pfn;
++        types[i] = type;
++    }
++
++    if ( rec->length != (sizeof *pages +
++                         (sizeof (uint64_t) * pages->count) +
++                         (PAGE_SIZE * pages_of_data)) )
++    {
++        ERROR("PAGE_DATA record wrong size: length %"PRIu32", expected "
++              "%zu + %zu + %zu", sizeof *pages,
++              (sizeof (uint64_t) * pages->count), (PAGE_SIZE * pages_of_data));
++        goto err;
++    }
++
++    rc = process_page_data(ctx, pages->count, pfns, types,
++                           &pages->pfn[pages->count]);
++ err:
++    free(types);
++    free(pfns);
 +
 +    return rc;
 +}
@@ -801,7 +905,7 @@ index 0000000..0659244
 +            return rc;
 +    }
 +
-+    for ( x = 0; x <= (end - start); ++x )
++    for ( x = 0; x < (end - start); ++x )
 +        ctx->x86_pv.p2m_pfns[start + x] = data->p2m_pfns[x];
 +
 +    DPRINTF("X86_PV_P2M_FRAMES record: GFNs %#"PRIx32"->%#"PRIx32,
@@ -1051,7 +1155,7 @@ index 0000000..0659244
 +    }
 +}
 +
-+static int handle_x86_pv_shared_info(struct context *ctx, struct record *rec)
++static int handle_shared_info(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    unsigned i;
@@ -1182,8 +1286,8 @@ index 0000000..0659244
 +            rc = handle_x86_pv_vcpu_xsave(ctx, &rec);
 +            break;
 +
-+        case REC_TYPE_x86_pv_shared_info:
-+            rc = handle_x86_pv_shared_info(ctx, &rec);
++        case REC_TYPE_shared_info:
++            rc = handle_shared_info(ctx, &rec);
 +            break;
 +
 +        case REC_TYPE_tsc_info:
@@ -1241,7 +1345,9 @@ index 0000000..0659244
 +    assert(rc);
 + cleanup:
 +
++    free(ctx->x86_pv.p2m);
 +    free(ctx->x86_pv.p2m_pfns);
++    free(ctx->x86_pv.pfn_types);
 +
 +    if ( ctx->x86_pv.m2p )
 +        munmap(ctx->x86_pv.m2p, ctx->x86_pv.nr_m2p_frames * PAGE_SIZE);
@@ -1258,6 +1364,3 @@ index 0000000..0659244
 + * indent-tabs-mode: nil
 + * End:
 + */
--- 
-1.7.10.4
-
