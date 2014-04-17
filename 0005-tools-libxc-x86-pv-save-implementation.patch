@@ -1,4 +1,4 @@
-From 97279539572f6a575abf5a3b0b29486503e91be9 Mon Sep 17 00:00:00 2001
+From b57940193273547a39d8a35b1ece44d2ca90aa0b Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 19 Mar 2014 12:39:25 +0000
 Subject: [PATCH 5/6] tools/libxc: x86 pv save implementation
@@ -9,11 +9,11 @@ Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
  tools/libxc/saverestore/common.c      |   36 ++
  tools/libxc/saverestore/common.h      |   52 ++
  tools/libxc/saverestore/save.c        |   33 +-
- tools/libxc/saverestore/save_x86_pv.c |  941 +++++++++++++++++++++++++++++++++
- 4 files changed, 1061 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/save_x86_pv.c |  933 +++++++++++++++++++++++++++++++++
+ 4 files changed, 1053 insertions(+), 1 deletion(-)
  create mode 100644 tools/libxc/saverestore/save_x86_pv.c
 
-diff -r 209b814641d0 tools/libxc/saverestore/common.c
+diff -r 71898ce2301e tools/libxc/saverestore/common.c
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
 @@ -1,3 +1,5 @@
@@ -22,7 +22,7 @@ diff -r 209b814641d0 tools/libxc/saverestore/common.c
  #include "common.h"
  
  static const char *dhdr_types[] =
-@@ -48,6 +50,40 @@ const char *rec_type_to_str(uint32_t typ
+@@ -49,6 +51,40 @@ const char *rec_type_to_str(uint32_t typ
      return "Reserved";
  }
  
@@ -63,7 +63,7 @@ diff -r 209b814641d0 tools/libxc/saverestore/common.c
  /*
   * Local variables:
   * mode: C
-diff -r 209b814641d0 tools/libxc/saverestore/common.h
+diff -r 71898ce2301e tools/libxc/saverestore/common.h
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
 @@ -10,6 +10,8 @@
@@ -132,7 +132,7 @@ diff -r 209b814641d0 tools/libxc/saverestore/common.h
  #endif
  /*
   * Local variables:
-diff -r 209b814641d0 tools/libxc/saverestore/save.c
+diff -r 71898ce2301e tools/libxc/saverestore/save.c
 --- a/tools/libxc/saverestore/save.c
 +++ b/tools/libxc/saverestore/save.c
 @@ -5,8 +5,39 @@ int xc_domain_save2(xc_interface *xch, i
@@ -176,10 +176,10 @@ diff -r 209b814641d0 tools/libxc/saverestore/save.c
  }
  
  /*
-diff -r 209b814641d0 tools/libxc/saverestore/save_x86_pv.c
+diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 --- /dev/null
 +++ b/tools/libxc/saverestore/save_x86_pv.c
-@@ -0,0 +1,941 @@
+@@ -0,0 +1,933 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -247,7 +247,7 @@ diff -r 209b814641d0 tools/libxc/saverestore/save_x86_pv.c
 +    size_t x;
 +
 +    if ( ctx->x86_pv.width == sizeof(unsigned long) )
-+        memcpy(dst, src, count);
++        memcpy(dst, src, count * sizeof *dst);
 +    else
 +    {
 +        for ( x = 0; x < count; ++x )
@@ -263,7 +263,6 @@ diff -r 209b814641d0 tools/libxc/saverestore/save_x86_pv.c
 +#endif
 +        }
 +    }
-+
 +}
 +
 +static int map_p2m(struct context *ctx)
@@ -654,12 +653,8 @@ diff -r 209b814641d0 tools/libxc/saverestore/save_x86_pv.c
 +             * 428 = (HYPERVISOR_VIRT_START_PAE >> L2_PAGETABLE_SHIFT_PAE) & 0x1ff
 +             *
 +             * ...which is conveniently unavailable to us in a 64bit build.
-+             * But not to worry, because ctx->m2p_mfn0 depends on the bitness
-+             * of the toolstack anway, meaning that a 64bit toolstack can't
-+             * spot 32bit guest Xen mappings... (nor could the old migration
-+             * code, but was hidden by a further bug)
 +             */
-+            if ( pte_to_frame(ctx, src[428]) == ctx->x86_pv.m2p_mfn0 )
++            if ( pte_to_frame(ctx, src[428]) == ctx->x86_pv.compat_m2p_mfn0 )
 +            {
 +                xen_first = 428;
 +                xen_last = 512;
@@ -971,7 +966,7 @@ diff -r 209b814641d0 tools/libxc/saverestore/save_x86_pv.c
 +
 +        for ( p = 0 ; p <= ctx->x86_pv.max_pfn; ++p )
 +        {
-+            if ( test_bit(p, to_send) || test_bit(p, to_fix) )
++            if ( test_bit(p, to_send) )
 +            {
 +                if ( write_one_page(ctx, p, true) )
 +                {
@@ -984,10 +979,7 @@ diff -r 209b814641d0 tools/libxc/saverestore/save_x86_pv.c
 +                    }
 +                }
 +                else
-+                {
-+                    clear_bit(p, to_fix);
 +                    ++written;
-+                }
 +            }
 +        }
 +

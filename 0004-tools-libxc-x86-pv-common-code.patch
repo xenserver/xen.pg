@@ -1,4 +1,4 @@
-From 21cc3908edaa11bf87784787c670d9343fa25abd Mon Sep 17 00:00:00 2001
+From 8a04119cc9457a702d849c718fda2ae1defd74bf Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 19 Mar 2014 12:17:02 +0000
 Subject: [PATCH 4/6] tools/libxc: x86 pv common code
@@ -6,14 +6,14 @@ Subject: [PATCH 4/6] tools/libxc: x86 pv common code
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 ---
- tools/libxc/saverestore/common.h        |   82 ++++++++++++
- tools/libxc/saverestore/common_x86_pv.c |  208 +++++++++++++++++++++++++++++++
- tools/libxc/saverestore/common_x86_pv.h |  105 ++++++++++++++++
- 3 files changed, 395 insertions(+)
+ tools/libxc/saverestore/common.h        |   82 +++++++++++
+ tools/libxc/saverestore/common_x86_pv.c |  229 +++++++++++++++++++++++++++++++
+ tools/libxc/saverestore/common_x86_pv.h |  105 ++++++++++++++
+ 3 files changed, 416 insertions(+)
  create mode 100644 tools/libxc/saverestore/common_x86_pv.c
  create mode 100644 tools/libxc/saverestore/common_x86_pv.h
 
-diff -r b0733567ac66 tools/libxc/saverestore/common.h
+diff -r 35143735f814 tools/libxc/saverestore/common.h
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
 @@ -1,7 +1,18 @@
@@ -83,8 +83,8 @@ diff -r b0733567ac66 tools/libxc/saverestore/common.h
 +            unsigned long max_mfn;
 +            /* Read-only machine to phys map */
 +            xen_pfn_t *m2p;
-+            /* firtst m2p mfn. Incorrectly based on toolstack bitness - FIXME */
-+            xen_pfn_t m2p_mfn0;
++            /* first mfn of the compat m2p (Only needed for 32bit PV guests) */
++            xen_pfn_t compat_m2p_mfn0;
 +            /* Number of m2p frames mapped */
 +            unsigned long nr_m2p_frames;
 +
@@ -113,10 +113,10 @@ diff -r b0733567ac66 tools/libxc/saverestore/common.h
  #endif
  /*
   * Local variables:
-diff -r b0733567ac66 tools/libxc/saverestore/common_x86_pv.c
+diff -r 35143735f814 tools/libxc/saverestore/common_x86_pv.c
 --- /dev/null
 +++ b/tools/libxc/saverestore/common_x86_pv.c
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,229 @@
 +#include <assert.h>
 +
 +#include "common_x86_pv.h"
@@ -303,7 +303,28 @@ diff -r b0733567ac66 tools/libxc/saverestore/common_x86_pv.c
 +    }
 +
 +    ctx->x86_pv.nr_m2p_frames = (M2P_CHUNK_SIZE >> PAGE_SHIFT) * m2p_chunks;
-+    ctx->x86_pv.m2p_mfn0 = entries[0].mfn;
++
++#ifdef __i386__
++    /* 32 bit toolstacks automatically get the compat m2p */
++    ctx->x86_pv.compat_m2p_mfn0 = entries[0].mfn;
++#else
++    /* 64 bit toolstacks need to ask Xen specially for it */
++    {
++        struct xen_machphys_mfn_list xmml = {
++            .max_extents = 1,
++            .extent_start = { &ctx->x86_pv.compat_m2p_mfn0 }
++        };
++
++        rc = do_memory_op(xch, XENMEM_machphys_compat_mfn_list,
++                          &xmml, sizeof xmml);
++        if ( rc || xmml.nr_extents != 1 )
++        {
++            PERROR("Failed to get compat mfn list from Xen");
++            rc = -1;
++            goto err;
++        }
++    }
++#endif
 +
 +    /* All Done */
 +    rc = 0;
@@ -325,7 +346,7 @@ diff -r b0733567ac66 tools/libxc/saverestore/common_x86_pv.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r b0733567ac66 tools/libxc/saverestore/common_x86_pv.h
+diff -r 35143735f814 tools/libxc/saverestore/common_x86_pv.h
 --- /dev/null
 +++ b/tools/libxc/saverestore/common_x86_pv.h
 @@ -0,0 +1,105 @@
