@@ -1,4 +1,4 @@
-From b57940193273547a39d8a35b1ece44d2ca90aa0b Mon Sep 17 00:00:00 2001
+From f51e38045d82ec88ea514d62a5613604240a6c14 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 19 Mar 2014 12:39:25 +0000
 Subject: [PATCH 5/6] tools/libxc: x86 pv save implementation
@@ -9,11 +9,11 @@ Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
  tools/libxc/saverestore/common.c      |   36 ++
  tools/libxc/saverestore/common.h      |   52 ++
  tools/libxc/saverestore/save.c        |   33 +-
- tools/libxc/saverestore/save_x86_pv.c |  933 +++++++++++++++++++++++++++++++++
- 4 files changed, 1053 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/save_x86_pv.c | 1111 +++++++++++++++++++++++++++++++++
+ 4 files changed, 1231 insertions(+), 1 deletion(-)
  create mode 100644 tools/libxc/saverestore/save_x86_pv.c
 
-diff -r 71898ce2301e tools/libxc/saverestore/common.c
+diff -r e238f83e7197 tools/libxc/saverestore/common.c
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
 @@ -1,3 +1,5 @@
@@ -63,7 +63,7 @@ diff -r 71898ce2301e tools/libxc/saverestore/common.c
  /*
   * Local variables:
   * mode: C
-diff -r 71898ce2301e tools/libxc/saverestore/common.h
+diff -r e238f83e7197 tools/libxc/saverestore/common.h
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
 @@ -10,6 +10,8 @@
@@ -75,7 +75,7 @@ diff -r 71898ce2301e tools/libxc/saverestore/common.h
  #undef mfn_to_pfn
  #undef pfn_to_mfn
  
-@@ -93,6 +95,56 @@ struct context
+@@ -97,6 +99,56 @@ struct context
      };
  };
  
@@ -132,7 +132,7 @@ diff -r 71898ce2301e tools/libxc/saverestore/common.h
  #endif
  /*
   * Local variables:
-diff -r 71898ce2301e tools/libxc/saverestore/save.c
+diff -r e238f83e7197 tools/libxc/saverestore/save.c
 --- a/tools/libxc/saverestore/save.c
 +++ b/tools/libxc/saverestore/save.c
 @@ -5,8 +5,39 @@ int xc_domain_save2(xc_interface *xch, i
@@ -176,10 +176,10 @@ diff -r 71898ce2301e tools/libxc/saverestore/save.c
  }
  
  /*
-diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
+diff -r e238f83e7197 tools/libxc/saverestore/save_x86_pv.c
 --- /dev/null
 +++ b/tools/libxc/saverestore/save_x86_pv.c
-@@ -0,0 +1,933 @@
+@@ -0,0 +1,1111 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -370,7 +370,7 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +    for ( x = 0; x < fl_entries; ++x )
 +        if ( !mfn_in_pseudophysmap(ctx, local_fl[x]) )
 +        {
-+            ERROR("Bad MFN in p2m_frame_list[%d]", x);
++            ERROR("Bad MFN in p2m_frame_list[%u]", x);
 +            pseudophysmap_walk(ctx, local_fl[x]);
 +            errno = ERANGE;
 +            goto err;
@@ -614,7 +614,7 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +}
 +
 +static int normalise_pagetable(struct context *ctx, const uint64_t *src,
-+                               uint64_t *dst, unsigned long type, bool live)
++                               uint64_t *dst, unsigned long type)
 +{
 +    xc_interface *xch = ctx->xch;
 +    uint64_t pte;
@@ -637,6 +637,7 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +        {
 +        case XEN_DOMCTL_PFINFO_L4TAB:
 +            ERROR("??? Found L4 table for 32bit guest");
++            errno = EINVAL;
 +            return -1;
 +
 +        case XEN_DOMCTL_PFINFO_L3TAB:
@@ -679,7 +680,9 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +
 +            if ( pte & _PAGE_PSE )
 +            {
-+                ERROR("It is impossible to migrate PV guests using superpages");
++                ERROR("Cannot migrate superpage (L%lu[%u]: 0x%016"PRIx64")",
++                      type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT, i, pte);
++                errno = E2BIG;
 +                return -1;
 +            }
 +
@@ -689,7 +692,7 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +                 * split pagetable updates, active grant mappings etc.  The
 +                 * pagetable will need to be resent after pausing.  It is
 +                 * however fatal if we have already paused the domain. */
-+                if ( live )
++                if ( !ctx->dominfo.paused )
 +                    errno = EAGAIN;
 +                else
 +                {
@@ -712,99 +715,249 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +    return 0;
 +}
 +
-+static int write_one_page(struct context *ctx, xen_pfn_t pfn, bool live)
++static int write_batch(struct context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
-+    xen_pfn_t mfn, type;
-+    int rc = -1, err;
-+    void *local_page = NULL, *guest_page = NULL;
++    xen_pfn_t *mfns = NULL, *types = NULL;
++    void *guest_mapping = NULL;
++    void **guest_data = NULL;
++    void **local_pages = NULL;
++    int *errors = NULL, rc = -1;
++    unsigned i, j, nr_pages = 0;
++    unsigned nr_pfns = ctx->nr_batch_pfns;
 +
-+    struct
-+    {
-+        struct rec_page_data_header h;
-+        uint64_t pfn;
-+    } page_data = { { 1, 0 } , ~0ULL };
-+    struct record rec =
-+    {
-+        .type = REC_TYPE_page_data,
-+        .length = sizeof page_data,
-+        .data = &page_data,
-+    };
++    struct rec_page_data_header hdr;
++    uint32_t rec_type = REC_TYPE_page_data, rec_size, rec_count, rec_res = 0;
++    uint64_t *rec_pfns = NULL;
++    size_t s;
 +
-+    type = mfn = pfn_to_mfn(ctx, pfn);
++    assert(nr_pfns != 0);
 +
-+    if ( xc_get_pfn_type_batch(xch, ctx->domid, 1, &type) )
++    /* MFNs of the batch pfns */
++    mfns = malloc(nr_pfns * sizeof *mfns);
++    /* Types of the batch pfns */
++    types = malloc(nr_pfns * sizeof *types);
++    /* Errors from attempting to map the mfns */
++    errors = malloc(nr_pfns * sizeof *errors);
++    /* Pointers to page data to send.  Might be from mapped mfns or local allocations */
++    guest_data = calloc(nr_pfns, sizeof *guest_data);
++    /* Pointers to locally allocated pages.  Probably not all used, but need freeing */
++    local_pages = calloc(nr_pfns, sizeof *local_pages);
++
++    if ( !mfns || !types || !errors || !guest_data || !local_pages )
 +    {
-+        PERROR("Unable to get mfn %#lx type", mfn);
++        ERROR("Unable to allocate arrays for a batch of %u pages",
++              nr_pfns);
 +        goto err;
 +    }
 +
-+    if ( (type & ~XEN_DOMCTL_PFINFO_LTAB_MASK) ||
-+         (((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) >= 5) &&
-+          ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) <= 8)) )
++    for ( i = 0; i < nr_pfns; ++i )
 +    {
-+        ERROR("Invalid type %#lx for mfn %#lx", type, mfn);
++        types[i] = mfns[i] = pfn_to_mfn(ctx, ctx->batch_pfns[i]);
++
++        /* Likely a ballooned page */
++        if ( mfns[i] == INVALID_MFN )
++            set_bit(ctx->batch_pfns[i], ctx->deferred_pages);
++    }
++
++    rc = xc_get_pfn_type_batch(xch, ctx->domid, nr_pfns, types);
++    if ( rc )
++    {
++        PERROR("Failed to get types for pfn batch");
 +        goto err;
 +    }
++    rc = -1;
 +
-+    page_data.pfn = (((uint64_t)type) << 32) | pfn;
-+
-+    switch (type)
++    for ( i = 0; i < nr_pfns; ++i )
 +    {
-+    case XEN_DOMCTL_PFINFO_BROKEN:
-+    case XEN_DOMCTL_PFINFO_XALLOC:
-+    case XEN_DOMCTL_PFINFO_XTAB:
-+        if ( write_record(ctx, &rec) )
-+            goto err;
-+        goto done;
-+    }
-+
-+    if ( !mfn_in_pseudophysmap(ctx, mfn) )
-+    {
-+        ERROR("Bad pfn %#lx", pfn);
-+        pseudophysmap_walk(ctx, mfn);
-+        goto err;
-+    }
-+
-+    guest_page = xc_map_foreign_bulk(
-+        xch, ctx->domid, PROT_READ, &mfn, &err, 1);
-+    if ( !guest_page || err )
-+    {
-+        PERROR("Unable to map mfn %#lx (err %d)", mfn, err);
-+        goto err;
-+    }
-+
-+    switch (type & XEN_DOMCTL_PFINFO_LTABTYPE_MASK)
-+    {
-+    case XEN_DOMCTL_PFINFO_L1TAB:
-+    case XEN_DOMCTL_PFINFO_L2TAB:
-+    case XEN_DOMCTL_PFINFO_L3TAB:
-+    case XEN_DOMCTL_PFINFO_L4TAB:
-+        local_page = malloc(PAGE_SIZE);
-+        if ( !local_page )
++        switch ( types[i] )
 +        {
-+            ERROR("Unable to allocate scratch page");
++        case XEN_DOMCTL_PFINFO_BROKEN:
++        case XEN_DOMCTL_PFINFO_XALLOC:
++        case XEN_DOMCTL_PFINFO_XTAB:
++            continue;
++        }
++
++        if ( !mfn_in_pseudophysmap(ctx, mfns[i]) )
++        {
++            ERROR("Bad mfn in for pfn %#lx, type %#lx",
++                  ctx->batch_pfns[i], types[i]);
++            pseudophysmap_walk(ctx, mfns[i]);
 +            goto err;
 +        }
 +
-+        if ( normalise_pagetable(ctx, guest_page, local_page, type, live) ||
-+             write_split_record(ctx, &rec, local_page, PAGE_SIZE) )
-+            goto err;
-+        break;
-+
-+    case XEN_DOMCTL_PFINFO_NOTAB:
-+        if ( write_split_record(ctx, &rec, guest_page, PAGE_SIZE) )
-+            goto err;
-+        break;
++        mfns[nr_pages++] = mfns[i];
 +    }
 +
-+ done:
++    if ( nr_pages > 0 )
++    {
++        guest_mapping = xc_map_foreign_bulk(
++            xch, ctx->domid, PROT_READ, mfns, errors, nr_pages);
++        if ( !guest_mapping )
++        {
++            PERROR("Failed to map guest pages");
++            goto err;
++        }
++    }
++
++    for ( i = 0, j = 0; i < nr_pfns; ++i )
++    {
++        switch ( types[i] )
++        {
++        case XEN_DOMCTL_PFINFO_BROKEN:
++        case XEN_DOMCTL_PFINFO_XALLOC:
++        case XEN_DOMCTL_PFINFO_XTAB:
++            continue;
++        }
++
++        if ( errors[j] )
++        {
++            ERROR("Mapping of pfn %#lx (mfn %#lx) failed %d",
++                  ctx->batch_pfns[i], mfns[j], errors[j]);
++            goto err;
++        }
++
++        switch ( types[i] )
++        {
++        case XEN_DOMCTL_PFINFO_L1TAB:
++        case XEN_DOMCTL_PFINFO_L1TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++
++        case XEN_DOMCTL_PFINFO_L2TAB:
++        case XEN_DOMCTL_PFINFO_L2TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++
++        case XEN_DOMCTL_PFINFO_L3TAB:
++        case XEN_DOMCTL_PFINFO_L3TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++
++        case XEN_DOMCTL_PFINFO_L4TAB:
++        case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++
++            guest_data[i] = local_pages[i] = malloc(PAGE_SIZE);
++            if ( !local_pages[i] )
++            {
++                ERROR("Unable to allocate scratch page for pagetable normalisation");
++                goto err;
++            }
++
++            rc = normalise_pagetable(ctx, guest_mapping + (j * PAGE_SIZE),
++                                     local_pages[i], types[i]);
++            if ( rc )
++            {
++                if ( rc == -1 && errno == EAGAIN )
++                {
++                    set_bit(ctx->batch_pfns[i], ctx->deferred_pages);
++                    guest_data[i] = NULL;
++                    types[i] = XEN_DOMCTL_PFINFO_XTAB;
++                    --nr_pages;
++                }
++                else
++                    goto err;
++            }
++            rc = -1;
++            break;
++
++        case XEN_DOMCTL_PFINFO_NOTAB:
++            guest_data[i] = guest_mapping + (j * PAGE_SIZE);
++            break;
++        }
++
++        ++j;
++    }
++
++    hdr.count = nr_pfns;
++    s = nr_pfns * sizeof *rec_pfns;
++
++
++    rec_pfns = malloc(s);
++    if ( !rec_pfns )
++    {
++        ERROR("Unable to allocate memory for page data pfn list");
++        goto err;
++    }
++
++    for ( i = 0; i < nr_pfns; ++i )
++        rec_pfns[i] = ((uint64_t)(types[i]) << 32) | ctx->batch_pfns[i];
++
++    /*        header +          pfns data           +        page data */
++    rec_size = 4 + 4 + (s) + (nr_pages * PAGE_SIZE);
++    rec_count = nr_pfns;
++
++    if ( write_exact(ctx->fd, &rec_type, sizeof(uint32_t)) ||
++         write_exact(ctx->fd, &rec_size, sizeof(uint32_t)) ||
++         write_exact(ctx->fd, &rec_count, sizeof(uint32_t)) ||
++         write_exact(ctx->fd, &rec_res, sizeof(uint32_t)) )
++    {
++        PERROR("Failed to write page_type header to stream");
++        goto err;
++    }
++
++    if ( write_exact(ctx->fd, rec_pfns, s) )
++    {
++        PERROR("Failed to write page_type header to stream");
++        goto err;
++    }
++
++
++    for ( i = 0; i < nr_pfns; ++i )
++        if ( guest_data[i] )
++        {
++            if ( write_exact(ctx->fd, guest_data[i], PAGE_SIZE) )
++            {
++                PERROR("Failed to write page into stream");
++                goto err;
++            }
++
++            --nr_pages;
++        }
++
++    /* Sanity check */
++    assert(nr_pages == 0);
++    ctx->nr_batch_pfns = 0;
 +    rc = 0;
 +
 + err:
-+    if ( guest_page )
-+        munmap(guest_page, PAGE_SIZE);
-+    free(local_page);
++    free(rec_pfns);
++    if ( guest_mapping )
++        munmap(guest_mapping, nr_pages * PAGE_SIZE);
++    for ( i = 0; local_pages && i < nr_pfns; ++i )
++        free(local_pages[i]);
++    free(local_pages);
++    free(guest_data);
++    free(errors);
++    free(types);
++    free(mfns);
++
++    return rc;
++}
++
++static int flush_batch(struct context *ctx)
++{
++    int rc = 0;
++
++    if ( ctx->nr_batch_pfns == 0 )
++        return rc;
++
++    rc = write_batch(ctx);
++
++    if ( !rc )
++    {
++        /* Valgrind sanity check */
++        free(ctx->batch_pfns);
++        ctx->batch_pfns = malloc(MAX_BATCH_SIZE * sizeof *ctx->batch_pfns);
++        rc = !ctx->batch_pfns;
++    }
++
++    return rc;
++}
++
++static int add_to_batch(struct context *ctx, xen_pfn_t pfn)
++{
++    int rc = 0;
++
++    if ( ctx->nr_batch_pfns == MAX_BATCH_SIZE )
++        rc = flush_batch(ctx);
++
++    if ( rc == 0 )
++        ctx->batch_pfns[ctx->nr_batch_pfns++] = pfn;
 +
 +    return rc;
 +}
@@ -906,9 +1059,9 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +    int rc;
 +    struct record end = { REC_TYPE_end, 0, NULL };
 +    xc_shadow_op_stats_t shadow_stats;
++    unsigned pages_written;
 +
 +    DECLARE_HYPERCALL_BUFFER(unsigned long, to_send);
-+    unsigned long *to_fix = NULL;
 +    unsigned x, max_iter = 5, dirty_threshold = 50;
 +    xen_pfn_t p;
 +
@@ -938,12 +1091,20 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +    rc = write_x86_pv_p2m_frames(ctx);
 +    if ( rc )
 +        goto err;
++    rc = -1;
++
++    ctx->batch_pfns = malloc(MAX_BATCH_SIZE * sizeof *ctx->batch_pfns);
++    if ( !ctx->batch_pfns )
++    {
++        ERROR("Unable to allocate memory for page batch list");
++        goto err;
++    }
 +
 +    to_send = xc_hypercall_buffer_alloc_pages(
 +        xch, to_send, NRPAGES(bitmap_size(ctx->x86_pv.max_pfn + 1)));
-+    to_fix = calloc(1, bitmap_size(ctx->x86_pv.max_pfn + 1));
++    ctx->deferred_pages = calloc(1, bitmap_size(ctx->x86_pv.max_pfn + 1));
 +
-+    if ( !to_send || !to_fix )
++    if ( !to_send || !ctx->deferred_pages )
 +    {
 +        ERROR("Unable to allocate memory for to_{send,fix} bitmaps");
 +        goto err;
@@ -959,29 +1120,32 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +        goto err;
 +    }
 +
-+    for ( x = 0; x < max_iter ; ++x )
++    for ( x = 0, pages_written = 0; x < max_iter ; ++x )
 +    {
-+        unsigned written = 0;
 +        DPRINTF("Iteration %u", x);
 +
 +        for ( p = 0 ; p <= ctx->x86_pv.max_pfn; ++p )
 +        {
 +            if ( test_bit(p, to_send) )
 +            {
-+                if ( write_one_page(ctx, p, true) )
++                rc = add_to_batch(ctx, p);
++                if ( rc )
 +                {
-+                    if ( errno == EAGAIN )
-+                        set_bit(p, to_fix);
-+                    else
-+                    {
-+                        ERROR("Fatal write error :s");
-+                        goto err;
-+                    }
++                    ERROR("Fatal write error :s");
++                    goto err;
 +                }
-+                else
-+                    ++written;
++
++                ++pages_written;
 +            }
 +        }
++
++        rc = flush_batch(ctx);
++        if ( rc )
++        {
++            ERROR("Fatal write error :s");
++            goto err;
++        }
++        rc = -1;
 +
 +        if ( xc_shadow_control(xch, ctx->domid,
 +                               XEN_DOMCTL_SHADOW_OP_CLEAN,
@@ -995,11 +1159,14 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +        else
 +        {
 +            DPRINTF("  Wrote %u pages; stats: faults %"PRIu32", dirty %"PRIu32,
-+                    written, shadow_stats.fault_count, shadow_stats.dirty_count);
++                    pages_written, shadow_stats.fault_count,
++                    shadow_stats.dirty_count);
 +        }
 +
 +        if ( shadow_stats.dirty_count < dirty_threshold )
 +            break;
++
++        pages_written = 0;
 +    }
 +
 +    if ( !ctx->dominfo.paused )
@@ -1028,16 +1195,25 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +     * Domain must be paused from this point onwards.
 +     */
 +
-+    for ( p = 0 ; p <= ctx->x86_pv.max_pfn; ++p )
++    for ( p = 0, pages_written = 0 ; p <= ctx->x86_pv.max_pfn; ++p )
 +    {
-+        if ( test_bit(p, to_send) || test_bit(p, to_fix) )
++        if ( test_bit(p, to_send) || test_bit(p, ctx->deferred_pages) )
 +        {
-+            if ( write_one_page(ctx, p, false) )
++            if ( add_to_batch(ctx, p) )
 +            {
 +                PERROR("Fatal error for pfn %lx", p);
 +                goto err;
 +            }
++            ++pages_written;
 +        }
++    }
++    DPRINTF("  Wrote %u pages", pages_written);
++
++    rc = flush_batch(ctx);
++    if ( rc )
++    {
++        ERROR("Fatal write error :s");
++        goto err;
 +    }
 +
 +    rc = write_tsc_info(ctx);
@@ -1086,7 +1262,7 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +    xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
 +                      NULL, 0, NULL, 0, NULL);
 +
-+    free(to_fix);
++    free(ctx->deferred_pages);
 +    xc_hypercall_buffer_free_pages(
 +        xch, to_send, NRPAGES(bitmap_size(ctx->x86_pv.max_pfn + 1)));
 +
@@ -1100,6 +1276,8 @@ diff -r 71898ce2301e tools/libxc/saverestore/save_x86_pv.c
 +
 +    if ( ctx->x86_pv.m2p )
 +        munmap(ctx->x86_pv.m2p, ctx->x86_pv.nr_m2p_frames * PAGE_SIZE);
++
++    free(ctx->batch_pfns);
 +
 +    return rc;
 +}

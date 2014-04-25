@@ -1,4 +1,4 @@
-From 13b3680ca719330b8fb71ed2837541cac2bc8b54 Mon Sep 17 00:00:00 2001
+From 77b8b1fbc41f592841c146984077cfa085b828ba Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Fri, 21 Mar 2014 21:26:01 +0000
 Subject: [PATCH 6/6] tools/libxc: x86 pv restore implementation
@@ -9,11 +9,11 @@ Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
  tools/libxc/saverestore/common.c         |   51 ++
  tools/libxc/saverestore/common.h         |   34 +
  tools/libxc/saverestore/restore.c        |  112 ++-
- tools/libxc/saverestore/restore_x86_pv.c | 1092 ++++++++++++++++++++++++++++++
- 4 files changed, 1288 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/restore_x86_pv.c | 1121 ++++++++++++++++++++++++++++++
+ 4 files changed, 1317 insertions(+), 1 deletion(-)
  create mode 100644 tools/libxc/saverestore/restore_x86_pv.c
 
-diff -r a9d8448db865 tools/libxc/saverestore/common.c
+diff -r b942df85f345 tools/libxc/saverestore/common.c
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
 @@ -85,6 +85,57 @@ int write_split_record(struct context *c
@@ -74,7 +74,7 @@ diff -r a9d8448db865 tools/libxc/saverestore/common.c
  /*
   * Local variables:
   * mode: C
-diff -r a9d8448db865 tools/libxc/saverestore/common.h
+diff -r b942df85f345 tools/libxc/saverestore/common.h
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
 @@ -12,6 +12,8 @@
@@ -86,7 +86,7 @@ diff -r a9d8448db865 tools/libxc/saverestore/common.h
  #undef mfn_to_pfn
  #undef pfn_to_mfn
  
-@@ -97,6 +99,8 @@ struct context
+@@ -101,6 +103,8 @@ struct context
  
  /* Saves an x86 PV domain. */
  int save_x86_pv(struct context *ctx);
@@ -95,7 +95,7 @@ diff -r a9d8448db865 tools/libxc/saverestore/common.h
  
  struct record
  {
-@@ -120,6 +124,22 @@ struct record
+@@ -124,6 +128,22 @@ struct record
              (_p)->x32._f = (_v);                \
      })
  
@@ -118,7 +118,7 @@ diff -r a9d8448db865 tools/libxc/saverestore/common.h
  /*
   * Writes a split record to the stream, applying correct padding where
   * appropriate.  It is common when sending records containing blobs from Xen
-@@ -145,6 +165,20 @@ static inline int write_record(struct co
+@@ -149,6 +169,20 @@ static inline int write_record(struct co
      return write_split_record(ctx, rec, NULL, 0);
  }
  
@@ -139,7 +139,7 @@ diff -r a9d8448db865 tools/libxc/saverestore/common.h
  #endif
  /*
   * Local variables:
-diff -r a9d8448db865 tools/libxc/saverestore/restore.c
+diff -r b942df85f345 tools/libxc/saverestore/restore.c
 --- a/tools/libxc/saverestore/restore.c
 +++ b/tools/libxc/saverestore/restore.c
 @@ -1,5 +1,62 @@
@@ -268,10 +268,10 @@ diff -r a9d8448db865 tools/libxc/saverestore/restore.c
  }
  
  /*
-diff -r a9d8448db865 tools/libxc/saverestore/restore_x86_pv.c
+diff -r b942df85f345 tools/libxc/saverestore/restore_x86_pv.c
 --- /dev/null
 +++ b/tools/libxc/saverestore/restore_x86_pv.c
-@@ -0,0 +1,1092 @@
+@@ -0,0 +1,1121 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -542,6 +542,7 @@ diff -r a9d8448db865 tools/libxc/saverestore/restore_x86_pv.c
 +    }
 +
 +    for ( i = 0; i < count; ++i )
++    {
 +        if ( types[i] != XEN_DOMCTL_PFINFO_XTAB &&
 +             types[i] != XEN_DOMCTL_PFINFO_BROKEN &&
 +             pfn_to_mfn(ctx, original_pfns[i]) == INVALID_MFN )
@@ -549,6 +550,7 @@ diff -r a9d8448db865 tools/libxc/saverestore/restore_x86_pv.c
 +            pfns[nr_pfns] = mfns[nr_pfns] = original_pfns[i];
 +            ++nr_pfns;
 +        }
++    }
 +
 +    if ( nr_pfns )
 +    {
@@ -632,8 +634,10 @@ diff -r a9d8448db865 tools/libxc/saverestore/restore_x86_pv.c
 +    xen_pfn_t *mfns = malloc(count * sizeof *mfns);
 +    int *map_errs = malloc(count * sizeof *map_errs);
 +    int rc = -1;
-+    void *mapping = NULL, *guest_page;
-+    unsigned i;
++    void *mapping = NULL, *guest_page = NULL;
++    unsigned i,    /* i indexes the pfns from the record */
++        j,         /* j indexes the subset of pfns we decide to map */
++        nr_pages;
 +
 +    if ( !mfns || !map_errs )
 +    {
@@ -650,22 +654,46 @@ diff -r a9d8448db865 tools/libxc/saverestore/restore_x86_pv.c
 +    }
 +    rc = -1;
 +
-+    for ( i = 0; i < count; ++i )
++    for ( i = 0, nr_pages = 0; i < count; ++i )
 +    {
 +        ctx->x86_pv.pfn_types[pfns[i]] = types[i];
-+        mfns[i] = pfn_to_mfn(ctx, pfns[i]);
++
++        switch ( types[i] )
++        {
++        case XEN_DOMCTL_PFINFO_NOTAB:
++
++        case XEN_DOMCTL_PFINFO_L1TAB:
++        case XEN_DOMCTL_PFINFO_L1TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++
++        case XEN_DOMCTL_PFINFO_L2TAB:
++        case XEN_DOMCTL_PFINFO_L2TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++
++        case XEN_DOMCTL_PFINFO_L3TAB:
++        case XEN_DOMCTL_PFINFO_L3TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++
++        case XEN_DOMCTL_PFINFO_L4TAB:
++        case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
++
++            mfns[nr_pages++] = pfn_to_mfn(ctx, pfns[i]);
++            break;
++        }
++
 +    }
 +
-+    mapping = guest_page = xc_map_foreign_bulk(xch, ctx->domid,
-+                                               PROT_READ | PROT_WRITE,
-+                                               mfns, map_errs, count);
-+    if ( !mapping )
++    if ( nr_pages > 0 )
 +    {
-+        PERROR("Unable to map %u mfns for page data", count);
-+        goto err;
++        mapping = guest_page = xc_map_foreign_bulk(
++            xch, ctx->domid, PROT_READ | PROT_WRITE,
++            mfns, map_errs, nr_pages);
++        if ( !mapping )
++        {
++            PERROR("Unable to map %u mfns for %u pages of data",
++                   nr_pages, count);
++            goto err;
++        }
 +    }
 +
-+    for ( i = 0; i < count; ++i )
++    for ( i = 0, j = 0; i < count; ++i )
 +    {
 +        switch ( types[i] )
 +        {
@@ -677,10 +705,10 @@ diff -r a9d8448db865 tools/libxc/saverestore/restore_x86_pv.c
 +            continue;
 +        }
 +
-+        if ( map_errs[i] )
++        if ( map_errs[j] )
 +        {
 +            ERROR("Mapping pfn %lx (mfn %lx, type %#"PRIx32")failed with %d",
-+                  pfns[i], mfns[i], types[i], map_errs[i]);
++                  pfns[i], mfns[j], types[i], map_errs[j]);
 +            goto err;
 +        }
 +
@@ -699,6 +727,7 @@ diff -r a9d8448db865 tools/libxc/saverestore/restore_x86_pv.c
 +            rc = -1;
 +        }
 +
++        ++j;
 +        guest_page += PAGE_SIZE;
 +        page_data += PAGE_SIZE;
 +    }
@@ -707,7 +736,7 @@ diff -r a9d8448db865 tools/libxc/saverestore/restore_x86_pv.c
 +
 + err:
 +    if ( mapping )
-+        munmap(mapping, count * PAGE_SIZE);
++        munmap(mapping, nr_pages * PAGE_SIZE);
 +
 +    free(map_errs);
 +    free(mfns);
