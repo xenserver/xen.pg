@@ -1,7 +1,9 @@
-From 2455ec09dc045829148bf095989e6dc366612ea4 Mon Sep 17 00:00:00 2001
-From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Wed, 16 Apr 2014 19:09:18 +0100
-Subject: [PATCH] hypercall/mem: Introduce XENMEM_machphys_compat_mfn_list
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1398777581 -7200
+# Node ID fb28e43d432d74e1e470e815e199a890c8804da0
+# Parent  c50d42d3eea87253f0ee9257a9758c1eb921282a
+x86/mem: introduce XENMEM_machphys_compat_mfn_list
 
 To correctly migrate a PV guest, the toolstack must remove Xen mappings from
 the guest pagetables.  For 32bit PV guests, the pagetables cannot be walked
@@ -11,16 +13,16 @@ mappings.
 
 The migration code performs this search efficiently by knowing that the Xen
 mappings will start at a known L2e and point to a known mfn, which will be the
-fist mfn in the m2p table.
+first mfn in the m2p table.
 
-Unfortunately there are two m2p tables in use; a regular and a compatibility
-one.  The toolstack looks for the first mfn of its own m2p table in the guest
-pagetables.  This only works if the toolstack is the same bitness as the 32bit
-domain being migrated, and leaves a problem for 64bit toolstacks which will
-never be able to find its regular m2p in a compat guest.
+Unfortunately there are two m2p tables in use; the regular and the
+compatibility one.  The toolstack looks for the first mfn of its own m2p table
+in the guest pagetables.  This only works if the toolstack is the same bitness
+as the 32bit domain being migrated, and leaves a problem for 64bit toolstacks
+which will never be able to find its regular m2p in a compat guest.
 
 It appears that this bug for 64bit toolstacks was discovered, but hacked
-around in an unsafe manor.  The code currently shoots any invalid L2es and
+around in an unsafe manner.  The code currently shoots any invalid L2es and
 doesn't report a failure for L2 tables in a 32 bit guest, even after the guest
 is paused.  This means that non Xen entries which should fail the migration
 don't, and the guest will resume on the far side with unexpectedly fewer
@@ -36,29 +38,11 @@ L4 tables, so can be safely shot by 32 and 64bit toolstacks without looking at
 where the mapping points to.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-CC: Keir Fraser <keir@xen.org>
-CC: Jan Beulich <JBeulich@suse.com>
-CC: Tim Deegan <tim@xen.org>
-CC: Ian Campbell <Ian.Campbell@citrix.com>
-CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
 
----
-
-I am happy for this to live as part of my "migration v2" series, but is
-presented here for individual review.
-
-Changes in v2:
- * Don't alias other local scope variables in subarch_memory_op
----
- xen/arch/x86/x86_64/compat/mm.c |    1 +
- xen/arch/x86/x86_64/mm.c        |   30 +++++++++++++++++++++++++++++-
- xen/include/public/memory.h     |   10 ++++++++++
- 3 files changed, 40 insertions(+), 1 deletion(-)
-
-diff -r fb3616caf202 xen/arch/x86/x86_64/compat/mm.c
+diff -r c50d42d3eea8 -r fb28e43d432d xen/arch/x86/x86_64/compat/mm.c
 --- a/xen/arch/x86/x86_64/compat/mm.c
 +++ b/xen/arch/x86/x86_64/compat/mm.c
-@@ -146,6 +146,7 @@ int compat_arch_memory_op(int op, XEN_GU
+@@ -148,6 +148,7 @@ int compat_arch_memory_op(unsigned long 
      }
  
      case XENMEM_machphys_mfn_list:
@@ -66,10 +50,10 @@ diff -r fb3616caf202 xen/arch/x86/x86_64/compat/mm.c
      {
          unsigned long limit;
          compat_pfn_t last_mfn;
-diff -r fb3616caf202 xen/arch/x86/x86_64/mm.c
+diff -r c50d42d3eea8 -r fb28e43d432d xen/arch/x86/x86_64/mm.c
 --- a/xen/arch/x86/x86_64/mm.c
 +++ b/xen/arch/x86/x86_64/mm.c
-@@ -953,7 +953,7 @@ long subarch_memory_op(int op, XEN_GUEST
+@@ -955,7 +955,7 @@ long subarch_memory_op(unsigned long cmd
      struct xen_machphys_mfn_list xmml;
      l3_pgentry_t l3e;
      l2_pgentry_t l2e;
@@ -78,7 +62,7 @@ diff -r fb3616caf202 xen/arch/x86/x86_64/mm.c
      xen_pfn_t mfn, last_mfn;
      unsigned int i;
      long rc = 0;
-@@ -1000,6 +1000,34 @@ long subarch_memory_op(int op, XEN_GUEST
+@@ -1003,6 +1003,34 @@ long subarch_memory_op(unsigned long cmd
  
          break;
  
@@ -113,23 +97,31 @@ diff -r fb3616caf202 xen/arch/x86/x86_64/mm.c
      case XENMEM_get_sharing_freed_pages:
          return mem_sharing_get_nr_saved_mfns();
  
-diff -r fb3616caf202 xen/include/public/memory.h
+diff -r c50d42d3eea8 -r fb28e43d432d xen/include/public/memory.h
 --- a/xen/include/public/memory.h
 +++ b/xen/include/public/memory.h
-@@ -465,6 +465,16 @@ DEFINE_XEN_GUEST_HANDLE(xen_mem_sharing_
-  * The zero value is appropiate.
-  */
+@@ -187,6 +187,15 @@ typedef struct xen_machphys_mfn_list xen
+ DEFINE_XEN_GUEST_HANDLE(xen_machphys_mfn_list_t);
  
-+/*
-+ * For a compat toolstack domain, this is indentical to
-+ * XENMEM_machphys_mfn_list.
+ /*
++ * For a compat caller, this is identical to XENMEM_machphys_mfn_list.
 + *
-+ * For a non compat toolstack domain, this functions similarly to
++ * For a non compat caller, this functions similarly to
 + * XENMEM_machphys_mfn_list, but returns the mfns making up the compatibility
 + * m2p table.
 + */
 +#define XENMEM_machphys_compat_mfn_list     25
 +
++/*
+  * Returns the location in virtual address space of the machine_to_phys
+  * mapping table. Architectures which do not have a m2p table, or which do not
+  * map it by default into guest address space, do not implement this command.
+@@ -514,6 +523,8 @@ DEFINE_XEN_GUEST_HANDLE(xen_mem_sharing_
+ 
  #endif /* defined(__XEN__) || defined(__XEN_TOOLS__) */
  
++/* Next available subop number is 26 */
++
  #endif /* __XEN_PUBLIC_MEMORY_H__ */
+ 
+ /*
