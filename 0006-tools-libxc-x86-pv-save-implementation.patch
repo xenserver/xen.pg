@@ -1,0 +1,1104 @@
+From 96363d3bd404c236ab572fee768dabe5b490688c Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 28 Apr 2014 15:33:16 +0100
+Subject: [PATCH 6/9] tools/libxc: x86 pv save implementation
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+---
+ tools/libxc/saverestore/common.h      |   20 ++
+ tools/libxc/saverestore/save.c        |  453 +++++++++++++++++++++++++-
+ tools/libxc/saverestore/save_x86_pv.c |  568 +++++++++++++++++++++++++++++++++
+ 3 files changed, 1040 insertions(+), 1 deletion(-)
+ create mode 100644 tools/libxc/saverestore/save_x86_pv.c
+
+diff -r 9b1d74db741f tools/libxc/saverestore/common.h
+--- a/tools/libxc/saverestore/common.h
++++ b/tools/libxc/saverestore/common.h
+@@ -12,6 +12,8 @@
+ #include "../xc_dom.h"
+ #include "../xc_bitops.h"
+ 
++#undef GET_FIELD
++#undef SET_FIELD
+ #undef mfn_to_pfn
+ #undef pfn_to_mfn
+ 
+@@ -121,6 +123,9 @@ struct context
+     };
+ };
+ 
++/* Saves an x86 PV domain. */
++int save_x86_pv(struct context *ctx);
++
+ /*
+  * Write the image and domain headers to the stream.
+  * (to eventually make static in save.c)
+@@ -137,6 +142,21 @@ struct record
+     void *data;
+ };
+ 
++/* Gets a field from an *_any union */
++#define GET_FIELD(_c, _p, _f)                   \
++    ({ (_c)->x86_pv.width == 8 ?                \
++            (_p)->x64._f:                       \
++            (_p)->x32._f;                       \
++    })                                          \
++
++/* Gets a field from an *_any union */
++#define SET_FIELD(_c, _p, _f, _v)               \
++    ({ if ( (_c)->x86_pv.width == 8 )           \
++            (_p)->x64._f = (_v);                \
++        else                                    \
++            (_p)->x32._f = (_v);                \
++    })
++
+ /*
+  * Writes a split record to the stream, applying correct padding where
+  * appropriate.  It is common when sending records containing blobs from Xen
+diff -r 9b1d74db741f tools/libxc/saverestore/save.c
+--- a/tools/libxc/saverestore/save.c
++++ b/tools/libxc/saverestore/save.c
+@@ -1,3 +1,4 @@
++#include <assert.h>
+ #include <arpa/inet.h>
+ 
+ #include "common.h"
+@@ -42,13 +43,463 @@ int write_headers(struct context *ctx, u
+     return 0;
+ }
+ 
++static int write_batch(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t *mfns = NULL, *types = NULL;
++    void *guest_mapping = NULL;
++    void **guest_data = NULL;
++    void **local_pages = NULL;
++    int *errors = NULL, rc = -1;
++    unsigned i, p, nr_pages = 0;
++    unsigned nr_pfns = ctx->nr_batch_pfns;
++    void *page, *orig_page;
++
++    struct rec_page_data_header hdr;
++    uint32_t rec_type = REC_TYPE_page_data, rec_size, rec_count, rec_res = 0;
++    uint64_t *rec_pfns = NULL;
++    size_t s;
++
++    assert(nr_pfns != 0);
++
++    /* MFNs of the batch pfns */
++    mfns = malloc(nr_pfns * sizeof *mfns);
++    /* Types of the batch pfns */
++    types = malloc(nr_pfns * sizeof *types);
++    /* Errors from attempting to map the mfns */
++    errors = malloc(nr_pfns * sizeof *errors);
++    /* Pointers to page data to send.  Might be from mapped mfns or local allocations */
++    guest_data = calloc(nr_pfns, sizeof *guest_data);
++    /* Pointers to locally allocated pages.  Probably not all used, but need freeing */
++    local_pages = calloc(nr_pfns, sizeof *local_pages);
++
++    if ( !mfns || !types || !errors || !guest_data || !local_pages )
++    {
++        ERROR("Unable to allocate arrays for a batch of %u pages",
++              nr_pfns);
++        goto err;
++    }
++
++    for ( i = 0; i < nr_pfns; ++i )
++    {
++        types[i] = mfns[i] = ctx->ops.pfn_to_gfn(ctx, ctx->batch_pfns[i]);
++
++        /* Likely a ballooned page */
++        if ( mfns[i] == INVALID_MFN )
++            set_bit(ctx->batch_pfns[i], ctx->deferred_pages);
++    }
++
++    rc = xc_get_pfn_type_batch(xch, ctx->domid, nr_pfns, types);
++    if ( rc )
++    {
++        PERROR("Failed to get types for pfn batch");
++        goto err;
++    }
++    rc = -1;
++
++    for ( i = 0; i < nr_pfns; ++i )
++    {
++        switch ( types[i] )
++        {
++        case XEN_DOMCTL_PFINFO_BROKEN:
++        case XEN_DOMCTL_PFINFO_XALLOC:
++        case XEN_DOMCTL_PFINFO_XTAB:
++            continue;
++        }
++
++        mfns[nr_pages++] = mfns[i];
++    }
++
++    if ( nr_pages > 0 )
++    {
++        guest_mapping = xc_map_foreign_bulk(
++            xch, ctx->domid, PROT_READ, mfns, errors, nr_pages);
++        if ( !guest_mapping )
++        {
++            PERROR("Failed to map guest pages");
++            goto err;
++        }
++    }
++
++    for ( i = 0, p = 0; i < nr_pfns; ++i )
++    {
++        switch ( types[i] )
++        {
++        case XEN_DOMCTL_PFINFO_BROKEN:
++        case XEN_DOMCTL_PFINFO_XALLOC:
++        case XEN_DOMCTL_PFINFO_XTAB:
++            continue;
++        }
++
++        if ( errors[p] )
++        {
++            ERROR("Mapping of pfn %#lx (mfn %#lx) failed %d",
++                  ctx->batch_pfns[i], mfns[p], errors[p]);
++            goto err;
++        }
++
++        orig_page = page = guest_mapping + (p * PAGE_SIZE);
++        rc = ctx->ops.normalise_page(ctx, types[i], &page);
++        if ( rc )
++        {
++            if ( rc == -1 && errno == EAGAIN )
++            {
++                set_bit(ctx->batch_pfns[i], ctx->deferred_pages);
++                types[i] = XEN_DOMCTL_PFINFO_XTAB;
++                --nr_pages;
++            }
++            else
++                goto err;
++        }
++        else
++            guest_data[i] = page;
++
++        if ( page != orig_page )
++            local_pages[i] = page;
++        rc = -1;
++
++        ++p;
++    }
++
++    hdr.count = nr_pfns;
++    s = nr_pfns * sizeof *rec_pfns;
++
++
++    rec_pfns = malloc(s);
++    if ( !rec_pfns )
++    {
++        ERROR("Unable to allocate memory for page data pfn list");
++        goto err;
++    }
++
++    for ( i = 0; i < nr_pfns; ++i )
++        rec_pfns[i] = ((uint64_t)(types[i]) << 32) | ctx->batch_pfns[i];
++
++    /*        header +          pfns data           +        page data */
++    rec_size = 4 + 4 + (s) + (nr_pages * PAGE_SIZE);
++    rec_count = nr_pfns;
++
++    if ( write_exact(ctx->fd, &rec_type, sizeof(uint32_t)) ||
++         write_exact(ctx->fd, &rec_size, sizeof(uint32_t)) ||
++         write_exact(ctx->fd, &rec_count, sizeof(uint32_t)) ||
++         write_exact(ctx->fd, &rec_res, sizeof(uint32_t)) )
++    {
++        PERROR("Failed to write page_type header to stream");
++        goto err;
++    }
++
++    if ( write_exact(ctx->fd, rec_pfns, s) )
++    {
++        PERROR("Failed to write page_type header to stream");
++        goto err;
++    }
++
++
++    for ( i = 0; i < nr_pfns; ++i )
++        if ( guest_data[i] )
++        {
++            if ( write_exact(ctx->fd, guest_data[i], PAGE_SIZE) )
++            {
++                PERROR("Failed to write page into stream");
++                goto err;
++            }
++
++            --nr_pages;
++        }
++
++    /* Sanity check */
++    assert(nr_pages == 0);
++    ctx->nr_batch_pfns = 0;
++    rc = 0;
++
++ err:
++    free(rec_pfns);
++    if ( guest_mapping )
++        munmap(guest_mapping, nr_pages * PAGE_SIZE);
++    for ( i = 0; local_pages && i < nr_pfns; ++i )
++            free(local_pages[i]);
++    free(local_pages);
++    free(guest_data);
++    free(errors);
++    free(types);
++    free(mfns);
++
++    return rc;
++}
++
++static int flush_batch(struct context *ctx)
++{
++    int rc = 0;
++
++    if ( ctx->nr_batch_pfns == 0 )
++        return rc;
++
++    rc = write_batch(ctx);
++
++    if ( !rc )
++    {
++        /* Valgrind sanity check */
++        free(ctx->batch_pfns);
++        ctx->batch_pfns = malloc(MAX_BATCH_SIZE * sizeof *ctx->batch_pfns);
++        rc = !ctx->batch_pfns;
++    }
++
++    return rc;
++}
++
++static int add_to_batch(struct context *ctx, xen_pfn_t pfn)
++{
++    int rc = 0;
++
++    if ( ctx->nr_batch_pfns == MAX_BATCH_SIZE )
++        rc = flush_batch(ctx);
++
++    if ( rc == 0 )
++        ctx->batch_pfns[ctx->nr_batch_pfns++] = pfn;
++
++    return rc;
++}
++
++static int write_page_data_live(struct context *ctx,
++                                xc_hypercall_buffer_t *to_send_hbuf,
++                                xc_shadow_op_stats_t *shadow_stats)
++{
++    xc_interface *xch = ctx->xch;
++    DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, to_send, to_send_hbuf);
++    unsigned pages_written;
++    unsigned x, max_iter = 5, dirty_threshold = 50;
++    xen_pfn_t p;
++    int rc = -1;
++
++    if ( xc_shadow_control(xch, ctx->domid,
++                           XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
++                           NULL, 0, NULL, 0, NULL) < 0 )
++    {
++        PERROR("Failed to enable logdirty");
++        goto out;
++    }
++
++    for ( x = 0, pages_written = 0; x < max_iter ; ++x )
++    {
++        DPRINTF("Iteration %u", x);
++
++        for ( p = 0 ; p < ctx->save.p2m_size; ++p )
++        {
++            if ( test_bit(p, to_send) )
++            {
++                rc = add_to_batch(ctx, p);
++                if ( rc )
++                {
++                    ERROR("Fatal write error :s");
++                    goto out;
++                }
++
++                ++pages_written;
++            }
++        }
++
++        rc = flush_batch(ctx);
++        if ( rc )
++        {
++            ERROR("Fatal write error :s");
++            goto out;
++        }
++        rc = -1;
++
++        if ( xc_shadow_control(
++                 xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
++                 HYPERCALL_BUFFER(to_send), ctx->save.p2m_size,
++                 NULL, 0, shadow_stats) != ctx->save.p2m_size )
++        {
++            PERROR("Failed to retrieve logdirty bitmap");
++            goto out;
++        }
++        else
++        {
++            DPRINTF("  Wrote %u pages; stats: faults %"PRIu32", dirty %"PRIu32,
++                    pages_written, shadow_stats->fault_count,
++                    shadow_stats->dirty_count);
++        }
++
++        if ( shadow_stats->dirty_count < dirty_threshold )
++            break;
++
++        pages_written = 0;
++    }
++    rc = 0;
++
++out:
++    return rc;
++}
++
++
++static int pause_domain(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++
++    if ( !ctx->dominfo.paused )
++    {
++        rc = (ctx->save.callbacks->suspend(ctx->save.callbacks->data) != 1);
++        if ( rc )
++        {
++            ERROR("Failed to suspend domain");
++            return rc;
++        }
++    }
++
++    IPRINTF("Domain now paused");
++
++    return 0;
++}
++
++static int write_page_data_paused(struct context *ctx,
++                                  xc_hypercall_buffer_t *to_send_hbuf,
++                                  xc_shadow_op_stats_t *shadow_stats)
++{
++    xc_interface *xch = ctx->xch;
++    DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, to_send, to_send_hbuf);
++    xen_pfn_t p;
++    unsigned int pages_written;
++    int rc = -1;
++
++    if ( xc_shadow_control(
++             xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
++             HYPERCALL_BUFFER(to_send), ctx->save.p2m_size,
++             NULL, 0, shadow_stats) != ctx->save.p2m_size )
++    {
++        PERROR("Failed to retrieve logdirty bitmap");
++        goto err;
++    }
++
++    /*
++     * Domain must be paused from this point onwards.
++     */
++
++    for ( p = 0, pages_written = 0 ; p < ctx->save.p2m_size; ++p )
++    {
++        if ( test_bit(p, to_send) || test_bit(p, ctx->deferred_pages) )
++        {
++            if ( add_to_batch(ctx, p) )
++            {
++                PERROR("Fatal error for pfn %lx", p);
++                goto err;
++            }
++            ++pages_written;
++        }
++    }
++    DPRINTF("  Wrote %u pages", pages_written);
++
++    rc = flush_batch(ctx);
++    if ( rc )
++    {
++        ERROR("Fatal write error :s");
++        goto err;
++    }
++
++  err:
++    return rc;
++}
++
++int write_page_data_and_pause(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    DECLARE_HYPERCALL_BUFFER(unsigned long, to_send);
++    xc_shadow_op_stats_t shadow_stats;
++    int rc;
++
++    ctx->batch_pfns = malloc(MAX_BATCH_SIZE * sizeof *ctx->batch_pfns);
++    if ( !ctx->batch_pfns )
++    {
++        ERROR("Unable to allocate memory for page batch list");
++        rc = -1;
++        goto out;
++    }
++
++    to_send = xc_hypercall_buffer_alloc_pages(
++        xch, to_send, NRPAGES(bitmap_size(ctx->save.p2m_size)));
++    ctx->deferred_pages = calloc(1, bitmap_size(ctx->save.p2m_size));
++
++    if ( !to_send || !ctx->deferred_pages )
++    {
++        ERROR("Unable to allocate memory for to_{send,fix} bitmaps");
++        rc = -1;
++        goto out;
++    }
++
++    memset(to_send, 0xff, bitmap_size(ctx->save.p2m_size));
++
++    rc = write_page_data_live(ctx, HYPERCALL_BUFFER(to_send), &shadow_stats);
++    if ( rc )
++        goto out;
++
++    rc = pause_domain(ctx);
++    if ( rc )
++        goto out;
++
++    rc = write_page_data_paused(ctx, HYPERCALL_BUFFER(to_send), &shadow_stats);
++    if ( rc )
++        goto out;
++
++    rc = 0;
++
++  out:
++    xc_hypercall_buffer_free_pages(xch, to_send,
++                                   NRPAGES(bitmap_size(ctx->save.p2m_size)));
++    free(ctx->deferred_pages);
++    free(ctx->batch_pfns);
++    return rc;
++}
++
+ int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_iters,
+                     uint32_t max_factor, uint32_t flags,
+                     struct save_callbacks* callbacks, int hvm,
+                     unsigned long vm_generationid_addr)
+ {
++    struct context ctx =
++        {
++            .xch = xch,
++            .fd = io_fd,
++        };
++
++    /* Older GCC cant initialise anonymous unions */
++    ctx.save.callbacks = callbacks;
++
+     IPRINTF("In experimental %s", __func__);
+-    return -1;
++
++    if ( xc_domain_getinfo(xch, dom, 1, &ctx.dominfo) != 1 )
++    {
++        PERROR("Failed to get domain info");
++        return -1;
++    }
++
++    if ( ctx.dominfo.domid != dom )
++    {
++        ERROR("Domain %d does not exist", dom);
++        return -1;
++    }
++
++    ctx.domid = dom;
++    IPRINTF("Saving domain %d", dom);
++
++    ctx.save.p2m_size = xc_domain_maximum_gpfn(xch, dom) + 1;
++    if ( ctx.save.p2m_size > ~XEN_DOMCTL_PFINFO_LTAB_MASK )
++    {
++        errno = E2BIG;
++        ERROR("Cannot save this big a guest");
++        return -1;
++    }
++
++    if ( ctx.dominfo.hvm )
++    {
++        ERROR("HVM Save not supported yet");
++        return -1;
++    }
++    else
++    {
++        ctx.ops = save_restore_ops_x86_pv;
++        return save_x86_pv(&ctx);
++    }
+ }
+ 
+ /*
+diff -r 9b1d74db741f tools/libxc/saverestore/save_x86_pv.c
+--- /dev/null
++++ b/tools/libxc/saverestore/save_x86_pv.c
+@@ -0,0 +1,568 @@
++#include <assert.h>
++
++#include "common_x86_pv.h"
++
++static int map_shinfo(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++
++    ctx->x86_pv.shinfo = xc_map_foreign_range(
++        xch, ctx->domid, PAGE_SIZE, PROT_READ, ctx->dominfo.shared_info_frame);
++    if ( !ctx->x86_pv.shinfo )
++    {
++        PERROR("Failed to map shared info frame at pfn %#lx",
++               ctx->dominfo.shared_info_frame);
++        return -1;
++    }
++
++    return 0;
++}
++
++static void copy_pfns_from_guest(struct context *ctx, xen_pfn_t *dst,
++                                 void *src, size_t count)
++{
++    size_t x;
++
++    if ( ctx->x86_pv.width == sizeof(unsigned long) )
++        memcpy(dst, src, count * sizeof *dst);
++    else
++    {
++        for ( x = 0; x < count; ++x )
++        {
++#ifdef __x86_64__
++            /* 64bit toolstack, 32bit guest.  Expand any INVALID_MFN. */
++            uint32_t s = ((uint32_t *)src)[x];
++
++            dst[x] = s == ~0U ? INVALID_MFN : s;
++#else
++            /* 32bit toolstack, 64bit guest.  Truncate their pointers */
++            dst[x] = ((uint64_t *)src)[x];
++#endif
++        }
++    }
++}
++
++static int map_p2m(struct context *ctx)
++{
++    /* Terminology:
++     *
++     * fll   - frame list list, top level p2m, list of fl mfns
++     * fl    - frame list, mid level p2m, list of leaf mfns
++     * local - own allocated buffers, adjusted for bitness
++     * guest - mappings into the domain
++     */
++    xc_interface *xch = ctx->xch;
++    int rc = -1;
++    unsigned tries = 100, x, fpp, fll_entries, fl_entries;
++    xen_pfn_t fll_mfn;
++
++    xen_pfn_t *local_fll = NULL;
++    void *guest_fll = NULL;
++    size_t local_fll_size;
++
++    xen_pfn_t *local_fl = NULL;
++    void *guest_fl = NULL;
++    size_t local_fl_size;
++
++    fpp = ctx->x86_pv.fpp = PAGE_SIZE / ctx->x86_pv.width;
++    fll_entries = (ctx->x86_pv.max_pfn / (fpp * fpp)) + 1;
++    fl_entries  = (ctx->x86_pv.max_pfn / fpp) + 1;
++
++    fll_mfn = GET_FIELD(ctx, ctx->x86_pv.shinfo, arch.pfn_to_mfn_frame_list_list);
++    if ( !fll_mfn )
++        IPRINTF("Waiting for domain to set up its p2m frame list list");
++
++    while ( tries-- && !fll_mfn )
++    {
++        usleep(10000);
++        fll_mfn = GET_FIELD(ctx, ctx->x86_pv.shinfo,
++                            arch.pfn_to_mfn_frame_list_list);
++    }
++
++    if ( !fll_mfn )
++    {
++        ERROR("Timed out waiting for p2m frame list list to be updated");
++        goto err;
++    }
++
++    /* Map the guest top p2m */
++    guest_fll = xc_map_foreign_range(xch, ctx->domid, PAGE_SIZE,
++                                     PROT_READ, fll_mfn);
++    if ( !guest_fll )
++    {
++        PERROR("Failed to map p2m frame list list at %#lx", fll_mfn);
++        goto err;
++    }
++
++    local_fll_size = fll_entries * sizeof *local_fll;
++    local_fll = malloc(local_fll_size);
++    if ( !local_fll )
++    {
++        ERROR("Cannot allocate %zu bytes for local p2m frame list list",
++              local_fll_size);
++        goto err;
++    }
++
++    copy_pfns_from_guest(ctx, local_fll, guest_fll, fll_entries);
++
++    /* Map the guest mid p2m frames */
++    guest_fl = xc_map_foreign_pages(xch, ctx->domid, PROT_READ,
++                                    local_fll, fll_entries);
++    if ( !guest_fl )
++    {
++        PERROR("Failed to map p2m frame list");
++        goto err;
++    }
++
++    local_fl_size = fl_entries * sizeof *local_fl;
++    local_fl = malloc(local_fl_size);
++    if ( !local_fl )
++    {
++        ERROR("Cannot allocate %zu bytes for local p2m frame list",
++              local_fl_size);
++        goto err;
++    }
++
++    copy_pfns_from_guest(ctx, local_fl, guest_fl, fl_entries);
++
++    /* Map the p2m leaves themselves */
++    ctx->x86_pv.p2m = xc_map_foreign_pages(xch, ctx->domid, PROT_READ,
++                                           local_fl, fl_entries);
++    if ( !ctx->x86_pv.p2m )
++    {
++        PERROR("Failed to map p2m frames");
++        goto err;
++    }
++
++    ctx->x86_pv.p2m_frames = fl_entries;
++    ctx->x86_pv.p2m_pfns = malloc(local_fl_size);
++    if ( !ctx->x86_pv.p2m_pfns )
++    {
++        ERROR("Cannot allocate %zu bytes for p2m pfns list",
++              local_fl_size);
++        goto err;
++    }
++
++    /* Convert leaf frames from mfns to pfns */
++    for ( x = 0; x < fl_entries; ++x )
++        if ( !mfn_in_pseudophysmap(ctx, local_fl[x]) )
++        {
++            ERROR("Bad MFN in p2m_frame_list[%u]", x);
++            pseudophysmap_walk(ctx, local_fl[x]);
++            errno = ERANGE;
++            goto err;
++        }
++        else
++            ctx->x86_pv.p2m_pfns[x] = mfn_to_pfn(ctx, local_fl[x]);
++
++    rc = 0;
++err:
++
++    free(local_fl);
++    if ( guest_fl )
++        munmap(guest_fl, fll_entries * PAGE_SIZE);
++
++    free(local_fll);
++    if ( guest_fll )
++        munmap(guest_fll, PAGE_SIZE);
++
++    return rc;
++}
++
++static int write_one_vcpu_basic(struct context *ctx, uint32_t id)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t mfn, pfn;
++    unsigned i;
++    int rc = -1;
++    vcpu_guest_context_any_t vcpu;
++    struct rec_x86_pv_vcpu vhdr = { .vcpu_id = id };
++    struct record rec =
++    {
++        .type = REC_TYPE_x86_pv_vcpu_basic,
++        .length = sizeof vhdr,
++        .data = &vhdr,
++    };
++
++    if ( xc_vcpu_getcontext(xch, ctx->domid, id, &vcpu) )
++    {
++        PERROR("Failed to get vcpu%u context", id);
++        goto err;
++    }
++
++    /* Vcpu 0 is special: Convert the suspend record to a PFN */
++    if ( id == 0 )
++    {
++        mfn = GET_FIELD(ctx, &vcpu, user_regs.edx);
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("Bad MFN for suspend record");
++            pseudophysmap_walk(ctx, mfn);
++            errno = ERANGE;
++            goto err;
++        }
++        SET_FIELD(ctx, &vcpu, user_regs.edx, mfn_to_pfn(ctx, mfn));
++    }
++
++    /* Convert GDT frames to PFNs */
++    for ( i = 0; (i * 512) < GET_FIELD(ctx, &vcpu, gdt_ents); ++i )
++    {
++        mfn = GET_FIELD(ctx, &vcpu, gdt_frames[i]);
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("Bad MFN for frame %u of vcpu%u's GDT", i, id);
++            pseudophysmap_walk(ctx, mfn);
++            errno = ERANGE;
++            goto err;
++        }
++        SET_FIELD(ctx, &vcpu, gdt_frames[i], mfn_to_pfn(ctx, mfn));
++    }
++
++    /* Convert CR3 to a PFN */
++    mfn = cr3_to_mfn(ctx, GET_FIELD(ctx, &vcpu, ctrlreg[3]));
++    if ( !mfn_in_pseudophysmap(ctx, mfn) )
++    {
++        ERROR("Bad MFN for vcpu%u's cr3", id);
++        pseudophysmap_walk(ctx, mfn);
++        errno = ERANGE;
++        goto err;
++    }
++    pfn = mfn_to_pfn(ctx, mfn);
++    SET_FIELD(ctx, &vcpu, ctrlreg[3], mfn_to_cr3(ctx, pfn));
++
++    /* 64bit guests: Convert CR1 (guest pagetables) to PFN */
++    if ( ctx->x86_pv.levels == 4 && vcpu.x64.ctrlreg[1] )
++    {
++        mfn = vcpu.x64.ctrlreg[1] >> PAGE_SHIFT;
++        if ( !mfn_in_pseudophysmap(ctx, mfn) )
++        {
++            ERROR("Bad MFN for vcpu%u's cr1", id);
++            pseudophysmap_walk(ctx, mfn);
++            errno = ERANGE;
++            goto err;
++        }
++
++        pfn = mfn_to_pfn(ctx, mfn);
++        vcpu.x64.ctrlreg[1] = 1 | ((uint64_t)pfn << PAGE_SHIFT);
++    }
++
++    if ( ctx->x86_pv.width == 8 )
++        rc = write_split_record(ctx, &rec, &vcpu, sizeof vcpu.x64);
++    else
++        rc = write_split_record(ctx, &rec, &vcpu, sizeof vcpu.x32);
++
++    if ( rc )
++        goto err;
++
++    DPRINTF("Writing vcpu%u basic context", id);
++    rc = 0;
++ err:
++
++    return rc;
++}
++
++static int write_one_vcpu_extended(struct context *ctx, uint32_t id)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++    struct rec_x86_pv_vcpu vhdr = { .vcpu_id = id };
++    struct record rec =
++    {
++        .type = REC_TYPE_x86_pv_vcpu_extended,
++        .length = sizeof vhdr,
++        .data = &vhdr,
++    };
++    struct xen_domctl domctl =
++    {
++        .cmd = XEN_DOMCTL_get_ext_vcpucontext,
++        .domain = ctx->domid,
++        .u.ext_vcpucontext.vcpu = id,
++    };
++
++    if ( xc_domctl(xch, &domctl) < 0 )
++    {
++        PERROR("Unable to get vcpu%u extended context", id);
++        return -1;
++    }
++
++    rc = write_split_record(ctx, &rec, &domctl.u.ext_vcpucontext,
++                            domctl.u.ext_vcpucontext.size);
++    if ( rc )
++        return rc;
++
++    DPRINTF("Writing vcpu%u extended context", id);
++
++    return 0;
++}
++
++static int write_one_vcpu_xsave(struct context *ctx, uint32_t id)
++{
++    xc_interface *xch = ctx->xch;
++    int rc = -1;
++    DECLARE_HYPERCALL_BUFFER(void, buffer);
++    struct rec_x86_pv_vcpu_xsave vhdr = { .vcpu_id = id };
++    struct record rec =
++    {
++        .type = REC_TYPE_x86_pv_vcpu_xsave,
++        .length = sizeof vhdr,
++        .data = &vhdr,
++    };
++    struct xen_domctl domctl =
++    {
++        .cmd = XEN_DOMCTL_getvcpuextstate,
++        .domain = ctx->domid,
++        .u.vcpuextstate.vcpu = id,
++    };
++
++    if ( xc_domctl(xch, &domctl) < 0 )
++    {
++        PERROR("Unable to get vcpu%u's xsave context", id);
++        goto err;
++    }
++
++    if ( !domctl.u.vcpuextstate.xfeature_mask )
++    {
++        DPRINTF("vcpu%u has no xsave context - skipping", id);
++        goto out;
++    }
++
++    buffer = xc_hypercall_buffer_alloc(xch, buffer, domctl.u.vcpuextstate.size);
++    if ( !buffer )
++    {
++        ERROR("Unable to allocate %"PRIx64" bytes for vcpu%u's xsave context",
++              domctl.u.vcpuextstate.size, id);
++        goto err;
++    }
++
++    set_xen_guest_handle(domctl.u.vcpuextstate.buffer, buffer);
++    if ( xc_domctl(xch, &domctl) < 0 )
++    {
++        PERROR("Unable to get vcpu%u's xsave context", id);
++        goto err;
++    }
++
++    vhdr.xfeature_mask = domctl.u.vcpuextstate.xfeature_mask;
++
++    rc = write_split_record(ctx, &rec, buffer, domctl.u.vcpuextstate.size);
++    if ( rc )
++        goto err;
++
++    DPRINTF("Writing vcpu%u xsave context", id);
++
++ out:
++    rc = 0;
++
++ err:
++    xc_hypercall_buffer_free(xch, buffer);
++
++    return rc;
++}
++
++static int write_all_vcpu_information(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    xc_vcpuinfo_t vinfo;
++    unsigned int i;
++    int rc;
++
++    for ( i = 0; i <= ctx->dominfo.max_vcpu_id; ++i )
++    {
++        rc = xc_vcpu_getinfo(xch, ctx->domid, i, &vinfo);
++        if ( rc )
++        {
++            PERROR("Failed to get vcpu%u information", i);
++            return rc;
++        }
++
++        if ( !vinfo.online )
++        {
++            DPRINTF("vcpu%u offline - skipping", i);
++            continue;
++        }
++
++        rc = write_one_vcpu_basic(ctx, i) ?:
++            write_one_vcpu_extended(ctx, i) ?:
++            write_one_vcpu_xsave(ctx, i);
++        if ( rc )
++            return rc;
++    };
++
++    return 0;
++}
++
++static int write_x86_pv_info(struct context *ctx)
++{
++    struct rec_x86_pv_info info =
++        {
++            .guest_width = ctx->x86_pv.width,
++            .pt_levels = ctx->x86_pv.levels,
++        };
++    struct record rec =
++        {
++            .type = REC_TYPE_x86_pv_info,
++            .length = sizeof info,
++            .data = &info
++        };
++
++    return write_record(ctx, &rec);
++}
++
++static int write_x86_pv_p2m_frames(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc; unsigned i;
++    size_t datasz = ctx->x86_pv.p2m_frames * sizeof(uint64_t);
++    uint64_t *data = NULL;
++    struct rec_x86_pv_p2m_frames hdr =
++        {
++            .start_pfn = 0,
++            .end_pfn = ctx->x86_pv.max_pfn,
++        };
++    struct record rec =
++        {
++            .type = REC_TYPE_x86_pv_p2m_frames,
++            .length = sizeof hdr,
++            .data = &hdr,
++        };
++
++    /* No need to translate if sizeof(uint64_t) == sizeof(xen_pfn_t) */
++    if ( sizeof(uint64_t) != sizeof(*ctx->x86_pv.p2m_pfns) )
++    {
++        if ( !(data = malloc(datasz)) )
++        {
++            ERROR("Cannot allocate %zu bytes for X86_PV_P2M_FRAMES data", datasz);
++            return -1;
++        }
++
++        for ( i = 0; i < ctx->x86_pv.p2m_frames; ++i )
++            data[i] = ctx->x86_pv.p2m_pfns[i];
++    }
++    else
++        data = (uint64_t *)ctx->x86_pv.p2m_pfns;
++
++    rc = write_split_record(ctx, &rec, data, datasz);
++
++    if ( data != (uint64_t *)ctx->x86_pv.p2m_pfns )
++        free(data);
++
++    return rc;
++}
++
++static int write_shared_info(struct context *ctx)
++{
++    struct record rec =
++    {
++        .type = REC_TYPE_shared_info,
++        .length = PAGE_SIZE,
++        .data = ctx->x86_pv.shinfo,
++    };
++
++    return write_record(ctx, &rec);
++}
++
++int save_x86_pv(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++    struct record end = { REC_TYPE_end, 0, NULL };
++
++    IPRINTF("In experimental %s", __func__);
++
++    /* Write Image and Domain headers to the stream */
++    rc = write_headers(ctx, DHDR_TYPE_x86_pv);
++    if ( rc )
++        goto err;
++
++    /* Query some properties, and stash in the save context */
++    rc = x86_pv_domain_info(ctx);
++    if ( rc )
++        goto err;
++
++    /* Write an X86_PV_INFO record into the stream */
++    rc = write_x86_pv_info(ctx);
++    if ( rc )
++        goto err;
++
++    /* Map various structures */
++    rc = x86_pv_map_m2p(ctx) ?: map_shinfo(ctx) ?: map_p2m(ctx);
++    if ( rc )
++        goto err;
++
++    /* Write a full X86_PV_P2M_FRAMES record into the stream */
++    rc = write_x86_pv_p2m_frames(ctx);
++    if ( rc )
++        goto err;
++
++    rc = write_page_data_and_pause(ctx);
++    if ( rc )
++        goto err;
++
++    rc = write_tsc_info(ctx);
++    if ( rc )
++        goto err;
++
++    rc = write_shared_info(ctx);
++    if ( rc )
++        goto err;
++
++    /* Refresh domain information now it has paused */
++    if ( (xc_domain_getinfo(xch, ctx->domid, 1, &ctx->dominfo) != 1) ||
++         (ctx->dominfo.domid != ctx->domid) )
++    {
++        PERROR("Unable to refresh domain information");
++        rc = -1;
++        goto err;
++    }
++    else if ( (!ctx->dominfo.shutdown ||
++               ctx->dominfo.shutdown_reason != SHUTDOWN_suspend ) &&
++              !ctx->dominfo.paused )
++    {
++        ERROR("Domain has not been suspended");
++        rc = -1;
++        goto err;
++    }
++
++    /* Write all the vcpu information */
++    rc = write_all_vcpu_information(ctx);
++    if ( rc )
++        goto err;
++
++    /* Write an END record */
++    rc = write_record(ctx, &end);
++    if ( rc )
++        goto err;
++
++    /* all done */
++    assert(!rc);
++    goto cleanup;
++
++ err:
++    assert(rc);
++ cleanup:
++
++    xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
++                      NULL, 0, NULL, 0, NULL);
++
++    free(ctx->x86_pv.p2m_pfns);
++
++    if ( ctx->x86_pv.p2m )
++        munmap(ctx->x86_pv.p2m, ctx->x86_pv.p2m_frames * PAGE_SIZE);
++
++    if ( ctx->x86_pv.shinfo )
++        munmap(ctx->x86_pv.shinfo, PAGE_SIZE);
++
++    if ( ctx->x86_pv.m2p )
++        munmap(ctx->x86_pv.m2p, ctx->x86_pv.nr_m2p_frames * PAGE_SIZE);
++
++    return rc;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */

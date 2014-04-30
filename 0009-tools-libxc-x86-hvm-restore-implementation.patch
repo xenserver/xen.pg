@@ -1,0 +1,334 @@
+From 4209ccb9869fbe26b8d32190b94c7853890078f4 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 28 Apr 2014 16:38:35 +0100
+Subject: [PATCH 9/9] tools/libxc: x86 hvm restore implementation
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+---
+ tools/libxc/saverestore/common.h          |    2 +
+ tools/libxc/saverestore/restore.c         |    5 +-
+ tools/libxc/saverestore/restore_x86_hvm.c |  289 +++++++++++++++++++++++++++++
+ 3 files changed, 294 insertions(+), 2 deletions(-)
+ create mode 100644 tools/libxc/saverestore/restore_x86_hvm.c
+
+diff -r 5c71342c7529 tools/libxc/saverestore/common.h
+--- a/tools/libxc/saverestore/common.h
++++ b/tools/libxc/saverestore/common.h
+@@ -131,6 +131,8 @@ int save_x86_pv(struct context *ctx);
+ int save_x86_hvm(struct context *ctx);
+ /* Restores an x86 PV domain. */
+ int restore_x86_pv(struct context *ctx);
++/* Restores an x86 HVM domain. */
++int restore_x86_hvm(struct context *ctx);
+ 
+ /*
+  * Write the image and domain headers to the stream.
+diff -r 5c71342c7529 tools/libxc/saverestore/restore.c
+--- a/tools/libxc/saverestore/restore.c
++++ b/tools/libxc/saverestore/restore.c
+@@ -99,8 +99,9 @@ int xc_domain_restore2(xc_interface *xch
+ 
+     if ( ctx.dominfo.hvm )
+     {
+-        ERROR("HVM Restore not supported yet");
+-        return -1;
++        ctx.ops = save_restore_ops_x86_hvm;
++        if ( restore_x86_hvm(&ctx) )
++            return -1;
+     }
+     else
+     {
+diff -r 5c71342c7529 tools/libxc/saverestore/restore_x86_hvm.c
+--- /dev/null
++++ b/tools/libxc/saverestore/restore_x86_hvm.c
+@@ -0,0 +1,289 @@
++#include <assert.h>
++
++#include "common_x86_pv.h"
++
++static int handle_end(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++
++    DPRINTF("End record");
++    return 0;
++}
++
++static int handle_toolstack(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++
++    if ( !ctx->restore.callbacks || !ctx->restore.callbacks->toolstack_restore )
++        return 0;
++
++    rc = ctx->restore.callbacks->toolstack_restore(ctx->domid, rec->data, rec->length,
++                                                   ctx->restore.callbacks->data);
++    if ( rc < 0 )
++        PERROR("restoring toolstack");
++    return rc;
++}
++
++static int handle_hvm_context(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++
++    rc = xc_domain_hvm_setcontext(xch, ctx->domid, rec->data, rec->length);
++    if ( rc < 0 )
++        PERROR("Unable to restore HVM context");
++    return rc;
++}
++
++static int handle_hvm_params(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    struct rec_hvm_params *hdr = rec->data;
++    struct rec_hvm_params_entry *entry = hdr->param;
++    unsigned int i;
++    int rc;
++
++    if ( rec->length < sizeof(*hdr)
++         || rec->length < sizeof(*hdr) + hdr->count * sizeof(*entry) )
++    {
++        ERROR("hvm_params record is too short");
++        return -1;
++    }
++
++    for ( i = 0; i < hdr->count; i++, entry++ )
++    {
++        switch ( entry->index )
++        {
++        case HVM_PARAM_CONSOLE_PFN:
++            ctx->restore.console_mfn = entry->value;
++            xc_clear_domain_page(xch, ctx->domid, entry->value);
++            break;
++        case HVM_PARAM_STORE_PFN:
++            ctx->restore.xenstore_mfn = entry->value;
++            xc_clear_domain_page(xch, ctx->domid, entry->value);
++            break;
++        case HVM_PARAM_IOREQ_PFN:
++        case HVM_PARAM_BUFIOREQ_PFN:
++            xc_clear_domain_page(xch, ctx->domid, entry->value);
++            break;
++        }
++
++        rc = xc_set_hvm_param(xch, ctx->domid, entry->index, entry->value);
++        if ( rc < 0 )
++        {
++            PERROR("set HVM param %"PRId64" = 0x%016"PRIx64,
++                   entry->index, entry->value);
++            return rc;
++        }
++    }
++    return 0;
++}
++
++static int set_extra_hvm_params(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++
++    rc = xc_set_hvm_param(xch, ctx->domid, HVM_PARAM_STORE_EVTCHN,
++                          ctx->restore.xenstore_evtchn);
++    if ( rc < 0 )
++    {
++        PERROR("set HVM_PARAM_STORE_EVTCHN");
++        goto out;
++    }
++
++out:
++    return rc;
++}
++
++static int dump_qemu(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    char qemusig[21];
++    uint32_t qlen;
++    void *qbuf = NULL;
++    int saved_errno;
++    char path[256];
++    FILE *fp;
++
++    if ( read_exact(ctx->fd, qemusig, sizeof(qemusig)) )
++    {
++        PERROR("Error reading QEMU signature");
++        goto err;
++    }
++    if ( memcmp(qemusig, "DeviceModelRecord0002", sizeof(qemusig)) )
++    {
++        qemusig[20] = '\0';
++        ERROR("Invalid device model state signature %s", qemusig);
++        goto err;
++    }
++
++    if ( read_exact(ctx->fd, &qlen, sizeof(qlen)) )
++    {
++        PERROR("Error reading QEMU record length");
++        goto err;
++    }
++
++    qbuf = malloc(qlen);
++    if ( !qbuf )
++    {
++        PERROR("no memory for device model state");
++        goto err;
++    }
++
++    if ( read_exact(ctx->fd, qbuf, qlen) )
++    {
++        PERROR("Error reading device model state");
++        goto err;
++    }
++
++    sprintf(path, XC_DEVICE_MODEL_RESTORE_FILE".%u", ctx->domid);
++    fp = fopen(path, "wb");
++    if ( !fp )
++        return -1;
++
++    DPRINTF("Writing %d bytes of QEMU data\n", qlen);
++    if ( fwrite(qbuf, 1, qlen, fp) != qlen )
++    {
++        saved_errno = errno;
++        fclose(fp);
++        errno = saved_errno;
++        goto err;
++    }
++
++    fclose(fp);
++
++    return 0;
++
++err:
++    free(qbuf);
++    return -1;
++}
++
++int restore_x86_hvm(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    struct record rec;
++    int rc;
++
++    IPRINTF("In experimental %s", __func__);
++
++    if ( ctx->restore.guest_type != DHDR_TYPE_x86_hvm )
++    {
++        ERROR("Unable to restore %s domain into an x86_hvm domain",
++              dhdr_type_to_str(ctx->restore.guest_type));
++        return -1;
++    }
++    else if ( ctx->restore.guest_page_size != 4096 )
++    {
++        ERROR("Invalid page size %d for x86_hvm domains",
++              ctx->restore.guest_page_size);
++        return -1;
++    }
++
++    do
++    {
++        rc = read_record(ctx, &rec);
++        if ( rc )
++            goto err;
++
++        switch ( rec.type )
++        {
++        case REC_TYPE_end:
++            rc = handle_end(ctx, &rec);
++            break;
++
++        case REC_TYPE_page_data:
++            rc = handle_page_data(ctx, &rec);
++            break;
++
++        case REC_TYPE_tsc_info:
++            rc = handle_tsc_info(ctx, &rec);
++            break;
++
++        case REC_TYPE_hvm_context:
++            rc = handle_hvm_context(ctx, &rec);
++            break;
++
++        case REC_TYPE_hvm_params:
++            rc = handle_hvm_params(ctx, &rec);
++            break;
++
++        case REC_TYPE_toolstack:
++            rc = handle_toolstack(ctx, &rec);
++            break;
++
++        default:
++            if ( rec.type & REC_TYPE_optional )
++            {
++                IPRINTF("Ignoring optional record (0x%"PRIx32", %s)",
++                        rec.type, rec_type_to_str(rec.type));
++                rc = 0;
++                break;
++            }
++
++            ERROR("Invalid record type (0x%"PRIx32", %s) for x86_pv domains",
++                  rec.type, rec_type_to_str(rec.type));
++            rc = -1;
++            break;
++        }
++
++        free(rec.data);
++        if ( rc )
++            goto err;
++
++    } while ( rec.type != REC_TYPE_end );
++
++    IPRINTF("Finished reading records");
++
++    rc = set_extra_hvm_params(ctx);
++    if ( rc )
++        goto err;
++
++    rc = xc_dom_gnttab_hvm_seed(xch, ctx->domid,
++                                ctx->restore.console_mfn,
++                                ctx->restore.xenstore_mfn,
++                                ctx->restore.console_domid,
++                                ctx->restore.xenstore_domid);
++    if ( rc )
++    {
++        PERROR("Failed to seed grant table");
++        goto err;
++    }
++
++    /*
++     * FIXME: reading the device model state from the stream should be
++     * done by libxl.
++     */
++    dump_qemu(ctx);
++
++    /* all done */
++    IPRINTF("All Done");
++    assert(!rc);
++    goto cleanup;
++
++ err:
++    assert(rc);
++ cleanup:
++
++    free(ctx->x86_pv.p2m);
++    free(ctx->x86_pv.p2m_pfns);
++    free(ctx->x86_pv.pfn_types);
++    free(ctx->restore.populated_pfns);
++
++    if ( ctx->x86_pv.m2p )
++        munmap(ctx->x86_pv.m2p, ctx->x86_pv.nr_m2p_frames * PAGE_SIZE);
++
++    return rc;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */

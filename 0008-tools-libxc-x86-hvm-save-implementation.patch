@@ -1,0 +1,264 @@
+From 3557a6e3a053e0dff8c2d05af2ec789e90346ab1 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 28 Apr 2014 16:23:41 +0100
+Subject: [PATCH 8/9] tools/libxc: x86 hvm save implementation
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+---
+ tools/libxc/saverestore/common.h       |    2 +
+ tools/libxc/saverestore/save.c         |    4 +-
+ tools/libxc/saverestore/save_x86_hvm.c |  220 ++++++++++++++++++++++++++++++++
+ 3 files changed, 224 insertions(+), 2 deletions(-)
+ create mode 100644 tools/libxc/saverestore/save_x86_hvm.c
+
+diff -r 0717082ba8e2 tools/libxc/saverestore/common.h
+--- a/tools/libxc/saverestore/common.h
++++ b/tools/libxc/saverestore/common.h
+@@ -127,6 +127,8 @@ struct context
+ 
+ /* Saves an x86 PV domain. */
+ int save_x86_pv(struct context *ctx);
++/* Saves an x86 HVM domain. */
++int save_x86_hvm(struct context *ctx);
+ /* Restores an x86 PV domain. */
+ int restore_x86_pv(struct context *ctx);
+ 
+diff -r 0717082ba8e2 tools/libxc/saverestore/save.c
+--- a/tools/libxc/saverestore/save.c
++++ b/tools/libxc/saverestore/save.c
+@@ -492,8 +492,8 @@ int xc_domain_save2(xc_interface *xch, i
+ 
+     if ( ctx.dominfo.hvm )
+     {
+-        ERROR("HVM Save not supported yet");
+-        return -1;
++        ctx.ops = save_restore_ops_x86_hvm;
++        return save_x86_hvm(&ctx);
+     }
+     else
+     {
+diff -r 0717082ba8e2 tools/libxc/saverestore/save_x86_hvm.c
+--- /dev/null
++++ b/tools/libxc/saverestore/save_x86_hvm.c
+@@ -0,0 +1,220 @@
++#include <assert.h>
++#include <arpa/inet.h>
++
++#include <xen/hvm/params.h>
++
++#include "common_x86_pv.h"
++
++static int write_hvm_context(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    unsigned long hvm_buf_size;
++    struct record hvm_rec = { .type = REC_TYPE_hvm_context, };
++    int rc;
++
++    hvm_buf_size = xc_domain_hvm_getcontext(xch, ctx->domid, 0, 0);
++    if ( hvm_buf_size == -1 )
++    {
++        PERROR("Couldn't get HVM context size from Xen");
++        rc = -1;
++        goto out;
++    }
++    hvm_rec.data = malloc(hvm_buf_size);
++    if ( !hvm_rec.data )
++    {
++        PERROR("Couldn't allocate memory");
++        rc = -1;
++        goto out;
++    }
++
++    hvm_rec.length = xc_domain_hvm_getcontext(xch, ctx->domid,
++                                              hvm_rec.data, hvm_buf_size);
++    if ( hvm_rec.length < 0 )
++    {
++        PERROR("HVM:Could not get hvm buffer");
++        rc = -1;
++        goto out;
++    }
++
++    rc = write_record(ctx, &hvm_rec);
++    if ( rc < 0 )
++    {
++        PERROR("error write HVM_CONTEXT record");
++        goto out;
++    }
++
++ out:
++    free(hvm_rec.data);
++    return rc;
++}
++
++static int write_hvm_params(struct context *ctx)
++{
++    static const unsigned int params[] = {
++        HVM_PARAM_STORE_PFN,
++        HVM_PARAM_IOREQ_PFN,
++        HVM_PARAM_BUFIOREQ_PFN,
++        HVM_PARAM_PAGING_RING_PFN,
++        HVM_PARAM_ACCESS_RING_PFN,
++        HVM_PARAM_SHARING_RING_PFN,
++        HVM_PARAM_VM86_TSS,
++        HVM_PARAM_CONSOLE_PFN,
++        HVM_PARAM_ACPI_IOPORTS_LOCATION,
++        HVM_PARAM_VIRIDIAN,
++        HVM_PARAM_IDENT_PT,
++        HVM_PARAM_PAE_ENABLED,
++    };
++    static const unsigned int num_params = ARRAY_SIZE(params);
++    xc_interface *xch = ctx->xch;
++    struct rec_hvm_params_entry *entries;
++    struct rec_hvm_params hdr = {
++        .count = 0,
++    };
++    struct record rec = {
++        .type   = REC_TYPE_hvm_params,
++        .length = sizeof(hdr),
++        .data   = &hdr,
++    };
++    unsigned int i;
++    int rc;
++
++    entries = malloc(num_params * sizeof(*entries));
++    if ( !entries )
++    {
++        PERROR("HVM params record");
++        rc = -1;
++        goto out;
++    }
++
++    for ( i = 0; i < num_params; i++ )
++    {
++        uint32_t index = params[i];
++        uint64_t value;
++
++        xc_get_hvm_param(xch, ctx->domid, index, (unsigned long *)&value);
++        if ( value != 0 )
++        {
++            entries[hdr.count].index = index;
++            entries[hdr.count].value = value;
++            hdr.count++;
++        }
++    }
++
++    rc = write_split_record(ctx, &rec, entries, hdr.count * sizeof(*entries));
++    if ( rc < 0 )
++    {
++        PERROR("error write HVM_PARAMS record");
++        goto out;
++    }
++
++out:
++    free(entries);
++    return rc;
++}
++
++static int write_toolstack(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    struct record rec = {
++        .type = REC_TYPE_toolstack,
++        .length = 0,
++    };
++    uint8_t *buf;
++    uint32_t len;
++    int rc;
++
++    if ( !ctx->save.callbacks || !ctx->save.callbacks->toolstack_save )
++        return 0;
++
++    if ( ctx->save.callbacks->toolstack_save(ctx->domid, &buf, &len, ctx->save.callbacks->data) < 0 )
++    {
++        PERROR("Error calling toolstack_save");
++        return -1;
++    }
++
++    rc = write_split_record(ctx, &rec, buf, len);
++    if ( rc < 0 )
++        PERROR("Error writing TOOLSTACK record");
++    free(buf);
++    return rc;
++}
++
++int save_x86_hvm(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++    struct record end = { REC_TYPE_end, 0, NULL };
++
++    IPRINTF("In experimental %s", __func__);
++
++    /* Write Image and Domain headers to the stream */
++    rc = write_headers(ctx, DHDR_TYPE_x86_hvm);
++    if ( rc )
++        goto err;
++
++    rc = write_page_data_and_pause(ctx);
++    if ( rc )
++        goto err;
++
++    rc = write_tsc_info(ctx);
++    if ( rc )
++        goto err;
++
++    /* Refresh domain information now it has paused */
++    if ( (xc_domain_getinfo(xch, ctx->domid, 1, &ctx->dominfo) != 1) ||
++         (ctx->dominfo.domid != ctx->domid) )
++    {
++        PERROR("Unable to refresh domain information");
++        rc = -1;
++        goto err;
++    }
++    else if ( (!ctx->dominfo.shutdown ||
++               ctx->dominfo.shutdown_reason != SHUTDOWN_suspend ) &&
++              !ctx->dominfo.paused )
++    {
++        ERROR("Domain has not been suspended");
++        rc = -1;
++        goto err;
++    }
++
++    rc = write_toolstack(ctx);
++    if ( rc )
++        goto err;
++
++    /* Write the HVM_CONTEXT record. */
++    rc = write_hvm_context(ctx);
++    if ( rc )
++        goto err;
++
++    /* Write HVM_PARAMS record contains applicable HVM params. */
++    rc = write_hvm_params(ctx);
++    if ( rc )
++        goto err;
++
++    /* Write an END record */
++    rc = write_record(ctx, &end);
++    if ( rc )
++        goto err;
++
++    /* all done */
++    assert(!rc);
++    goto cleanup;
++
++ err:
++    assert(rc);
++ cleanup:
++
++    xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
++                      NULL, 0, NULL, 0, NULL);
++    return rc;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */

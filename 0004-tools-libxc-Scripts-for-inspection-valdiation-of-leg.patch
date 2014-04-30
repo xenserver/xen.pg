@@ -1,17 +1,18 @@
-From 1d082ef758ab4b6469a57ddf50f8199b08b8f2f6 Mon Sep 17 00:00:00 2001
+From a664af800dc6a141fc6e214f7b4ea3fa193a8f1e Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 6 Mar 2014 00:03:18 +0000
-Subject: [PATCH 3/6] tools/libxc: Scripts for inspection/valdiation of legacy
+Subject: [PATCH 4/9] tools/libxc: Scripts for inspection/valdiation of legacy
  and new streams
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
- tools/libxc/saverestore/scripts/generate.py        |   59 ++++
- .../libxc/saverestore/scripts/inspect-legacy32.py  |  167 ++++++++++
- tools/libxc/saverestore/scripts/streamspec.py      |   89 ++++++
- tools/libxc/saverestore/scripts/verify.py          |  330 ++++++++++++++++++++
- 4 files changed, 645 insertions(+)
+ tools/libxc/saverestore/scripts/generate.py        |   59 +++
+ .../libxc/saverestore/scripts/inspect-legacy32.py  |  167 +++++++++
+ tools/libxc/saverestore/scripts/streamspec.py      |  106 ++++++
+ tools/libxc/saverestore/scripts/verify.py          |  385 ++++++++++++++++++++
+ 4 files changed, 717 insertions(+)
  create mode 100755 tools/libxc/saverestore/scripts/generate.py
  create mode 100755 tools/libxc/saverestore/scripts/inspect-legacy32.py
  create mode 100644 tools/libxc/saverestore/scripts/streamspec.py
@@ -257,7 +258,7 @@ diff --git a/tools/libxc/saverestore/scripts/streamspec.py b/tools/libxc/saveres
 new file mode 100644
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/streamspec.py
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,106 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -298,6 +299,9 @@ new file mode 100644
 +REC_TYPE_x86_pv_vcpu_xsave    = 0x00000006
 +REC_TYPE_shared_info          = 0x00000007
 +REC_TYPE_tsc_info             = 0x00000008
++REC_TYPE_hvm_context          = 0x00000009
++REC_TYPE_hvm_params           = 0x0000000a
++REC_TYPE_toolstack            = 0x0000000b
 +
 +rec_type_to_str = {
 +    REC_TYPE_end                  : "End",
@@ -309,6 +313,9 @@ new file mode 100644
 +    REC_TYPE_x86_pv_vcpu_xsave    : "x86 PV vcpu xsave",
 +    REC_TYPE_shared_info          : "Shared info",
 +    REC_TYPE_tsc_info             : "TSC info",
++    REC_TYPE_hvm_context          : "HVM context",
++    REC_TYPE_hvm_params           : "HVM params",
++    REC_TYPE_toolstack            : "Toolstack",
 +}
 +
 +# page_data
@@ -347,11 +354,22 @@ new file mode 100644
 +
 +# tsc_info
 +TSC_INFO_FORMAT           = "=IIQI"
++
++# hvm_params
++HVM_PARAMS_FORMAT         = "=II"
++HVM_PARAMS_ENTRY_FORMAT   = "=QQ"
++
++#
++# libxl format
++#
++
++LIBXL_QEMU_SIGNATURE = "DeviceModelRecord0002"
++LIBXL_QEMU_RECORD_HDR = "=%dsI" % (len(LIBXL_QEMU_SIGNATURE), )
 diff --git a/tools/libxc/saverestore/scripts/verify.py b/tools/libxc/saverestore/scripts/verify.py
 new file mode 100755
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/verify.py
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,385 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -586,6 +604,32 @@ new file mode 100755
 +    print ("  Mode %u, %u kHz, %u ns, incarnation %d"
 +           % (mode, khz, nsec, incarn))
 +
++def verify_record_hvm_context(content):
++
++    if len(content) == 0:
++        raise RecordError("Zero length HVM context")
++
++def verify_record_hvm_params(content):
++
++    sz = struct.calcsize(HVM_PARAMS_FORMAT)
++
++    if len(content) < sz:
++        raise RecordError("Length should be at least %u bytes" % (sz, ))
++
++    count, rsvd = struct.unpack(HVM_PARAMS_FORMAT, content[:sz])
++
++    if rsvd != 0:
++        raise RecordError("Reserved field not zero (0x%04x)" % (rsvd, ))
++
++    sz += count * struct.calcsize(HVM_PARAMS_ENTRY_FORMAT)
++
++    if len(content) != sz:
++        raise RecordError("Length should be %u bytes" % (sz, ))
++
++def verify_toolstack(content):
++    # Opaque blob -- nothing to verify.
++    pass
++
 +record_verifiers = {
 +    REC_TYPE_end : verify_record_end,
 +    REC_TYPE_page_data : verify_page_data,
@@ -601,6 +645,10 @@ new file mode 100755
 +
 +    REC_TYPE_shared_info: verify_record_shared_info,
 +    REC_TYPE_tsc_info: verify_record_tsc_info,
++
++    REC_TYPE_hvm_context: verify_record_hvm_context,
++    REC_TYPE_hvm_params: verify_record_hvm_params,
++    REC_TYPE_toolstack: verify_toolstack,
 +}
 +
 +_squahsed_data_records = 0
@@ -649,6 +697,29 @@ new file mode 100755
 +
 +    return type
 +
++def verify_qemu_record(fin):
++
++    sz = struct.calcsize(LIBXL_QEMU_RECORD_HDR)
++
++    hdr = fin.read(sz)
++
++    if len(hdr) == 0:
++        return
++
++    if len(hdr) < sz:
++        raise StreamError("Junk found on the end of the stream")
++
++    (sig, length) = struct.unpack(LIBXL_QEMU_RECORD_HDR, hdr)
++
++    if sig != LIBXL_QEMU_SIGNATURE or length == 0:
++        raise StreamError("Junk found on the end of the stream")
++
++    qemu_record = fin.read(length)
++
++    if len(qemu_record) != length:
++        raise StreamError("Truncated qemu save record")
++
++    print("Libxl qemu save record, length %u" % (length, ))
 +
 +def main(argv = sys.argv):
 +
@@ -663,6 +734,8 @@ new file mode 100755
 +
 +        while verify_record(fin) != REC_TYPE_end:
 +            pass
++
++        verify_qemu_record(fin)
 +
 +        if fin.read(1) != "":
 +            raise StreamError("Junk found on the end of the stream")
