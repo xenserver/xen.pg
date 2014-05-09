@@ -1,4 +1,4 @@
-From a664af800dc6a141fc6e214f7b4ea3fa193a8f1e Mon Sep 17 00:00:00 2001
+From ec241bcbdceec0fa9369b94a0d68f6c632a63a47 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 6 Mar 2014 00:03:18 +0000
 Subject: [PATCH 4/9] tools/libxc: Scripts for inspection/valdiation of legacy
@@ -8,13 +8,13 @@ Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
- tools/libxc/saverestore/scripts/generate.py        |   59 +++
- .../libxc/saverestore/scripts/inspect-legacy32.py  |  167 +++++++++
- tools/libxc/saverestore/scripts/streamspec.py      |  106 ++++++
- tools/libxc/saverestore/scripts/verify.py          |  385 ++++++++++++++++++++
- 4 files changed, 717 insertions(+)
+ tools/libxc/saverestore/scripts/generate.py   |   59 +++
+ tools/libxc/saverestore/scripts/legacy.py     |  535 +++++++++++++++++++++++++
+ tools/libxc/saverestore/scripts/streamspec.py |  109 +++++
+ tools/libxc/saverestore/scripts/verify.py     |  385 ++++++++++++++++++
+ 4 files changed, 1088 insertions(+)
  create mode 100755 tools/libxc/saverestore/scripts/generate.py
- create mode 100755 tools/libxc/saverestore/scripts/inspect-legacy32.py
+ create mode 100755 tools/libxc/saverestore/scripts/legacy.py
  create mode 100644 tools/libxc/saverestore/scripts/streamspec.py
  create mode 100755 tools/libxc/saverestore/scripts/verify.py
 
@@ -82,175 +82,543 @@ new file mode 100755
 +
 +if __name__ == "__main__":
 +    sys.exit(main(sys.argv[1:]))
-diff --git a/tools/libxc/saverestore/scripts/inspect-legacy32.py b/tools/libxc/saverestore/scripts/inspect-legacy32.py
+diff --git a/tools/libxc/saverestore/scripts/legacy.py b/tools/libxc/saverestore/scripts/legacy.py
 new file mode 100755
 --- /dev/null
-+++ b/tools/libxc/saverestore/scripts/inspect-legacy32.py
-@@ -0,0 +1,167 @@
++++ b/tools/libxc/saverestore/scripts/legacy.py
+@@ -0,0 +1,535 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
 +import sys
 +import struct
++import streamspec
++import os
 +
-+fin = None
-+guest_width = 0
-+guest_levels = 0
++__version__ = 1
++
++fin = None     # Input file/fd
++fout = None    # Output file/fd
++twidth = 0     # Legacy toolstack bitness (32 or 64)
++pv = None      # Boolean (pv or hvm)
++
++def stream_read(_ = None):
++    if _ is None:
++        return fin.read()
++    else:
++        return os.read(fin.fileno(), _)
++
++def stream_write(_):
++    if fout is not None:
++        os.write(fout.fileno(), _)
 +
 +class StreamError(StandardError):
 +    pass
 +
-+def rdexact(n):
-+    _ = fin.read(n)
-+    if len(_) != n:
++class VM(object):
++
++    def __init__(self):
++        # Common
++        self.p2m_size = 0
++
++        # PV
++        self.max_vcpu_id = 0
++        self.online_vcpu_map = []
++        self.width = 0
++        self.levels = 0
++        self.basic_len = 0
++        self.extd = False
++        self.xsave_len = 0
++
++def write_ihdr():
++    stream_write(struct.pack(streamspec.IHDR_FORMAT,
++                             streamspec.IHDR_MARKER, # Marker
++                             streamspec.IHDR_IDENT,  # Ident
++                             1,                      # Version
++                             streamspec.IHDR_OPT_LE, # Options
++                             0, 0))                  # Reserved
++
++def write_dhdr():
++    if pv:
++        dtype = streamspec.DHDR_TYPE_x86_pv
++    else:
++        dtype = streamspec.DHDR_TYPE_x86_hvm
++
++    stream_write(struct.pack(streamspec.DHDR_FORMAT,
++                             dtype,        # Type
++                             12,           # Page size
++                             0,            # Reserved
++                             0,            # Xen major (converted)
++                             __version__)) # Xen minor (converted)
++
++def write_record(rt, *argl):
++    alldata = ''.join(argl)
++    length = len(alldata)
++
++    record = struct.pack(streamspec.RH_FORMAT, rt, length) + alldata
++    plen = (8 - (length & 7)) & 7
++    record += '\x00' * plen
++
++    stream_write(record)
++
++def write_pv_info(vm):
++    write_record(streamspec.REC_TYPE_x86_pv_info,
++                 struct.pack(streamspec.X86_PV_INFO_FORMAT,
++                             vm.width, vm.levels, 0))
++
++def write_pv_p2m_frames(vm, pfns):
++    write_record(streamspec.REC_TYPE_x86_pv_p2m_frames,
++                 struct.pack(streamspec.X86_PV_P2M_FRAMES_FORMAT,
++                             0, vm.p2m_size - 1),
++                 struct.pack("Q" * len(pfns), *pfns))
++
++def write_pv_vcpu_basic(vcpu_id, data):
++    write_record(streamspec.REC_TYPE_x86_pv_vcpu_basic,
++                 struct.pack(streamspec.X86_PV_VCPU_FORMAT, vcpu_id, 0),
++                 data)
++
++def write_pv_vcpu_extd(vcpu_id, data):
++    write_record(streamspec.REC_TYPE_x86_pv_vcpu_extended,
++                 struct.pack(streamspec.X86_PV_VCPU_FORMAT, vcpu_id, 0),
++                 data)
++
++def write_pv_vcpu_xsave(vcpu_id, mask, data):
++    write_record(streamspec.REC_TYPE_x86_pv_vcpu_xsave,
++                 struct.pack(streamspec.X86_PV_VCPU_XSAVE_FORMAT,
++                             vcpu_id, 0, mask),
++                 data)
++
++def write_page_data(pfns, pages):
++    if fout is None: # Safe copying 1M buffers around for no reason
++        return
++
++    new_pfns = [(((x & 0xf0000000) << 32) | (x & 0x0fffffff)) for x in pfns]
++
++    # Optimise the needless buffer copying in write_record()
++    stream_write(struct.pack(streamspec.RH_FORMAT,
++                             streamspec.REC_TYPE_page_data,
++                             8 + (len(new_pfns) * 8) + len(pages)))
++    stream_write(struct.pack(streamspec.PAGE_DATA_FORMAT, len(new_pfns), 0))
++    stream_write(struct.pack("Q" * len(new_pfns), *new_pfns))
++    stream_write(pages)
++
++def write_tsc_info(mode, khz, nsec, incarn):
++    write_record(streamspec.REC_TYPE_tsc_info,
++                 struct.pack(streamspec.TSC_INFO_FORMAT,
++                             mode, khz, nsec, incarn))
++
++def write_hvm_params(params):
++    if pv:
++        raise StreamError("HVM-only param in PV stream")
++    elif len(params) % 2:
++        raise RuntimeError("Expected even length list of hvm parameters")
++
++    write_record(streamspec.REC_TYPE_hvm_params,
++                 struct.pack(streamspec.HVM_PARAMS_FORMAT, len(params) / 2, 0),
++                 struct.pack("Q" * len(params), *params))
++
++
++def rdexact(nr_bytes):
++    """Read exactly nr_bytes from fin"""
++    _ = stream_read(nr_bytes)
++    if len(_) != nr_bytes:
 +        raise IOError("Stream truncated")
-+    #print"> read 0x%x bytes" % (n, )
 +    return _
 +
 +def unpack_exact(fmt):
-+    l = struct.calcsize(fmt)
-+    return struct.unpack(fmt, rdexact(l))
++    """Unpack a format from fin"""
++    sz = struct.calcsize(fmt)
++    return struct.unpack(fmt, rdexact(sz))
 +
-+def read_extended_info():
-+    global guest_width, guest_level
-+
-+    sig, rem_length = struct.unpack("II", rdexact(8))
-+
-+    if sig != 0xffffffff:
-+        raise StreamError("Bad extended info signature 0x%08x" % (sig,))
++def unpack_ulongs(nr_ulongs):
++    if twidth == 32:
++        return unpack_exact("I" * nr_ulongs)
 +    else:
-+        print "Endended Info: length 0x%x" % (rem_length,)
++        return unpack_exact("Q" * nr_ulongs)
 +
++def skip_xl_header():
++
++    hdr = rdexact(32)
++    if hdr != "Xen saved domain, xl format\n \0 \r":
++        raise StreamError("No xl header")
++
++    opts = rdexact(16)
++    _, _, _, optlen = struct.unpack("=IIII", opts)
++
++    optdata = rdexact(optlen)
++
++    print "Skipped xl header"
++
++    stream_write(hdr)
++    stream_write(opts)
++    stream_write(optdata)
++
++def read_pv_extended_info(vm):
++
++    marker, = unpack_ulongs(1)
++
++    if twidth == 32:
++        expected = 0xffffffff
++    else:
++        expected = 0xffffffffffffffff
++
++    if marker != expected:
++        raise StreamError("Unexpected extended info marker 0x%x" % (marker, ))
++
++    total_length, = unpack_exact("I")
 +    so_far = 0
-+    while so_far < rem_length:
 +
-+        blkid, datasz = struct.unpack("4sI", rdexact(8))
++    print "Extended Info: length 0x%x" % (total_length, )
++
++    while so_far < total_length:
++
++        blkid, datasz = unpack_exact("=4sI")
 +        so_far += 8
 +
 +        print "  Record type: %s, size 0x%x" % (blkid, datasz)
 +
++        data = rdexact(datasz)
++        so_far += datasz
++
 +        # Eww, but this is how it is done :(
 +        if blkid == "vcpu":
++
++            vm.basic_len = datasz
++
 +            if datasz == 0x1430:
-+                guest_width = 8
-+                guest_levels = 4
++                vm.width = 8
++                vm.levels = 4
 +                print "    64bit domain, 4 levels"
++            elif datasz == 0xaf0:
++                vm.width = 4
++                vm.levels = 3
++                print "    32bit domain, 3 levels"
 +            else:
 +                raise StreamError("Unable to determine guest width/level")
 +
-+        rdexact(datasz)
-+        so_far += datasz
++            write_pv_info(vm)
 +
-+    if so_far != rem_length:
-+        raise StreamError("Overshot total Extended Info size. Consumed 0x%x bytes" % (so_far,))
++        elif blkid == "extv":
++            vm.extd = True
 +
-+def read_chunks():
++        elif blkid == "xcnt":
++            vm.xsave_len, = struct.unpack_from("I", data, 0)
++            print "xcnt sz 0x%x" % (vm.xsave_len, )
++
++        else:
++            raise StreamError("Unrecognised extended block")
++
++
++    if so_far != total_length:
++        raise StreamError("Overshot Extended Info size by %d bytes"
++                          % (so_far - total_length,))
++
++def read_pv_p2m_frames(vm):
++    fpp = 4096 / vm.width
++    p2m_frame_len = (vm.p2m_size - 1) / fpp + 1
++
++    print "P2M frames: fpp %d, p2m_frame_len %d" % (fpp, p2m_frame_len)
++    write_pv_p2m_frames(vm, unpack_ulongs(p2m_frame_len))
++
++def read_pv_tail(vm):
++
++    nr_unmapped_pfns, = unpack_exact("I")
++
++    if nr_unmapped_pfns != 0:
++        # "Unmapped" pfns are bogus
++        _ = unpack_ulongs(nr_unmapped_pfns)
++        raise StreamError("Found bogus 'unmapped pfns'")
++
++    for vcpu_id in vm.online_vcpu_map:
++
++        basic = rdexact(vm.basic_len)
++        print "Got VCPU basic (size 0x%x)" % (vm.basic_len, ),
++        write_pv_vcpu_basic(vcpu_id, basic)
++
++        if vm.extd:
++            extd = rdexact(128)
++            print "extd (size 0x%x)" % (128, ),
++            write_pv_vcpu_extd(vcpu_id, extd)
++
++        if vm.xsave_len:
++            mask, size = unpack_exact("QQ")
++            assert vm.xsave_len - 16 == size
++
++            xsave = rdexact(size)
++            print "xsave (mask 0x%x, size 0x%x)" % (mask, size),
++            write_pv_vcpu_xsave(vcpu_id, mask, xsave)
++        print ""
++
++    shinfo = rdexact(4096)
++    print "Got shinfo"
++
++    write_record(streamspec.REC_TYPE_shared_info, shinfo)
++    write_record(streamspec.REC_TYPE_end, "")
++
++
++def read_chunks(vm):
++
++    hvm_params = []
 +
 +    while True:
 +
-+        chunk_type, = struct.unpack("i", rdexact(4))
-+        print "Chunk: type 0x%x" % (chunk_type,)
++        marker, = unpack_exact("=i")
++        if marker <= 0:
++            print "Chunk: type 0x%x" % (marker, )
 +
-+        if chunk_type == 0:
++        if marker == 0:
 +            print "  End"
++
++            if hvm_params:
++                write_hvm_params(hvm_params)
++
 +            return
 +
-+        elif chunk_type > 0:
-+            print "  Page Batch"
-+            pfn_array = rdexact(chunk_type * 4)
-+            page_data = rdexact(chunk_type * 4096)
++        elif marker > 0:
 +
-+        elif chunk_type == -2:
++            if marker > 1024:
++                raise StreamError("Page batch (%d) exceeded MAX_BATCH"
++                                  % (marker, ))
++            pfns = unpack_ulongs(marker)
++
++            # xc_domain_save() leaves many XEN_DOMCTL_PFINFO_XTAB records for
++            # sequences of pfns it cant map.  Drop these.
++            pfns = [ x for x in pfns if x != 0xf0000000 ]
++
++            if len(set(pfns)) != len(pfns):
++                raise StreamError("Duplicate pfns in batch")
++
++                # print "0x[",
++                # for pfn in pfns:
++                #     print "%x" % (pfn, ),
++                # print "]"
++
++            nr_pages = len([x for x in pfns if (x & 0xf0000000) < 0xd0000000])
++
++            #print "  Page Batch, %d PFNs, %d pages" % (marker, nr_pages)
++            pages = rdexact(nr_pages * 4096)
++
++            write_page_data(pfns, pages)
++
++        elif marker == -1: # XC_SAVE_ID_ENABLE_VERIFY_MODE
++            # Verify mode... Seemingly nothing to do...
++            pass
++
++        elif marker == -2: # XC_SAVE_ID_VCPU_INFO
 +            max_id, = unpack_exact("i")
-+            bitmap = rdexact(((max_id/64) + 1) * 8)
-+            print "  Vcpu info: max_id %d" % (max_id, )
 +
-+        elif chunk_type == -7:
-+            mode, nsec, khz, incarn = unpack_exact("IQII")
-+            print "  TSC_INFO: mode %s, %d ns, %d khz, %d incarn" % ( mode, nsec, khz, incarn)
++            if max_id > 4095:
++                raise StreamError("Vcpu max_id out of range: %d > 4095"
++                                  % (max_id, ) )
 +
-+        elif chunk_type == -9:
++            vm.max_vcpu_id = max_id
++            bitmap = unpack_exact("Q" * ((max_id/64) + 1))
++
++            for idx, word in enumerate(bitmap):
++                bit_idx = 0
++
++                while word > 0:
++                    if word & 1:
++                        vm.online_vcpu_map.append((idx * 64) + bit_idx)
++
++                    bit_idx += 1
++                    word >>= 1
++
++            print "  Vcpu info: max_id %d, online map %s" % (vm.max_vcpu_id,
++                                                             vm.online_vcpu_map)
++
++        elif marker == -3: # XC_SAVE_ID_HVM_IDENT_PT
++            _, ident_pt = unpack_exact("=IQ")
++            print "  EPT Identity Pagetable 0x%x" % (ident_pt, )
++            hvm_params.extend([12, # HVM_PARAM_IDENT_PT
++                               ident_pt])
++
++        elif marker == -4: # XC_SAVE_ID_HVM_VM86_TSS
++            _, vm86_tss = unpack_exact("=IQ")
++            print "  VM86 TSS: 0x%x" % (vm86_tss, )
++            hvm_params.extend([15, # HVM_PARAM_VM86_TSS
++                               vm86_tss])
++
++        elif marker == -5: # XC_SAVE_ID_TMEM
++            raise RuntimeError("todo")
++
++        elif marker == -6: # XC_SAVE_ID_TMEM_EXTRA
++            raise RuntimeError("todo")
++
++        elif marker == -7: # XC_SAVE_ID_TSC_INFO
++            mode, nsec, khz, incarn = unpack_exact("=IQII")
++            print ("  TSC_INFO: mode %s, %d ns, %d khz, %d incarn"
++                   % (mode, nsec, khz, incarn))
++            write_tsc_info(mode, khz, nsec, incarn)
++
++        elif marker == -8: # XC_SAVE_ID_HVM_CONSOLE_PFN
++            _, console_pfn = unpack_exact("=IQ")
++            print "  Console pfn 0x%x" % (console_pfn, )
++            hvm_params.extend([17, # HVM_PARAM_CONSOLE_PFN
++                               console_pfn])
++
++        elif marker == -9: # XC_SAVE_ID_LAST_CHECKPOINT
 +            print "  Last Checkpoint"
++            # Nothing to do
 +
-+        elif chunk_type == -12:
++        elif marker == -10: # XC_SAVE_ID_HVM_ACPI_IOPORTS_LOCATION
++            _, loc = unpack_exact("=IQ")
++            print "  ACPI ioport location 0x%x" % (loc, )
++            hvm_params.extend([19, # HVM_PARAM_ACPI_IOPORTS_LOCATION
++                               loc])
++
++        elif marker == -11: # XC_SAVE_ID_HVM_VIRIDIAN
++            _, loc = unpack_exact("=IQ")
++            print "  Viridian location 0x%x" % (loc, )
++            hvm_params.extend([9, # HVM_PARAM_VIRIDIAN
++                               loc])
++
++        elif marker == -12: # XC_SAVE_ID_COMPRESSED_DATA
 +            sz, = unpack_exact("I")
 +            data = rdexact(sz)
 +            print "  Compressed Data: sz 0x%x" % (sz, )
++            raise RuntimeError("todo")
 +
-+        elif chunk_type == -18:
++        elif marker == -13: # XC_SAVE_ID_ENABLE_COMPRESSION
++            raise RuntimeError("todo")
++
++        elif marker == -14: # XC_SAVE_ID_HVM_GENERATION_ID_ADDR
++            _, genid_loc = unpack_exact("=IQ")
++            print "  Generation ID Address 0x%x" % (genid_loc, )
++            print >> sys.stderr, "TODO - reimplement genid"
++
++        elif marker == -15: # XC_SAVE_ID_HVM_PAGING_RING_PFN
++            _, paging_ring_pfn = unpack_exact("=IQ")
++            print "  Paging ring pfn 0x%x" % (paging_ring_pfn, )
++            hvm_params.extend([27, # HVM_PARAM_PAGING_RING_PFN
++                               paging_ring_pfn])
++
++        elif marker == -16: # XC_SAVE_ID_HVM_ACCESS_RING_PFN
++            _, access_ring_pfn = unpack_exact("=IQ")
++            print "  Access ring pfn 0x%x" % (access_ring_pfn, )
++            hvm_params.extend([28, # HVM_PARAM_ACCESS_RING_PFN
++                               access_ring_pfn])
++
++        elif marker == -17: # XC_SAVE_ID_HVM_SHARING_RING_PFN
++            _, sharing_ring_pfn = unpack_exact("=IQ")
++            print "  Sharing ring pfn 0x%x" % (sharing_ring_pfn, )
++            hvm_params.extend([29, # HVM_PARAM_SHARING_RING_PFN
++                               sharing_ring_pfn])
++
++        elif marker == -18:
 +            sz, = unpack_exact("I")
 +            data = rdexact(sz)
 +            print "  Toolstack Data: sz 0x%x" % (sz, )
++            print >> sys.stderr, "TODO - fix libxl's use of this"
++            write_record(streamspec.REC_TYPE_toolstack, data)
 +
 +        else:
 +            raise StreamError("Unrecognised chunk")
 +
-+def main(argv = sys.argv):
-+    global fin
++def read_hvm_tail(vm):
 +
-+    if len(argv) == 2:
-+        fin = open(argv[1], "rb")
++    io, bufio, store = unpack_exact("QQQ")
++    print "Magic pfns: 0x%x 0x%x 0x%x" % (io, bufio, store)
++    write_hvm_params([5, io,     # HVM_PARAM_IOREQ_PFN
++                      6, bufio,  # HVM_PARAM_BUFIOREQ_PFN
++                      1, store]) # HVM_PARAM_STORE_PFN
++
++    blobsz, = unpack_exact("I")
++    print "Got HVM Context (0x%x bytes)" % (blobsz, )
++    blob = rdexact(blobsz)
++
++    write_record(streamspec.REC_TYPE_hvm_context, blob)
++    write_record(streamspec.REC_TYPE_end, "")
++
++
++
++def read_qemu(vm):
++
++    rawsig = rdexact(21)
++    sig, = struct.unpack("21s", rawsig)
++    print "Qemu signature: %s" % (sig, )
++
++    if sig == "DeviceModelRecord0002":
++        rawsz = rdexact(4)
++        sz, = struct.unpack("I", rawsz)
++        qdata = rdexact(sz)
++
++        stream_write(rawsig)
++        stream_write(rawsz)
++        stream_write(qdata)
++
 +    else:
-+        fin = sys.stdin
++        raise RuntimeError("Unrecognised Qemu sig '%s'" % (sig, ))
++
++
++def read_vm(vm):
 +
 +    try:
-+        # Skip Xl header
-+        if "Xen saved domain, xl format\n \0 \r" != rdexact(32):
-+            raise StreamError("No xl header")
 +
-+        _, _, _, optlen = struct.unpack("=IIII", rdexact(16))
-+        rdexact(optlen)
-+        print "xl header skipped"
++        vm.p2m_size, = unpack_ulongs(1)
++        print "P2M Size: 0x%x" % (vm.p2m_size,)
 +
-+        # P2M size
-+        p2m_size, = struct.unpack("I", rdexact(4))
-+        print "P2M Size: 0x%x" % (p2m_size,)
++        write_ihdr()
++        write_dhdr()
 +
-+        # Extended info
-+        read_extended_info()
++        if pv:
++            read_pv_extended_info(vm)
++            read_pv_p2m_frames(vm)
 +
-+        # P2M list
++        read_chunks(vm)
 +
-+        fpp = 4096/guest_width
-+        p2m_len = (p2m_size + fpp - 1) / fpp
++        if pv:
++            read_pv_tail(vm)
++        else:
++            read_hvm_tail(vm)
++            read_qemu(vm)
 +
-+        print "Reading p2m frames.  fpp: %d, p2m_len: %d" % (fpp, p2m_len)
++        _ = stream_read(1)
++        if _ != "":
++            _ += stream_read()
 +
-+        p2m_frames = rdexact(p2m_len * 4)
-+        if p2m_len < 20:
-+            print list(struct.unpack("I" * p2m_len, p2m_frames))
++            print "%d unexpected trailing bytes in stream" % (len(_), )
 +
-+        read_chunks()
-+
-+        unmapped_pfn_count, = unpack_exact("I")
-+        unmapped_pfn_list = rdexact(unmapped_pfn_count * 4)
-+        print "Unmapped PFN count: 0x%x" % (unmapped_pfn_count, )
-+
-+        # VCPU Context fudge
-+        _ = rdexact(0x1430)
-+        _ = rdexact(128)
-+        xfeature_mask, xsize = unpack_exact("QQ")
-+        _ = rdexact(xsize)
-+        print "Got VCPU information"
-+
-+        shared_info = rdexact(4096)
-+        print "Got shinfo"
-+
-+        if fin.read(1) != "":
 +            raise StreamError("Junk found on the end of the stream")
 +
 +    except (IOError, StreamError, ) as e:
-+        print "Error: ", e
++        print >> sys.stderr, "Error: ", e
 +        return 1
 +
 +    except RuntimeError as e:
-+        print "Script error", e
-+        print "Please fix me"
++        print >> sys.stderr, "Script error", e
++        print >> sys.stderr, "Please fix me"
 +        return 2
-+
-+    print "Done"
 +    return 0
 +
++def usage():
++    print >> sys.stderr, "%s img <32|64> <pv|hvm> xl-to-skip?" % sys.argv[0]
++    return 1
++
++def main(argv):
++    global fin, fout, twidth, pv
++
++    if ( len(argv) not in (5, 6) or
++         argv[2] not in ("32", "64") or
++         argv[3] not in ("pv", "hvm") or
++         argv[4] not in ("0", "1") ):
++        sys.exit(usage())
++
++    fin = open(argv[1], "rb")
++    twidth = int(argv[2])
++    pv = argv[3] == "pv"
++
++    if len(argv) == 6:
++        fout = open(argv[5], "wb")
++
++    if int(argv[4]):
++        skip_xl_header()
++
++    rc = read_vm(VM())
++
++    fout.close()
++
++    return rc
 +
 +if __name__ == "__main__":
 +    sys.exit(main(sys.argv))
@@ -258,14 +626,15 @@ diff --git a/tools/libxc/saverestore/scripts/streamspec.py b/tools/libxc/saveres
 new file mode 100644
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/streamspec.py
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,109 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
 +# Image Header
 +IHDR_FORMAT = "!QIIHHI"
 +
-+IHDR_IDENT = 0x58454E46 # "XENF" in ASCII
++IHDR_MARKER = 0xffffffffffffffff
++IHDR_IDENT  = 0x58454E46 # "XENF" in ASCII
 +
 +IHDR_OPT_ENDIAN_ = 0
 +IHDR_OPT_LE = (0 << IHDR_OPT_ENDIAN_)
@@ -345,6 +714,8 @@ new file mode 100644
 +X86_PV_INFO_OPT_VMASST    = (1 << X86_PV_INFO_OPT_VMASST_)
 +
 +X86_PV_INFO_OPT_RESZ_MASK = 0xfe
++
++X86_PV_P2M_FRAMES_FORMAT  = "=II"
 +
 +# x86_pv_vcpu_{basic,extended}
 +X86_PV_VCPU_FORMAT        = "=II"
