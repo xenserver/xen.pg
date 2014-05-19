@@ -1,0 +1,396 @@
+# HG changeset patch
+# User Paul Durrant <paul.durrant@citrix.com>
+# Date 1399888999 -7200
+# Node ID cbcd61b780db1a77218d44117dbafd3e42b1d4b4
+# Parent  5de95dc797f5a9a923a780f09e2e6f41b2543c67
+ioreq-server: on-demand creation of ioreq server
+
+This patch only creates the ioreq server when the legacy HVM parameters
+are read (by an emulator).
+
+A lock is introduced to protect access to the ioreq server by multiple
+emulator/tool invocations should such an eventuality arise. The guest is
+protected by creation of the ioreq server only being done whilst the
+domain is paused.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 5de95dc797f5 -r cbcd61b780db xen/arch/x86/hvm/hvm.c
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -652,74 +652,157 @@ static void hvm_ioreq_server_remove_vcpu
+     spin_unlock(&s->lock);
+ }
+ 
++static void hvm_ioreq_server_remove_all_vcpus(struct hvm_ioreq_server *s)
++{
++    struct hvm_ioreq_vcpu *sv, *next;
++
++    spin_lock(&s->lock);
++
++    list_for_each_entry_safe ( sv,
++                               next,
++                               &s->ioreq_vcpu_list,
++                               list_entry )
++    {
++        struct vcpu *v = sv->vcpu;
++
++        list_del(&sv->list_entry);
++
++        if ( v->vcpu_id == 0 )
++            free_xen_event_channel(v, s->bufioreq_evtchn);
++
++        free_xen_event_channel(v, sv->ioreq_evtchn);
++
++        xfree(sv);
++    }
++
++    spin_unlock(&s->lock);
++}
++
++static int hvm_ioreq_server_map_pages(struct hvm_ioreq_server *s)
++{
++    struct domain *d = s->domain;
++    unsigned long pfn;
++    int rc;
++
++    pfn = d->arch.hvm_domain.params[HVM_PARAM_IOREQ_PFN];
++    rc = hvm_map_ioreq_page(s, 0, pfn);
++    if ( rc )
++        return rc;
++
++    pfn = d->arch.hvm_domain.params[HVM_PARAM_BUFIOREQ_PFN];
++    rc = hvm_map_ioreq_page(s, 1, pfn);
++    if ( rc )
++        goto fail;
++
++    return 0;
++
++fail:
++    hvm_unmap_ioreq_page(s, 0);
++    return rc;
++}
++
++static void hvm_ioreq_server_unmap_pages(struct hvm_ioreq_server *s)
++{
++    hvm_unmap_ioreq_page(s, 1);
++    hvm_unmap_ioreq_page(s, 0);
++}
++
++static int hvm_ioreq_server_init(struct hvm_ioreq_server *s, struct domain *d,
++                                 domid_t domid)
++{
++    struct vcpu *v;
++    int rc;
++
++    s->domain = d;
++    s->domid = domid;
++
++    spin_lock_init(&s->lock);
++    INIT_LIST_HEAD(&s->ioreq_vcpu_list);
++    spin_lock_init(&s->bufioreq_lock);
++
++    rc = hvm_ioreq_server_map_pages(s);
++    if ( rc )
++        return rc;
++
++    for_each_vcpu ( d, v )
++    {
++        rc = hvm_ioreq_server_add_vcpu(s, v);
++        if ( rc )
++            goto fail;
++    }
++
++    return 0;
++
++ fail:
++    hvm_ioreq_server_remove_all_vcpus(s);
++    hvm_ioreq_server_unmap_pages(s);
++
++    return rc;
++}
++
++static void hvm_ioreq_server_deinit(struct hvm_ioreq_server *s)
++{
++    hvm_ioreq_server_remove_all_vcpus(s);
++    hvm_ioreq_server_unmap_pages(s);
++}
++
+ static int hvm_create_ioreq_server(struct domain *d, domid_t domid)
+ {
+     struct hvm_ioreq_server *s;
+-
++    int rc;
++
++    rc = -ENOMEM;
+     s = xzalloc(struct hvm_ioreq_server);
+     if ( !s )
+-        return -ENOMEM;
+-
+-    s->domain = d;
+-    s->domid = domid;
+-
+-    spin_lock_init(&s->lock);
+-    INIT_LIST_HEAD(&s->ioreq_vcpu_list);
+-    spin_lock_init(&s->bufioreq_lock);
+-
+-    /*
+-     * The domain needs to wait until HVM_PARAM_IOREQ_PFN and
+-     * HVM_PARAM_BUFIOREQ_PFN are both set.
+-     */
++        goto fail1;
++
+     domain_pause(d);
+-    domain_pause(d);
++    spin_lock(&d->arch.hvm_domain.ioreq_server_lock);
++
++    rc = -EEXIST;
++    if ( d->arch.hvm_domain.ioreq_server != NULL )
++        goto fail2;
++
++    rc = hvm_ioreq_server_init(s, d, domid);
++    if ( rc )
++        goto fail2;
+ 
+     d->arch.hvm_domain.ioreq_server = s;
++
++    spin_unlock(&d->arch.hvm_domain.ioreq_server_lock);
++    domain_unpause(d);
++
+     return 0;
++
++ fail2:
++    spin_unlock(&d->arch.hvm_domain.ioreq_server_lock);
++    domain_unpause(d);
++
++    xfree(s);
++ fail1:
++    return rc;
+ }
+ 
+ static void hvm_destroy_ioreq_server(struct domain *d)
+ {
+-    struct hvm_ioreq_server *s = d->arch.hvm_domain.ioreq_server;
+-
+-    hvm_unmap_ioreq_page(s, 1);
+-    hvm_unmap_ioreq_page(s, 0);
++    struct hvm_ioreq_server *s;
++
++    domain_pause(d);
++    spin_lock(&d->arch.hvm_domain.ioreq_server_lock);
++
++    s = d->arch.hvm_domain.ioreq_server;
++    if ( s )
++    {
++        d->arch.hvm_domain.ioreq_server = NULL;
++        hvm_ioreq_server_deinit(s);
++    }
++
++    spin_unlock(&d->arch.hvm_domain.ioreq_server_lock);
++    domain_unpause(d);
+ 
+     xfree(s);
+ }
+ 
+-static int hvm_set_ioreq_pfn(struct domain *d, bool_t buf,
+-                             unsigned long pfn)
+-{
+-    struct hvm_ioreq_server *s = d->arch.hvm_domain.ioreq_server;
+-    int rc;
+-
+-    spin_lock(&s->lock);
+-
+-    rc = hvm_map_ioreq_page(s, buf, pfn);
+-    if ( rc )
+-        goto fail;
+-
+-    if ( !buf )
+-    {
+-        struct hvm_ioreq_vcpu *sv;
+-
+-        list_for_each_entry ( sv,
+-                              &s->ioreq_vcpu_list,
+-                              list_entry )
+-            hvm_update_ioreq_evtchn(s, sv);
+-    }
+-
+-    spin_unlock(&s->lock);
+-    domain_unpause(d); /* domain_pause() in hvm_create_ioreq_server() */
+-
+-    return 0;
+-
+- fail:
+-    spin_unlock(&s->lock);
+-    return rc;
+-}
+-
+ static int hvm_replace_event_channel(struct vcpu *v, domid_t remote_domid,
+                                      evtchn_port_t *p_port)
+ {
+@@ -737,9 +820,20 @@ static int hvm_replace_event_channel(str
+ 
+ static int hvm_set_dm_domain(struct domain *d, domid_t domid)
+ {
+-    struct hvm_ioreq_server *s = d->arch.hvm_domain.ioreq_server;
++    struct hvm_ioreq_server *s;
+     int rc = 0;
+ 
++    spin_lock(&d->arch.hvm_domain.ioreq_server_lock);
++
++    /*
++     * Lack of ioreq server is not a failure. HVM_PARAM_DM_DOMAIN will
++     * still be set and thus, when the server is created, it will have
++     * the correct domid.
++     */
++    s = d->arch.hvm_domain.ioreq_server;
++    if ( !s )
++        goto done;
++
+     domain_pause(d);
+     spin_lock(&s->lock);
+ 
+@@ -776,12 +870,13 @@ static int hvm_set_dm_domain(struct doma
+     spin_unlock(&s->lock);
+     domain_unpause(d);
+ 
++ done:
++    spin_unlock(&d->arch.hvm_domain.ioreq_server_lock);
+     return rc;
+ }
+ 
+ int hvm_domain_initialise(struct domain *d)
+ {
+-    domid_t domid;
+     int rc;
+ 
+     if ( !hvm_enabled )
+@@ -807,6 +902,7 @@ int hvm_domain_initialise(struct domain 
+ 
+     }
+ 
++    spin_lock_init(&d->arch.hvm_domain.ioreq_server_lock);
+     spin_lock_init(&d->arch.hvm_domain.irq_lock);
+     spin_lock_init(&d->arch.hvm_domain.uc_lock);
+ 
+@@ -847,21 +943,14 @@ int hvm_domain_initialise(struct domain 
+ 
+     rtc_init(d);
+ 
+-    domid = d->arch.hvm_domain.params[HVM_PARAM_DM_DOMAIN];
+-    rc = hvm_create_ioreq_server(d, domid);
++    register_portio_handler(d, 0xe9, 1, hvm_print_line);
++
++    rc = hvm_funcs.domain_initialise(d);
+     if ( rc != 0 )
+         goto fail2;
+ 
+-    register_portio_handler(d, 0xe9, 1, hvm_print_line);
+-
+-    rc = hvm_funcs.domain_initialise(d);
+-    if ( rc != 0 )
+-        goto fail3;
+-
+     return 0;
+ 
+- fail3:
+-    hvm_destroy_ioreq_server(d);
+  fail2:
+     rtc_deinit(d);
+     stdvga_deinit(d);
+@@ -1518,7 +1607,7 @@ int hvm_vcpu_initialise(struct vcpu *v)
+ {
+     int rc;
+     struct domain *d = v->domain;
+-    struct hvm_ioreq_server *s = d->arch.hvm_domain.ioreq_server;
++    struct hvm_ioreq_server *s;
+ 
+     hvm_asid_flush_vcpu(v);
+ 
+@@ -1561,7 +1650,14 @@ int hvm_vcpu_initialise(struct vcpu *v)
+          && (rc = nestedhvm_vcpu_initialise(v)) < 0 ) /* teardown: nestedhvm_vcpu_destroy */
+         goto fail5;
+ 
+-    rc = hvm_ioreq_server_add_vcpu(s, v);
++    spin_lock(&d->arch.hvm_domain.ioreq_server_lock);
++
++    s = d->arch.hvm_domain.ioreq_server;
++    if ( s )
++        rc = hvm_ioreq_server_add_vcpu(s, v);
++
++    spin_unlock(&d->arch.hvm_domain.ioreq_server_lock);
++
+     if ( rc != 0 )
+         goto fail6;
+ 
+@@ -1598,9 +1694,15 @@ int hvm_vcpu_initialise(struct vcpu *v)
+ void hvm_vcpu_destroy(struct vcpu *v)
+ {
+     struct domain *d = v->domain;
+-    struct hvm_ioreq_server *s = d->arch.hvm_domain.ioreq_server;
+-
+-    hvm_ioreq_server_remove_vcpu(s, v);
++    struct hvm_ioreq_server *s;
++
++    spin_lock(&d->arch.hvm_domain.ioreq_server_lock);
++
++    s = d->arch.hvm_domain.ioreq_server;
++    if ( s )
++        hvm_ioreq_server_remove_vcpu(s, v);
++
++    spin_unlock(&d->arch.hvm_domain.ioreq_server_lock);
+ 
+     nestedhvm_vcpu_destroy(v);
+ 
+@@ -4421,12 +4523,6 @@ long do_hvm_op(unsigned long op, XEN_GUE
+ 
+             switch ( a.index )
+             {
+-            case HVM_PARAM_IOREQ_PFN:
+-                rc = hvm_set_ioreq_pfn(d, 0, a.value);
+-                break;
+-            case HVM_PARAM_BUFIOREQ_PFN:
+-                rc = hvm_set_ioreq_pfn(d, 1, a.value);
+-                break;
+             case HVM_PARAM_CALLBACK_IRQ:
+                 hvm_set_callback_via(d, a.value);
+                 hvm_latch_shinfo_size(d);
+@@ -4472,7 +4568,7 @@ long do_hvm_op(unsigned long op, XEN_GUE
+                 domctl_lock_release();
+                 break;
+             case HVM_PARAM_DM_DOMAIN:
+-                /* Not reflexive, as we must domain_pause(). */
++                /* Not reflexive, as we may need to domain_pause(). */
+                 rc = -EPERM;
+                 if ( curr_d == d )
+                     break;
+@@ -4578,6 +4674,18 @@ long do_hvm_op(unsigned long op, XEN_GUE
+             case HVM_PARAM_ACPI_S_STATE:
+                 a.value = d->arch.hvm_domain.is_s3_suspended ? 3 : 0;
+                 break;
++            case HVM_PARAM_IOREQ_PFN:
++            case HVM_PARAM_BUFIOREQ_PFN:
++            case HVM_PARAM_BUFIOREQ_EVTCHN: {
++                domid_t domid;
++                
++                /* May need to create server */
++                domid = d->arch.hvm_domain.params[HVM_PARAM_DM_DOMAIN];
++                rc = hvm_create_ioreq_server(d, domid);
++                if ( rc != 0 && rc != -EEXIST )
++                    goto param_fail;
++                /*FALLTHRU*/
++            }
+             default:
+                 a.value = d->arch.hvm_domain.params[a.index];
+                 break;
+diff -r 5de95dc797f5 -r cbcd61b780db xen/include/asm-x86/hvm/domain.h
+--- a/xen/include/asm-x86/hvm/domain.h
++++ b/xen/include/asm-x86/hvm/domain.h
+@@ -64,6 +64,7 @@ struct hvm_ioreq_server {
+ };
+ 
+ struct hvm_domain {
++    spinlock_t              ioreq_server_lock;
+     struct hvm_ioreq_server *ioreq_server;
+ 
+     struct pl_time         pl_time;
