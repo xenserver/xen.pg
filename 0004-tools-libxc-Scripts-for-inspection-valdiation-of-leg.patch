@@ -1,4 +1,4 @@
-From ec241bcbdceec0fa9369b94a0d68f6c632a63a47 Mon Sep 17 00:00:00 2001
+From 84a29103b6b6125b8065bf644112ae7b3fd927f6 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 6 Mar 2014 00:03:18 +0000
 Subject: [PATCH 4/9] tools/libxc: Scripts for inspection/valdiation of legacy
@@ -9,10 +9,10 @@ Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
  tools/libxc/saverestore/scripts/generate.py   |   59 +++
- tools/libxc/saverestore/scripts/legacy.py     |  535 +++++++++++++++++++++++++
+ tools/libxc/saverestore/scripts/legacy.py     |  583 +++++++++++++++++++++++++
  tools/libxc/saverestore/scripts/streamspec.py |  109 +++++
- tools/libxc/saverestore/scripts/verify.py     |  385 ++++++++++++++++++
- 4 files changed, 1088 insertions(+)
+ tools/libxc/saverestore/scripts/verify.py     |  385 ++++++++++++++++
+ 4 files changed, 1136 insertions(+)
  create mode 100755 tools/libxc/saverestore/scripts/generate.py
  create mode 100755 tools/libxc/saverestore/scripts/legacy.py
  create mode 100644 tools/libxc/saverestore/scripts/streamspec.py
@@ -86,7 +86,7 @@ diff --git a/tools/libxc/saverestore/scripts/legacy.py b/tools/libxc/saverestore
 new file mode 100755
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/legacy.py
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,583 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -106,11 +106,13 @@ new file mode 100755
 +    if _ is None:
 +        return fin.read()
 +    else:
-+        return os.read(fin.fileno(), _)
++        return fin.read(_)
++        # return os.read(fin.fileno(), _)
 +
 +def stream_write(_):
-+    if fout is not None:
-+        os.write(fout.fileno(), _)
++    return fout.write(_)
++    # if fout is not None:
++    #     os.write(fout.fileno(), _)
 +
 +class StreamError(StandardError):
 +    pass
@@ -327,7 +329,8 @@ new file mode 100755
 +    if nr_unmapped_pfns != 0:
 +        # "Unmapped" pfns are bogus
 +        _ = unpack_ulongs(nr_unmapped_pfns)
-+        raise StreamError("Found bogus 'unmapped pfns'")
++        print "discarding %d bogus 'unmapped pfns'" % (nr_unmapped_pfns, )
++        #raise StreamError("Found bogus 'unmapped pfns'")
 +
 +    for vcpu_id in vm.online_vcpu_map:
 +
@@ -485,7 +488,8 @@ new file mode 100755
 +        elif marker == -14: # XC_SAVE_ID_HVM_GENERATION_ID_ADDR
 +            _, genid_loc = unpack_exact("=IQ")
 +            print "  Generation ID Address 0x%x" % (genid_loc, )
-+            print >> sys.stderr, "TODO - reimplement genid"
++            hvm_params.extend([32, # HVM_PARAM_VM_GENERATION_ID_ADDR
++                               genid_loc])
 +
 +        elif marker == -15: # XC_SAVE_ID_HVM_PAGING_RING_PFN
 +            _, paging_ring_pfn = unpack_exact("=IQ")
@@ -573,14 +577,6 @@ new file mode 100755
 +            read_hvm_tail(vm)
 +            read_qemu(vm)
 +
-+        _ = stream_read(1)
-+        if _ != "":
-+            _ += stream_read()
-+
-+            print "%d unexpected trailing bytes in stream" % (len(_), )
-+
-+            raise StreamError("Junk found on the end of the stream")
-+
 +    except (IOError, StreamError, ) as e:
 +        print >> sys.stderr, "Error: ", e
 +        return 1
@@ -591,31 +587,83 @@ new file mode 100755
 +        return 2
 +    return 0
 +
-+def usage():
-+    print >> sys.stderr, "%s img <32|64> <pv|hvm> xl-to-skip?" % sys.argv[0]
-+    return 1
++def open_file_or_fd(val, mode):
++    """
++    If 'val' looks like a decimal integer, open it as an fd.  If not, try to
++    open it as a regular file.
++    """
++
++    fd = -1
++    try:
++        # Does it look like an integer?
++        try:
++            fd = int(val, 10)
++        except ValueError:
++            pass
++
++        # Try to open it...
++        if fd != -1:
++            return os.fdopen(fd, mode)
++        else:
++            return open(val, mode)
++
++    except StandardError, e:
++        if fd != -1:
++            print >> sys.stderr, "Unable to open fd %d: %s" % (fd, e)
++        else:
++            print >> sys.stderr, "Unable to open file '%s': %s" % (val, e)
++
++    raise SystemExit(1)
++
 +
 +def main(argv):
++    from optparse import OptionParser
 +    global fin, fout, twidth, pv
 +
-+    if ( len(argv) not in (5, 6) or
-+         argv[2] not in ("32", "64") or
-+         argv[3] not in ("pv", "hvm") or
-+         argv[4] not in ("0", "1") ):
-+        sys.exit(usage())
++    # Change stdout to be line-buffered.
++    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 1)
 +
-+    fin = open(argv[1], "rb")
-+    twidth = int(argv[2])
-+    pv = argv[3] == "pv"
++    parser = OptionParser(version = __version__,
++                          usage = ("%prog -i INPUT -o OUTPUT"
++                                   " -w WIDTH -g GUEST [-x]"))
 +
-+    if len(argv) == 6:
-+        fout = open(argv[5], "wb")
++    parser.add_option("-v", action = "store_true", default = False,
++                      help = "More verbose")
 +
-+    if int(argv[4]):
++    # Required options
++    parser.add_option("-i", "--in", dest = "fin", metavar = "<FD or FILE>",
++                      help = "Legacy input to convert")
++    parser.add_option("-o", "--out", dest = "fout", metavar = "<FD or FILE>",
++                      help = "v2 format output")
++    parser.add_option("-w", "--width", dest = "twidth",
++                      metavar = "<32/64>", choices = ["32", "64"],
++                      help = "Legacy toostack bitness")
++    parser.add_option("-g", "--guest-type", dest = "gtype",
++                      metavar = "<pv/hvm>", choices = ["pv", "hvm"],
++                      help = "Type of guest in stream")
++
++    # Optional options
++    parser.add_option("-x", "--xl", action = "store_true", default = False,
++                      help = ("Is an `xl` header present in the stream?"
++                              " (default no)"))
++
++    opts, args = parser.parse_args()
++
++    if (opts.fin is None or opts.fout is None or
++        opts.twidth is None or opts.gtype is None):
++
++        parser.print_help(sys.stderr)
++        raise SystemExit(1)
++
++    fin    = open_file_or_fd(opts.fin,  "rb")
++    fout   = open_file_or_fd(opts.fout, "wb")
++    twidth = int(opts.twidth)
++    pv     = opts.gtype == "pv"
++
++    if opts.xl:
 +        skip_xl_header()
 +
 +    rc = read_vm(VM())
-+
 +    fout.close()
 +
 +    return rc

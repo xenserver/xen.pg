@@ -1,4 +1,4 @@
-From 4209ccb9869fbe26b8d32190b94c7853890078f4 Mon Sep 17 00:00:00 2001
+From d7295378875d8a8c06b8f0db06927a136f7af7bd Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Mon, 28 Apr 2014 16:38:35 +0100
 Subject: [PATCH 9/9] tools/libxc: x86 hvm restore implementation
@@ -8,11 +8,11 @@ Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 ---
  tools/libxc/saverestore/common.h          |    2 +
  tools/libxc/saverestore/restore.c         |    5 +-
- tools/libxc/saverestore/restore_x86_hvm.c |  289 +++++++++++++++++++++++++++++
- 3 files changed, 294 insertions(+), 2 deletions(-)
+ tools/libxc/saverestore/restore_x86_hvm.c |  296 +++++++++++++++++++++++++++++
+ 3 files changed, 301 insertions(+), 2 deletions(-)
  create mode 100644 tools/libxc/saverestore/restore_x86_hvm.c
 
-diff -r 5c71342c7529 tools/libxc/saverestore/common.h
+diff -r d790080e45a6 tools/libxc/saverestore/common.h
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
 @@ -131,6 +131,8 @@ int save_x86_pv(struct context *ctx);
@@ -24,7 +24,7 @@ diff -r 5c71342c7529 tools/libxc/saverestore/common.h
  
  /*
   * Write the image and domain headers to the stream.
-diff -r 5c71342c7529 tools/libxc/saverestore/restore.c
+diff -r d790080e45a6 tools/libxc/saverestore/restore.c
 --- a/tools/libxc/saverestore/restore.c
 +++ b/tools/libxc/saverestore/restore.c
 @@ -99,8 +99,9 @@ int xc_domain_restore2(xc_interface *xch
@@ -39,10 +39,10 @@ diff -r 5c71342c7529 tools/libxc/saverestore/restore.c
      }
      else
      {
-diff -r 5c71342c7529 tools/libxc/saverestore/restore_x86_hvm.c
+diff -r d790080e45a6 tools/libxc/saverestore/restore_x86_hvm.c
 --- /dev/null
 +++ b/tools/libxc/saverestore/restore_x86_hvm.c
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,296 @@
 +#include <assert.h>
 +
 +#include "common_x86_pv.h"
@@ -145,65 +145,67 @@ diff -r 5c71342c7529 tools/libxc/saverestore/restore_x86_hvm.c
 +static int dump_qemu(struct context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
-+    char qemusig[21];
++    char qemusig[21], path[256];
 +    uint32_t qlen;
 +    void *qbuf = NULL;
-+    int saved_errno;
-+    char path[256];
-+    FILE *fp;
++    int rc = -1;
++    FILE *fp = NULL;
 +
 +    if ( read_exact(ctx->fd, qemusig, sizeof(qemusig)) )
 +    {
 +        PERROR("Error reading QEMU signature");
-+        goto err;
++        goto out;
 +    }
++
 +    if ( memcmp(qemusig, "DeviceModelRecord0002", sizeof(qemusig)) )
 +    {
 +        qemusig[20] = '\0';
 +        ERROR("Invalid device model state signature %s", qemusig);
-+        goto err;
++        goto out;
 +    }
 +
 +    if ( read_exact(ctx->fd, &qlen, sizeof(qlen)) )
 +    {
 +        PERROR("Error reading QEMU record length");
-+        goto err;
++        goto out;
 +    }
 +
 +    qbuf = malloc(qlen);
 +    if ( !qbuf )
 +    {
 +        PERROR("no memory for device model state");
-+        goto err;
++        goto out;
 +    }
 +
 +    if ( read_exact(ctx->fd, qbuf, qlen) )
 +    {
 +        PERROR("Error reading device model state");
-+        goto err;
++        goto out;
 +    }
 +
 +    sprintf(path, XC_DEVICE_MODEL_RESTORE_FILE".%u", ctx->domid);
 +    fp = fopen(path, "wb");
 +    if ( !fp )
-+        return -1;
-+
-+    DPRINTF("Writing %d bytes of QEMU data\n", qlen);
-+    if ( fwrite(qbuf, 1, qlen, fp) != qlen )
 +    {
-+        saved_errno = errno;
-+        fclose(fp);
-+        errno = saved_errno;
-+        goto err;
++        PERROR("Failed to open '%s' for writing", path);
++        goto out;
 +    }
 +
-+    fclose(fp);
++    DPRINTF("Writing %u bytes of QEMU data", qlen);
++    if ( fwrite(qbuf, 1, qlen, fp) != qlen )
++    {
++        PERROR("Failed to write %u bytes of QEMU data", qlen);
++        goto out;
++    }
 +
-+    return 0;
++    rc = 0;
 +
-+err:
++ out:
++    if ( fp )
++        fclose(fp);
 +    free(qbuf);
-+    return -1;
++
++    return rc;
 +}
 +
 +int restore_x86_hvm(struct context *ctx)
@@ -301,7 +303,12 @@ diff -r 5c71342c7529 tools/libxc/saverestore/restore_x86_hvm.c
 +     * FIXME: reading the device model state from the stream should be
 +     * done by libxl.
 +     */
-+    dump_qemu(ctx);
++    rc = dump_qemu(ctx);
++    if ( rc )
++    {
++        ERROR("Failed to dump qemu");
++        goto err;
++    }
 +
 +    /* all done */
 +    IPRINTF("All Done");
