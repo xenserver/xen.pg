@@ -1,7 +1,7 @@
 # HG changeset patch
-# Parent 328101871f5bbdbb818c3e24d047c98dbf83a4bf
+# Parent 06197260bdbb3ee9d53e1f602245448deda30314
 
-diff -r 328101871f5b .hgignore
+diff -r 06197260bdbb .hgignore
 --- a/.hgignore
 +++ b/.hgignore
 @@ -243,6 +243,7 @@
@@ -12,7 +12,7 @@ diff -r 328101871f5b .hgignore
  ^tools/xcutils/lsevtchn$
  ^tools/xcutils/xc_restore$
  ^tools/xcutils/xc_save$
-diff -r 328101871f5b mk/xen-4.4.spec.in
+diff -r 06197260bdbb mk/xen-4.4.spec.in
 --- a/mk/xen-4.4.spec.in
 +++ b/mk/xen-4.4.spec.in
 @@ -420,6 +420,7 @@ rm -rf $RPM_BUILD_ROOT
@@ -23,7 +23,7 @@ diff -r 328101871f5b mk/xen-4.4.spec.in
  %{_libdir}/%{name}/bin/xenpaging
  %{_libdir}/%{name}/bin/xenpvnetboot
  
-diff -r 328101871f5b tools/Makefile
+diff -r 06197260bdbb tools/Makefile
 --- a/tools/Makefile
 +++ b/tools/Makefile
 @@ -22,6 +22,7 @@ SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
@@ -34,7 +34,7 @@ diff -r 328101871f5b tools/Makefile
  
  # do not recurse in to a dir we are about to delete
  ifneq "$(MAKECMDGOALS)" "distclean"
-diff -r 328101871f5b tools/xenguest/Makefile
+diff -r 06197260bdbb tools/xenguest/Makefile
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,29 @@
@@ -67,10 +67,10 @@ diff -r 328101871f5b tools/xenguest/Makefile
 +clean:
 +	$(RM) *.o $(ALL_TARGETS)
 +	$(RM) $(DEPS)
-diff -r 328101871f5b tools/xenguest/xenguest.c
+diff -r 06197260bdbb tools/xenguest/xenguest.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,630 @@
 +#include <getopt.h>
 +#include <errno.h>
 +#include <syslog.h>
@@ -638,6 +638,17 @@ diff -r 328101871f5b tools/xenguest/xenguest.c
 +        exit(1);
 +    }
 +
++    if ( opt_domid > 0 )
++    {
++        xs_domain_path = xs_get_domain_path(xsh, opt_domid);
++
++        if ( !xs_domain_path )
++        {
++            err("Failed to obtain XenStore domain path\n");
++            exit(1);
++        }
++    }
++
 +    switch (opt_mode) {
 +    case -1:
 +        err("xenguest: no `-mode' option specified\n");
@@ -670,6 +681,8 @@ diff -r 328101871f5b tools/xenguest/xenguest.c
 +        break;
 +    }
 +
++    free(xs_domain_path);
++
 +    xs_close(xsh);
 +    xc_interface_close(xch);
 +
@@ -688,10 +701,10 @@ diff -r 328101871f5b tools/xenguest/xenguest.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r 328101871f5b tools/xenguest/xenguest_posix.c
+diff -r 06197260bdbb tools/xenguest/xenguest_posix.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest_posix.c
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,271 @@
 +#include <stdlib.h>
 +#include <stdio.h>
 +#include <string.h>
@@ -953,10 +966,20 @@ diff -r 328101871f5b tools/xenguest/xenguest_posix.c
 +    CHK_SYSCALL(close(stdout_pipe[0]));
 +    CHK_SYSCALL(close(stderr_pipe[0]));
 +}
-diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff -r 06197260bdbb tools/xenguest/xenguest_stubs.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,598 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -991,6 +1014,8 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +
 +#include "xg_internal.h"
 +
++char *xs_domain_path = NULL;
++
 +/* The following boolean flags are all set by their value
 +   in the platform area of xenstore. The only value that
 +   is considered true is the string 'true' */
@@ -1015,15 +1040,11 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +static char *
 +xenstore_getsv(xs_handle *xsh, int domid, const char *fmt, va_list ap)
 +{
-+    char *path = NULL, *s = NULL;
++    char *s = NULL;
 +    int n, m;
 +    char key[1024] = { 0 };
 +
-+    path = xs_get_domain_path(xsh, domid);
-+    if (path == NULL)
-+        goto out;
-+
-+    n = snprintf(key, sizeof(key), "%s/", path);
++    n = snprintf(key, sizeof(key), "%s/", xs_domain_path);
 +    if (n < 0)
 +        goto out;
 +    m = vsnprintf(key + n, sizeof(key) - n, fmt, ap);
@@ -1032,7 +1053,6 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +
 +    s = xs_read(xsh, XBT_NULL, key, NULL);
 +out:
-+    free(path);
 +    return s;
 +}
 +
@@ -1077,14 +1097,10 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +xenstore_putsv(xs_handle *xsh, int domid, const char *_key, const char *fmt, ...)
 +{
 +    int n, m, rc = -1;
-+    char *path, key[512], val[512];
++    char key[512], val[512];
 +    va_list ap;
 +
-+    path = xs_get_domain_path(xsh, domid);
-+    if (path == NULL)
-+        goto out;
-+
-+    n = snprintf(key, sizeof(key), "%s/%s", path, _key);
++    n = snprintf(key, sizeof(key), "%s/%s", xs_domain_path, _key);
 +    if (n < 0)
 +        goto out;
 +
@@ -1096,7 +1112,6 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +
 +    rc = xs_write(xsh, XBT_NULL, key, val, strlen(val));
 +out:
-+    free(path);
 +    return rc;
 +}
 +
@@ -1117,9 +1132,15 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +    if ( val )
 +    {
 +        if ( !strcmp(val, "1") )
-+            return 1;
++        {
++            ret = 1;
++            goto out;
++        }
 +        else if ( !strcmp(val, "0") )
-+            return 0;
++        {
++            ret = 0;
++            goto out;
++        }
 +        if ( !strcasecmp(val, "true") )
 +            ret = 1;
 +        else
@@ -1136,6 +1157,7 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +    else
 +        xenstore_puts(xsh, domid, key, "0");
 +
++ out:
 +    free(val);
 +    return ret;
 +}
@@ -1462,9 +1484,10 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +{
 +    uint64_t paddr;
 +    void *vaddr;
-+    const char *genid_val_str;
++    char *genid_val_str;
 +    char *end;
 +    uint64_t genid[2];
++    int rc = -1;
 +
 +    xc_get_hvm_param(xch, domid, HVM_PARAM_VM_GENERATION_ID_ADDR, &paddr);
 +    if (paddr == 0)
@@ -1481,12 +1504,12 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +    if ( errno )
 +    {
 +        err("strtoull of '%s' failed: %s\n", genid_val_str, strerror(errno));
-+        return -1;
++        goto out;
 +    }
 +    else if ( genid[0] == 0 || genid[1] == 0 )
 +    {
 +        err("'%s' is not a valid generation id", genid_val_str);
-+        return -1;
++        goto out;
 +    }
 +
 +    vaddr = xc_map_foreign_range(xch, domid, XC_PAGE_SIZE,
@@ -1494,7 +1517,7 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +                                 paddr >> XC_PAGE_SHIFT);
 +    if (vaddr == NULL) {
 +        err("Failed to map VM generation ID page: %s", strerror(errno));
-+        return -1;
++        goto out;
 +    }
 +    memcpy(vaddr + (paddr & ~XC_PAGE_MASK), genid, 2 * sizeof(*genid));
 +    munmap(vaddr, XC_PAGE_SIZE);
@@ -1505,8 +1528,11 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 +
 +    info("Wrote generation ID %"PRId64":%"PRId64" at 0x%"PRIx64,
 +         genid[0], genid[1], paddr);
++    rc = 0;
 +
-+    return 0;
++ out:
++    free(genid_val_str);
++    return rc;
 +}
 +
 +int stub_xc_domain_restore(xc_interface *xch, xs_handle *xsh, int fd, int domid,
@@ -1552,10 +1578,10 @@ diff -r 328101871f5b tools/xenguest/xenguest_stubs.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r 328101871f5b tools/xenguest/xg_internal.h
+diff -r 06197260bdbb tools/xenguest/xg_internal.h
 --- /dev/null
 +++ b/tools/xenguest/xg_internal.h
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,59 @@
 +#ifndef __XG_INTERNAL_H__
 +#define __XG_INTERNAL_H__
 +
@@ -1601,6 +1627,8 @@ diff -r 328101871f5b tools/xenguest/xg_internal.h
 +
 +void setup_legacy_conversion(int opt_fd, enum xenguest_mode mode);
 +void cleanup_legacy_conversion(void);
++
++extern char *xs_domain_path;
 +
 +#endif
 +
