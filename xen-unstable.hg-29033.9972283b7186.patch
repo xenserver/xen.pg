@@ -1,0 +1,43 @@
+# HG changeset patch
+# User Jason Andryuk <andryuk@aero.org>
+# Date 1400673748 -3600
+# Node ID 9972283b71866d6c3fd15b9fc77a20f9c728f39c
+# Parent  d914c2725cc590499373f40653855051ff88d84a
+libxc: Protect xc_domain_resume from clobbering domain registers
+
+xc_domain_resume() expects the guest to be in state SHUTDOWN_suspend.
+However, nothing verifies the state before modify_returncode() modifies
+the domain's registers.  This will crash guest processes or the kernel
+itself.
+
+This can be demonstrated with `LIBXL_SAVE_HELPER=/bin/false xl migrate`.
+
+Signed-off-by: Jason Andryuk <andryuk@aero.org>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+
+diff -r d914c2725cc5 -r 9972283b7186 tools/libxc/xc_resume.c
+--- a/tools/libxc/xc_resume.c
++++ b/tools/libxc/xc_resume.c
+@@ -33,12 +33,21 @@ static int modify_returncode(xc_interfac
+     struct domain_info_context *dinfo = &_dinfo;
+     int rc;
+ 
+-    if ( xc_domain_getinfo(xch, domid, 1, &info) != 1 )
++    if ( xc_domain_getinfo(xch, domid, 1, &info) != 1 ||
++         info.domid != domid )
+     {
+         PERROR("Could not get domain info");
+         return -1;
+     }
+ 
++    if ( !info.shutdown || (info.shutdown_reason != SHUTDOWN_suspend) )
++    {
++        ERROR("Dom %d not suspended: (shutdown %d, reason %d)", domid,
++              info.shutdown, info.shutdown_reason);
++        errno = EINVAL;
++        return -1;
++    }
++
+     if ( info.hvm )
+     {
+         /* HVM guests without PV drivers have no return code to modify. */
