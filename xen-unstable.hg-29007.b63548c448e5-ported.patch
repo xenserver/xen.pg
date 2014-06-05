@@ -1,0 +1,76 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1400254870 -7200
+# Node ID b63548c448e50b67f8e4a112b0ec2909a3852f4c
+# Parent 9a171771c4ccf8aa435268c9c4cbe81a2afe3bfe
+x86/boot: correct CR4 setup on APs
+
+It is not safe to load mmu_cr4_features into cr4 early on AP start.  Features
+such as MCE require an int 0x18 handler to be set up.
+
+Instead, load the minimum Xen CR4 features early but defer loading the full
+'mmu_cr4_features' set until after the IDT has been set up.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 9a171771c4cc xen/arch/x86/boot/x86_64.S
+--- a/xen/arch/x86/boot/x86_64.S
++++ b/xen/arch/x86/boot/x86_64.S
+@@ -9,8 +9,8 @@
+         mov     %ecx,%gs
+         mov     %ecx,%ss
+ 
+-        /* Enable full CR4 features. */
+-        mov     mmu_cr4_features(%rip),%rcx
++        /* Enable minimal CR4 features. */
++        mov     $XEN_MINIMAL_CR4,%rcx
+         mov     %rcx,%cr4
+ 
+         mov     stack_start(%rip),%rsp
+diff -r 9a171771c4cc xen/arch/x86/setup.c
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -100,8 +100,7 @@ char __attribute__ ((__section__(".bss.s
+ 
+ struct cpuinfo_x86 __read_mostly boot_cpu_data = { 0, 0, 0, 0, -1 };
+ 
+-unsigned long __read_mostly mmu_cr4_features =
+-    X86_CR4_PSE | X86_CR4_PGE | X86_CR4_PAE;
++unsigned long __read_mostly mmu_cr4_features = XEN_MINIMAL_CR4;
+ 
+ bool_t __initdata acpi_disabled;
+ bool_t __initdata acpi_force;
+diff -r 9a171771c4cc xen/arch/x86/smpboot.c
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -318,7 +318,6 @@ void start_secondary(void *unused)
+     this_cpu(curr_vcpu) = idle_vcpu[cpu];
+     if ( cpu_has_efer )
+         rdmsrl(MSR_EFER, this_cpu(efer));
+-    asm volatile ( "mov %%cr4,%0" : "=r" (this_cpu(cr4)) );
+ 
+     /*
+      * Just as during early bootstrap, it is convenient here to disable
+@@ -342,6 +341,9 @@ void start_secondary(void *unused)
+ 
+     /* Full exception support from here on in. */
+ 
++    /* Safe to enable feature such as CR4.MCE with the IDT set up now. */
++    write_cr4(mmu_cr4_features);
++
+     percpu_traps_init();
+ 
+     init_percpu_time();
+diff -r 9a171771c4cc xen/include/asm-x86/processor.h
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -141,6 +141,8 @@
+ #define PFEC_page_paged     (1U<<5)
+ #define PFEC_page_shared    (1U<<6)
+ 
++#define XEN_MINIMAL_CR4 (X86_CR4_PSE | X86_CR4_PGE | X86_CR4_PAE)
++
+ #ifndef __ASSEMBLY__
+ 
+ struct domain;

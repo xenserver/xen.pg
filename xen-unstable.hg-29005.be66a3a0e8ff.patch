@@ -1,0 +1,97 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1400254696 -7200
+# Node ID be66a3a0e8ff4ece3b37a10d56dbc5e270cda732
+# Parent  21e48fc99dc1c7257b0b0646e035aaca201494d9
+x86/traps: functional prep work
+
+* Promote certain actions to earlier in __start_xen().
+* Declare double_fault and early_page_fault as standard trap handlers.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 21e48fc99dc1 -r be66a3a0e8ff xen/arch/x86/setup.c
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -558,8 +558,15 @@ void __init noreturn __start_xen(unsigne
+         .stop_bits = 1
+     };
+ 
++    set_processor_id(0);
++    set_current((struct vcpu *)0xfffff000); /* debug sanity. */
++    idle_vcpu[0] = current;
++
+     percpu_init_areas();
+ 
++    smp_prepare_boot_cpu();
++    sort_exception_tables();
++
+     set_intr_gate(TRAP_page_fault, &early_page_fault);
+ 
+     loader = (mbi->flags & MBI_LOADERNAME)
+@@ -588,15 +595,10 @@ void __init noreturn __start_xen(unsigne
+ 
+     parse_video_info();
+ 
+-    set_current((struct vcpu *)0xfffff000); /* debug sanity */
+-    idle_vcpu[0] = current;
+-    set_processor_id(0); /* needed early, for smp_processor_id() */
+     if ( cpu_has_efer )
+         rdmsrl(MSR_EFER, this_cpu(efer));
+     asm volatile ( "mov %%cr4,%0" : "=r" (this_cpu(cr4)) );
+ 
+-    smp_prepare_boot_cpu();
+-
+     /* We initialise the serial devices very early so we can get debugging. */
+     ns16550.io_base = 0x3f8;
+     ns16550.irq     = 4;
+@@ -1212,8 +1214,6 @@ void __init noreturn __start_xen(unsigne
+     if ( opt_watchdog ) 
+         nmi_watchdog = NMI_LOCAL_APIC;
+ 
+-    sort_exception_tables();
+-
+     find_smp_config();
+ 
+     dmi_scan_machine();
+diff -r 21e48fc99dc1 -r be66a3a0e8ff xen/arch/x86/x86_64/traps.c
+--- a/xen/arch/x86/x86_64/traps.c
++++ b/xen/arch/x86/x86_64/traps.c
+@@ -223,7 +223,6 @@ void show_page_walk(unsigned long addr)
+            l1_table_offset(addr), l1e_get_intpte(l1e), pfn);
+ }
+ 
+-void double_fault(void);
+ void do_double_fault(struct cpu_user_regs *regs)
+ {
+     unsigned int cpu;
+diff -r 21e48fc99dc1 -r be66a3a0e8ff xen/include/asm-x86/processor.h
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -500,12 +500,14 @@ DECLARE_TRAP_HANDLER(overflow);
+ DECLARE_TRAP_HANDLER(bounds);
+ DECLARE_TRAP_HANDLER(invalid_op);
+ DECLARE_TRAP_HANDLER(device_not_available);
++DECLARE_TRAP_HANDLER(double_fault);
+ DECLARE_TRAP_HANDLER(coprocessor_segment_overrun);
+ DECLARE_TRAP_HANDLER(invalid_TSS);
+ DECLARE_TRAP_HANDLER(segment_not_present);
+ DECLARE_TRAP_HANDLER(stack_segment);
+ DECLARE_TRAP_HANDLER(general_protection);
+ DECLARE_TRAP_HANDLER(page_fault);
++DECLARE_TRAP_HANDLER(early_page_fault);
+ DECLARE_TRAP_HANDLER(coprocessor_error);
+ DECLARE_TRAP_HANDLER(simd_coprocessor_error);
+ DECLARE_TRAP_HANDLER(machine_check);
+diff -r 21e48fc99dc1 -r be66a3a0e8ff xen/include/asm-x86/setup.h
+--- a/xen/include/asm-x86/setup.h
++++ b/xen/include/asm-x86/setup.h
+@@ -7,7 +7,6 @@ extern unsigned long xenheap_initial_phy
+ 
+ void early_cpu_init(void);
+ void early_time_init(void);
+-void early_page_fault(void);
+ 
+ int intel_cpu_init(void);
+ int amd_init_cpu(void);

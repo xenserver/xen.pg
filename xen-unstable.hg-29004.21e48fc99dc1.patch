@@ -1,0 +1,147 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1400254666 -7200
+# Node ID 21e48fc99dc1c7257b0b0646e035aaca201494d9
+# Parent  472a751dd7e57c9fffe1eb02dae46c46a13f0e98
+x86/misc: early cleanup
+
+Various bits of cleanup without functional impact as far as the series goes,
+but make subsequent patches cleaner.
+
+* WARN_ON(1) is just WARN().
+* Replace hand-crafted rolled stack printing with fatal_trap().
+* 16 BSS bytes is overkill for an empty idtr to triple fault with.  Construct
+  it on the stack using an appropriate struct, and correct the asm memory
+  constraint.
+* Fix watchdog asymmetry in panic().  machine_halt() needs just as much
+  watchdog care as machine_restart(), but it should be up to the arch
+  implementation of machine_{halt,restart}() to play with the watchdog.
+* unsigned and const correctness for trapstr(), along with whitespace cleanup.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 472a751dd7e5 -r 21e48fc99dc1 xen/arch/x86/shutdown.c
+--- a/xen/arch/x86/shutdown.c
++++ b/xen/arch/x86/shutdown.c
+@@ -34,7 +34,6 @@ enum reboot_type {
+         BOOT_CF9 = 'p',
+ };
+ 
+-static long no_idt[2];
+ static int reboot_mode;
+ 
+ /*
+@@ -466,6 +465,7 @@ void machine_restart(unsigned int delay_
+ {
+     unsigned int i, attempt;
+     enum reboot_type orig_reboot_type = reboot_type;
++    const struct desc_ptr no_idt = { 0 };
+ 
+     watchdog_disable();
+     console_start_sync();
+@@ -532,7 +532,7 @@ void machine_restart(unsigned int delay_
+                            ? BOOT_ACPI : BOOT_TRIPLE);
+             break;
+         case BOOT_TRIPLE:
+-            asm volatile ( "lidt %0 ; int3" : "=m" (no_idt) );
++            asm volatile ("lidt %0; int3" : : "m" (no_idt));
+             reboot_type = BOOT_KBD;
+             break;
+         case BOOT_ACPI:
+diff -r 472a751dd7e5 -r 21e48fc99dc1 xen/arch/x86/traps.c
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -375,21 +375,18 @@ void vcpu_show_execution_state(struct vc
+     vcpu_unpause(v);
+ }
+ 
+-static char *trapstr(int trapnr)
++static const char *trapstr(unsigned int trapnr)
+ {
+-    static char *strings[] = { 
+-        "divide error", "debug", "nmi", "bkpt", "overflow", "bounds", 
+-        "invalid opcode", "device not available", "double fault", 
+-        "coprocessor segment", "invalid tss", "segment not found", 
+-        "stack error", "general protection fault", "page fault", 
+-        "spurious interrupt", "coprocessor error", "alignment check", 
++    static const char * const strings[] = {
++        "divide error", "debug", "nmi", "bkpt", "overflow", "bounds",
++        "invalid opcode", "device not available", "double fault",
++        "coprocessor segment", "invalid tss", "segment not found",
++        "stack error", "general protection fault", "page fault",
++        "spurious interrupt", "coprocessor error", "alignment check",
+         "machine check", "simd error"
+     };
+ 
+-    if ( (trapnr < 0) || (trapnr >= ARRAY_SIZE(strings)) )
+-        return "???";
+-
+-    return strings[trapnr];
++    return trapnr < ARRAY_SIZE(strings) ? strings[trapnr] : "???";
+ }
+ 
+ /*
+@@ -1485,15 +1482,10 @@ void __init do_early_page_fault(struct c
+ 
+     if ( stuck++ == 1000 )
+     {
+-        unsigned long *stk = (unsigned long *)regs;
+-        printk("Early fatal page fault at %04x:%p (cr2=%p, ec=%04x)\n", 
++        console_start_sync();
++        printk("Early fatal page fault at %04x:%p (cr2=%p, ec=%04x)\n",
+                regs->cs, _p(regs->eip), _p(cr2), regs->error_code);
+-        show_page_walk(cr2);
+-        printk("Stack dump: ");
+-        while ( ((long)stk & ((PAGE_SIZE - 1) & ~(BYTES_PER_LONG - 1))) != 0 )
+-            printk("%p ", _p(*stk++));
+-        for ( ; ; )
+-            halt();
++        fatal_trap(TRAP_page_fault, regs);
+     }
+ }
+ 
+@@ -3393,7 +3385,7 @@ void do_debug(struct cpu_user_regs *regs
+             }
+             if ( !debugger_trap_fatal(TRAP_debug, regs) )
+             {
+-                WARN_ON(1);
++                WARN();
+                 regs->eflags &= ~X86_EFLAGS_TF;
+             }
+         }
+@@ -3508,11 +3500,11 @@ void __devinit percpu_traps_init(void)
+ void __init trap_init(void)
+ {
+     /*
+-     * Note that interrupt gates are always used, rather than trap gates. We 
+-     * must have interrupts disabled until DS/ES/FS/GS are saved because the 
+-     * first activation must have the "bad" value(s) for these registers and 
+-     * we may lose them if another activation is installed before they are 
+-     * saved. The page-fault handler also needs interrupts disabled until %cr2 
++     * Note that interrupt gates are always used, rather than trap gates. We
++     * must have interrupts disabled until DS/ES/FS/GS are saved because the
++     * first activation must have the "bad" value(s) for these registers and
++     * we may lose them if another activation is installed before they are
++     * saved. The page-fault handler also needs interrupts disabled until %cr2
+      * has been read and saved on the stack.
+      */
+     set_intr_gate(TRAP_divide_error,&divide_error);
+diff -r 472a751dd7e5 -r 21e48fc99dc1 xen/drivers/char/console.c
+--- a/xen/drivers/char/console.c
++++ b/xen/drivers/char/console.c
+@@ -1124,14 +1124,9 @@ void panic(const char *fmt, ...)
+ #endif
+ 
+     if ( opt_noreboot )
+-    {
+         machine_halt();
+-    }
+     else
+-    {
+-        watchdog_disable();
+         machine_restart(5000);
+-    }
+ }
+ 
+ void __bug(char *file, int line)

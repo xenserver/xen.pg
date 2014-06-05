@@ -1,0 +1,364 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1400502244 -7200
+# Node ID 556fa9483c7c503b78dd18e5dfadd8c4a81e8456
+# Parent f05ebd2abeb2d002b6deac1c250c06a1a85bc318
+x86/irqs: move interrupt-stub generation out of C
+
+In addition, generate stubs for reserved exceptions.  These go through the
+standard handle_exception mechanism, although the C handler do_reserved_trap()
+is a terminal error path.
+
+ * Move all automatic stub generation out of i8259.c and into entry.S.
+ * Move patching of the master IDT into trap_init(). Provide ASSERT()s to
+   ensure we have fully populated the IDT and don't accidentally clobbered any
+   preexisting traps.
+ * Demote TRAP_copro_seg and TRAP_spurious_int to being reserved exceptions
+   and remove their custom entry points.
+ * Point double_fault's exception_table entry at do_reserved_trap.  We do not
+   ever expect to enter a real double fault this way.
+ * Acquaint Xen with #VE but leave it reserved.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r f05ebd2abeb2 xen/arch/x86/i8259.c
+--- a/xen/arch/x86/i8259.c
++++ b/xen/arch/x86/i8259.c
+@@ -23,65 +23,6 @@
+ #include <io_ports.h>
+ 
+ /*
+- * Common place to define all x86 IRQ vectors
+- *
+- * This builds up the IRQ handler stubs using some ugly macros in irq.h
+- *
+- * These macros create the low-level assembly IRQ routines that save
+- * register context and call do_IRQ(). do_IRQ() then does all the
+- * operations that are needed to keep the AT (or SMP IOAPIC)
+- * interrupt-controller happy.
+- */
+-
+-__asm__(".section .text");
+-
+-#define IRQ_NAME(nr) VEC##nr##_interrupt
+-
+-#define BI(nr)                                           \
+-void IRQ_NAME(nr)(void);                                 \
+-__asm__(                                                 \
+-".if " STR(0x##nr) " >= " STR(FIRST_DYNAMIC_VECTOR) "\n" \
+-__ALIGN_STR "\n"                                         \
+-STR(IRQ_NAME(nr)) ":\n\t"                                \
+-BUILD_IRQ(0x##nr) "\n"                                   \
+-".else\n"                                                \
+-".equ " STR(IRQ_NAME(nr)) ", 0\n"                        \
+-".endif\n")
+-
+-#define BUILD_16_IRQS(x) \
+-    BI(x##0); BI(x##1); BI(x##2); BI(x##3); \
+-    BI(x##4); BI(x##5); BI(x##6); BI(x##7); \
+-    BI(x##8); BI(x##9); BI(x##a); BI(x##b); \
+-    BI(x##c); BI(x##d); BI(x##e); BI(x##f)
+-
+-BUILD_16_IRQS(0); BUILD_16_IRQS(1); BUILD_16_IRQS(2); BUILD_16_IRQS(3);
+-BUILD_16_IRQS(4); BUILD_16_IRQS(5); BUILD_16_IRQS(6); BUILD_16_IRQS(7);
+-BUILD_16_IRQS(8); BUILD_16_IRQS(9); BUILD_16_IRQS(a); BUILD_16_IRQS(b);
+-BUILD_16_IRQS(c); BUILD_16_IRQS(d); BUILD_16_IRQS(e); BUILD_16_IRQS(f);
+-
+-#undef BUILD_16_IRQS
+-#undef BI
+-
+-
+-#define IRQ(x,y) IRQ_NAME(x##y)
+-
+-#define IRQLIST_16(x) \
+-    IRQ(x,0), IRQ(x,1), IRQ(x,2), IRQ(x,3), \
+-    IRQ(x,4), IRQ(x,5), IRQ(x,6), IRQ(x,7), \
+-    IRQ(x,8), IRQ(x,9), IRQ(x,a), IRQ(x,b), \
+-    IRQ(x,c), IRQ(x,d), IRQ(x,e), IRQ(x,f)
+-
+-static void (*__initdata interrupt[NR_VECTORS])(void) = {
+-    IRQLIST_16(0), IRQLIST_16(1), IRQLIST_16(2), IRQLIST_16(3),
+-    IRQLIST_16(4), IRQLIST_16(5), IRQLIST_16(6), IRQLIST_16(7),
+-    IRQLIST_16(8), IRQLIST_16(9), IRQLIST_16(a), IRQLIST_16(b),
+-    IRQLIST_16(c), IRQLIST_16(d), IRQLIST_16(e), IRQLIST_16(f)
+-};
+-
+-#undef IRQ
+-#undef IRQLIST_16
+-
+-/*
+  * This is the 'legacy' 8259A Programmable Interrupt Controller,
+  * present in the majority of PC/AT boxes.
+  * plus some generic x86 specific things if generic specifics makes
+@@ -395,7 +336,7 @@ static struct irqaction __read_mostly ca
+ 
+ void __init init_IRQ(void)
+ {
+-    int vector, irq, cpu = smp_processor_id();
++    int irq, cpu = smp_processor_id();
+ 
+     init_bsp_APIC();
+ 
+@@ -403,14 +344,6 @@ void __init init_IRQ(void)
+ 
+     BUG_ON(init_irq_data() < 0);
+ 
+-    for ( vector = FIRST_DYNAMIC_VECTOR; vector < NR_VECTORS; vector++ )
+-    {
+-        if (vector == HYPERCALL_VECTOR || vector == LEGACY_SYSCALL_VECTOR)
+-            continue;
+-        BUG_ON(!interrupt[vector]);
+-        set_intr_gate(vector, interrupt[vector]);
+-    }
+-
+     for (irq = 0; platform_legacy_irq(irq); irq++) {
+         struct irq_desc *desc = irq_to_desc(irq);
+         
+diff -r f05ebd2abeb2 xen/arch/x86/traps.c
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -383,7 +383,7 @@ static const char *trapstr(unsigned int 
+         "coprocessor segment", "invalid tss", "segment not found",
+         "stack error", "general protection fault", "page fault",
+         "spurious interrupt", "coprocessor error", "alignment check",
+-        "machine check", "simd error"
++        "machine check", "simd error", "virtualisation exception"
+     };
+ 
+     return trapnr < ARRAY_SIZE(strings) ? strings[trapnr] : "???";
+@@ -531,6 +531,15 @@ int set_guest_nmi_trapbounce(void)
+     return !null_trap_bounce(v, tb);
+ }
+ 
++void do_reserved_trap(struct cpu_user_regs *regs)
++{
++    unsigned int trapnr = regs->entry_vector;
++
++    DEBUGGER_trap_fatal(trapnr, regs);
++    show_execution_state(regs);
++    panic("FATAL RESERVED TRAP %#x: %s", trapnr, trapstr(trapnr));
++}
++
+ static void do_trap(struct cpu_user_regs *regs, int use_error_code)
+ {
+     struct vcpu *curr = current;
+@@ -586,7 +595,6 @@ void do_##name(struct cpu_user_regs *reg
+ DO_ERROR_NOCODE(divide_error)
+ DO_ERROR_NOCODE(overflow)
+ DO_ERROR_NOCODE(bounds)
+-DO_ERROR_NOCODE(coprocessor_segment_overrun)
+ DO_ERROR(       invalid_TSS)
+ DO_ERROR(       segment_not_present)
+ DO_ERROR(       stack_segment)
+@@ -3340,10 +3348,6 @@ void do_debug(struct cpu_user_regs *regs
+     return;
+ }
+ 
+-void do_spurious_interrupt_bug(struct cpu_user_regs *regs)
+-{
+-}
+-
+ static void __set_intr_gate(unsigned int n, uint32_t dpl, void *addr)
+ {
+     int i;
+@@ -3442,13 +3446,11 @@ void __init init_idt_traps(void)
+     set_intr_gate(TRAP_invalid_op,&invalid_op);
+     set_intr_gate(TRAP_no_device,&device_not_available);
+     set_intr_gate(TRAP_double_fault,&double_fault);
+-    set_intr_gate(TRAP_copro_seg,&coprocessor_segment_overrun);
+     set_intr_gate(TRAP_invalid_tss,&invalid_TSS);
+     set_intr_gate(TRAP_no_segment,&segment_not_present);
+     set_intr_gate(TRAP_stack_error,&stack_segment);
+     set_intr_gate(TRAP_gp_fault,&general_protection);
+     set_intr_gate(TRAP_page_fault,&early_page_fault);
+-    set_intr_gate(TRAP_spurious_int,&spurious_interrupt_bug);
+     set_intr_gate(TRAP_copro_error,&coprocessor_error);
+     set_intr_gate(TRAP_alignment_check,&alignment_check);
+     set_intr_gate(TRAP_machine_check,&machine_check);
+@@ -3466,8 +3468,11 @@ void __init init_idt_traps(void)
+     this_cpu(compat_gdt_table) = boot_cpu_compat_gdt_table;
+ }
+ 
++extern void (*__initconst autogen_entrypoints[NR_VECTORS])(void);
+ void __init trap_init(void)
+ {
++    unsigned int vector;
++
+     /* Replace early pagefault with real pagefault handler. */
+     set_intr_gate(TRAP_page_fault, &page_fault);
+ 
+@@ -3478,6 +3483,21 @@ void __init trap_init(void)
+     /* Fast trap for int80 (faster than taking the #GP-fixup path). */
+     _set_gate(idt_table + 0x80, SYS_DESC_trap_gate, 3, &int80_direct_trap);
+ 
++    for ( vector = 0; vector < NR_VECTORS; ++vector )
++    {
++        if ( autogen_entrypoints[vector] )
++        {
++            /* Found autogen entry: check we won't clobber an existing trap. */
++            ASSERT(idt_table[vector].b == 0);
++            set_intr_gate(vector, autogen_entrypoints[vector]);
++        }
++        else
++        {
++            /* No entry point: confirm we have an existing trap in place. */
++            ASSERT(idt_table[vector].b != 0);
++        }
++    }
++
+     percpu_traps_init();
+ 
+     cpu_init();
+diff -r f05ebd2abeb2 xen/arch/x86/x86_64/entry.S
+--- a/xen/arch/x86/x86_64/entry.S
++++ b/xen/arch/x86/x86_64/entry.S
+@@ -582,11 +582,6 @@ ENTRY(invalid_op)
+         movl  $TRAP_invalid_op,4(%rsp)
+         jmp   handle_exception
+ 
+-ENTRY(coprocessor_segment_overrun)
+-        pushq $0
+-        movl  $TRAP_copro_seg,4(%rsp)
+-        jmp   handle_exception
+-
+ ENTRY(invalid_TSS)
+         movl  $TRAP_invalid_tss,4(%rsp)
+         jmp   handle_exception
+@@ -607,11 +602,6 @@ ENTRY(alignment_check)
+         movl  $TRAP_alignment_check,4(%rsp)
+         jmp   handle_exception
+ 
+-ENTRY(spurious_interrupt_bug)
+-        pushq $0
+-        movl  $TRAP_spurious_int,4(%rsp)
+-        jmp   handle_exception
+-
+ ENTRY(double_fault)
+         movl  $TRAP_double_fault,4(%rsp)
+         SAVE_ALL
+@@ -710,18 +700,21 @@ ENTRY(exception_table)
+         .quad do_bounds
+         .quad do_invalid_op
+         .quad do_device_not_available
+-        .quad 0 # double_fault
+-        .quad do_coprocessor_segment_overrun
++        .quad do_reserved_trap /* double_fault - has its own entry. */
++        .quad do_reserved_trap /* coproc_seg_overrun - Intel 387 only. */
+         .quad do_invalid_TSS
+         .quad do_segment_not_present
+         .quad do_stack_segment
+         .quad do_general_protection
+         .quad do_page_fault
+-        .quad do_spurious_interrupt_bug
++        .quad do_reserved_trap /* Default PIC spurious irq - architecturally reserved. */
+         .quad do_coprocessor_error
+         .quad do_alignment_check
+         .quad do_machine_check
+         .quad do_simd_coprocessor_error
++        .rept TRAP_last_reserved + 1 - ((. - exception_table) / 8)
++        .quad do_reserved_trap /* Architecturally reserved exceptions. */
++        .endr
+ 
+ ENTRY(hypercall_table)
+         .quad do_set_trap_table     /*  0 */
+@@ -818,3 +811,51 @@ ENTRY(hypercall_args_table)
+         .rept NR_hypercalls-(.-hypercall_args_table)
+         .byte 0 /* do_ni_hypercall      */
+         .endr
++
++/* Table of automatically generated entry points.  One per vector. */
++        .section .init.rodata, "a", @progbits
++GLOBAL(autogen_entrypoints)
++        /* pop into the .init.rodata section and record an entry point. */
++        .macro entrypoint ent
++        .pushsection .init.rodata
++        .quad \ent
++        .popsection
++        .endm
++
++        .text
++autogen_stubs: /* Automatically generated stubs. */
++
++        vec = 0
++        .rept NR_VECTORS
++        ALIGN
++
++        /* Common interrupts, heading towards do_IRQ(). */
++        .if vec >= FIRST_DYNAMIC_VECTOR && vec != HYPERCALL_VECTOR && vec != LEGACY_SYSCALL_VECTOR
++
++1:      pushq $0
++        movb  $vec,4(%rsp)
++        jmp   common_interrupt
++
++        entrypoint 1b
++
++        /* Reserved exceptions, heading towards do_reserved_trap(). */
++        .elseif vec == TRAP_copro_seg || vec == TRAP_spurious_int || (vec > TRAP_simd_error && vec <= TRAP_last_reserved)
++
++1:      test  $8,%spl        /* 64bit exception frames are 16 byte aligned, but the word */
++        jz    2f             /* size is 8 bytes.  Check whether the processor gave us an */
++        pushq $0             /* error code, and insert an empty one if not.              */
++2:      movb  $vec,4(%rsp)
++        jmp   handle_exception
++
++        entrypoint 1b
++
++        /* Hand crafted entry points above. */
++        .else
++        entrypoint 0
++        .endif
++
++        vec = vec + 1
++        .endr
++
++        .section .init.rodata
++        .size autogen_entrypoints, . - autogen_entrypoints
+diff -r f05ebd2abeb2 xen/include/asm-x86/processor.h
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -113,6 +113,7 @@
+ #define TRAP_alignment_check  17
+ #define TRAP_machine_check    18
+ #define TRAP_simd_error       19
++#define TRAP_virtualisation   20
+ #define TRAP_last_reserved    31
+ 
+ /* Set for entry via SYSCALL. Informs return code to use SYSRETQ not IRETQ. */
+@@ -538,7 +539,6 @@ DECLARE_TRAP_HANDLER(bounds);
+ DECLARE_TRAP_HANDLER(invalid_op);
+ DECLARE_TRAP_HANDLER(device_not_available);
+ DECLARE_TRAP_HANDLER(double_fault);
+-DECLARE_TRAP_HANDLER(coprocessor_segment_overrun);
+ DECLARE_TRAP_HANDLER(invalid_TSS);
+ DECLARE_TRAP_HANDLER(segment_not_present);
+ DECLARE_TRAP_HANDLER(stack_segment);
+@@ -549,12 +549,12 @@ DECLARE_TRAP_HANDLER(coprocessor_error);
+ DECLARE_TRAP_HANDLER(simd_coprocessor_error);
+ DECLARE_TRAP_HANDLER(machine_check);
+ DECLARE_TRAP_HANDLER(alignment_check);
+-DECLARE_TRAP_HANDLER(spurious_interrupt_bug);
+ #undef DECLARE_TRAP_HANDLER
+ 
+ void trap_nop(void);
+ void enable_nmis(void);
+ void noreturn do_nmi_crash(struct cpu_user_regs *regs);
++void do_reserved_trap(struct cpu_user_regs *regs);
+ 
+ void syscall_enter(void);
+ void sysenter_entry(void);
+diff -r f05ebd2abeb2 xen/include/asm-x86/x86_64/asm_defns.h
+--- a/xen/include/asm-x86/x86_64/asm_defns.h
++++ b/xen/include/asm-x86/x86_64/asm_defns.h
+@@ -208,11 +208,6 @@ 987:    movq  UREGS_rbp(%rsp),%rbp
+ #define REX64_PREFIX "rex64/"
+ #endif
+ 
+-#define BUILD_IRQ(nr)                           \
+-    "pushq $0\n\t"                              \
+-    "movl $"#nr",4(%rsp)\n\t"                   \
+-    "jmp common_interrupt"
+-
+ #ifdef __ASSEMBLY__
+ # define _ASM_EX(p) p-.
+ #else

@@ -1,0 +1,106 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1400254524 -7200
+# Node ID 03ad366bb9e33e6929f085ac5add65e51b08e96a
+# Parent  ba0e42e7ddb4972e18851c2fad429d9edaf84f97
+x86/traps: mnemonics for system descriptor types
+
+Avoids some particularly obscure magic numbers.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r ba0e42e7ddb4 -r 03ad366bb9e3 xen/arch/x86/crash.c
+--- a/xen/arch/x86/crash.c
++++ b/xen/arch/x86/crash.c
+@@ -149,7 +149,8 @@ static void nmi_shootdown_cpus(void)
+              * This update is safe from a security point of view, as this pcpu 
+              * is never going to try to sysret back to a PV vcpu.
+              */
+-            _set_gate_lower(&idt_tables[i][TRAP_nmi], 14, 0, &trap_nop);
++            _set_gate_lower(&idt_tables[i][TRAP_nmi],
++                            SYS_DESC_irq_gate, 0, &trap_nop);
+             set_ist(&idt_tables[i][TRAP_machine_check], IST_NONE);
+         }
+         else
+diff -r ba0e42e7ddb4 -r 03ad366bb9e3 xen/arch/x86/traps.c
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -3431,8 +3431,8 @@ static void __set_intr_gate(unsigned int
+     /* Keep secondary tables in sync with IRQ updates. */
+     for ( i = 1; i < nr_cpu_ids; i++ )
+         if ( idt_tables[i] != NULL )
+-            _set_gate(&idt_tables[i][n], 14, dpl, addr);
+-    _set_gate(&idt_table[n], 14, dpl, addr);
++            _set_gate(&idt_tables[i][n], SYS_DESC_irq_gate, dpl, addr);
++    _set_gate(&idt_table[n], SYS_DESC_irq_gate, dpl, addr);
+ }
+ 
+ static void set_swint_gate(unsigned int n, void *addr)
+@@ -3457,12 +3457,12 @@ void load_TR(void)
+         this_cpu(gdt_table) + TSS_ENTRY - FIRST_RESERVED_GDT_ENTRY,
+         (unsigned long)tss,
+         offsetof(struct tss_struct, __cacheline_filler) - 1,
+-        9);
++        SYS_DESC_tss_avail);
+     _set_tssldt_desc(
+         this_cpu(compat_gdt_table) + TSS_ENTRY - FIRST_RESERVED_GDT_ENTRY,
+         (unsigned long)tss,
+         offsetof(struct tss_struct, __cacheline_filler) - 1,
+-        11);
++        SYS_DESC_tss_busy);
+ 
+     /* Switch to non-compat GDT (which has B bit clear) to execute LTR. */
+     asm volatile (
+diff -r ba0e42e7ddb4 -r 03ad366bb9e3 xen/arch/x86/x86_64/traps.c
+--- a/xen/arch/x86/x86_64/traps.c
++++ b/xen/arch/x86/x86_64/traps.c
+@@ -390,14 +390,12 @@ void __devinit subarch_percpu_traps_init
+         set_ist(&idt_table[TRAP_nmi],           IST_NMI);
+         set_ist(&idt_table[TRAP_machine_check], IST_MCE);
+ 
+-        /*
+-         * The 32-on-64 hypercall entry vector is only accessible from ring 1.
+-         * Also note that this is a trap gate, not an interrupt gate.
+-         */
+-        _set_gate(idt_table+HYPERCALL_VECTOR, 15, 1, &compat_hypercall);
++        /* The 32-on-64 hypercall vector is only accessible from ring 1. */
++        _set_gate(idt_table + HYPERCALL_VECTOR,
++                  SYS_DESC_trap_gate, 1, &compat_hypercall);
+ 
+         /* Fast trap for int80 (faster than taking the #GP-fixup path). */
+-        _set_gate(idt_table+0x80, 15, 3, &int80_direct_trap);
++        _set_gate(idt_table + 0x80, SYS_DESC_trap_gate, 3, &int80_direct_trap);
+     }
+ 
+     stack_bottom = (char *)get_stack_bottom();
+diff -r ba0e42e7ddb4 -r 03ad366bb9e3 xen/include/asm-x86/desc.h
+--- a/xen/include/asm-x86/desc.h
++++ b/xen/include/asm-x86/desc.h
+@@ -98,6 +98,14 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++/* System Descriptor types for GDT and IDT entries. */
++#define SYS_DESC_ldt          2
++#define SYS_DESC_tss_avail    9
++#define SYS_DESC_tss_busy     11
++#define SYS_DESC_call_gate    12
++#define SYS_DESC_irq_gate     14
++#define SYS_DESC_trap_gate    15
++
+ struct desc_struct {
+     u32 a, b;
+ };
+diff -r ba0e42e7ddb4 -r 03ad366bb9e3 xen/include/asm-x86/ldt.h
+--- a/xen/include/asm-x86/ldt.h
++++ b/xen/include/asm-x86/ldt.h
+@@ -18,7 +18,7 @@ static inline void load_LDT(struct vcpu 
+         desc = (!is_pv_32on64_vcpu(v)
+                 ? this_cpu(gdt_table) : this_cpu(compat_gdt_table))
+                + LDT_ENTRY - FIRST_RESERVED_GDT_ENTRY;
+-        _set_tssldt_desc(desc, LDT_VIRT_START(v), ents*8-1, 2);
++        _set_tssldt_desc(desc, LDT_VIRT_START(v), ents*8-1, SYS_DESC_ldt);
+         __asm__ __volatile__ ( "lldt %%ax" : : "a" (LDT_ENTRY << 3) );
+     }
+ }

@@ -1,0 +1,176 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1400502285 -7200
+# Node ID 29c4ad010ac0d2932c5491ae26cc096aeb130e7c
+# Parent  556fa9483c7c503b78dd18e5dfadd8c4a81e8456
+x86/misc: post cleanup
+
+* panic() now works on early boot.  Replace EARLY_FAIL()
+* Cleanup __set_intr_gate() & friends.  The master IDT is fully constructed on
+  early boot, and only subsequently altered on the crash path.  Make them
+  private to traps.c, move them into .init, and remove the loop over all idts,
+  as __set_intr_gate() will never find an AP to patch. (For some reason,
+  leaving out the noinline causes ~1.5k of code bloat from GCC inlining
+  everything)
+* No need to clear X86_EFLAGS_NT in cpu_init().  This is covered by the eflags
+  reset in __high_start().
+* Missing '\n' from unexpected MCE printk.
+* load_system_tables() is x86 specific.  Move its declaration into an x86 header.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 556fa9483c7c -r 29c4ad010ac0 xen/arch/x86/cpu/common.c
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -593,9 +593,6 @@ void __cpuinit cpu_init(void)
+ 	/* Install correct page table. */
+ 	write_ptbase(current);
+ 
+-	/* No nested task. */
+-	asm volatile ("pushf ; andw $0xbfff,(%"__OP"sp) ; popf" );
+-
+ 	/* Ensure FPU gets initialised for each domain. */
+ 	stts();
+ 
+diff -r 556fa9483c7c -r 29c4ad010ac0 xen/arch/x86/cpu/mcheck/mce.c
+--- a/xen/arch/x86/cpu/mcheck/mce.c
++++ b/xen/arch/x86/cpu/mcheck/mce.c
+@@ -73,7 +73,7 @@ custom_param("mce_verbosity", mce_set_ve
+ static void unexpected_machine_check(struct cpu_user_regs *regs, long error_code)
+ {
+     console_force_unlock();
+-    printk("Unexpected Machine Check Exception");
++    printk("Unexpected Machine Check Exception\n");
+     fatal_trap(TRAP_machine_check, regs);
+ }
+ 
+diff -r 556fa9483c7c -r 29c4ad010ac0 xen/arch/x86/setup.c
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -133,11 +133,6 @@ static void __init parse_acpi_param(char
+     }
+ }
+ 
+-#define EARLY_FAIL(f, a...) do {                \
+-    printk( f , ## a );                         \
+-    for ( ; ; ) halt();                         \
+-} while (0)
+-
+ static const module_t *__initdata initial_images;
+ static unsigned int __initdata nr_initial_images;
+ 
+@@ -669,11 +664,10 @@ void __init noreturn __start_xen(unsigne
+ 
+     /* Check that we have at least one Multiboot module. */
+     if ( !(mbi->flags & MBI_MODULES) || (mbi->mods_count == 0) )
+-        EARLY_FAIL("dom0 kernel not specified. "
+-                   "Check bootloader configuration.\n");
++        panic("dom0 kernel not specified. Check bootloader configuration.");
+ 
+     if ( ((unsigned long)cpu0_stack & (STACK_SIZE-1)) != 0 )
+-        EARLY_FAIL("Misaligned CPU0 stack.\n");
++        panic("Misaligned CPU0 stack.");
+ 
+     if ( efi_enabled )
+     {
+@@ -754,9 +748,7 @@ void __init noreturn __start_xen(unsigne
+         e820_raw_nr = 2;
+     }
+     else
+-    {
+-        EARLY_FAIL("Bootloader provided no memory information.\n");
+-    }
++        panic("Bootloader provided no memory information.");
+ 
+     /* Sanitise the raw E820 map to produce a final clean version. */
+     max_page = raw_max_page = init_e820(memmap_type, e820_raw, &e820_raw_nr);
+@@ -791,7 +783,7 @@ void __init noreturn __start_xen(unsigne
+     for ( i = 0; !efi_enabled && i < mbi->mods_count; i++ )
+     {
+         if ( mod[i].mod_start & (PAGE_SIZE - 1) )
+-            EARLY_FAIL("Bootloader didn't honor module alignment request.\n");
++            panic("Bootloader didn't honor module alignment request.");
+         mod[i].mod_end -= mod[i].mod_start;
+         mod[i].mod_start >>= PAGE_SHIFT;
+         mod[i].reserved = 0;
+@@ -964,7 +956,7 @@ void __init noreturn __start_xen(unsigne
+     }
+ 
+     if ( modules_headroom && !mod->reserved )
+-        EARLY_FAIL("Not enough memory to relocate the dom0 kernel image.\n");
++        panic("Not enough memory to relocate the dom0 kernel image.");
+     for ( i = 0; i < mbi->mods_count; ++i )
+     {
+         uint64_t s = (uint64_t)mod[i].mod_start << PAGE_SHIFT;
+@@ -973,7 +965,7 @@ void __init noreturn __start_xen(unsigne
+     }
+ 
+     if ( !xen_phys_start )
+-        EARLY_FAIL("Not enough memory to relocate Xen.\n");
++        panic("Not enough memory to relocate Xen.");
+     reserve_e820_ram(&boot_e820, efi_enabled ? mbi->mem_upper : __pa(&_start),
+                      __pa(&_end));
+ 
+diff -r 556fa9483c7c -r 29c4ad010ac0 xen/arch/x86/traps.c
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -3422,22 +3422,17 @@ void do_debug(struct cpu_user_regs *regs
+     return;
+ }
+ 
+-static void __set_intr_gate(unsigned int n, uint32_t dpl, void *addr)
++static void __init noinline __set_intr_gate(unsigned int n, uint32_t dpl, void *addr)
+ {
+-    int i;
+-    /* Keep secondary tables in sync with IRQ updates. */
+-    for ( i = 1; i < nr_cpu_ids; i++ )
+-        if ( idt_tables[i] != NULL )
+-            _set_gate(&idt_tables[i][n], SYS_DESC_irq_gate, dpl, addr);
+     _set_gate(&idt_table[n], SYS_DESC_irq_gate, dpl, addr);
+ }
+ 
+-static void set_swint_gate(unsigned int n, void *addr)
++static void __init set_swint_gate(unsigned int n, void *addr)
+ {
+     __set_intr_gate(n, 3, addr);
+ }
+ 
+-void set_intr_gate(unsigned int n, void *addr)
++static void __init set_intr_gate(unsigned int n, void *addr)
+ {
+     __set_intr_gate(n, 0, addr);
+ }
+diff -r 556fa9483c7c -r 29c4ad010ac0 xen/include/asm-x86/desc.h
+--- a/xen/include/asm-x86/desc.h
++++ b/xen/include/asm-x86/desc.h
+@@ -199,7 +199,6 @@ DECLARE_PER_CPU(struct desc_struct *, gd
+ extern struct desc_struct boot_cpu_compat_gdt_table[];
+ DECLARE_PER_CPU(struct desc_struct *, compat_gdt_table);
+ 
+-extern void set_intr_gate(unsigned int irq, void * addr);
+ extern void load_TR(void);
+ 
+ #endif /* !__ASSEMBLY__ */
+diff -r 556fa9483c7c -r 29c4ad010ac0 xen/include/asm-x86/system.h
+--- a/xen/include/asm-x86/system.h
++++ b/xen/include/asm-x86/system.h
+@@ -180,6 +180,7 @@ static inline int local_irq_is_enabled(v
+ 
+ void trap_init(void);
+ void init_idt_traps(void);
++void load_system_tables(void);
+ void percpu_traps_init(void);
+ void subarch_percpu_traps_init(void);
+ 
+diff -r 556fa9483c7c -r 29c4ad010ac0 xen/include/xen/sched.h
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -770,7 +770,6 @@ void domain_unpause(struct domain *d);
+ void domain_pause_by_systemcontroller(struct domain *d);
+ void domain_unpause_by_systemcontroller(struct domain *d);
+ void cpu_init(void);
+-void load_system_tables(void);
+ 
+ struct scheduler;
+ 

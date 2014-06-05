@@ -1,0 +1,315 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1400254747 -7200
+# Node ID 8a29b6b0f50b27747a74a6c1d3039221656a5bfb
+# Parent  be66a3a0e8ff4ece3b37a10d56dbc5e270cda732
+x86/boot: install trap handlers much earlier on boot
+
+Patch the trap handlers into the master idt very early on boot, and setup &
+load the GDT, IDT, TR and LDT. Load the IDT before the TR so we stand a chance
+of catching an invalid TSS exception rather than triple faulting.
+
+This provides full exception support far earlier on boot than previously.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r be66a3a0e8ff -r 8a29b6b0f50b xen/arch/x86/cpu/common.c
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -515,6 +515,61 @@ void __init early_cpu_init(void)
+ 	centaur_init_cpu();
+ 	early_cpu_detect();
+ }
++
++/*
++ * Sets up system tables and descriptors.
++ *
++ * - Sets up TSS with stack pointers, including ISTs
++ * - Inserts TSS selector into regular and compat GDTs
++ * - Loads GDT, IDT, TR then null LDT
++ */
++void __cpuinit load_system_tables(void)
++{
++	unsigned int cpu = smp_processor_id();
++	unsigned long stack_bottom = get_stack_bottom(),
++		stack_top = stack_bottom & ~(STACK_SIZE - 1);
++
++	struct tss_struct *tss = &this_cpu(init_tss);
++	struct desc_struct *gdt =
++		this_cpu(gdt_table) - FIRST_RESERVED_GDT_ENTRY;
++	struct desc_struct *compat_gdt =
++		this_cpu(compat_gdt_table) - FIRST_RESERVED_GDT_ENTRY;
++
++	const struct desc_ptr gdtr = {
++		.base = (unsigned long)gdt,
++		.limit = LAST_RESERVED_GDT_BYTE,
++	};
++	const struct desc_ptr idtr = {
++		.base = (unsigned long)idt_tables[cpu],
++		.limit = (IDT_ENTRIES * sizeof(idt_entry_t)) - 1,
++	};
++
++	/* Main stack for interrupts/exceptions. */
++	tss->rsp0 = stack_bottom;
++	tss->bitmap = IOBMP_INVALID_OFFSET;
++
++	/* MCE, NMI and Double Fault handlers get their own stacks. */
++	tss->ist[IST_MCE - 1] = stack_top + IST_MCE * PAGE_SIZE;
++	tss->ist[IST_DF  - 1] = stack_top + IST_DF  * PAGE_SIZE;
++	tss->ist[IST_NMI - 1] = stack_top + IST_NMI * PAGE_SIZE;
++
++	_set_tssldt_desc(
++		gdt + TSS_ENTRY,
++		(unsigned long)tss,
++		offsetof(struct tss_struct, __cacheline_filler) - 1,
++		SYS_DESC_tss_avail);
++	_set_tssldt_desc(
++		compat_gdt + TSS_ENTRY,
++		(unsigned long)tss,
++		offsetof(struct tss_struct, __cacheline_filler) - 1,
++		SYS_DESC_tss_busy);
++
++	asm volatile ("lgdt %0"  : : "m"  (gdtr) );
++	asm volatile ("lidt %0"  : : "m"  (idtr) );
++	asm volatile ("ltr  %w0" : : "rm" (TSS_ENTRY << 3) );
++	asm volatile ("lldt %w0" : : "rm" (0) );
++}
++
+ /*
+  * cpu_init() initializes state that is per-CPU. Some data is already
+  * initialized (naturally) in the bootstrap process, such as the GDT
+@@ -524,11 +579,6 @@ void __init early_cpu_init(void)
+ void __cpuinit cpu_init(void)
+ {
+ 	int cpu = smp_processor_id();
+-	struct tss_struct *t = &this_cpu(init_tss);
+-	struct desc_ptr gdt_desc = {
+-		.base = (unsigned long)(this_cpu(gdt_table) - FIRST_RESERVED_GDT_ENTRY),
+-		.limit = LAST_RESERVED_GDT_BYTE
+-	};
+ 
+ 	if (cpumask_test_and_set_cpu(cpu, &cpu_initialized)) {
+ 		printk(KERN_WARNING "CPU#%d already initialized!\n", cpu);
+@@ -543,22 +593,12 @@ void __cpuinit cpu_init(void)
+ 	/* Install correct page table. */
+ 	write_ptbase(current);
+ 
+-	asm volatile ( "lgdt %0" : : "m" (gdt_desc) );
+-
+ 	/* No nested task. */
+ 	asm volatile ("pushf ; andw $0xbfff,(%"__OP"sp) ; popf" );
+ 
+ 	/* Ensure FPU gets initialised for each domain. */
+ 	stts();
+ 
+-	/* Set up and load the per-CPU TSS and LDT. */
+-	t->bitmap = IOBMP_INVALID_OFFSET;
+-	/* Bottom-of-stack must be 16-byte aligned! */
+-	BUG_ON((get_stack_bottom() & 15) != 0);
+-	t->rsp0 = get_stack_bottom();
+-	load_TR();
+-	asm volatile ( "lldt %%ax" : : "a" (0) );
+-
+ 	/* Clear all 6 debug registers: */
+ #define CD(register) asm volatile ( "mov %0,%%db" #register : : "r"(0UL) );
+ 	CD(0); CD(1); CD(2); CD(3); /* no db4 and db5 */; CD(6); CD(7);
+diff -r be66a3a0e8ff -r 8a29b6b0f50b xen/arch/x86/setup.c
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -558,16 +558,21 @@ void __init noreturn __start_xen(unsigne
+         .stop_bits = 1
+     };
+ 
++    /* Critical region without IDT or TSS.  Any fault is deadly! */
++
+     set_processor_id(0);
+     set_current((struct vcpu *)0xfffff000); /* debug sanity. */
+     idle_vcpu[0] = current;
+ 
+     percpu_init_areas();
+ 
++    init_idt_traps();
++    load_system_tables();
++
+     smp_prepare_boot_cpu();
+     sort_exception_tables();
+ 
+-    set_intr_gate(TRAP_page_fault, &early_page_fault);
++    /* Full exception support from here on in. */
+ 
+     loader = (mbi->flags & MBI_LOADERNAME)
+         ? (char *)__va(mbi->boot_loader_name) : "unknown";
+diff -r be66a3a0e8ff -r 8a29b6b0f50b xen/arch/x86/smpboot.c
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -303,15 +303,6 @@ static void set_cpu_sibling_map(int cpu)
+     }
+ }
+ 
+-static void construct_percpu_idt(unsigned int cpu)
+-{
+-    unsigned char idt_load[10];
+-
+-    *(unsigned short *)(&idt_load[0]) = (IDT_ENTRIES*sizeof(idt_entry_t))-1;
+-    *(unsigned long  *)(&idt_load[2]) = (unsigned long)idt_tables[cpu];
+-    __asm__ __volatile__ ( "lidt %0" : "=m" (idt_load) );
+-}
+-
+ void start_secondary(void *unused)
+ {
+     /*
+@@ -320,6 +311,8 @@ void start_secondary(void *unused)
+      */
+     unsigned int cpu = booting_cpu;
+ 
++    /* Critical region without IDT or TSS.  Any fault is deadly! */
++
+     set_processor_id(cpu);
+     set_current(idle_vcpu[cpu]);
+     this_cpu(curr_vcpu) = idle_vcpu[cpu];
+@@ -345,6 +338,10 @@ void start_secondary(void *unused)
+      */
+     spin_debug_disable();
+ 
++    load_system_tables();
++
++    /* Full exception support from here on in. */
++
+     percpu_traps_init();
+ 
+     init_percpu_time();
+@@ -353,12 +350,6 @@ void start_secondary(void *unused)
+ 
+     smp_callin();
+ 
+-    /*
+-     * At this point, boot CPU has fully initialised the IDT. It is
+-     * now safe to make ourselves a private copy.
+-     */
+-    construct_percpu_idt(cpu);
+-
+     setup_secondary_APIC_clock();
+ 
+     /*
+diff -r be66a3a0e8ff -r 8a29b6b0f50b xen/arch/x86/traps.c
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -3497,7 +3497,7 @@ void __devinit percpu_traps_init(void)
+     ler_enable();
+ }
+ 
+-void __init trap_init(void)
++void __init init_idt_traps(void)
+ {
+     /*
+      * Note that interrupt gates are always used, rather than trap gates. We
+@@ -3515,23 +3515,42 @@ void __init trap_init(void)
+     set_intr_gate(TRAP_bounds,&bounds);
+     set_intr_gate(TRAP_invalid_op,&invalid_op);
+     set_intr_gate(TRAP_no_device,&device_not_available);
++    set_intr_gate(TRAP_double_fault,&double_fault);
+     set_intr_gate(TRAP_copro_seg,&coprocessor_segment_overrun);
+     set_intr_gate(TRAP_invalid_tss,&invalid_TSS);
+     set_intr_gate(TRAP_no_segment,&segment_not_present);
+     set_intr_gate(TRAP_stack_error,&stack_segment);
+     set_intr_gate(TRAP_gp_fault,&general_protection);
+-    set_intr_gate(TRAP_page_fault,&page_fault);
++    set_intr_gate(TRAP_page_fault,&early_page_fault);
+     set_intr_gate(TRAP_spurious_int,&spurious_interrupt_bug);
+     set_intr_gate(TRAP_copro_error,&coprocessor_error);
+     set_intr_gate(TRAP_alignment_check,&alignment_check);
+     set_intr_gate(TRAP_machine_check,&machine_check);
+     set_intr_gate(TRAP_simd_error,&simd_coprocessor_error);
+ 
++    /* Specify dedicated interrupt stacks for NMI, #DF, and #MC. */
++    set_ist(&idt_table[TRAP_double_fault],  IST_DF);
++    set_ist(&idt_table[TRAP_nmi],           IST_NMI);
++    set_ist(&idt_table[TRAP_machine_check], IST_MCE);
++
+     /* CPU0 uses the master IDT. */
+     idt_tables[0] = idt_table;
+ 
+     this_cpu(gdt_table) = boot_cpu_gdt_table;
+     this_cpu(compat_gdt_table) = boot_cpu_compat_gdt_table;
++}
++
++void __init trap_init(void)
++{
++    /* Replace early pagefault with real pagefault handler. */
++    set_intr_gate(TRAP_page_fault, &page_fault);
++
++    /* The 32-on-64 hypercall vector is only accessible from ring 1. */
++    _set_gate(idt_table + HYPERCALL_VECTOR,
++              SYS_DESC_trap_gate, 1, &compat_hypercall);
++
++    /* Fast trap for int80 (faster than taking the #GP-fixup path). */
++    _set_gate(idt_table + 0x80, SYS_DESC_trap_gate, 3, &int80_direct_trap);
+ 
+     percpu_traps_init();
+ 
+diff -r be66a3a0e8ff -r 8a29b6b0f50b xen/arch/x86/x86_64/traps.c
+--- a/xen/arch/x86/x86_64/traps.c
++++ b/xen/arch/x86/x86_64/traps.c
+@@ -379,23 +379,6 @@ static int write_stack_trampoline(
+ void __devinit subarch_percpu_traps_init(void)
+ {
+     char *stack_bottom, *stack;
+-    int   cpu = smp_processor_id();
+-
+-    if ( cpu == 0 )
+-    {
+-        /* Specify dedicated interrupt stacks for NMI, #DF, and #MC. */
+-        set_intr_gate(TRAP_double_fault, &double_fault);
+-        set_ist(&idt_table[TRAP_double_fault],  IST_DF);
+-        set_ist(&idt_table[TRAP_nmi],           IST_NMI);
+-        set_ist(&idt_table[TRAP_machine_check], IST_MCE);
+-
+-        /* The 32-on-64 hypercall vector is only accessible from ring 1. */
+-        _set_gate(idt_table + HYPERCALL_VECTOR,
+-                  SYS_DESC_trap_gate, 1, &compat_hypercall);
+-
+-        /* Fast trap for int80 (faster than taking the #GP-fixup path). */
+-        _set_gate(idt_table + 0x80, SYS_DESC_trap_gate, 3, &int80_direct_trap);
+-    }
+ 
+     stack_bottom = (char *)get_stack_bottom();
+     stack        = (char *)((unsigned long)stack_bottom & ~(STACK_SIZE - 1));
+@@ -403,15 +386,6 @@ void __devinit subarch_percpu_traps_init
+     /* IST_MAX IST pages + 1 syscall page + 1 guard page + primary stack. */
+     BUILD_BUG_ON((IST_MAX + 2) * PAGE_SIZE + PRIMARY_STACK_SIZE > STACK_SIZE);
+ 
+-    /* Machine Check handler has its own per-CPU 4kB stack. */
+-    this_cpu(init_tss).ist[IST_MCE-1] = (unsigned long)&stack[IST_MCE * PAGE_SIZE];
+-
+-    /* Double-fault handler has its own per-CPU 4kB stack. */
+-    this_cpu(init_tss).ist[IST_DF-1] = (unsigned long)&stack[IST_DF * PAGE_SIZE];
+-
+-    /* NMI handler has its own per-CPU 4kB stack. */
+-    this_cpu(init_tss).ist[IST_NMI-1] = (unsigned long)&stack[IST_NMI * PAGE_SIZE];
+-
+     /* Trampoline for SYSCALL entry from long mode. */
+     stack = &stack[IST_MAX * PAGE_SIZE]; /* Skip the IST stacks. */
+     wrmsrl(MSR_LSTAR, (unsigned long)stack);
+diff -r be66a3a0e8ff -r 8a29b6b0f50b xen/include/asm-x86/system.h
+--- a/xen/include/asm-x86/system.h
++++ b/xen/include/asm-x86/system.h
+@@ -179,6 +179,7 @@ static inline int local_irq_is_enabled(v
+ #define BROKEN_INIT_AFTER_S1    0x0002
+ 
+ void trap_init(void);
++void init_idt_traps(void);
+ void percpu_traps_init(void);
+ void subarch_percpu_traps_init(void);
+ 
+diff -r be66a3a0e8ff -r 8a29b6b0f50b xen/include/xen/sched.h
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -770,6 +770,7 @@ void domain_unpause(struct domain *d);
+ void domain_pause_by_systemcontroller(struct domain *d);
+ void domain_unpause_by_systemcontroller(struct domain *d);
+ void cpu_init(void);
++void load_system_tables(void);
+ 
+ struct scheduler;
+ 

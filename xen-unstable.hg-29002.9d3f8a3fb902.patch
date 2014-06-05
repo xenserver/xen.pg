@@ -1,0 +1,135 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1400254600 -7200
+# Node ID 9d3f8a3fb902e2c12a1e4ebc436a3d154703e6f6
+# Parent  03ad366bb9e33e6929f085ac5add65e51b08e96a
+x86/traps: make panic and reboot paths safe during early boot
+
+Reverse two conditions in show_registers().  For an early crash, it is not
+safe to dereference 'current' for its HVM status before knowing that it is a
+guest vcpu.
+
+Introduce SYS_STATE_smp_boot to distinguish the point at which APs need
+considering before boot is complete.  There is one code change required as a
+result; .init.text symbols are still in use before Xen is active, so alter its
+predicate in is_active_kernel_text().
+
+Make use of SYS_STATE_smp_boot in machine_{halt,restart}().  Before Xen starts
+booting the APs, any execution here is certainly the BSP.
+
+When halting or rebooting particularly early, this avoids the risks of a #PF
+or #GP when accessing the LAPIC before generic_apic_probe(), as well as trying
+to enable interrupts before init_IRQ() is complete.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 03ad366bb9e3 -r 9d3f8a3fb902 xen/arch/x86/setup.c
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -1319,6 +1319,8 @@ void __init noreturn __start_xen(unsigne
+ 
+     console_init_postirq();
+ 
++    system_state = SYS_STATE_smp_boot;
++
+     do_presmp_initcalls();
+ 
+     for_each_present_cpu ( i )
+diff -r 03ad366bb9e3 -r 9d3f8a3fb902 xen/arch/x86/shutdown.c
+--- a/xen/arch/x86/shutdown.c
++++ b/xen/arch/x86/shutdown.c
+@@ -96,8 +96,13 @@ void machine_halt(void)
+ {
+     watchdog_disable();
+     console_start_sync();
+-    local_irq_enable();
+-    smp_call_function(__machine_halt, NULL, 0);
++
++    if ( system_state >= SYS_STATE_smp_boot )
++    {
++        local_irq_enable();
++        smp_call_function(__machine_halt, NULL, 0);
++    }
++
+     __machine_halt(NULL);
+ }
+ 
+@@ -466,18 +471,6 @@ void machine_restart(unsigned int delay_
+     console_start_sync();
+     spin_debug_disable();
+ 
+-    local_irq_enable();
+-
+-    /* Ensure we are the boot CPU. */
+-    if ( get_apic_id() != boot_cpu_physical_apicid )
+-    {
+-        /* Send IPI to the boot CPU (logical cpu 0). */
+-        on_selected_cpus(cpumask_of(0), __machine_restart,
+-                         &delay_millisecs, 0);
+-        for ( ; ; )
+-            halt();
+-    }
+-
+     /*
+      * We may be called from an interrupt context, and various functions we
+      * may need to call (alloc_domheap_pages, map_domain_page, ...) assert that
+@@ -485,7 +478,22 @@ void machine_restart(unsigned int delay_
+      */
+     local_irq_count(0) = 0;
+ 
+-    smp_send_stop();
++    if ( system_state >= SYS_STATE_smp_boot )
++    {
++        local_irq_enable();
++
++        /* Ensure we are the boot CPU. */
++        if ( get_apic_id() != boot_cpu_physical_apicid )
++        {
++            /* Send IPI to the boot CPU (logical cpu 0). */
++            on_selected_cpus(cpumask_of(0), __machine_restart,
++                             &delay_millisecs, 0);
++            for ( ; ; )
++                halt();
++        }
++
++        smp_send_stop();
++    }
+ 
+     mdelay(delay_millisecs);
+ 
+diff -r 03ad366bb9e3 -r 9d3f8a3fb902 xen/arch/x86/x86_64/traps.c
+--- a/xen/arch/x86/x86_64/traps.c
++++ b/xen/arch/x86/x86_64/traps.c
+@@ -86,7 +86,7 @@ void show_registers(struct cpu_user_regs
+     enum context context;
+     struct vcpu *v = current;
+ 
+-    if ( has_hvm_container_vcpu(v) && guest_mode(regs) )
++    if ( guest_mode(regs) && has_hvm_container_vcpu(v) )
+     {
+         struct segment_register sreg;
+         context = CTXT_hvm_guest;
+diff -r 03ad366bb9e3 -r 9d3f8a3fb902 xen/common/symbols.c
+--- a/xen/common/symbols.c
++++ b/xen/common/symbols.c
+@@ -96,7 +96,7 @@ static unsigned int get_symbol_offset(un
+ bool_t is_active_kernel_text(unsigned long addr)
+ {
+     return (is_kernel_text(addr) ||
+-            (system_state == SYS_STATE_boot && is_kernel_inittext(addr)));
++            (system_state < SYS_STATE_active && is_kernel_inittext(addr)));
+ }
+ 
+ const char *symbols_lookup(unsigned long addr,
+diff -r 03ad366bb9e3 -r 9d3f8a3fb902 xen/include/xen/kernel.h
+--- a/xen/include/xen/kernel.h
++++ b/xen/include/xen/kernel.h
+@@ -92,6 +92,7 @@ extern char _sinittext[], _einittext[];
+ extern enum system_state {
+     SYS_STATE_early_boot,
+     SYS_STATE_boot,
++    SYS_STATE_smp_boot,
+     SYS_STATE_active,
+     SYS_STATE_suspend,
+     SYS_STATE_resume
