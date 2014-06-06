@@ -1,0 +1,113 @@
+# HG changeset patch
+# User Roger Pau Monné <roger.pau@citrix.com>
+# Date 1401983615 -7200
+# Node ID 5506f7bdf59e872d1261c969c679e99f97ab8571
+# Parent  3f06a1b477f10572c5f59a28ffeb24d7b45f0a1b
+x86: fix reboot/shutdown with running HVM guests
+
+If there's a guest using VMX/SVM when the hypervisor shuts down, it
+can lead to the following crash due to VMX/SVM functions being called
+after hvm_cpu_down has been called. In order to prevent that, check in
+{svm/vmx}_ctxt_switch_from that the cpu virtualization extensions are
+still enabled.
+
+(XEN) Domain 0 shutdown: rebooting machine.
+(XEN) Assertion 'read_cr0() & X86_CR0_TS' failed at vmx.c:644
+(XEN) ----[ Xen-4.5-unstable  x86_64  debug=y  Tainted:    C ]----
+(XEN) CPU:    0
+(XEN) RIP:    e008:[<ffff82d0801d90ce>] vmx_ctxt_switch_from+0x1e/0x14c
+...
+(XEN) Xen call trace:
+(XEN)    [<ffff82d0801d90ce>] vmx_ctxt_switch_from+0x1e/0x14c
+(XEN)    [<ffff82d08015d129>] __context_switch+0x127/0x462
+(XEN)    [<ffff82d080160acf>] __sync_local_execstate+0x6a/0x8b
+(XEN)    [<ffff82d080160af9>] sync_local_execstate+0x9/0xb
+(XEN)    [<ffff82d080161728>] map_domain_page+0x88/0x4de
+(XEN)    [<ffff82d08014e721>] map_vtd_domain_page+0xd/0xf
+(XEN)    [<ffff82d08014cda2>] io_apic_read_remap_rte+0x158/0x29f
+(XEN)    [<ffff82d0801448a8>] iommu_read_apic_from_ire+0x27/0x29
+(XEN)    [<ffff82d080165625>] io_apic_read+0x17/0x65
+(XEN)    [<ffff82d080166143>] __ioapic_read_entry+0x38/0x61
+(XEN)    [<ffff82d080166aa8>] clear_IO_APIC_pin+0x1a/0xf3
+(XEN)    [<ffff82d080166bae>] clear_IO_APIC+0x2d/0x60
+(XEN)    [<ffff82d080166f63>] disable_IO_APIC+0xd/0x81
+(XEN)    [<ffff82d08018228b>] smp_send_stop+0x58/0x68
+(XEN)    [<ffff82d080181aa7>] machine_restart+0x80/0x20a
+(XEN)    [<ffff82d080181c3c>] __machine_restart+0xb/0xf
+(XEN)    [<ffff82d080128fb9>] smp_call_function_interrupt+0x99/0xc0
+(XEN)    [<ffff82d080182330>] call_function_interrupt+0x33/0x43
+(XEN)    [<ffff82d08016bd89>] do_IRQ+0x9e/0x63a
+(XEN)    [<ffff82d08016406f>] common_interrupt+0x5f/0x70
+(XEN)    [<ffff82d0801a8600>] mwait_idle+0x29c/0x2f7
+(XEN)    [<ffff82d08015cf67>] idle_loop+0x58/0x76
+(XEN)
+(XEN)
+(XEN) ****************************************
+(XEN) Panic on CPU 0:
+(XEN) Assertion 'read_cr0() & X86_CR0_TS' failed at vmx.c:644
+(XEN) ****************************************
+
+Suggested-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff -r 3f06a1b477f1 -r 5506f7bdf59e xen/arch/x86/hvm/svm/svm.c
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -966,6 +966,14 @@ static void svm_ctxt_switch_from(struct 
+ {
+     int cpu = smp_processor_id();
+ 
++    /*
++     * Return early if trying to do a context switch without SVM enabled,
++     * this can happen when the hypervisor shuts down with HVM guests
++     * still running.
++     */
++    if ( unlikely((read_efer() & EFER_SVME) == 0) )
++        return;
++
+     svm_fpu_leave(v);
+ 
+     svm_save_dr(v);
+diff -r 3f06a1b477f1 -r 5506f7bdf59e xen/arch/x86/hvm/vmx/vmcs.c
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -74,7 +74,7 @@ u64 vmx_ept_vpid_cap __read_mostly;
+ static DEFINE_PER_CPU_READ_MOSTLY(struct vmcs_struct *, vmxon_region);
+ static DEFINE_PER_CPU(struct vmcs_struct *, current_vmcs);
+ static DEFINE_PER_CPU(struct list_head, active_vmcs_list);
+-static DEFINE_PER_CPU(bool_t, vmxon);
++DEFINE_PER_CPU(bool_t, vmxon);
+ 
+ static u32 vmcs_revision_id __read_mostly;
+ u64 __read_mostly vmx_basic_msr;
+diff -r 3f06a1b477f1 -r 5506f7bdf59e xen/arch/x86/hvm/vmx/vmx.c
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -671,6 +671,14 @@ static void vmx_fpu_leave(struct vcpu *v
+ 
+ static void vmx_ctxt_switch_from(struct vcpu *v)
+ {
++    /*
++     * Return early if trying to do a context switch without VMX enabled,
++     * this can happen when the hypervisor shuts down with HVM guests
++     * still running.
++     */
++    if ( unlikely(!this_cpu(vmxon)) )
++        return;
++
+     vmx_fpu_leave(v);
+     vmx_save_guest_msrs(v);
+     vmx_restore_host_msrs();
+diff -r 3f06a1b477f1 -r 5506f7bdf59e xen/include/asm-x86/hvm/vmx/vmcs.h
+--- a/xen/include/asm-x86/hvm/vmx/vmcs.h
++++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
+@@ -490,6 +490,8 @@ void virtual_vmcs_exit(void *vvmcs);
+ u64 virtual_vmcs_vmread(void *vvmcs, u32 vmcs_encoding);
+ void virtual_vmcs_vmwrite(void *vvmcs, u32 vmcs_encoding, u64 val);
+ 
++DECLARE_PER_CPU(bool_t, vmxon);
++
+ #endif /* ASM_X86_HVM_VMX_VMCS_H__ */
+ 
+ /*
