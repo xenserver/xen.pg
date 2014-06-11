@@ -1,0 +1,82 @@
+# HG changeset patch
+# User Jan Beulich <jbeulich@suse.com>
+# Date 1402398725 -7200
+# Node ID 6cb02f900442b0486ed1bdd700a026e75127bbe0
+# Parent 09968661e6125c85ba968b45a1da2abde6549237
+x86/HVM: refine SMEP/SMAP tests in HVM_CR4_GUEST_RESERVED_BITS()
+
+Andrew validly points out that the use of the macro on the restore path
+can't rely on the CPUID bits for the guest already being in place (as
+their setting by the tool stack in turn requires the other restore
+operations already having taken place). And even worse, using
+hvm_cpuid() is invalid here because that function assumes to be used in
+the context of the vCPU in question.
+
+Reverting to the behavior prior to the change from checking
+cpu_has_sm?p to hvm_vcpu_has_sm?p() would break the other (non-restore)
+use of the macro. So let's revert to the prior behavior only for the
+restore path, by adding a respective second parameter to the macro.
+
+Obviously the two cpu_has_* uses in the macro should really also be
+converted to hvm_cpuid() based checks at least for the non-restore
+path.
+
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Tested-by: David Vrabel <david.vrabel@citrix.com>
+
+diff -r 09968661e612 xen/arch/x86/hvm/hvm.c
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -857,7 +857,7 @@ static int hvm_load_cpu_ctxt(struct doma
+         return -EINVAL;
+     }
+ 
+-    if ( ctxt.cr4 & HVM_CR4_GUEST_RESERVED_BITS(v) )
++    if ( ctxt.cr4 & HVM_CR4_GUEST_RESERVED_BITS(v, 1) )
+     {
+         printk(XENLOG_G_ERR "HVM%d restore: bad CR4 %#" PRIx64 "\n",
+                d->domain_id, ctxt.cr4);
+@@ -1974,7 +1974,7 @@ int hvm_set_cr4(unsigned long value)
+     struct vcpu *v = current;
+     unsigned long old_cr;
+ 
+-    if ( value & HVM_CR4_GUEST_RESERVED_BITS(v) )
++    if ( value & HVM_CR4_GUEST_RESERVED_BITS(v, 0) )
+     {
+         HVM_DBG_LOG(DBG_LEVEL_1,
+                     "Guest attempts to set reserved bit in CR4: %lx",
+diff -r 09968661e612 xen/include/asm-x86/hvm/hvm.h
+--- a/xen/include/asm-x86/hvm/hvm.h
++++ b/xen/include/asm-x86/hvm/hvm.h
+@@ -373,18 +373,24 @@ static inline bool_t hvm_vcpu_has_smep(v
+     (X86_CR4_VMXE | X86_CR4_PAE | X86_CR4_MCE))
+ 
+ /* These bits in CR4 cannot be set by the guest. */
+-#define HVM_CR4_GUEST_RESERVED_BITS(_v)                 \
++#define HVM_CR4_GUEST_RESERVED_BITS(v, restore) ({      \
++    const struct vcpu *_v = (v);                        \
++    bool_t _restore = !!(restore);                      \
++    ASSERT((_restore) || _v == current);                \
+     (~((unsigned long)                                  \
+        (X86_CR4_VME | X86_CR4_PVI | X86_CR4_TSD |       \
+         X86_CR4_DE  | X86_CR4_PSE | X86_CR4_PAE |       \
+         X86_CR4_MCE | X86_CR4_PGE | X86_CR4_PCE |       \
+         X86_CR4_OSFXSR | X86_CR4_OSXMMEXCPT |           \
+-        (hvm_vcpu_has_smep() ? X86_CR4_SMEP : 0) |      \
++        (((_restore) ? cpu_has_smep :                   \
++                       hvm_vcpu_has_smep()) ?           \
++         X86_CR4_SMEP : 0) |                            \
+         (cpu_has_fsgsbase ? X86_CR4_FSGSBASE : 0) |     \
+-        ((nestedhvm_enabled((_v)->domain) && cpu_has_vmx)\
+-                      ? X86_CR4_VMXE : 0)  |             \
+-        (cpu_has_pcid ? X86_CR4_PCIDE : 0) |             \
+-        (cpu_has_xsave ? X86_CR4_OSXSAVE : 0))))
++        ((nestedhvm_enabled(_v->domain) && cpu_has_vmx) \
++                      ? X86_CR4_VMXE : 0)  |            \
++        (cpu_has_pcid ? X86_CR4_PCIDE : 0) |            \
++        (cpu_has_xsave ? X86_CR4_OSXSAVE : 0))));       \
++})
+ 
+ /* These exceptions must always be intercepted. */
+ #define HVM_TRAP_MASK ((1U << TRAP_machine_check) | (1U << TRAP_invalid_op))
