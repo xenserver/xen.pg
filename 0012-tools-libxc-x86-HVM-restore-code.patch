@@ -1,60 +1,40 @@
-From d7295378875d8a8c06b8f0db06927a136f7af7bd Mon Sep 17 00:00:00 2001
+From 7a4ce4482afc7dc655ebadffe54ee36c3a800871 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Mon, 28 Apr 2014 16:38:35 +0100
-Subject: [PATCH 9/9] tools/libxc: x86 hvm restore implementation
+Date: Sat, 7 Jun 2014 21:17:51 +0100
+Subject: [PATCH 12/14] tools/libxc: x86 HVM restore code
 
-Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
- tools/libxc/saverestore/common.h          |    2 +
- tools/libxc/saverestore/restore.c         |    5 +-
- tools/libxc/saverestore/restore_x86_hvm.c |  296 +++++++++++++++++++++++++++++
- 3 files changed, 301 insertions(+), 2 deletions(-)
+ tools/libxc/saverestore/common.h          |    1 +
+ tools/libxc/saverestore/restore_x86_hvm.c |  280 +++++++++++++++++++++++++++++
+ 2 files changed, 281 insertions(+)
  create mode 100644 tools/libxc/saverestore/restore_x86_hvm.c
 
-diff -r d790080e45a6 tools/libxc/saverestore/common.h
+diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
+index 9e70ed6..e16e0de 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -131,6 +131,8 @@ int save_x86_pv(struct context *ctx);
- int save_x86_hvm(struct context *ctx);
- /* Restores an x86 PV domain. */
- int restore_x86_pv(struct context *ctx);
-+/* Restores an x86 HVM domain. */
-+int restore_x86_hvm(struct context *ctx);
+@@ -251,6 +251,7 @@ extern struct save_ops save_ops_x86_pv;
+ extern struct save_ops save_ops_x86_hvm;
  
- /*
-  * Write the image and domain headers to the stream.
-diff -r d790080e45a6 tools/libxc/saverestore/restore.c
---- a/tools/libxc/saverestore/restore.c
-+++ b/tools/libxc/saverestore/restore.c
-@@ -99,8 +99,9 @@ int xc_domain_restore2(xc_interface *xch
+ extern struct restore_ops restore_ops_x86_pv;
++extern struct restore_ops restore_ops_x86_hvm;
  
-     if ( ctx.dominfo.hvm )
-     {
--        ERROR("HVM Restore not supported yet");
--        return -1;
-+        ctx.ops = save_restore_ops_x86_hvm;
-+        if ( restore_x86_hvm(&ctx) )
-+            return -1;
-     }
-     else
-     {
-diff -r d790080e45a6 tools/libxc/saverestore/restore_x86_hvm.c
+ struct record
+ {
+diff --git a/tools/libxc/saverestore/restore_x86_hvm.c b/tools/libxc/saverestore/restore_x86_hvm.c
+new file mode 100644
+index 0000000..299d77f
 --- /dev/null
 +++ b/tools/libxc/saverestore/restore_x86_hvm.c
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,280 @@
 +#include <assert.h>
 +
-+#include "common_x86_pv.h"
++#include "common_x86.h"
 +
-+static int handle_end(struct context *ctx, struct record *rec)
-+{
-+    xc_interface *xch = ctx->xch;
-+
-+    DPRINTF("End record");
-+    return 0;
-+}
-+
++/* TODO: remove */
 +static int handle_toolstack(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -70,6 +50,9 @@ diff -r d790080e45a6 tools/libxc/saverestore/restore_x86_hvm.c
 +    return rc;
 +}
 +
++/*
++ * Process an HVM_CONTEXT record from the stream.
++ */
 +static int handle_hvm_context(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -81,6 +64,9 @@ diff -r d790080e45a6 tools/libxc/saverestore/restore_x86_hvm.c
 +    return rc;
 +}
 +
++/*
++ * Process an HVM_PARAMS record from the stream.
++ */
 +static int handle_hvm_params(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -125,23 +111,7 @@ diff -r d790080e45a6 tools/libxc/saverestore/restore_x86_hvm.c
 +    return 0;
 +}
 +
-+static int set_extra_hvm_params(struct context *ctx)
-+{
-+    xc_interface *xch = ctx->xch;
-+    int rc;
-+
-+    rc = xc_set_hvm_param(xch, ctx->domid, HVM_PARAM_STORE_EVTCHN,
-+                          ctx->restore.xenstore_evtchn);
-+    if ( rc < 0 )
-+    {
-+        PERROR("set HVM_PARAM_STORE_EVTCHN");
-+        goto out;
-+    }
-+
-+out:
-+    return rc;
-+}
-+
++/* TODO: remove */
 +static int dump_qemu(struct context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -208,85 +178,88 @@ diff -r d790080e45a6 tools/libxc/saverestore/restore_x86_hvm.c
 +    return rc;
 +}
 +
-+int restore_x86_hvm(struct context *ctx)
++/*
++ * restore_ops function.
++ */
++static int x86_hvm_localise_page(struct context *ctx, uint32_t type, void *page)
++{
++    /* no-op */
++    return 0;
++}
++
++/*
++ * restore_ops function. Confirms the stream matches the domain.
++ */
++static int x86_hvm_setup(struct context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct record rec;
-+    int rc;
 +
-+    IPRINTF("In experimental %s", __func__);
-+
-+    if ( ctx->restore.guest_type != DHDR_TYPE_x86_hvm )
++    if ( ctx->restore.guest_type != DHDR_TYPE_X86_HVM )
 +    {
 +        ERROR("Unable to restore %s domain into an x86_hvm domain",
 +              dhdr_type_to_str(ctx->restore.guest_type));
 +        return -1;
 +    }
-+    else if ( ctx->restore.guest_page_size != 4096 )
++    else if ( ctx->restore.guest_page_size != PAGE_SIZE )
 +    {
 +        ERROR("Invalid page size %d for x86_hvm domains",
 +              ctx->restore.guest_page_size);
 +        return -1;
 +    }
 +
-+    do
++    return 0;
++}
++
++/*
++ * restore_ops function.
++ */
++static int x86_hvm_process_record(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++
++    switch ( rec->type )
 +    {
-+        rc = read_record(ctx, &rec);
-+        if ( rc )
-+            goto err;
++    case REC_TYPE_TSC_INFO:
++        return handle_tsc_info(ctx, rec);
 +
-+        switch ( rec.type )
++    case REC_TYPE_HVM_CONTEXT:
++        return handle_hvm_context(ctx, rec);
++
++    case REC_TYPE_HVM_PARAMS:
++        return handle_hvm_params(ctx, rec);
++
++    case REC_TYPE_TOOLSTACK:
++        return handle_toolstack(ctx, rec);
++
++    default:
++        if ( rec->type & REC_TYPE_OPTIONAL )
 +        {
-+        case REC_TYPE_end:
-+            rc = handle_end(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_page_data:
-+            rc = handle_page_data(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_tsc_info:
-+            rc = handle_tsc_info(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_hvm_context:
-+            rc = handle_hvm_context(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_hvm_params:
-+            rc = handle_hvm_params(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_toolstack:
-+            rc = handle_toolstack(ctx, &rec);
-+            break;
-+
-+        default:
-+            if ( rec.type & REC_TYPE_optional )
-+            {
-+                IPRINTF("Ignoring optional record (0x%"PRIx32", %s)",
-+                        rec.type, rec_type_to_str(rec.type));
-+                rc = 0;
-+                break;
-+            }
-+
-+            ERROR("Invalid record type (0x%"PRIx32", %s) for x86_pv domains",
-+                  rec.type, rec_type_to_str(rec.type));
-+            rc = -1;
-+            break;
++            IPRINTF("Ignoring optional record (0x%"PRIx32", %s)",
++                    rec->type, rec_type_to_str(rec->type));
++            return 0;
 +        }
 +
-+        free(rec.data);
-+        if ( rc )
-+            goto err;
++        ERROR("Invalid record type (0x%"PRIx32", %s) for x86_hvm domains",
++              rec->type, rec_type_to_str(rec->type));
++        return -1;
++    }
++}
 +
-+    } while ( rec.type != REC_TYPE_end );
++/*
++ * restore_ops function.  Sets extra hvm parameters and seeds the grant table.
++ */
++static int x86_hvm_stream_complete(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
 +
-+    IPRINTF("Finished reading records");
-+
-+    rc = set_extra_hvm_params(ctx);
++    rc = xc_set_hvm_param(xch, ctx->domid, HVM_PARAM_STORE_EVTCHN,
++                          ctx->restore.xenstore_evtchn);
 +    if ( rc )
-+        goto err;
++    {
++        PERROR("Failed to set HVM_PARAM_STORE_EVTCHN");
++        return rc;
++    }
 +
 +    rc = xc_dom_gnttab_hvm_seed(xch, ctx->domid,
 +                                ctx->restore.console_mfn,
@@ -296,7 +269,7 @@ diff -r d790080e45a6 tools/libxc/saverestore/restore_x86_hvm.c
 +    if ( rc )
 +    {
 +        PERROR("Failed to seed grant table");
-+        goto err;
++        return rc;
 +    }
 +
 +    /*
@@ -307,28 +280,26 @@ diff -r d790080e45a6 tools/libxc/saverestore/restore_x86_hvm.c
 +    if ( rc )
 +    {
 +        ERROR("Failed to dump qemu");
-+        goto err;
++        return rc;
 +    }
-+
-+    /* all done */
-+    IPRINTF("All Done");
-+    assert(!rc);
-+    goto cleanup;
-+
-+ err:
-+    assert(rc);
-+ cleanup:
-+
-+    free(ctx->x86_pv.p2m);
-+    free(ctx->x86_pv.p2m_pfns);
-+    free(ctx->x86_pv.pfn_types);
-+    free(ctx->restore.populated_pfns);
-+
-+    if ( ctx->x86_pv.m2p )
-+        munmap(ctx->x86_pv.m2p, ctx->x86_pv.nr_m2p_frames * PAGE_SIZE);
 +
 +    return rc;
 +}
++
++static int x86_hvm_cleanup(struct context *ctx)
++{
++    /* no-op */
++    return 0;
++}
++
++struct restore_ops restore_ops_x86_hvm =
++{
++    .localise_page   = x86_hvm_localise_page,
++    .setup           = x86_hvm_setup,
++    .process_record  = x86_hvm_process_record,
++    .stream_complete = x86_hvm_stream_complete,
++    .cleanup         = x86_hvm_cleanup,
++};
 +
 +/*
 + * Local variables:
@@ -339,3 +310,6 @@ diff -r d790080e45a6 tools/libxc/saverestore/restore_x86_hvm.c
 + * indent-tabs-mode: nil
 + * End:
 + */
+-- 
+1.7.10.4
+

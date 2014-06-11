@@ -1,0 +1,116 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1402404405 -3600
+# Node ID 2a11baf9453a284df0ec3e8c3ca58fd58502ec40
+# Parent 867d3f930eee6566693b5894d62d0b83fd1cbd11
+tools/libxc: Annotate xc_report_error with __attribute__((format))
+
+This helps the compiler spot printf formatting errors.
+
+Fix up all errors discovered.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+
+diff -r 867d3f930eee tools/libxc/xc_core.c
+--- a/tools/libxc/xc_core.c
++++ b/tools/libxc/xc_core.c
+@@ -497,7 +497,7 @@ xc_domain_dumpcore_via_callback(xc_inter
+     ctxt = calloc(sizeof(*ctxt), info.max_vcpu_id + 1);
+     if ( !ctxt )
+     {
+-        PERROR("Could not allocate vcpu context array", domid);
++        PERROR("Could not allocate vcpu context array");
+         goto out;
+     }
+ 
+diff -r 867d3f930eee tools/libxc/xc_domain_restore.c
+--- a/tools/libxc/xc_domain_restore.c
++++ b/tools/libxc/xc_domain_restore.c
+@@ -46,6 +46,8 @@
+ #include <xen/hvm/ioreq.h>
+ #include <xen/hvm/params.h>
+ 
++#include <inttypes.h>
++
+ struct restore_ctx {
+     unsigned long max_mfn; /* max mfn of the current host machine */
+     unsigned long hvirt_start; /* virtual starting address of the hypervisor */
+@@ -101,7 +103,7 @@ static ssize_t rdexact(xc_interface *xch
+             errno = 0;
+         }
+         if ( len <= 0 ) {
+-            ERROR("%s failed (read rc: %d, errno: %d)", __func__, len, errno);
++            ERROR("%s failed (read rc: %zd, errno: %d)", __func__, len, errno);
+             return -1;
+         }
+         offset += len;
+@@ -443,7 +445,7 @@ static int compat_buffer_qemu(xc_interfa
+     }
+ 
+     if ( memcmp(qbuf, "QEVM", 4) ) {
+-        ERROR("Invalid QEMU magic: 0x%08x", *(unsigned long*)qbuf);
++        ERROR("Invalid QEMU magic: 0x%08"PRIx32, *(uint32_t*)qbuf);
+         free(qbuf);
+         return -1;
+     }
+@@ -1761,7 +1763,7 @@ int xc_domain_restore(xc_interface *xch,
+     } else if (pagebuf.acpi_ioport_location == 0) {
+         DBGPRINTF("Use old firmware ioport from the checkpoint\n");
+     } else {
+-        ERROR("Error, unknow acpi ioport location (%i)", pagebuf.acpi_ioport_location);
++        ERROR("Error, unknow acpi ioport location (%"PRId64")", pagebuf.acpi_ioport_location);
+     }
+ 
+     tdatatmp = tdata;
+diff -r 867d3f930eee tools/libxc/xc_gnttab.c
+--- a/tools/libxc/xc_gnttab.c
++++ b/tools/libxc/xc_gnttab.c
+@@ -75,7 +75,7 @@ static void *_gnttab_map_table(xc_interf
+ 
+     if ( rc || (query.status != GNTST_okay) )
+     {
+-        ERROR("Could not query dom's grant size\n", domid);
++        ERROR("Could not query dom%d's grant size\n", domid);
+         return NULL;
+     }
+ 
+diff -r 867d3f930eee tools/libxc/xc_hvm_build_x86.c
+--- a/tools/libxc/xc_hvm_build_x86.c
++++ b/tools/libxc/xc_hvm_build_x86.c
+@@ -474,7 +474,7 @@ static int setup_guest(xc_interface *xch
+         rc = xc_domain_populate_physmap_exact(xch, dom, 1, 0, 0, &pfn);
+         if ( rc != 0 )
+         {
+-            PERROR("Could not allocate %d'th special page.", i);
++            PERROR("Could not allocate %ld'th special page.", i);
+             goto error_out;
+         }
+         if ( xc_clear_domain_page(xch, dom, special_pfn(i)) )
+diff -r 867d3f930eee tools/libxc/xc_private.h
+--- a/tools/libxc/xc_private.h
++++ b/tools/libxc/xc_private.h
+@@ -93,7 +93,8 @@ struct xc_interface_core {
+     xc_osdep_handle  ops_handle; /* opaque data for xc_osdep_ops */
+ };
+ 
+-void xc_report_error(xc_interface *xch, int code, const char *fmt, ...);
++void xc_report_error(xc_interface *xch, int code, const char *fmt, ...)
++    __attribute__((format(printf,3,4)));
+ void xc_reportv(xc_interface *xch, xentoollog_logger *lg, xentoollog_level,
+                 int code, const char *fmt, va_list args)
+      __attribute__((format(printf,5,0)));
+diff -r 867d3f930eee tools/xenpaging/xenpaging.c
+--- a/tools/xenpaging/xenpaging.c
++++ b/tools/xenpaging/xenpaging.c
+@@ -912,7 +912,7 @@ int main(int argc, char *argv[])
+ 
+             if ( req.gfn > paging->max_pages )
+             {
+-                ERROR("Requested gfn %"PRIx64" higher than max_pages %lx\n", req.gfn, paging->max_pages);
++                ERROR("Requested gfn %"PRIx64" higher than max_pages %x\n", req.gfn, paging->max_pages);
+                 goto out;
+             }
+ 

@@ -1,0 +1,448 @@
+From 13c64c0432ce0e4ff4ab69e57cd50e8fa4decbfe Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Sat, 7 Jun 2014 21:16:33 +0100
+Subject: [PATCH 07/14] tools/libxc: x86 PV common code
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+---
+ tools/libxc/saverestore/common.h        |    5 +
+ tools/libxc/saverestore/common_x86_pv.c |  250 +++++++++++++++++++++++++++++++
+ tools/libxc/saverestore/common_x86_pv.h |  144 ++++++++++++++++++
+ 3 files changed, 399 insertions(+)
+ create mode 100644 tools/libxc/saverestore/common_x86_pv.c
+ create mode 100644 tools/libxc/saverestore/common_x86_pv.h
+
+diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
+index d9a3655..5f6af00 100644
+--- a/tools/libxc/saverestore/common.h
++++ b/tools/libxc/saverestore/common.h
+@@ -14,6 +14,10 @@
+ 
+ #undef mfn_to_pfn
+ #undef pfn_to_mfn
++#undef GET_FIELD
++#undef SET_FIELD
++#undef MEMCPY_FIELD
++#undef MEMSET_ARRAY_FIELD
+ 
+ 
+ #include "stream_format.h"
+@@ -240,6 +244,7 @@ struct context
+     };
+ };
+ 
++extern struct common_ops common_ops_x86_pv;
+ 
+ struct record
+ {
+diff --git a/tools/libxc/saverestore/common_x86_pv.c b/tools/libxc/saverestore/common_x86_pv.c
+new file mode 100644
+index 0000000..02a006b
+--- /dev/null
++++ b/tools/libxc/saverestore/common_x86_pv.c
+@@ -0,0 +1,250 @@
++#include <assert.h>
++
++#include "common_x86_pv.h"
++
++/* common_ops function */
++static bool x86_pv_pfn_is_valid(const struct context *ctx, xen_pfn_t pfn)
++{
++    return pfn <= ctx->x86_pv.max_pfn;
++}
++
++/* common_ops function */
++static xen_pfn_t x86_pv_pfn_to_gfn(const struct context *ctx, xen_pfn_t pfn)
++{
++    assert(pfn <= ctx->x86_pv.max_pfn);
++
++    if ( ctx->x86_pv.width == sizeof(uint64_t) )
++        /* 64 bit guest.  Need to truncate their pfns for 32 bit toolstacks */
++        return ((uint64_t *)ctx->x86_pv.p2m)[pfn];
++    else
++    {
++        /* 32 bit guest.  Need to expand INVALID_MFN for 64 bit toolstacks */
++        uint32_t mfn = ((uint32_t *)ctx->x86_pv.p2m)[pfn];
++
++        return mfn == ~0U ? INVALID_MFN : mfn;
++    }
++}
++
++/* common_ops function */
++static void x86_pv_set_page_type(struct context *ctx, xen_pfn_t pfn,
++                                 unsigned long type)
++{
++    assert(pfn <= ctx->x86_pv.max_pfn);
++
++    ctx->x86_pv.pfn_types[pfn] = type;
++}
++
++/* common_ops function */
++static void x86_pv_set_gfn(struct context *ctx, xen_pfn_t pfn,
++                           xen_pfn_t mfn)
++{
++    assert(pfn <= ctx->x86_pv.max_pfn);
++
++    if ( ctx->x86_pv.width == sizeof(uint64_t) )
++        /* 64 bit guest.  Need to expand INVALID_MFN for 32 bit toolstacks */
++        ((uint64_t *)ctx->x86_pv.p2m)[pfn] = mfn == INVALID_MFN ? ~0ULL : mfn;
++    else
++        /* 32 bit guest.  Can safely truncate INVALID_MFN for 64 bit toolstacks */
++        ((uint32_t *)ctx->x86_pv.p2m)[pfn] = mfn;
++}
++
++struct common_ops common_ops_x86_pv = {
++    .pfn_is_valid   = x86_pv_pfn_is_valid,
++    .pfn_to_gfn     = x86_pv_pfn_to_gfn,
++    .set_page_type  = x86_pv_set_page_type,
++    .set_gfn        = x86_pv_set_gfn,
++};
++
++xen_pfn_t mfn_to_pfn(struct context *ctx, xen_pfn_t mfn)
++{
++    assert(mfn <= ctx->x86_pv.max_mfn);
++    return ctx->x86_pv.m2p[mfn];
++}
++
++bool mfn_in_pseudophysmap(struct context *ctx, xen_pfn_t mfn)
++{
++    return ( (mfn <= ctx->x86_pv.max_mfn) &&
++             (mfn_to_pfn(ctx, mfn) <= ctx->x86_pv.max_pfn) &&
++             (ctx->ops.pfn_to_gfn(ctx, mfn_to_pfn(ctx, mfn) == mfn)) );
++}
++
++void dump_bad_pseudophysmap_entry(struct context *ctx, xen_pfn_t mfn)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t pfn = ~0UL;
++
++    ERROR("mfn %#lx, max %#lx", mfn, ctx->x86_pv.max_mfn);
++
++    if ( (mfn != ~0UL) && (mfn <= ctx->x86_pv.max_mfn) )
++    {
++        pfn = ctx->x86_pv.m2p[mfn];
++        ERROR("  m2p[%#lx] = %#lx, max_pfn %#lx",
++              mfn, pfn, ctx->x86_pv.max_pfn);
++    }
++
++    if ( (pfn != ~0UL) && (pfn <= ctx->x86_pv.max_pfn) )
++        ERROR("  p2m[%#lx] = %#lx",
++              pfn, ctx->ops.pfn_to_gfn(ctx, pfn));
++}
++
++xen_pfn_t cr3_to_mfn(struct context *ctx, uint64_t cr3)
++{
++    if ( ctx->x86_pv.width == 8 )
++        return cr3 >> 12;
++    else
++        return (((uint32_t)cr3 >> 12) | ((uint32_t)cr3 << 20));
++}
++
++uint64_t mfn_to_cr3(struct context *ctx, xen_pfn_t mfn)
++{
++    if ( ctx->x86_pv.width == 8 )
++        return ((uint64_t)mfn) << 12;
++    else
++        return (((uint32_t)mfn << 12) | ((uint32_t)mfn >> 20));
++}
++
++int x86_pv_domain_info(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    unsigned int guest_width, guest_levels, fpp;
++    int max_pfn;
++
++    /* Get the domain width */
++    if ( xc_domain_get_guest_width(xch, ctx->domid, &guest_width) )
++    {
++        PERROR("Unable to determine dom%d's width", ctx->domid);
++        return -1;
++    }
++
++    if ( guest_width == 4 )
++        guest_levels = 3;
++    else if ( guest_width == 8 )
++        guest_levels = 4;
++    else
++    {
++        ERROR("Invalid guest width %d.  Expected 32 or 64", guest_width * 8);
++        return -1;
++    }
++    ctx->x86_pv.width = guest_width;
++    ctx->x86_pv.levels = guest_levels;
++    fpp = PAGE_SIZE / ctx->x86_pv.width;
++
++    DPRINTF("%d bits, %d levels", guest_width * 8, guest_levels);
++
++    /* Get the domain's size */
++    max_pfn = xc_domain_maximum_gpfn(xch, ctx->domid);
++    if ( max_pfn < 0 )
++    {
++        PERROR("Unable to obtain guests max pfn");
++        return -1;
++    }
++
++    if ( max_pfn > 0 )
++    {
++        ctx->x86_pv.max_pfn = max_pfn;
++        ctx->x86_pv.p2m_frames = (ctx->x86_pv.max_pfn + fpp) / fpp;
++
++        DPRINTF("max_pfn %#x, p2m_frames %d", max_pfn, ctx->x86_pv.p2m_frames);
++    }
++
++    return 0;
++}
++
++int x86_pv_map_m2p(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    long max_page = xc_maximum_ram_page(xch);
++    unsigned long m2p_chunks, m2p_size;
++    privcmd_mmap_entry_t *entries = NULL;
++    xen_pfn_t *extents_start = NULL;
++    int rc = -1, i;
++
++    if ( max_page < 0 )
++    {
++        PERROR("Failed to get maximum ram page");
++        goto err;
++    }
++
++    ctx->x86_pv.max_mfn = max_page;
++    m2p_size   = M2P_SIZE(ctx->x86_pv.max_mfn);
++    m2p_chunks = M2P_CHUNKS(ctx->x86_pv.max_mfn);
++
++    extents_start = malloc(m2p_chunks * sizeof(xen_pfn_t));
++    if ( !extents_start )
++    {
++        ERROR("Unable to allocate %zu bytes for m2p mfns",
++              m2p_chunks * sizeof(xen_pfn_t));
++        goto err;
++    }
++
++    if ( xc_machphys_mfn_list(xch, m2p_chunks, extents_start) )
++    {
++        PERROR("Failed to get m2p mfn list");
++        goto err;
++    }
++
++    entries = malloc(m2p_chunks * sizeof(privcmd_mmap_entry_t));
++    if ( !entries )
++    {
++        ERROR("Unable to allocate %zu bytes for m2p mapping mfns",
++              m2p_chunks * sizeof(privcmd_mmap_entry_t));
++        goto err;
++    }
++
++    for ( i = 0; i < m2p_chunks; ++i )
++        entries[i].mfn = extents_start[i];
++
++    ctx->x86_pv.m2p = xc_map_foreign_ranges(
++        xch, DOMID_XEN, m2p_size, PROT_READ,
++        M2P_CHUNK_SIZE, entries, m2p_chunks);
++
++    if ( !ctx->x86_pv.m2p )
++    {
++        PERROR("Failed to mmap m2p ranges");
++        goto err;
++    }
++
++    ctx->x86_pv.nr_m2p_frames = (M2P_CHUNK_SIZE >> PAGE_SHIFT) * m2p_chunks;
++
++#ifdef __i386__
++    /* 32 bit toolstacks automatically get the compat m2p */
++    ctx->x86_pv.compat_m2p_mfn0 = entries[0].mfn;
++#else
++    /* 64 bit toolstacks need to ask Xen specially for it */
++    {
++        struct xen_machphys_mfn_list xmml = {
++            .max_extents = 1,
++            .extent_start = { &ctx->x86_pv.compat_m2p_mfn0 }
++        };
++
++        rc = do_memory_op(xch, XENMEM_machphys_compat_mfn_list,
++                          &xmml, sizeof(xmml));
++        if ( rc || xmml.nr_extents != 1 )
++        {
++            PERROR("Failed to get compat mfn list from Xen");
++            rc = -1;
++            goto err;
++        }
++    }
++#endif
++
++    /* All Done */
++    rc = 0;
++    DPRINTF("max_mfn %#lx", ctx->x86_pv.max_mfn);
++
++err:
++    free(entries);
++    free(extents_start);
++
++    return rc;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/tools/libxc/saverestore/common_x86_pv.h b/tools/libxc/saverestore/common_x86_pv.h
+new file mode 100644
+index 0000000..bb2e9fc
+--- /dev/null
++++ b/tools/libxc/saverestore/common_x86_pv.h
+@@ -0,0 +1,144 @@
++#ifndef __COMMON_X86_PV_H
++#define __COMMON_X86_PV_H
++
++#include "common_x86.h"
++
++/* Gets a field from an *_any union */
++#define GET_FIELD(_c, _p, _f)                   \
++    ({ (_c)->x86_pv.width == 8 ?                \
++            (_p)->x64._f:                       \
++            (_p)->x32._f;                       \
++    })                                          \
++
++/* Gets a field from an *_any union */
++#define SET_FIELD(_c, _p, _f, _v)               \
++    ({ if ( (_c)->x86_pv.width == 8 )           \
++            (_p)->x64._f = (_v);                \
++        else                                    \
++            (_p)->x32._f = (_v);                \
++    })
++
++/* memcpy field _f from _s to _d, of an *_any union */
++#define MEMCPY_FIELD(_c, _d, _s, _f)                                    \
++    ({ if ( (_c)->x86_pv.width == 8 )                                   \
++            memcpy(&(_d)->x64._f, &(_s)->x64._f, sizeof((_d)->x64._f)); \
++        else                                                            \
++            memcpy(&(_d)->x32._f, &(_s)->x32._f, sizeof((_d)->x32._f)); \
++    })
++
++/* memset array field _f with value _v, from an *_any union */
++#define MEMSET_ARRAY_FIELD(_c, _d, _f, _v)                              \
++    ({ if ( (_c)->x86_pv.width == 8 )                                   \
++           memset(&(_d)->x64._f[0], (_v), sizeof((_d)->x64._f));        \
++       else                                                             \
++           memset(&(_d)->x32._f[0], (_v), sizeof((_d)->x32._f));        \
++    })
++
++/*
++ * Convert an mfn to a pfn, given Xens m2p table.
++ *
++ * Caller must ensure that the requested mfn is in range.
++ */
++xen_pfn_t mfn_to_pfn(struct context *ctx, xen_pfn_t mfn);
++
++/*
++ * Convert a pfn to an mfn, given the guests p2m table.
++ *
++ * Caller must ensure that the requested pfn is in range.
++ */
++xen_pfn_t pfn_to_mfn(struct context *ctx, xen_pfn_t pfn);
++
++/*
++ * Set a mapping in the p2m table.
++ *
++ * Caller must ensure that the requested pfn is in range.
++ */
++void set_p2m(struct context *ctx, xen_pfn_t pfn, xen_pfn_t mfn);
++
++/*
++ * Query whether a particular mfn is valid in the physmap of a guest.
++ */
++bool mfn_in_pseudophysmap(struct context *ctx, xen_pfn_t mfn);
++
++/*
++ * Debug a particular mfn by walking the p2m and m2p.
++ */
++void dump_bad_pseudophysmap_entry(struct context *ctx, xen_pfn_t mfn);
++
++/*
++ * Convert a PV cr3 field to an mfn.
++ *
++ * Adjusts for Xen's extended-cr3 format to pack a 44bit physical address into
++ * a 32bit architectural cr3.
++ */
++xen_pfn_t cr3_to_mfn(struct context *ctx, uint64_t cr3);
++
++/*
++ * Convert an mfn to a PV cr3 field.
++ *
++ * Adjusts for Xen's extended-cr3 format to pack a 44bit physical address into
++ * a 32bit architectural cr3.
++ */
++uint64_t mfn_to_cr3(struct context *ctx, xen_pfn_t mfn);
++
++/*
++ * Extract an mfn from a Pagetable Entry.
++ */
++static inline xen_pfn_t pte_to_frame(struct context *ctx, uint64_t pte)
++{
++    if ( ctx->x86_pv.width == 8 )
++        return (pte >> PAGE_SHIFT) & ((1ULL << (52 - PAGE_SHIFT)) - 1);
++    else
++        return (pte >> PAGE_SHIFT) & ((1ULL << (44 - PAGE_SHIFT)) - 1);
++}
++
++/*
++ * Change the mfn in a Pagetable Entry while leaving the flags alone.
++ */
++static inline void update_pte(struct context *ctx, uint64_t *pte, xen_pfn_t mfn)
++{
++    if ( ctx->x86_pv.width == 8 )
++        *pte &= ~(((1ULL << (52 - PAGE_SHIFT)) - 1) << PAGE_SHIFT);
++    else
++        *pte &= ~(((1ULL << (44 - PAGE_SHIFT)) - 1) << PAGE_SHIFT);
++
++    *pte |= (uint64_t)mfn << PAGE_SHIFT;
++}
++
++/*
++ * Get current domain information.
++ *
++ * Fills ctx->x86_pv
++ * - .width
++ * - .levels
++ * - .fpp
++ * - .p2m_frames
++ *
++ * Used by the save side to create the X86_PV_INFO record, and by the restore
++ * side to verify the incoming stream.
++ *
++ * Returns 0 on success and non-zero on error.
++ */
++int x86_pv_domain_info(struct context *ctx);
++
++/*
++ * Maps the Xen M2P.
++ *
++ * Fills ctx->x86_pv.
++ * - .max_mfn
++ * - .m2p
++ *
++ * Returns 0 on success and non-zero on error.
++ */
++int x86_pv_map_m2p(struct context *ctx);
++
++#endif
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+-- 
+1.7.10.4
+

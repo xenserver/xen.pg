@@ -1,92 +1,29 @@
-From 84a29103b6b6125b8065bf644112ae7b3fd927f6 Mon Sep 17 00:00:00 2001
+From a64fe30f99b06647812250aef1f6d4f392db3c66 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 6 Mar 2014 00:03:18 +0000
-Subject: [PATCH 4/9] tools/libxc: Scripts for inspection/valdiation of legacy
+Subject: [PATCH 02/14] scripts: Scripts for inspection/valdiation of legacy
  and new streams
+
+TODO: move to tools/python and install properly...
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
- tools/libxc/saverestore/scripts/generate.py   |   59 +++
- tools/libxc/saverestore/scripts/legacy.py     |  583 +++++++++++++++++++++++++
- tools/libxc/saverestore/scripts/streamspec.py |  109 +++++
- tools/libxc/saverestore/scripts/verify.py     |  385 ++++++++++++++++
- 4 files changed, 1136 insertions(+)
- create mode 100755 tools/libxc/saverestore/scripts/generate.py
+ tools/libxc/saverestore/scripts/legacy.py     |  576 +++++++++++++++++++++++++
+ tools/libxc/saverestore/scripts/streamspec.py |  136 ++++++
+ tools/libxc/saverestore/scripts/verify.py     |  377 ++++++++++++++++
+ 3 files changed, 1089 insertions(+)
  create mode 100755 tools/libxc/saverestore/scripts/legacy.py
  create mode 100644 tools/libxc/saverestore/scripts/streamspec.py
  create mode 100755 tools/libxc/saverestore/scripts/verify.py
 
-diff --git a/tools/libxc/saverestore/scripts/generate.py b/tools/libxc/saverestore/scripts/generate.py
-new file mode 100755
---- /dev/null
-+++ b/tools/libxc/saverestore/scripts/generate.py
-@@ -0,0 +1,59 @@
-+#!/usr/bin/env python
-+# -*- coding: utf-8 -*-
-+
-+from streamspec import *
-+import struct, sys
-+
-+ihdr = struct.pack(IHDR_FORMAT,
-+                   0xffffffffffffffff, # Marker
-+                   IHDR_IDENT,         # "XENF" in ASCII
-+                   1,                  # Version
-+                   IHDR_OPT_LE,        # Options
-+                   0, 0                # Reserved
-+                   )
-+
-+def emit_record(type, data):
-+    length = len(data)
-+
-+    r = struct.pack(RH_FORMAT, type, length)
-+    r += data
-+
-+    padding_len = (8 - (length & 7)) & 7
-+    r += '\x00' * padding_len
-+
-+    sys.stdout.write(r)
-+
-+
-+def emit_pv():
-+
-+    dhdr = struct.pack(DHDR_FORMAT,
-+                       DHDR_TYPE_x86_pv,  # Type
-+                       12, # Page size
-+                       0,  # Reserved
-+                       4,  # Xen major
-+                       5   # Xen minor
-+                       )
-+
-+    sys.stdout.write(ihdr)
-+    sys.stdout.write(dhdr)
-+
-+    x86_pv_info = struct.pack(X86_PV_INFO_FORMAT,
-+                              8, # Guest width
-+                              4, # Guest levels
-+                              0  # Options
-+                              )
-+
-+    emit_record(REC_TYPE_x86_pv_info, x86_pv_info)
-+    emit_record(REC_TYPE_end, "")
-+    return 0
-+
-+
-+def main(argv = sys.argv):
-+
-+    if len(argv) == 0 or argv[0] == "pv":
-+        return emit_pv()
-+    else:
-+        return 1
-+
-+if __name__ == "__main__":
-+    sys.exit(main(sys.argv[1:]))
 diff --git a/tools/libxc/saverestore/scripts/legacy.py b/tools/libxc/saverestore/scripts/legacy.py
 new file mode 100755
+index 0000000..a1b0070
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/legacy.py
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,576 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -103,16 +40,10 @@ new file mode 100755
 +pv = None      # Boolean (pv or hvm)
 +
 +def stream_read(_ = None):
-+    if _ is None:
-+        return fin.read()
-+    else:
-+        return fin.read(_)
-+        # return os.read(fin.fileno(), _)
++    return fin.read(_)
 +
 +def stream_write(_):
 +    return fout.write(_)
-+    # if fout is not None:
-+    #     os.write(fout.fileno(), _)
 +
 +class StreamError(StandardError):
 +    pass
@@ -166,7 +97,7 @@ new file mode 100755
 +def write_pv_info(vm):
 +    write_record(streamspec.REC_TYPE_x86_pv_info,
 +                 struct.pack(streamspec.X86_PV_INFO_FORMAT,
-+                             vm.width, vm.levels, 0))
++                             vm.width, vm.levels, 0, 0))
 +
 +def write_pv_p2m_frames(vm, pfns):
 +    write_record(streamspec.REC_TYPE_x86_pv_p2m_frames,
@@ -176,18 +107,17 @@ new file mode 100755
 +
 +def write_pv_vcpu_basic(vcpu_id, data):
 +    write_record(streamspec.REC_TYPE_x86_pv_vcpu_basic,
-+                 struct.pack(streamspec.X86_PV_VCPU_FORMAT, vcpu_id, 0),
++                 struct.pack(streamspec.X86_PV_VCPU_FORMAT_HDR, vcpu_id, 0),
 +                 data)
 +
 +def write_pv_vcpu_extd(vcpu_id, data):
 +    write_record(streamspec.REC_TYPE_x86_pv_vcpu_extended,
-+                 struct.pack(streamspec.X86_PV_VCPU_FORMAT, vcpu_id, 0),
++                 struct.pack(streamspec.X86_PV_VCPU_FORMAT_HDR, vcpu_id, 0),
 +                 data)
 +
-+def write_pv_vcpu_xsave(vcpu_id, mask, data):
++def write_pv_vcpu_xsave(vcpu_id, data):
 +    write_record(streamspec.REC_TYPE_x86_pv_vcpu_xsave,
-+                 struct.pack(streamspec.X86_PV_VCPU_XSAVE_FORMAT,
-+                             vcpu_id, 0, mask),
++                 struct.pack(streamspec.X86_PV_VCPU_FORMAT_HDR, vcpu_id, 0),
 +                 data)
 +
 +def write_page_data(pfns, pages):
@@ -207,7 +137,7 @@ new file mode 100755
 +def write_tsc_info(mode, khz, nsec, incarn):
 +    write_record(streamspec.REC_TYPE_tsc_info,
 +                 struct.pack(streamspec.TSC_INFO_FORMAT,
-+                             mode, khz, nsec, incarn))
++                             mode, khz, nsec, incarn, 0))
 +
 +def write_hvm_params(params):
 +    if pv:
@@ -349,7 +279,7 @@ new file mode 100755
 +
 +            xsave = rdexact(size)
 +            print "xsave (mask 0x%x, size 0x%x)" % (mask, size),
-+            write_pv_vcpu_xsave(vcpu_id, mask, xsave)
++            write_pv_vcpu_xsave(vcpu_id, xsave)
 +        print ""
 +
 +    shinfo = rdexact(4096)
@@ -672,11 +602,15 @@ new file mode 100755
 +    sys.exit(main(sys.argv))
 diff --git a/tools/libxc/saverestore/scripts/streamspec.py b/tools/libxc/saverestore/scripts/streamspec.py
 new file mode 100644
+index 0000000..9f97b46
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/streamspec.py
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,136 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
++
++# Python structures for the Migration v2 stream format.
++# See docs/specs/libxc-migration-stream.pandoc
 +
 +# Image Header
 +IHDR_FORMAT = "!QIIHHI"
@@ -691,7 +625,7 @@ new file mode 100644
 +IHDR_OPT_RESZ_MASK = 0xfffe
 +
 +# Domain Header
-+DHDR_FORMAT = "=IHHII"
++DHDR_FORMAT = "IHHII"
 +
 +DHDR_TYPE_x86_pv  = 0x00000001
 +DHDR_TYPE_x86_hvm = 0x00000002
@@ -705,7 +639,7 @@ new file mode 100644
 +    DHDR_TYPE_arm     : "ARM",
 +}
 +
-+RH_FORMAT = "=II"
++RH_FORMAT = "II"
 +
 +REC_TYPE_end                  = 0x00000000
 +REC_TYPE_page_data            = 0x00000001
@@ -719,6 +653,7 @@ new file mode 100644
 +REC_TYPE_hvm_context          = 0x00000009
 +REC_TYPE_hvm_params           = 0x0000000a
 +REC_TYPE_toolstack            = 0x0000000b
++REC_TYPE_x86_pv_vcpu_msrs     = 0x0000000c
 +
 +rec_type_to_str = {
 +    REC_TYPE_end                  : "End",
@@ -733,10 +668,11 @@ new file mode 100644
 +    REC_TYPE_hvm_context          : "HVM context",
 +    REC_TYPE_hvm_params           : "HVM params",
 +    REC_TYPE_toolstack            : "Toolstack",
++    REC_TYPE_x86_pv_vcpu_msrs     : "x86 PV vcpu msrs",
 +}
 +
 +# page_data
-+PAGE_DATA_FORMAT             = "=II"
++PAGE_DATA_FORMAT             = "II"
 +PAGE_DATA_PFN_MASK           = (1L << 52) - 1
 +PAGE_DATA_PFN_RESZ_MASK      = ((1L << 60) - 1) & ~((1L << 52) - 1)
 +
@@ -756,27 +692,19 @@ new file mode 100644
 +PAGE_DATA_TYPE_XTAB          = (0xfL << PAGE_DATA_TYPE_SHIFT) # Invalid
 +
 +# x86_pv_info
-+X86_PV_INFO_FORMAT        = "=BBB"
++X86_PV_INFO_FORMAT        = "BBHI"
 +
-+X86_PV_INFO_OPT_VMASST_   = 0
-+X86_PV_INFO_OPT_VMASST    = (1 << X86_PV_INFO_OPT_VMASST_)
++X86_PV_P2M_FRAMES_FORMAT  = "II"
 +
-+X86_PV_INFO_OPT_RESZ_MASK = 0xfe
-+
-+X86_PV_P2M_FRAMES_FORMAT  = "=II"
-+
-+# x86_pv_vcpu_{basic,extended}
-+X86_PV_VCPU_FORMAT        = "=II"
-+
-+# x86_pv_vcpu_xsave
-+X86_PV_VCPU_XSAVE_FORMAT  = "=IIQ"
++# x86_pv_vcpu_{basic,extended,xsave,msrs}
++X86_PV_VCPU_FORMAT_HDR    = "II"
 +
 +# tsc_info
-+TSC_INFO_FORMAT           = "=IIQI"
++TSC_INFO_FORMAT           = "IIQII"
 +
 +# hvm_params
-+HVM_PARAMS_FORMAT         = "=II"
-+HVM_PARAMS_ENTRY_FORMAT   = "=QQ"
++HVM_PARAMS_ENTRY_FORMAT   = "QQ"
++HVM_PARAMS_FORMAT         = "II"
 +
 +#
 +# libxl format
@@ -784,11 +712,42 @@ new file mode 100644
 +
 +LIBXL_QEMU_SIGNATURE = "DeviceModelRecord0002"
 +LIBXL_QEMU_RECORD_HDR = "=%dsI" % (len(LIBXL_QEMU_SIGNATURE), )
++
++
++# If run as a python script alone, confirm some expected sizes
++if __name__ == "__main__":
++    import sys
++    from struct import calcsize
++
++    ok = True
++    for fmt, sz in [ ("IHDR_FORMAT", 24),
++                     ("DHDR_FORMAT", 16),
++                     ("RH_FORMAT", 8),
++
++                     ("PAGE_DATA_FORMAT", 8),
++                     ("X86_PV_INFO_FORMAT", 8),
++                     ("X86_PV_P2M_FRAMES_FORMAT", 8),
++                     ("X86_PV_VCPU_FORMAT_HDR", 8),
++                     ("TSC_INFO_FORMAT", 24),
++                     ("HVM_PARAMS_ENTRY_FORMAT", 16),
++                     ("HVM_PARAMS_FORMAT", 8),
++                     ]:
++
++        realsz = calcsize(getattr(sys.modules[__name__], fmt))
++        if realsz != sz:
++            print "%s is %d bytes but expected %d" % (fmt, realsz, sz)
++            ok = False
++
++    if ok:
++        sys.exit(0)
++    else:
++        sys.exit(1)
 diff --git a/tools/libxc/saverestore/scripts/verify.py b/tools/libxc/saverestore/scripts/verify.py
 new file mode 100755
+index 0000000..883cc18
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/verify.py
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,377 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -942,14 +901,14 @@ new file mode 100755
 +
 +
 +def verify_record_x86_pv_vcpu_generic(content, name):
-+    # Generic for both REC_TYPE_x86_pv_vcpu_{basic,extended}
-+    minsz = struct.calcsize(X86_PV_VCPU_FORMAT)
++    # Generic for all REC_TYPE_x86_pv_vcpu_{basic,extended,xsave,msrs}
++    minsz = struct.calcsize(X86_PV_VCPU_FORMAT_HDR)
 +
 +    if len(content) <= minsz:
 +        raise RecordError("X86_PV_VCPU_%s record length must be at least %d"
 +                          " bytes long" % (name, minsz))
 +
-+    vcpuid, res1 = struct.unpack_from(X86_PV_VCPU_FORMAT, content)
++    vcpuid, res1 = struct.unpack_from(X86_PV_VCPU_FORMAT_HDR, content)
 +
 +    if res1 != 0:
 +        raise StreamError("Reserved bits set in x86_pv_vcpu_%s record 0x%04x"
@@ -957,30 +916,15 @@ new file mode 100755
 +
 +    print "  vcpu%d %s context, %d bytes" % (vcpuid, name, len(content) - minsz)
 +
-+def verify_record_x86_pv_vcpu_xsave(content):
-+    minsz = struct.calcsize(X86_PV_VCPU_XSAVE_FORMAT)
-+
-+    if len(content) <= minsz:
-+        raise RecordError("X86_PV_VCPU_XSAVE record length must be at least %d"
-+                          " bytes long" % (minsz, ))
-+
-+    vcpuid, res1, xmask = struct.unpack_from(X86_PV_VCPU_XSAVE_FORMAT,
-+                                             content)
-+
-+    if res1 != 0:
-+        raise StreamError("Reserved bits set in X86_PV_VCPU_XSAVE record "
-+                          "0x%04x" % (res1, ))
-+
-+    print "  vcpu%d xsave context, mask 0x%x" % (vcpuid, xmask)
-+
 +
 +def verify_x86_pv_info(content):
 +
-+    if len(content) != 3:
-+        raise RecordError("x86_pf_info: expected length of 3, got %d"
-+                          % (len(content), ))
++    expectedsz = struct.calcsize(X86_PV_INFO_FORMAT)
++    if len(content) != expectedsz:
++        raise RecordError("x86_pv_info: expected length of %d, got %d"
++                          % (expectedsz, len(content)))
 +
-+    width, levels, options = struct.unpack(X86_PV_INFO_FORMAT, content)
++    width, levels, res1, res2 = struct.unpack(X86_PV_INFO_FORMAT, content)
 +
 +    if width not in (4, 8):
 +        raise RecordError("Expected width of 4 or 8, got %d" % (width, ))
@@ -988,9 +932,9 @@ new file mode 100755
 +    if levels not in (3, 4):
 +        raise RecordError("Expected levels of 3 or 4, got %d" % (levels, ))
 +
-+    if (options & X86_PV_INFO_OPT_RESZ_MASK) != 0:
-+        raise StreamError("Reserved bits set in X86_PV_INFO options: 0x%02x"
-+                          % (options & X86_PV_INFO_OPT_RESZ_MASK, ))
++    if res1 != 0 or res2 != 0:
++        raise StreamError("Reserved bits set in X86_PV_INFO: 0x%04x 0x%08x"
++                          % (res1, res2))
 +
 +    bitness = {4:32, 8:64}[width]
 +
@@ -1019,7 +963,11 @@ new file mode 100755
 +    if len(content) != sz:
 +        raise RecordError("Length should be %u bytes" % (sz, ))
 +
-+    mode, khz, nsec, incarn = struct.unpack(TSC_INFO_FORMAT, content)
++    mode, khz, nsec, incarn, res1 = struct.unpack(TSC_INFO_FORMAT, content)
++
++    if res1 != 0:
++        raise StreamError("Reserved bits set in TSC_INFO: 0x%08x" % (res1, ))
++
 +    print ("  Mode %u, %u kHz, %u ns, incarnation %d"
 +           % (mode, khz, nsec, incarn))
 +
@@ -1060,7 +1008,10 @@ new file mode 100755
 +        lambda x: verify_record_x86_pv_vcpu_generic(x, "basic"),
 +    REC_TYPE_x86_pv_vcpu_extended :
 +        lambda x: verify_record_x86_pv_vcpu_generic(x, "extended"),
-+    REC_TYPE_x86_pv_vcpu_xsave : verify_record_x86_pv_vcpu_xsave,
++    REC_TYPE_x86_pv_vcpu_xsave :
++        lambda x: verify_record_x86_pv_vcpu_generic(x, "xsave"),
++    REC_TYPE_x86_pv_vcpu_msrs :
++        lambda x: verify_record_x86_pv_vcpu_generic(x, "msrs"),
 +
 +    REC_TYPE_shared_info: verify_record_shared_info,
 +    REC_TYPE_tsc_info: verify_record_tsc_info,
@@ -1174,3 +1125,6 @@ new file mode 100755
 +
 +if __name__ == "__main__":
 +    sys.exit(main(sys.argv))
+-- 
+1.7.10.4
+

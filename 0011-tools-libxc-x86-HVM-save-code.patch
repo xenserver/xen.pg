@@ -1,60 +1,53 @@
-From 2d3a55939d453017582bc21a78881cffd7827617 Mon Sep 17 00:00:00 2001
+From 9d0f00157ef29df36d23bc63f140f8b17edef7bb Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Mon, 28 Apr 2014 16:23:41 +0100
-Subject: [PATCH 8/9] tools/libxc: x86 hvm save implementation
+Date: Sat, 7 Jun 2014 21:17:33 +0100
+Subject: [PATCH 11/14] tools/libxc: x86 HVM save code
 
-Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
- tools/libxc/saverestore/common.h       |    2 +
- tools/libxc/saverestore/save.c         |    4 +-
- tools/libxc/saverestore/save_x86_hvm.c |  221 ++++++++++++++++++++++++++++++++
- 3 files changed, 225 insertions(+), 2 deletions(-)
+ tools/libxc/saverestore/common.h       |    1 +
+ tools/libxc/saverestore/save_x86_hvm.c |  223 ++++++++++++++++++++++++++++++++
+ 2 files changed, 224 insertions(+)
  create mode 100644 tools/libxc/saverestore/save_x86_hvm.c
 
-diff -r 18b6b72ad16f tools/libxc/saverestore/common.h
+diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
+index 7ba9c4f..9e70ed6 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -127,6 +127,8 @@ struct context
+@@ -248,6 +248,7 @@ extern struct common_ops common_ops_x86_pv;
+ extern struct common_ops common_ops_x86_hvm;
  
- /* Saves an x86 PV domain. */
- int save_x86_pv(struct context *ctx);
-+/* Saves an x86 HVM domain. */
-+int save_x86_hvm(struct context *ctx);
- /* Restores an x86 PV domain. */
- int restore_x86_pv(struct context *ctx);
+ extern struct save_ops save_ops_x86_pv;
++extern struct save_ops save_ops_x86_hvm;
  
-diff -r 18b6b72ad16f tools/libxc/saverestore/save.c
---- a/tools/libxc/saverestore/save.c
-+++ b/tools/libxc/saverestore/save.c
-@@ -437,8 +437,8 @@ int xc_domain_save2(xc_interface *xch, i
+ extern struct restore_ops restore_ops_x86_pv;
  
-     if ( ctx.dominfo.hvm )
-     {
--        ERROR("HVM Save not supported yet");
--        return -1;
-+        ctx.ops = save_restore_ops_x86_hvm;
-+        return save_x86_hvm(&ctx);
-     }
-     else
-     {
-diff -r 18b6b72ad16f tools/libxc/saverestore/save_x86_hvm.c
+diff --git a/tools/libxc/saverestore/save_x86_hvm.c b/tools/libxc/saverestore/save_x86_hvm.c
+new file mode 100644
+index 0000000..6548eae
 --- /dev/null
 +++ b/tools/libxc/saverestore/save_x86_hvm.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,223 @@
 +#include <assert.h>
-+#include <arpa/inet.h>
++
++#include "common_x86.h"
 +
 +#include <xen/hvm/params.h>
 +
-+#include "common_x86_pv.h"
-+
++/*
++ * Query for the HVM context and write an HVM_CONTEXT record into the stream.
++ */
 +static int write_hvm_context(struct context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
 +    unsigned long hvm_buf_size;
-+    struct record hvm_rec = { .type = REC_TYPE_hvm_context, };
 +    int rc;
++    struct record hvm_rec =
++    {
++        .type = REC_TYPE_HVM_CONTEXT,
++    };
 +
 +    hvm_buf_size = xc_domain_hvm_getcontext(xch, ctx->domid, 0, 0);
 +    if ( hvm_buf_size == -1 )
@@ -63,6 +56,7 @@ diff -r 18b6b72ad16f tools/libxc/saverestore/save_x86_hvm.c
 +        rc = -1;
 +        goto out;
 +    }
++
 +    hvm_rec.data = malloc(hvm_buf_size);
 +    if ( !hvm_rec.data )
 +    {
@@ -92,6 +86,10 @@ diff -r 18b6b72ad16f tools/libxc/saverestore/save_x86_hvm.c
 +    return rc;
 +}
 +
++/*
++ * Query for a range of HVM parameters and write an HVM_PARAMS record into the
++ * stream.
++ */
 +static int write_hvm_params(struct context *ctx)
 +{
 +    static const unsigned int params[] = {
@@ -109,34 +107,41 @@ diff -r 18b6b72ad16f tools/libxc/saverestore/save_x86_hvm.c
 +        HVM_PARAM_PAE_ENABLED,
 +        HVM_PARAM_VM_GENERATION_ID_ADDR,
 +    };
-+    static const unsigned int num_params = ARRAY_SIZE(params);
++
 +    xc_interface *xch = ctx->xch;
-+    struct rec_hvm_params_entry *entries;
++    struct rec_hvm_params_entry entries[ARRAY_SIZE(params)];
 +    struct rec_hvm_params hdr = {
 +        .count = 0,
 +    };
 +    struct record rec = {
-+        .type   = REC_TYPE_hvm_params,
++        .type   = REC_TYPE_HVM_PARAMS,
 +        .length = sizeof(hdr),
 +        .data   = &hdr,
 +    };
 +    unsigned int i;
 +    int rc;
 +
-+    entries = malloc(num_params * sizeof(*entries));
-+    if ( !entries )
-+    {
-+        PERROR("HVM params record");
-+        rc = -1;
-+        goto out;
-+    }
-+
-+    for ( i = 0; i < num_params; i++ )
++    for ( i = 0; i < ARRAY_SIZE(params); i++ )
 +    {
 +        uint32_t index = params[i];
 +        uint64_t value;
 +
-+        xc_get_hvm_param(xch, ctx->domid, index, (unsigned long *)&value);
++        rc = xc_get_hvm_param(xch, ctx->domid, index, (unsigned long *)&value);
++        if ( rc )
++        {
++            /* Gross XenServer hack. Consider HVM_PARAM_CONSOLE_PFN failure
++             * nonfatal. This is related to the fact it is impossible to
++             * distinguish "no console" from a console at pfn/evtchn 0.
++             *
++             * TODO - find a compatible way to fix this.
++             */
++            if ( index == HVM_PARAM_CONSOLE_PFN )
++                continue;
++
++            PERROR("Failed to get HVMPARAM at index %u", index);
++            return rc;
++        }
++
 +        if ( value != 0 )
 +        {
 +            entries[hdr.count].index = index;
@@ -146,22 +151,18 @@ diff -r 18b6b72ad16f tools/libxc/saverestore/save_x86_hvm.c
 +    }
 +
 +    rc = write_split_record(ctx, &rec, entries, hdr.count * sizeof(*entries));
-+    if ( rc < 0 )
-+    {
-+        PERROR("error write HVM_PARAMS record");
-+        goto out;
-+    }
++    if ( rc )
++        PERROR("Failed to write HVM_PARAMS record");
 +
-+out:
-+    free(entries);
 +    return rc;
 +}
 +
++/* TODO - remove. */
 +static int write_toolstack(struct context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
 +    struct record rec = {
-+        .type = REC_TYPE_toolstack,
++        .type = REC_TYPE_TOOLSTACK,
 +        .length = 0,
 +    };
 +    uint8_t *buf;
@@ -184,75 +185,64 @@ diff -r 18b6b72ad16f tools/libxc/saverestore/save_x86_hvm.c
 +    return rc;
 +}
 +
-+int save_x86_hvm(struct context *ctx)
++static int x86_hvm_normalise_page(struct context *ctx, xen_pfn_t type, void **page)
 +{
-+    xc_interface *xch = ctx->xch;
++    /* no-op */
++    return 0;
++}
++
++static int x86_hvm_setup(struct context *ctx)
++{
++    /* no-op */
++    return 0;
++}
++
++static int x86_hvm_start_of_stream(struct context *ctx)
++{
++    /* no-op */
++    return 0;
++}
++
++static int x86_hvm_end_of_stream(struct context *ctx)
++{
 +    int rc;
-+    struct record end = { REC_TYPE_end, 0, NULL };
-+
-+    IPRINTF("In experimental %s", __func__);
-+
-+    /* Write Image and Domain headers to the stream */
-+    rc = write_headers(ctx, DHDR_TYPE_x86_hvm);
-+    if ( rc )
-+        goto err;
-+
-+    rc = send_domain_memory(ctx);
-+    if ( rc )
-+        goto err;
 +
 +    rc = write_tsc_info(ctx);
 +    if ( rc )
-+        goto err;
++        return rc;
 +
-+    /* Refresh domain information now it has paused */
-+    if ( (xc_domain_getinfo(xch, ctx->domid, 1, &ctx->dominfo) != 1) ||
-+         (ctx->dominfo.domid != ctx->domid) )
-+    {
-+        PERROR("Unable to refresh domain information");
-+        rc = -1;
-+        goto err;
-+    }
-+    else if ( (!ctx->dominfo.shutdown ||
-+               ctx->dominfo.shutdown_reason != SHUTDOWN_suspend ) &&
-+              !ctx->dominfo.paused )
-+    {
-+        ERROR("Domain has not been suspended");
-+        rc = -1;
-+        goto err;
-+    }
-+
++    /* TODO - remove. */
 +    rc = write_toolstack(ctx);
 +    if ( rc )
-+        goto err;
++        return rc;
 +
 +    /* Write the HVM_CONTEXT record. */
 +    rc = write_hvm_context(ctx);
 +    if ( rc )
-+        goto err;
++        return rc;
 +
 +    /* Write HVM_PARAMS record contains applicable HVM params. */
 +    rc = write_hvm_params(ctx);
 +    if ( rc )
-+        goto err;
++        return rc;
 +
-+    /* Write an END record */
-+    rc = write_record(ctx, &end);
-+    if ( rc )
-+        goto err;
-+
-+    /* all done */
-+    assert(!rc);
-+    goto cleanup;
-+
-+ err:
-+    assert(rc);
-+ cleanup:
-+
-+    xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
-+                      NULL, 0, NULL, 0, NULL);
 +    return rc;
 +}
++
++static int x86_hvm_cleanup(struct context *ctx)
++{
++    /* no-op */
++    return 0;
++}
++
++struct save_ops save_ops_x86_hvm =
++{
++    .normalise_page  = x86_hvm_normalise_page,
++    .setup           = x86_hvm_setup,
++    .start_of_stream = x86_hvm_start_of_stream,
++    .end_of_stream   = x86_hvm_end_of_stream,
++    .cleanup         = x86_hvm_cleanup,
++};
 +
 +/*
 + * Local variables:
@@ -263,3 +253,6 @@ diff -r 18b6b72ad16f tools/libxc/saverestore/save_x86_hvm.c
 + * indent-tabs-mode: nil
 + * End:
 + */
+-- 
+1.7.10.4
+

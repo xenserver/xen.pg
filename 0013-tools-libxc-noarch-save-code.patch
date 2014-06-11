@@ -1,0 +1,575 @@
+From 499ba815aef239950ed8fe16764439df1e1d82cb Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Sun, 8 Jun 2014 03:03:29 +0100
+Subject: [PATCH 13/14] tools/libxc: noarch save code
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+---
+ tools/libxc/saverestore/save.c |  545 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 544 insertions(+), 1 deletion(-)
+
+diff --git a/tools/libxc/saverestore/save.c b/tools/libxc/saverestore/save.c
+index f6ad734..9ad43a5 100644
+--- a/tools/libxc/saverestore/save.c
++++ b/tools/libxc/saverestore/save.c
+@@ -1,11 +1,554 @@
++#include <assert.h>
++#include <arpa/inet.h>
++
+ #include "common.h"
+ 
++/*
++ * Writes an Image header and Domain header into the stream.
++ */
++static int write_headers(struct context *ctx, uint16_t guest_type)
++{
++    xc_interface *xch = ctx->xch;
++    int32_t xen_version = xc_version(xch, XENVER_version, NULL);
++    struct ihdr ihdr =
++        {
++            .marker  = IHDR_MARKER,
++            .id      = htonl(IHDR_ID),
++            .version = htonl(IHDR_VERSION),
++            .options = htons(IHDR_OPT_LITTLE_ENDIAN),
++        };
++    struct dhdr dhdr =
++        {
++            .type       = guest_type,
++            .page_shift = XC_PAGE_SHIFT,
++            .xen_major  = (xen_version >> 16) & 0xffff,
++            .xen_minor  = (xen_version)       & 0xffff,
++        };
++
++    if ( xen_version < 0 )
++    {
++        PERROR("Unable to obtain Xen Version");
++        return -1;
++    }
++
++    if ( write_exact(ctx->fd, &ihdr, sizeof(ihdr)) )
++    {
++        PERROR("Unable to write Image Header to stream");
++        return -1;
++    }
++
++    if ( write_exact(ctx->fd, &dhdr, sizeof(dhdr)) )
++    {
++        PERROR("Unable to write Domain Header to stream");
++        return -1;
++    }
++
++    return 0;
++}
++
++/*
++ * Writes an END record into the stream.
++ */
++static int write_end_record(struct context *ctx)
++{
++    struct record end = { REC_TYPE_END, 0, NULL };
++
++    return write_record(ctx, &end);
++}
++
++/*
++ * Writes a batch of memory as a PAGE_DATA record into the stream.  The batch
++ * is constructed in ctx->save.batch_pfns.
++ *
++ * This function:
++ * - gets the types for each pfn in the batch.
++ * - for each pfn with real data:
++ *   - maps and attempts to localise the pages.
++ * - construct and writes a PAGE_DATA record into the stream.
++ */
++static int write_batch(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t *mfns = NULL, *types = NULL;
++    void *guest_mapping = NULL;
++    void **guest_data = NULL;
++    void **local_pages = NULL;
++    int *errors = NULL, rc = -1;
++    unsigned i, p, nr_pages = 0;
++    unsigned nr_pfns = ctx->save.nr_batch_pfns;
++    void *page, *orig_page;
++    uint64_t *rec_pfns = NULL;
++    struct rec_page_data_header hdr = { 0 };
++    struct record rec =
++    {
++        .type = REC_TYPE_PAGE_DATA,
++    };
++
++    assert(nr_pfns != 0);
++
++    /* Mfns of the batch pfns. */
++    mfns = malloc(nr_pfns * sizeof(*mfns));
++    /* Types of the batch pfns. */
++    types = malloc(nr_pfns * sizeof(*types));
++    /* Errors from attempting to map the mfns. */
++    errors = malloc(nr_pfns * sizeof(*errors));
++    /* Pointers to page data to send.  Either mapped mfns or local allocations. */
++    guest_data = calloc(nr_pfns, sizeof(*guest_data));
++    /* Pointers to locally allocated pages.  Need freeing. */
++    local_pages = calloc(nr_pfns, sizeof(*local_pages));
++
++    if ( !mfns || !types || !errors || !guest_data || !local_pages )
++    {
++        ERROR("Unable to allocate arrays for a batch of %u pages",
++              nr_pfns);
++        goto err;
++    }
++
++    for ( i = 0; i < nr_pfns; ++i )
++    {
++        types[i] = mfns[i] = ctx->ops.pfn_to_gfn(ctx, ctx->save.batch_pfns[i]);
++
++        /* Likely a ballooned page. */
++        if ( mfns[i] == INVALID_MFN )
++            set_bit(ctx->save.batch_pfns[i], ctx->save.deferred_pages);
++    }
++
++    rc = xc_get_pfn_type_batch(xch, ctx->domid, nr_pfns, types);
++    if ( rc )
++    {
++        PERROR("Failed to get types for pfn batch");
++        goto err;
++    }
++    rc = -1;
++
++    for ( i = 0; i < nr_pfns; ++i )
++    {
++        switch ( types[i] )
++        {
++        case XEN_DOMCTL_PFINFO_BROKEN:
++        case XEN_DOMCTL_PFINFO_XALLOC:
++        case XEN_DOMCTL_PFINFO_XTAB:
++            continue;
++        }
++
++        mfns[nr_pages++] = mfns[i];
++    }
++
++    if ( nr_pages > 0 )
++    {
++        guest_mapping = xc_map_foreign_bulk(
++            xch, ctx->domid, PROT_READ, mfns, errors, nr_pages);
++        if ( !guest_mapping )
++        {
++            PERROR("Failed to map guest pages");
++            goto err;
++        }
++    }
++
++    for ( i = 0, p = 0; i < nr_pfns; ++i )
++    {
++        switch ( types[i] )
++        {
++        case XEN_DOMCTL_PFINFO_BROKEN:
++        case XEN_DOMCTL_PFINFO_XALLOC:
++        case XEN_DOMCTL_PFINFO_XTAB:
++            continue;
++        }
++
++        if ( errors[p] )
++        {
++            ERROR("Mapping of pfn %#lx (mfn %#lx) failed %d",
++                  ctx->save.batch_pfns[i], mfns[p], errors[p]);
++            goto err;
++        }
++
++        orig_page = page = guest_mapping + (p * PAGE_SIZE);
++        rc = ctx->save.ops.normalise_page(ctx, types[i], &page);
++        if ( rc )
++        {
++            if ( rc == -1 && errno == EAGAIN )
++            {
++                set_bit(ctx->save.batch_pfns[i], ctx->save.deferred_pages);
++                types[i] = XEN_DOMCTL_PFINFO_XTAB;
++                --nr_pages;
++            }
++            else
++                goto err;
++        }
++        else
++            guest_data[i] = page;
++
++        if ( page != orig_page )
++            local_pages[i] = page;
++        rc = -1;
++
++        ++p;
++    }
++
++    rec_pfns = malloc(nr_pfns * sizeof(*rec_pfns));
++    if ( !rec_pfns )
++    {
++        ERROR("Unable to allocate %zu bytes of memory for page data pfn list",
++              nr_pfns * sizeof(*rec_pfns));
++        goto err;
++    }
++
++    hdr.count = nr_pfns;
++
++    rec.length = sizeof(hdr);
++    rec.length += nr_pfns * sizeof(*rec_pfns);
++    rec.length += nr_pages * PAGE_SIZE;
++
++    for ( i = 0; i < nr_pfns; ++i )
++        rec_pfns[i] = ((uint64_t)(types[i]) << 32) | ctx->save.batch_pfns[i];
++
++    if ( write_record_header(ctx, &rec) ||
++         write_exact(ctx->fd, &hdr, sizeof(hdr)) ||
++         write_exact(ctx->fd, rec_pfns, nr_pfns * sizeof(*rec_pfns)) )
++    {
++        PERROR("Failed to write page_type header to stream");
++        goto err;
++    }
++
++    for ( i = 0; i < nr_pfns; ++i )
++    {
++        if ( guest_data[i] )
++        {
++            if ( write_exact(ctx->fd, guest_data[i], PAGE_SIZE) )
++            {
++                PERROR("Failed to write page into stream");
++                goto err;
++            }
++
++            --nr_pages;
++        }
++    }
++
++    /* Sanity check we have sent all the pages we expected to. */
++    assert(nr_pages == 0);
++    rc = ctx->save.nr_batch_pfns = 0;
++
++ err:
++    free(rec_pfns);
++    if ( guest_mapping )
++        munmap(guest_mapping, nr_pages * PAGE_SIZE);
++    for ( i = 0; local_pages && i < nr_pfns; ++i )
++            free(local_pages[i]);
++    free(local_pages);
++    free(guest_data);
++    free(errors);
++    free(types);
++    free(mfns);
++
++    return rc;
++}
++
++/*
++ * Flush a batch of pfns into the stream.
++ */
++static int flush_batch(struct context *ctx)
++{
++    int rc = 0;
++
++    if ( ctx->save.nr_batch_pfns == 0 )
++        return rc;
++
++    rc = write_batch(ctx);
++
++    if ( !rc )
++    {
++        VALGRIND_MAKE_MEM_UNDEFINED(ctx->save.batch_pfns,
++                                    MAX_BATCH_SIZE * sizeof(*ctx->save.batch_pfns));
++    }
++
++    return rc;
++}
++
++/*
++ * Add a single pfn to the batch, flushing the batch if full.
++ */
++static int add_to_batch(struct context *ctx, xen_pfn_t pfn)
++{
++    int rc = 0;
++
++    if ( ctx->save.nr_batch_pfns == MAX_BATCH_SIZE )
++        rc = flush_batch(ctx);
++
++    if ( rc == 0 )
++        ctx->save.batch_pfns[ctx->save.nr_batch_pfns++] = pfn;
++
++    return rc;
++}
++
++/*
++ * Pause the domain.
++ */
++static int pause_domain(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
++
++    if ( !ctx->dominfo.paused )
++    {
++        /* TODO: Properly specify the return value from this callback. */
++        rc = (ctx->save.callbacks->suspend(ctx->save.callbacks->data) != 1);
++        if ( rc )
++        {
++            ERROR("Failed to suspend domain");
++            return rc;
++        }
++    }
++
++    IPRINTF("Domain now paused");
++    return 0;
++}
++
++/*
++ * Send all domain memory.  This is the heart of the live migration loop.
++ */
++static int send_domain_memory(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    DECLARE_HYPERCALL_BUFFER(unsigned long, to_send);
++    xc_shadow_op_stats_t stats = { -1, -1 };
++    unsigned pages_written;
++    unsigned x, max_iter = 5, dirty_threshold = 50;
++    xen_pfn_t p;
++    int rc = -1;
++
++    to_send = xc_hypercall_buffer_alloc_pages(
++        xch, to_send, NRPAGES(bitmap_size(ctx->save.p2m_size)));
++
++    ctx->save.batch_pfns = malloc(MAX_BATCH_SIZE * sizeof(*ctx->save.batch_pfns));
++    ctx->save.deferred_pages = calloc(1, bitmap_size(ctx->save.p2m_size));
++
++    if ( !ctx->save.batch_pfns || !to_send || !ctx->save.deferred_pages )
++    {
++        ERROR("Unable to allocate memory for to_{send,fix}/batch bitmaps");
++        goto out;
++    }
++
++    if ( xc_shadow_control(xch, ctx->domid,
++                           XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
++                           NULL, 0, NULL, 0, NULL) < 0 )
++    {
++        PERROR("Failed to enable logdirty");
++        goto out;
++    }
++
++    for ( x = 0, pages_written = 0; x < max_iter ; ++x )
++    {
++        if ( x == 0 )
++        {
++            /* First iteration, send all pages. */
++            memset(to_send, 0xff, bitmap_size(ctx->save.p2m_size));
++        }
++        else
++        {
++            /* Else consult the dirty bitmap. */
++            if ( xc_shadow_control(
++                     xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
++                     HYPERCALL_BUFFER(to_send), ctx->save.p2m_size,
++                     NULL, 0, &stats) != ctx->save.p2m_size )
++            {
++                PERROR("Failed to retrieve logdirty bitmap");
++                rc = -1;
++                goto out;
++            }
++            else
++                DPRINTF("  Wrote %u pages; stats: faults %"PRIu32", dirty %"PRIu32,
++                        pages_written, stats.fault_count, stats.dirty_count);
++            pages_written = 0;
++
++            if ( stats.dirty_count < dirty_threshold )
++                break;
++        }
++
++        DPRINTF("Iteration %u", x);
++
++        for ( p = 0 ; p < ctx->save.p2m_size; ++p )
++        {
++            if ( test_bit(p, to_send) )
++            {
++                rc = add_to_batch(ctx, p);
++                if ( rc )
++                    goto out;
++                ++pages_written;
++            }
++        }
++
++        rc = flush_batch(ctx);
++        if ( rc )
++            goto out;
++    }
++
++    rc = pause_domain(ctx);
++    if ( rc )
++        goto out;
++
++    if ( xc_shadow_control(
++             xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
++             HYPERCALL_BUFFER(to_send), ctx->save.p2m_size,
++             NULL, 0, &stats) != ctx->save.p2m_size )
++    {
++        PERROR("Failed to retrieve logdirty bitmap");
++        rc = -1;
++        goto out;
++    }
++
++    for ( p = 0, pages_written = 0 ; p < ctx->save.p2m_size; ++p )
++    {
++        if ( test_bit(p, to_send) || test_bit(p, ctx->save.deferred_pages) )
++        {
++            rc = add_to_batch(ctx, p);
++            if ( rc )
++                goto out;
++            ++pages_written;
++        }
++    }
++
++    rc = flush_batch(ctx);
++    if ( rc )
++        goto out;
++
++    DPRINTF("  Wrote %u pages", pages_written);
++    IPRINTF("Sent all pages");
++
++  out:
++    xc_hypercall_buffer_free_pages(xch, to_send,
++                                   NRPAGES(bitmap_size(ctx->save.p2m_size)));
++    free(ctx->save.deferred_pages);
++    free(ctx->save.batch_pfns);
++    return rc;
++}
++
++/*
++ * Save a domain.
++ */
++static int save(struct context *ctx, uint16_t guest_type)
++{
++    xc_interface *xch = ctx->xch;
++    int rc, saved_rc = 0, saved_errno = 0;
++
++    IPRINTF("Saving domain %d, type %s",
++            ctx->domid, dhdr_type_to_str(guest_type));
++
++    rc = ctx->save.ops.setup(ctx);
++    if ( rc )
++        goto err;
++
++    rc = write_headers(ctx, guest_type);
++    if ( rc )
++        goto err;
++
++    rc = ctx->save.ops.start_of_stream(ctx);
++    if ( rc )
++        goto err;
++
++    rc = send_domain_memory(ctx);
++    if ( rc )
++        goto err;
++
++    /* Refresh domain information now it has paused. */
++    if ( (xc_domain_getinfo(xch, ctx->domid, 1, &ctx->dominfo) != 1) ||
++         (ctx->dominfo.domid != ctx->domid) )
++    {
++        PERROR("Unable to refresh domain information");
++        rc = -1;
++        goto err;
++    }
++    else if ( (!ctx->dominfo.shutdown ||
++               ctx->dominfo.shutdown_reason != SHUTDOWN_suspend ) &&
++              !ctx->dominfo.paused )
++    {
++        ERROR("Domain has not been suspended");
++        rc = -1;
++        goto err;
++    }
++
++    rc = ctx->save.ops.end_of_stream(ctx);
++    if ( rc )
++        goto err;
++
++    rc = write_end_record(ctx);
++    if ( rc )
++        goto err;
++
++    xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
++                      NULL, 0, NULL, 0, NULL);
++
++    IPRINTF("Save successful");
++    goto done;
++
++ err:
++    saved_errno = errno;
++    saved_rc = rc;
++    PERROR("Save failed");
++
++ done:
++    rc = ctx->save.ops.cleanup(ctx);
++    if ( rc )
++        PERROR("Failed to clean up");
++
++    if ( saved_rc )
++    {
++        rc = saved_rc;
++        errno = saved_errno;
++    }
++
++    return rc;
++};
++
+ int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_iters,
+                     uint32_t max_factor, uint32_t flags,
+                     struct save_callbacks* callbacks, int hvm)
+ {
++    struct context ctx =
++        {
++            .xch = xch,
++            .fd = io_fd,
++        };
++
++    /* GCC 4.4 (of CentOS 6.x vintage) can' t initialise anonymous unions :( */
++    ctx.save.callbacks = callbacks;
++
+     IPRINTF("In experimental %s", __func__);
+-    return -1;
++
++    if ( xc_domain_getinfo(xch, dom, 1, &ctx.dominfo) != 1 )
++    {
++        PERROR("Failed to get domain info");
++        return -1;
++    }
++
++    if ( ctx.dominfo.domid != dom )
++    {
++        ERROR("Domain %d does not exist", dom);
++        return -1;
++    }
++
++    ctx.domid = dom;
++    IPRINTF("Saving domain %d", dom);
++
++    ctx.save.p2m_size = xc_domain_maximum_gpfn(xch, dom) + 1;
++    if ( ctx.save.p2m_size > ~XEN_DOMCTL_PFINFO_LTAB_MASK )
++    {
++        errno = E2BIG;
++        ERROR("Cannot save this big a guest");
++        return -1;
++    }
++
++    if ( ctx.dominfo.hvm )
++    {
++        ctx.ops = common_ops_x86_hvm;
++        ctx.save.ops = save_ops_x86_hvm;
++        return save(&ctx, DHDR_TYPE_X86_HVM);
++    }
++    else
++    {
++        ctx.ops = common_ops_x86_pv;
++        ctx.save.ops = save_ops_x86_pv;
++        return save(&ctx, DHDR_TYPE_X86_PV);
++    }
+ }
+ 
+ /*
+-- 
+1.7.10.4
+

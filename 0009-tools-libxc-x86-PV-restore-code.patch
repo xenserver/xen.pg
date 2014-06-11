@@ -1,215 +1,57 @@
-From e99e5cf44fabe55896afadf189f58a0b143c9e50 Mon Sep 17 00:00:00 2001
+From 9fee65f7fe4a95d795137d89fd3d04321dd9e906 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Mon, 28 Apr 2014 15:47:09 +0100
-Subject: [PATCH 7/9] tools/libxc: x86 pv restore implementation
+Date: Sat, 7 Jun 2014 21:17:09 +0100
+Subject: [PATCH 09/14] tools/libxc: x86 PV restore code
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
- tools/libxc/saverestore/common.h         |   20 +
- tools/libxc/saverestore/restore.c        |  115 ++++-
- tools/libxc/saverestore/restore_x86_pv.c |  824 ++++++++++++++++++++++++++++++
- 3 files changed, 958 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/common.h         |    2 +
+ tools/libxc/saverestore/restore_x86_pv.c |  965 ++++++++++++++++++++++++++++++
+ 2 files changed, 967 insertions(+)
  create mode 100644 tools/libxc/saverestore/restore_x86_pv.c
 
-diff -r bc1a31d9296b tools/libxc/saverestore/common.h
+diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
+index 5c8a370..bb21e01 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -14,6 +14,8 @@
+@@ -248,6 +248,8 @@ extern struct common_ops common_ops_x86_pv;
  
- #undef GET_FIELD
- #undef SET_FIELD
-+#undef MEMCPY_FIELD
-+#undef MEMSET_ARRAY_FIELD
- #undef mfn_to_pfn
- #undef pfn_to_mfn
+ extern struct save_ops save_ops_x86_pv;
  
-@@ -125,6 +127,8 @@ struct context
- 
- /* Saves an x86 PV domain. */
- int save_x86_pv(struct context *ctx);
-+/* Restores an x86 PV domain. */
-+int restore_x86_pv(struct context *ctx);
- 
- /*
-  * Write the image and domain headers to the stream.
-@@ -157,6 +161,22 @@ struct record
-             (_p)->x32._f = (_v);                \
-     })
- 
-+/* memcpy field _f from _s to _d, of an *_any union */
-+#define MEMCPY_FIELD(_c, _d, _s, _f)                                    \
-+    ({ if ( (_c)->x86_pv.width == 8 )                                   \
-+            memcpy(&(_d)->x64._f, &(_s)->x64._f, sizeof((_d)->x64._f)); \
-+        else                                                            \
-+            memcpy(&(_d)->x32._f, &(_s)->x32._f, sizeof((_d)->x32._f)); \
-+    })
++extern struct restore_ops restore_ops_x86_pv;
 +
-+/* memset array field _f with value _v, from an *_any union */
-+#define MEMSET_ARRAY_FIELD(_c, _d, _f, _v)                              \
-+    ({ if ( (_c)->x86_pv.width == 8 )                                   \
-+           memset(&(_d)->x64._f[0], (_v), sizeof((_d)->x64._f));        \
-+       else                                                             \
-+           memset(&(_d)->x32._f[0], (_v), sizeof((_d)->x32._f));        \
-+    })
-+
- /*
-  * Writes a split record to the stream, applying correct padding where
-  * appropriate.  It is common when sending records containing blobs from Xen
-diff -r bc1a31d9296b tools/libxc/saverestore/restore.c
---- a/tools/libxc/saverestore/restore.c
-+++ b/tools/libxc/saverestore/restore.c
-@@ -1,5 +1,62 @@
-+#include <arpa/inet.h>
-+
- #include "common.h"
- 
-+static int read_headers(struct context *ctx)
-+{
-+    xc_interface *xch = ctx->xch;
-+    struct ihdr ihdr;
-+    struct dhdr dhdr;
-+
-+    if ( read_exact(ctx->fd, &ihdr, sizeof ihdr) )
-+    {
-+        PERROR("Failed to read Image Header from stream");
-+        return -1;
-+    }
-+
-+    ihdr.id      = ntohl(ihdr.id);
-+    ihdr.version = ntohl(ihdr.version);
-+    ihdr.options = ntohs(ihdr.options);
-+
-+    if ( ihdr.marker != IHDR_MARKER )
-+    {
-+        ERROR("Invalid marker: Got 0x%016"PRIx64, ihdr.marker);
-+        return -1;
-+    }
-+    else if ( ihdr.id != IHDR_ID )
-+    {
-+        ERROR("Invalid ID: Expected 0x%08"PRIx32", Got 0x%08"PRIx32,
-+              IHDR_ID, ihdr.id);
-+        return -1;
-+    }
-+    else if ( ihdr.version != IHDR_VERSION )
-+    {
-+        ERROR("Invalid Version: Expected %d, Got %d", ihdr.version, IHDR_VERSION);
-+        return -1;
-+    }
-+    else if ( ihdr.options & IHDR_OPT_BIG_ENDIAN )
-+    {
-+        ERROR("Unable to handle big endian streams");
-+        return -1;
-+    }
-+
-+    ctx->restore.format_version = ihdr.version;
-+
-+    if ( read_exact(ctx->fd, &dhdr, sizeof dhdr) )
-+    {
-+        PERROR("Failed to read Domain Header from stream");
-+        return -1;
-+    }
-+
-+    ctx->restore.guest_type = dhdr.type;
-+    ctx->restore.guest_page_size = (1U << dhdr.page_shift);
-+
-+    IPRINTF("Found %s domain from Xen %d.%d",
-+            dhdr_type_to_str(dhdr.type), dhdr.xen_major, dhdr.xen_minor);
-+    return 0;
-+}
-+
-+
- int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
-                        unsigned int store_evtchn, unsigned long *store_mfn,
-                        domid_t store_domid, unsigned int console_evtchn,
-@@ -8,8 +65,64 @@ int xc_domain_restore2(xc_interface *xch
-                        int checkpointed_stream,
-                        struct restore_callbacks *callbacks)
+ struct record
  {
-+    struct context ctx =
-+        {
-+            .xch = xch,
-+            .fd = io_fd,
-+        };
-+
-+    ctx.restore.console_evtchn = console_evtchn;
-+    ctx.restore.console_domid = console_domid;
-+    ctx.restore.xenstore_evtchn = store_evtchn;
-+    ctx.restore.xenstore_domid = store_domid;
-+    ctx.restore.callbacks = callbacks;
-+
-     IPRINTF("In experimental %s", __func__);
--    return -1;
-+
-+    if ( xc_domain_getinfo(xch, dom, 1, &ctx.dominfo) != 1 )
-+    {
-+        PERROR("Failed to get domain info");
-+        return -1;
-+    }
-+
-+    if ( ctx.dominfo.domid != dom )
-+    {
-+        ERROR("Domain %d does not exist", dom);
-+        return -1;
-+    }
-+
-+    ctx.domid = dom;
-+    IPRINTF("Restoring domain %d", dom);
-+
-+    if ( read_headers(&ctx) )
-+        return -1;
-+
-+    if ( ctx.dominfo.hvm )
-+    {
-+        ERROR("HVM Restore not supported yet");
-+        return -1;
-+    }
-+    else
-+    {
-+        ctx.ops = save_restore_ops_x86_pv;
-+        if ( restore_x86_pv(&ctx) )
-+            return -1;
-+    }
-+
-+    DPRINTF("XenStore: mfn %#lx, dom %d, evt %u",
-+            ctx.restore.xenstore_mfn,
-+            ctx.restore.xenstore_domid,
-+            ctx.restore.xenstore_evtchn);
-+
-+    DPRINTF("Console: mfn %#lx, dom %d, evt %u",
-+            ctx.restore.console_mfn,
-+            ctx.restore.console_domid,
-+            ctx.restore.console_evtchn);
-+
-+    *console_mfn = ctx.restore.console_mfn;
-+    *store_mfn = ctx.restore.xenstore_mfn;
-+
-+    return 0;
- }
- 
- static bool pfn_is_populated(struct context *ctx, xen_pfn_t pfn)
-diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
+     uint32_t type;
+diff --git a/tools/libxc/saverestore/restore_x86_pv.c b/tools/libxc/saverestore/restore_x86_pv.c
+new file mode 100644
+index 0000000..3174d4c
 --- /dev/null
 +++ b/tools/libxc/saverestore/restore_x86_pv.c
-@@ -0,0 +1,824 @@
+@@ -0,0 +1,965 @@
 +#include <assert.h>
-+#include <arpa/inet.h>
 +
 +#include "common_x86_pv.h"
 +
++/*
++ * Expand our local tracking information for the p2m table and domains maximum
++ * size.  Normally this will be called once to expand from 0 to max_pfn, but
++ * is liable to expand multiple times if the domain grows on the sending side
++ * after migration has started.
++ */
 +static int expand_p2m(struct context *ctx, unsigned long max_pfn)
 +{
 +    xc_interface *xch = ctx->xch;
 +    unsigned long old_max = ctx->x86_pv.max_pfn, i;
-+    unsigned long end_frame = (max_pfn + ctx->x86_pv.fpp) / ctx->x86_pv.fpp;
-+    unsigned long old_end_frame = (old_max + ctx->x86_pv.fpp) / ctx->x86_pv.fpp;
++    unsigned int fpp = PAGE_SIZE / ctx->x86_pv.width;
++    unsigned long end_frame = (max_pfn + fpp) / fpp;
++    unsigned long old_end_frame = (old_max + fpp) / fpp;
 +    xen_pfn_t *p2m = NULL, *p2m_pfns = NULL;
 +    uint32_t *pfn_types = NULL;
 +    size_t p2msz, p2m_pfnsz, pfn_typesz;
 +
-+    /* We expect expand_p2m to be called exactly once, expanding from 0 the
-+     * domains max, but assert some sanity */
 +    assert(max_pfn > old_max);
 +
 +    p2msz = (max_pfn + 1) * ctx->x86_pv.width;
@@ -221,7 +63,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    }
 +    ctx->x86_pv.p2m = p2m;
 +
-+    pfn_typesz = (max_pfn + 1) * sizeof *pfn_types;
++    pfn_typesz = (max_pfn + 1) * sizeof(*pfn_types);
 +    pfn_types = realloc(ctx->x86_pv.pfn_types, pfn_typesz);
 +    if ( !pfn_types )
 +    {
@@ -230,7 +72,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    }
 +    ctx->x86_pv.pfn_types = pfn_types;
 +
-+    p2m_pfnsz = (end_frame + 1) * sizeof *p2m_pfns;
++    p2m_pfnsz = (end_frame + 1) * sizeof(*p2m_pfns);
 +    p2m_pfns = realloc(ctx->x86_pv.p2m_pfns, p2m_pfnsz);
 +    if ( !p2m_pfns )
 +    {
@@ -254,6 +96,9 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    return 0;
 +}
 +
++/*
++ * Pin all of the pagetables.  TODO - batch the hypercalls.
++ */
 +static int pin_pagetables(struct context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -292,12 +137,14 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +            PERROR("Failed to pin page table for pfn %#lx", i);
 +            return -1;
 +        }
-+
 +    }
 +
 +    return 0;
 +}
 +
++/*
++ * Update details in a guests start_info strucutre.
++ */
 +static int process_start_info(struct context *ctx, vcpu_guest_context_any_t *vcpu)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -314,7 +161,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    }
 +    else if ( ctx->x86_pv.pfn_types[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
 +    {
-+        ERROR("Start Info pfn %#lx has bad type %lu", pfn,
++        ERROR("Start Info pfn %#lx has bad type %"PRIu32, pfn,
 +              ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
 +        goto err;
 +    }
@@ -322,8 +169,8 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    mfn = ctx->ops.pfn_to_gfn(ctx, pfn);
 +    if ( !mfn_in_pseudophysmap(ctx, mfn) )
 +    {
-+        ERROR("Start Info has bad MFN");
-+        pseudophysmap_walk(ctx, mfn);
++        ERROR("Start Info has bad mfn");
++        dump_bad_pseudophysmap_entry(ctx, mfn);
 +        goto err;
 +    }
 +
@@ -346,15 +193,14 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    mfn = ctx->ops.pfn_to_gfn(ctx, pfn);
 +    if ( !mfn_in_pseudophysmap(ctx, mfn) )
 +    {
-+        ERROR("XenStore pfn has bad MFN");
-+        pseudophysmap_walk(ctx, mfn);
++        ERROR("XenStore pfn has bad mfn");
++        dump_bad_pseudophysmap_entry(ctx, mfn);
 +        goto err;
 +    }
 +
 +    ctx->restore.xenstore_mfn = mfn;
 +    SET_FIELD(ctx, guest_start_info, store_mfn, mfn);
 +    SET_FIELD(ctx, guest_start_info, store_evtchn, ctx->restore.xenstore_evtchn);
-+
 +
 +    /* Deal with console stuff */
 +    pfn = GET_FIELD(ctx, guest_start_info, console.domU.mfn);
@@ -367,8 +213,8 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    mfn = ctx->ops.pfn_to_gfn(ctx, pfn);
 +    if ( !mfn_in_pseudophysmap(ctx, mfn) )
 +    {
-+        ERROR("Console pfn has bad MFN");
-+        pseudophysmap_walk(ctx, mfn);
++        ERROR("Console pfn has bad mfn");
++        dump_bad_pseudophysmap_entry(ctx, mfn);
 +        goto err;
 +    }
 +
@@ -392,6 +238,11 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    return rc;
 +}
 +
++/*
++ * Copy the p2m which has been constructed locally as memory has been
++ * allocated, over the p2m in guest, so the guest can find its memory again on
++ * resume.
++ */
 +static int update_guest_p2m(struct context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -411,7 +262,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        }
 +        else if ( ctx->x86_pv.pfn_types[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
 +        {
-+            ERROR("pfn (%#lx) for p2m_frame_list[%u] has bad type %lu", pfn, i,
++            ERROR("pfn (%#lx) for p2m_frame_list[%u] has bad type %"PRIu32, pfn, i,
 +                  ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
 +            goto err;
 +        }
@@ -419,8 +270,8 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        mfn = ctx->ops.pfn_to_gfn(ctx, pfn);
 +        if ( !mfn_in_pseudophysmap(ctx, mfn) )
 +        {
-+            ERROR("p2m_frame_list[%u] has bad MFN", i);
-+            pseudophysmap_walk(ctx, mfn);
++            ERROR("p2m_frame_list[%u] has bad mfn", i);
++            dump_bad_pseudophysmap_entry(ctx, mfn);
 +            goto err;
 +        }
 +
@@ -446,14 +297,10 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    return rc;
 +}
 +
-+static int handle_end(struct context *ctx, struct record *rec)
-+{
-+    xc_interface *xch = ctx->xch;
-+
-+    DPRINTF("End record");
-+    return 0;
-+}
-+
++/*
++ * Process a toolstack record.  TODO - remove from spec and code once libxl
++ * framing is sorted.
++ */
 +static int handle_toolstack(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -469,15 +316,18 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    return rc;
 +}
 +
++/*
++ * Process an X86_PV_INFO record.
++ */
 +static int handle_x86_pv_info(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    struct rec_x86_pv_info *info = rec->data;
 +
-+    if ( rec->length < sizeof *info )
++    if ( rec->length < sizeof(*info) )
 +    {
-+        ERROR("X86_PV_INFO record trucated: length %"PRIu32", expected %zu",
-+              rec->length, sizeof *info);
++        ERROR("X86_PV_INFO record truncated: length %"PRIu32", expected %zu",
++              rec->length, sizeof(*info));
 +        return -1;
 +    }
 +    else if ( info->guest_width != 4 &&
@@ -492,7 +342,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        int rc;
 +        struct xen_domctl domctl;
 +
-+        /* try to set address size, domain is always created 64 bit */
++        /* Try to set address size, domain is always created 64 bit. */
 +        memset(&domctl, 0, sizeof(domctl));
 +        domctl.domain = ctx->domid;
 +        domctl.cmd    = XEN_DOMCTL_set_address_size;
@@ -506,7 +356,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +            return -1;
 +        }
 +
-+        /* domain informations changed, better to refresh */
++        /* Domain informations changed, better to refresh. */
 +        rc = x86_pv_domain_info(ctx);
 +        if ( rc != 0 )
 +        {
@@ -534,17 +384,21 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    return 0;
 +}
 +
++/*
++ * Process an X86_PV_P2M_FRAMES record.  Takes care of expanding the local p2m
++ * state if needed.
++ */
 +static int handle_x86_pv_p2m_frames(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    struct rec_x86_pv_p2m_frames *data = rec->data;
-+    unsigned start, end, x;
++    unsigned start, end, x, fpp = PAGE_SIZE / ctx->x86_pv.width;
 +    int rc;
 +
-+    if ( rec->length < sizeof *data )
++    if ( rec->length < sizeof(*data) )
 +    {
-+        ERROR("X86_PV_P2M_FRAMES record trucated: length %"PRIu32", min %zu",
-+              rec->length, sizeof *data + sizeof(uint64_t));
++        ERROR("X86_PV_P2M_FRAMES record truncated: length %"PRIu32", min %zu",
++              rec->length, sizeof(*data) + sizeof(uint64_t));
 +        return -1;
 +    }
 +    else if ( data->start_pfn > data->end_pfn )
@@ -554,16 +408,16 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        return -1;
 +    }
 +
-+    start =  data->start_pfn / ctx->x86_pv.fpp;
-+    end = data->end_pfn / ctx->x86_pv.fpp + 1;
++    start =  data->start_pfn / fpp;
++    end = data->end_pfn / fpp + 1;
 +
-+    if ( rec->length != sizeof *data + ((end - start) * sizeof (uint64_t)) )
++    if ( rec->length != sizeof(*data) + ((end - start) * sizeof(uint64_t)) )
 +    {
 +        ERROR("X86_PV_P2M_FRAMES record wrong size: start_pfn %#"PRIx32
 +              ", end_pfn %#"PRIx32", length %"PRIu32
 +              ", expected %zu + (%u - %u) * %zu",
 +              data->start_pfn, data->end_pfn, rec->length,
-+              sizeof *data, end, start, sizeof(uint64_t));
++              sizeof(*data), end, start, sizeof(uint64_t));
 +        return -1;
 +    }
 +
@@ -582,27 +436,30 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    return 0;
 +}
 +
++/*
++ * Process an X86_PV_VCPU_BASIC record from the stream.
++ */
 +static int handle_x86_pv_vcpu_basic(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_x86_pv_vcpu *vhdr = rec->data;
++    struct rec_x86_pv_vcpu_hdr *vhdr = rec->data;
 +    vcpu_guest_context_any_t vcpu;
-+    size_t vcpusz = ctx->x86_pv.width == 8 ? sizeof vcpu.x64 : sizeof vcpu.x32;
++    size_t vcpusz = ctx->x86_pv.width == 8 ? sizeof(vcpu.x64) : sizeof(vcpu.x32);
 +    xen_pfn_t pfn, mfn;
 +    unsigned long tmp;
 +    unsigned i;
 +    int rc = -1;
 +
-+    if ( rec->length <= sizeof *vhdr )
++    if ( rec->length <= sizeof(*vhdr) )
 +    {
-+        ERROR("X86_PV_VCPU_BASIC record trucated: length %"PRIu32", min %zu",
-+              rec->length, sizeof *vhdr + 1);
++        ERROR("X86_PV_VCPU_BASIC record truncated: length %"PRIu32", min %zu",
++              rec->length, sizeof(*vhdr) + 1);
 +        goto err;
 +    }
-+    else if ( rec->length != sizeof *vhdr + vcpusz )
++    else if ( rec->length != sizeof(*vhdr) + vcpusz )
 +    {
-+        ERROR("X86_PV_VCPU_EXTENDED record wrong size: length %"PRIu32
-+              ", expected %zu", rec->length, sizeof *vhdr + vcpusz);
++        ERROR("X86_PV_VCPU_BASIC record wrong size: length %"PRIu32
++              ", expected %zu", rec->length, sizeof(*vhdr) + vcpusz);
 +        goto err;
 +    }
 +    else if ( vhdr->vcpu_id > ctx->dominfo.max_vcpu_id )
@@ -617,7 +474,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +
 +    SET_FIELD(ctx, &vcpu, flags, GET_FIELD(ctx, &vcpu, flags) | VGCF_online);
 +
-+    /* Vcpu 0 is special: Convert the suspend record to an MFN */
++    /* Vcpu 0 is special: Convert the suspend record to an mfn. */
 +    if ( vhdr->vcpu_id == 0 )
 +    {
 +        rc = process_start_info(ctx, &vcpu);
@@ -634,7 +491,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        goto err;
 +    }
 +
-+    /* Convert GDT frames to MFNs */
++    /* Convert GDT frames to mfns. */
 +    for ( i = 0; (i * 512) < tmp; ++i )
 +    {
 +        pfn = GET_FIELD(ctx, &vcpu, gdt_frames[i]);
@@ -645,7 +502,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        }
 +        else if ( ctx->x86_pv.pfn_types[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
 +        {
-+            ERROR("GDT frame %u (pfn %#lx) has bad type %lu", i, pfn,
++            ERROR("GDT frame %u (pfn %#lx) has bad type %"PRIu32, i, pfn,
 +                  ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
 +            goto err;
 +        }
@@ -653,15 +510,15 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        mfn = ctx->ops.pfn_to_gfn(ctx, pfn);
 +        if ( !mfn_in_pseudophysmap(ctx, mfn) )
 +        {
-+            ERROR("GDT frame %u has bad MFN", i);
-+            pseudophysmap_walk(ctx, mfn);
++            ERROR("GDT frame %u has bad mfn", i);
++            dump_bad_pseudophysmap_entry(ctx, mfn);
 +            goto err;
 +        }
 +
 +        SET_FIELD(ctx, &vcpu, gdt_frames[i], mfn);
 +    }
 +
-+    /* Convert CR3 to an MFN */
++    /* Convert CR3 to an mfn. */
 +    pfn = cr3_to_mfn(ctx, GET_FIELD(ctx, &vcpu, ctrlreg[3]));
 +    if ( pfn >= ctx->x86_pv.max_pfn )
 +    {
@@ -671,7 +528,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    else if ( (ctx->x86_pv.pfn_types[pfn] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK ) !=
 +              (((xen_pfn_t)ctx->x86_pv.levels) << XEN_DOMCTL_PFINFO_LTAB_SHIFT) )
 +    {
-+        ERROR("cr3 (pfn %#lx) has bad type %lu, expected %lu", pfn,
++        ERROR("cr3 (pfn %#lx) has bad type %"PRIu32", expected %"PRIu32, pfn,
 +              ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT,
 +              ctx->x86_pv.levels);
 +        goto err;
@@ -680,14 +537,14 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    mfn = ctx->ops.pfn_to_gfn(ctx, pfn);
 +    if ( !mfn_in_pseudophysmap(ctx, mfn) )
 +    {
-+        ERROR("cr3 has bad MFN");
-+        pseudophysmap_walk(ctx, mfn);
++        ERROR("cr3 has bad mfn");
++        dump_bad_pseudophysmap_entry(ctx, mfn);
 +        goto err;
 +    }
 +
 +    SET_FIELD(ctx, &vcpu, ctrlreg[3], mfn_to_cr3(ctx, mfn));
 +
-+    /* 64bit guests: Convert CR1 (guest pagetables) to MFN */
++    /* 64bit guests: Convert CR1 (guest pagetables) to mfn. */
 +    if ( ctx->x86_pv.levels == 4 && (vcpu.x64.ctrlreg[1] & 1) )
 +    {
 +        pfn = vcpu.x64.ctrlreg[1] >> PAGE_SHIFT;
@@ -700,7 +557,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        else if ( (ctx->x86_pv.pfn_types[pfn] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK) !=
 +                  (((xen_pfn_t)ctx->x86_pv.levels) << XEN_DOMCTL_PFINFO_LTAB_SHIFT) )
 +        {
-+            ERROR("cr1 (pfn %#lx) has bad type %lu, expected %lu", pfn,
++            ERROR("cr1 (pfn %#lx) has bad type %"PRIu32", expected %"PRIu32, pfn,
 +                  ctx->x86_pv.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT,
 +                  ctx->x86_pv.levels);
 +            goto err;
@@ -709,8 +566,8 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        mfn = ctx->ops.pfn_to_gfn(ctx, pfn);
 +        if ( !mfn_in_pseudophysmap(ctx, mfn) )
 +        {
-+            ERROR("cr1 has bad MFN");
-+            pseudophysmap_walk(ctx, mfn);
++            ERROR("cr1 has bad mfn");
++            dump_bad_pseudophysmap_entry(ctx, mfn);
 +            goto err;
 +        }
 +
@@ -724,27 +581,30 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    }
 +
 +    rc = 0;
-+    DPRINTF("vcpu%d X86_PV_VCPU_BASIC record", vhdr->vcpu_id);
++    DPRINTF("vcpu%"PRId32" X86_PV_VCPU_BASIC record", vhdr->vcpu_id);
 + err:
 +    return rc;
 +}
 +
++/*
++ * Process an X86_PV_VCPU_EXTENDED record from the stream.
++ */
 +static int handle_x86_pv_vcpu_extended(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_x86_pv_vcpu *vcpu = rec->data;
++    struct rec_x86_pv_vcpu_hdr *vcpu = rec->data;
 +    DECLARE_DOMCTL;
 +
-+    if ( rec->length <= sizeof *vcpu )
++    if ( rec->length <= sizeof(*vcpu) )
 +    {
-+        ERROR("X86_PV_VCPU_EXTENDED record trucated: length %"PRIu32", min %zu",
-+              rec->length, sizeof *vcpu + 1);
++        ERROR("X86_PV_VCPU_EXTENDED record truncated: length %"PRIu32", min %zu",
++              rec->length, sizeof(*vcpu) + 1);
 +        return -1;
 +    }
-+    else if ( rec->length > sizeof *vcpu + 128 )
++    else if ( rec->length > sizeof(*vcpu) + 128 )
 +    {
 +        ERROR("X86_PV_VCPU_EXTENDED record too long: length %"PRIu32", max %zu",
-+              rec->length, sizeof *vcpu + 128);
++              rec->length, sizeof(*vcpu) + 128);
 +        return -1;
 +    }
 +    else if ( vcpu->vcpu_id > ctx->dominfo.max_vcpu_id )
@@ -757,7 +617,8 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +
 +    domctl.cmd = XEN_DOMCTL_set_ext_vcpucontext;
 +    domctl.domain = ctx->domid;
-+    memcpy(&domctl.u.ext_vcpucontext, &vcpu->context, rec->length - sizeof *vcpu);
++    memcpy(&domctl.u.ext_vcpucontext, &vcpu->context,
++           rec->length - sizeof(*vcpu));
 +
 +    if ( xc_domctl(xch, &domctl) != 0 )
 +    {
@@ -765,34 +626,37 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +        return -1;
 +    }
 +
-+    DPRINTF("vcpu%d X86_PV_VCPU_EXTENDED record", vcpu->vcpu_id);
++    DPRINTF("vcpu%"PRId32" X86_PV_VCPU_EXTENDED record", vcpu->vcpu_id);
 +    return 0;
 +}
 +
++/*
++ * Process an X86_PV_VCPU_XSAVE record from the stream.
++ */
 +static int handle_x86_pv_vcpu_xsave(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_x86_pv_vcpu_xsave *vcpu = rec->data;
++    struct rec_x86_pv_vcpu_hdr *vhdr = rec->data;
 +    int rc;
 +    DECLARE_DOMCTL;
 +    DECLARE_HYPERCALL_BUFFER(void, buffer);
 +    size_t buffersz;
 +
-+    if ( rec->length <= sizeof *vcpu )
++    if ( rec->length <= sizeof(*vhdr) )
 +    {
-+        ERROR("X86_PV_VCPU_XSAVE record trucated: length %"PRIu32", min %zu",
-+              rec->length, sizeof *vcpu + 1);
++        ERROR("X86_PV_VCPU_XSAVE record truncated: length %"PRIu32", min %zu",
++              rec->length, sizeof(*vhdr) + 1);
 +        return -1;
 +    }
-+    else if ( vcpu->vcpu_id > ctx->dominfo.max_vcpu_id )
++    else if ( vhdr->vcpu_id > ctx->dominfo.max_vcpu_id )
 +    {
-+        ERROR("X86_PV_VCPU_EXTENDED record vcpu_id (%"PRIu32
++        ERROR("X86_PV_VCPU_XSAVE record vcpu_id (%"PRIu32
 +              ") exceeds domain max (%u)",
-+              vcpu->vcpu_id, ctx->dominfo.max_vcpu_id);
++              vhdr->vcpu_id, ctx->dominfo.max_vcpu_id);
 +        return -1;
 +    }
 +
-+    buffersz = rec->length - sizeof *vcpu;
++    buffersz = rec->length - sizeof(*vhdr);
 +    buffer = xc_hypercall_buffer_alloc(xch, buffer, buffersz);
 +    if ( !buffer )
 +    {
@@ -803,27 +667,88 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +
 +    domctl.cmd = XEN_DOMCTL_setvcpuextstate;
 +    domctl.domain = ctx->domid;
-+    domctl.u.vcpuextstate.vcpu = vcpu->vcpu_id;
-+    domctl.u.vcpuextstate.xfeature_mask = vcpu->xfeature_mask;
++    domctl.u.vcpuextstate.vcpu = vhdr->vcpu_id;
 +    domctl.u.vcpuextstate.size = buffersz;
 +    set_xen_guest_handle(domctl.u.vcpuextstate.buffer, buffer);
++
++    memcpy(buffer, vhdr->context, buffersz);
 +
 +    rc = xc_domctl(xch, &domctl);
 +
 +    xc_hypercall_buffer_free(xch, buffer);
 +
 +    if ( rc )
-+    {
-+        PERROR("Failed to set vcpu%"PRIu32"'s xsave info", vcpu->vcpu_id);
-+        return rc;
-+    }
++        PERROR("Failed to set vcpu%"PRIu32"'s xsave info", vhdr->vcpu_id);
 +    else
-+    {
-+        DPRINTF("vcpu%d X86_PV_VCPU_XSAVE record", vcpu->vcpu_id);
-+        return 0;
-+    }
++        DPRINTF("vcpu%"PRId32" X86_PV_VCPU_XSAVE record", vhdr->vcpu_id);
++
++    return rc;
 +}
 +
++/*
++ * Process an X86_PV_VCPU_MSRS record from the stream.
++ */
++static int handle_x86_pv_vcpu_msrs(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++    struct rec_x86_pv_vcpu_hdr *vhdr = rec->data;
++    int rc;
++    DECLARE_DOMCTL;
++    DECLARE_HYPERCALL_BUFFER(void, buffer);
++    size_t buffersz = rec->length - sizeof(*vhdr);
++
++    if ( rec->length <= sizeof(*vhdr) )
++    {
++        ERROR("X86_PV_VCPU_MSRS record truncated: length %"PRIu32", min %zu",
++              rec->length, sizeof(*vhdr) + 1);
++        return -1;
++    }
++    else if ( vhdr->vcpu_id > ctx->dominfo.max_vcpu_id )
++    {
++        ERROR("X86_PV_VCPU_MSRS record vcpu_id (%"PRIu32
++              ") exceeds domain max (%u)",
++              vhdr->vcpu_id, ctx->dominfo.max_vcpu_id);
++        return -1;
++    }
++    else if ( buffersz % sizeof(xen_domctl_vcpu_msr_t) != 0 )
++    {
++        ERROR("X86_PV_VCPU_MSRS payload size %zu"
++              " expected to be a multiple of %zu",
++              buffersz, sizeof(xen_domctl_vcpu_msr_t));
++        return -1;
++    }
++
++    buffer = xc_hypercall_buffer_alloc(xch, buffer, buffersz);
++    if ( !buffer )
++    {
++        ERROR("Unable to allocate %zu bytes for msr hypercall buffer",
++              buffersz);
++        return -1;
++    }
++
++    domctl.cmd = XEN_DOMCTL_set_vcpu_msrs;
++    domctl.domain = ctx->domid;
++    domctl.u.vcpu_msrs.vcpu = vhdr->vcpu_id;
++    domctl.u.vcpu_msrs.msr_count = buffersz % sizeof(xen_domctl_vcpu_msr_t);
++    set_xen_guest_handle(domctl.u.vcpuextstate.buffer, buffer);
++
++    memcpy(buffer, vhdr->context, buffersz);
++
++    rc = xc_domctl(xch, &domctl);
++
++    xc_hypercall_buffer_free(xch, buffer);
++
++    if ( rc )
++        PERROR("Failed to set vcpu%"PRIu32"'s msrs", vhdr->vcpu_id);
++    else
++        DPRINTF("vcpu%"PRId32" X86_PV_VCPU_MSRS record", vhdr->vcpu_id);
++
++    return rc;
++}
++
++/*
++ * Process a SHARED_INFO record from the stream.
++ */
 +static int handle_shared_info(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -835,7 +760,7 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    if ( rec->length != PAGE_SIZE )
 +    {
 +        ERROR("X86_PV_SHARED_INFO record wrong size: length %"PRIu32
-+              ", expected %u", rec->length, PAGE_SIZE);
++              ", expected %lu", rec->length, PAGE_SIZE);
 +        goto err;
 +    }
 +
@@ -869,21 +794,77 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    return rc;
 +}
 +
-+int restore_x86_pv(struct context *ctx)
++/*
++ * restore_ops function.  Convert pfns back to mfns in pagetables.  Possibly
++ * needs to populate new frames if a PTE is found referring to a frame which
++ * hasn't yet been seen from PAGE_DATA records.
++ */
++static int x86_pv_localise_page(struct context *ctx, uint32_t type, void *page)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct record rec;
++    uint64_t *table = page;
++    uint64_t pte;
++    unsigned i;
++
++    type &= XEN_DOMCTL_PFINFO_LTABTYPE_MASK;
++
++    /* Only page tables need localisation. */
++    if ( type < XEN_DOMCTL_PFINFO_L1TAB || type > XEN_DOMCTL_PFINFO_L4TAB )
++        return 0;
++
++    for ( i = 0; i < (PAGE_SIZE / sizeof(uint64_t)); ++i )
++    {
++        pte = table[i];
++
++        if ( pte & _PAGE_PRESENT )
++        {
++            xen_pfn_t mfn, pfn;
++
++            pfn = pte_to_frame(ctx, pte);
++            mfn = ctx->ops.pfn_to_gfn(ctx, pfn);
++
++            if ( mfn == INVALID_MFN )
++            {
++                if ( populate_pfns(ctx, 1, &pfn, &type) )
++                    return -1;
++
++                mfn = ctx->ops.pfn_to_gfn(ctx, pfn);
++            }
++
++            if ( !mfn_in_pseudophysmap(ctx, mfn) )
++            {
++                ERROR("Bad mfn for L%"PRIu32"[%u]",
++                      type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT, i);
++                dump_bad_pseudophysmap_entry(ctx, mfn);
++                errno = ERANGE;
++                return -1;
++            }
++
++            update_pte(ctx, &pte, mfn);
++
++            table[i] = pte;
++        }
++    }
++
++    return 0;
++}
++
++/*
++ * restore_ops function.  Confirm that the incoming stream matches the type of
++ * domain we are attempting to restore into.
++ */
++static int x86_pv_setup(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
 +    int rc;
 +
-+    IPRINTF("In experimental %s", __func__);
-+
-+    if ( ctx->restore.guest_type != DHDR_TYPE_x86_pv )
++    if ( ctx->restore.guest_type != DHDR_TYPE_X86_PV )
 +    {
 +        ERROR("Unable to restore %s domain into an x86_pv domain",
 +              dhdr_type_to_str(ctx->restore.guest_type));
 +        return -1;
 +    }
-+    else if ( ctx->restore.guest_page_size != 4096 )
++    else if ( ctx->restore.guest_page_size != PAGE_SIZE )
 +    {
 +        ERROR("Invalid page size %d for x86_pv domains",
 +              ctx->restore.guest_page_size);
@@ -892,90 +873,81 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +
 +    rc = x86_pv_domain_info(ctx);
 +    if ( rc )
-+        goto err;
++        return rc;
 +
 +    rc = x86_pv_map_m2p(ctx);
 +    if ( rc )
-+        goto err;
++        return rc;
 +
-+    do
++    return rc;
++}
++
++/*
++ * restore_ops function.
++ */
++static int x86_pv_process_record(struct context *ctx, struct record *rec)
++{
++    xc_interface *xch = ctx->xch;
++
++    switch ( rec->type )
 +    {
-+        rc = read_record(ctx, &rec);
-+        if ( rc )
-+            goto err;
++    case REC_TYPE_X86_PV_INFO:
++        return handle_x86_pv_info(ctx, rec);
 +
-+        switch ( rec.type )
++    case REC_TYPE_X86_PV_P2M_FRAMES:
++        return handle_x86_pv_p2m_frames(ctx, rec);
++
++    case REC_TYPE_X86_PV_VCPU_BASIC:
++        return handle_x86_pv_vcpu_basic(ctx, rec);
++
++    case REC_TYPE_X86_PV_VCPU_EXTENDED:
++        return handle_x86_pv_vcpu_extended(ctx, rec);
++
++    case REC_TYPE_X86_PV_VCPU_XSAVE:
++        return handle_x86_pv_vcpu_xsave(ctx, rec);
++
++    case REC_TYPE_SHARED_INFO:
++        return handle_shared_info(ctx, rec);
++
++    case REC_TYPE_TOOLSTACK:
++        return handle_toolstack(ctx, rec);
++
++    case REC_TYPE_TSC_INFO:
++        return handle_tsc_info(ctx, rec);
++
++    case REC_TYPE_X86_PV_VCPU_MSRS:
++        return handle_x86_pv_vcpu_msrs(ctx, rec);
++
++    default:
++        if ( rec->type & REC_TYPE_OPTIONAL )
 +        {
-+        case REC_TYPE_end:
-+            rc = handle_end(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_page_data:
-+            rc = handle_page_data(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_x86_pv_info:
-+            rc = handle_x86_pv_info(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_x86_pv_p2m_frames:
-+            rc = handle_x86_pv_p2m_frames(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_x86_pv_vcpu_basic:
-+            rc = handle_x86_pv_vcpu_basic(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_x86_pv_vcpu_extended:
-+            rc = handle_x86_pv_vcpu_extended(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_x86_pv_vcpu_xsave:
-+            rc = handle_x86_pv_vcpu_xsave(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_shared_info:
-+            rc = handle_shared_info(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_toolstack:
-+            rc = handle_toolstack(ctx, &rec);
-+            break;
-+
-+        case REC_TYPE_tsc_info:
-+            rc = handle_tsc_info(ctx, &rec);
-+            break;
-+
-+        default:
-+            if ( rec.type & REC_TYPE_optional )
-+            {
-+                IPRINTF("Ignoring optional record (0x%"PRIx32", %s)",
-+                        rec.type, rec_type_to_str(rec.type));
-+                rc = 0;
-+                break;
-+            }
-+
-+            ERROR("Invalid record type (0x%"PRIx32", %s) for x86_pv domains",
-+                  rec.type, rec_type_to_str(rec.type));
-+            rc = -1;
-+            break;
++            IPRINTF("Ignoring optional record (0x%"PRIx32", %s)",
++                    rec->type, rec_type_to_str(rec->type));
++            return 0;
 +        }
 +
-+        free(rec.data);
-+        if ( rc )
-+            goto err;
++        ERROR("Invalid record type (0x%"PRIx32", %s) for x86_pv domains",
++              rec->type, rec_type_to_str(rec->type));
++        return -1;
++    }
++}
 +
-+    } while ( rec.type != REC_TYPE_end );
-+
-+    IPRINTF("Finished reading records");
++/*
++ * restore_ops function.  Pin the pagetables, rewrite the p2m and seed the
++ * grant table.
++ */
++static int x86_pv_stream_complete(struct context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc;
 +
 +    rc = pin_pagetables(ctx);
 +    if ( rc )
-+        goto err;
++        return rc;
 +
 +    rc = update_guest_p2m(ctx);
 +    if ( rc )
-+        goto err;
++        return rc;
 +
 +    rc = xc_dom_gnttab_seed(xch, ctx->domid,
 +                            ctx->restore.console_mfn,
@@ -985,28 +957,35 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 +    if ( rc )
 +    {
 +        PERROR("Failed to seed grant table");
-+        goto err;
++        return rc;
 +    }
 +
-+    /* all done */
-+    IPRINTF("All Done");
-+    assert(!rc);
-+    goto cleanup;
++    return rc;
++}
 +
-+ err:
-+    assert(rc);
-+ cleanup:
-+
++/*
++ * restore_ops function.
++ */
++static int x86_pv_cleanup(struct context *ctx)
++{
 +    free(ctx->x86_pv.p2m);
 +    free(ctx->x86_pv.p2m_pfns);
 +    free(ctx->x86_pv.pfn_types);
-+    free(ctx->restore.populated_pfns);
 +
 +    if ( ctx->x86_pv.m2p )
 +        munmap(ctx->x86_pv.m2p, ctx->x86_pv.nr_m2p_frames * PAGE_SIZE);
 +
-+    return rc;
++    return 0;
 +}
++
++struct restore_ops restore_ops_x86_pv =
++{
++    .localise_page   = x86_pv_localise_page,
++    .setup           = x86_pv_setup,
++    .process_record  = x86_pv_process_record,
++    .stream_complete = x86_pv_stream_complete,
++    .cleanup         = x86_pv_cleanup,
++};
 +
 +/*
 + * Local variables:
@@ -1017,3 +996,6 @@ diff -r bc1a31d9296b tools/libxc/saverestore/restore_x86_pv.c
 + * indent-tabs-mode: nil
 + * End:
 + */
+-- 
+1.7.10.4
+
