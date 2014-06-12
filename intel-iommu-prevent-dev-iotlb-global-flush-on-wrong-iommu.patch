@@ -1,0 +1,123 @@
+# HG changeset patch
+# Parent 1984e28b3a3247aefa6cf002ab44c2475346617c
+IOMMU: Prevent device IOTLB operations on wrong IOMMU
+
+PCIE ATS allows for device's to contain IOTLB's, the VT-d code was iterating
+around all ATS capable devices and issuing IOTLB operations for all IOMMU's,
+even though each ATS device's is only accessible via one particular IOMMU.
+
+Issuing an IOMMU operation to a device not accessible via that IOMMU results
+in an IOMMU timeout because the device does not reply. VT-d IOMMU timeouts
+result in a Xen panic.
+
+Therefore this bug prevents any Intel system with 2 or more ATS enabled IOMMU's,
+each with an ATS device connected to them, from booting Xen.
+
+The patch add's a IOMMU pointer to the ATS device struct so the VT-d code can
+ensure it does not issue IOMMU ATS operations on the wrong IOMMU. A void
+pointer has to be used because AMD and Intel IOMMU implementations do not have
+a common IOMMU structure or indexing mechanism.
+
+Optimised AMD's IOMMU code by leveraging the new IOMMU field in the ATS
+structure.
+
+diff -r 1984e28b3a32 xen/drivers/passthrough/amd/iommu_cmd.c
+--- a/xen/drivers/passthrough/amd/iommu_cmd.c
++++ b/xen/drivers/passthrough/amd/iommu_cmd.c
+@@ -303,8 +303,7 @@ void amd_iommu_flush_iotlb(u8 devfn, con
+     if ( !pci_ats_enabled(ats_pdev->seg, ats_pdev->bus, ats_pdev->devfn) )
+         return;
+ 
+-    iommu = find_iommu_for_device(ats_pdev->seg,
+-                                  PCI_BDF2(ats_pdev->bus, ats_pdev->devfn));
++    iommu = ats_pdev->iommu;
+ 
+     if ( !iommu )
+     {
+diff -r 1984e28b3a32 xen/drivers/passthrough/amd/pci_amd_iommu.c
+--- a/xen/drivers/passthrough/amd/pci_amd_iommu.c
++++ b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+@@ -163,7 +163,7 @@ static void amd_iommu_setup_domain_devic
+          !pci_ats_enabled(iommu->seg, bus, pdev->devfn) )
+     {
+         if ( devfn == pdev->devfn )
+-            enable_ats_device(iommu->seg, bus, devfn);
++            enable_ats_device(iommu, iommu->seg, bus, devfn);
+ 
+         amd_iommu_flush_iotlb(devfn, pdev, INV_IOMMU_ALL_PAGES_ADDRESS, 0);
+     }
+diff -r 1984e28b3a32 xen/drivers/passthrough/ats.h
+--- a/xen/drivers/passthrough/ats.h
++++ b/xen/drivers/passthrough/ats.h
+@@ -24,6 +24,7 @@ struct pci_ats_dev {
+     u8 bus;
+     u8 devfn;
+     u16 ats_queue_depth;    /* ATS device invalidation queue depth */
++    void *iommu;
+ };
+ 
+ #define ATS_REG_CAP    4
+@@ -34,7 +35,7 @@ struct pci_ats_dev {
+ extern struct list_head ats_devices;
+ extern bool_t ats_enabled;
+ 
+-int enable_ats_device(int seg, int bus, int devfn);
++int enable_ats_device(void *iommu, int seg, int bus, int devfn);
+ void disable_ats_device(int seg, int bus, int devfn);
+ struct pci_ats_dev *get_ats_device(int seg, int bus, int devfn);
+ 
+diff -r 1984e28b3a32 xen/drivers/passthrough/vtd/iommu.c
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -1442,7 +1442,7 @@ static int domain_context_mapping(
+         ret = domain_context_mapping_one(domain, drhd->iommu, bus, devfn,
+                                          pdev);
+         if ( !ret && devfn == pdev->devfn && ats_device(pdev, drhd) > 0 )
+-            enable_ats_device(seg, bus, devfn);
++            enable_ats_device(drhd->iommu, seg, bus, devfn);
+ 
+         break;
+ 
+@@ -1930,7 +1930,7 @@ static int intel_iommu_enable_device(str
+     if ( ret <= 0 )
+         return ret;
+ 
+-    ret = enable_ats_device(pdev->seg, pdev->bus, pdev->devfn);
++    ret = enable_ats_device(drhd->iommu, pdev->seg, pdev->bus, pdev->devfn);
+ 
+     return ret >= 0 ? 0 : ret;
+ }
+diff -r 1984e28b3a32 xen/drivers/passthrough/vtd/x86/ats.c
+--- a/xen/drivers/passthrough/vtd/x86/ats.c
++++ b/xen/drivers/passthrough/vtd/x86/ats.c
+@@ -120,6 +120,10 @@ int dev_invalidate_iotlb(struct iommu *i
+     {
+         sid = (pdev->bus << 8) | pdev->devfn;
+ 
++        /* Only invalidate devices that belong to this IOMMU */
++        if (!pdev->iommu || pdev->iommu != iommu)
++            continue;
++
+         switch ( type ) {
+         case DMA_TLB_DSI_FLUSH:
+             if ( !device_in_domain(iommu, pdev, did) )
+diff -r 1984e28b3a32 xen/drivers/passthrough/x86/ats.c
+--- a/xen/drivers/passthrough/x86/ats.c
++++ b/xen/drivers/passthrough/x86/ats.c
+@@ -23,7 +23,7 @@ LIST_HEAD(ats_devices);
+ bool_t __read_mostly ats_enabled = 1;
+ boolean_param("ats", ats_enabled);
+ 
+-int enable_ats_device(int seg, int bus, int devfn)
++int enable_ats_device(void *iommu, int seg, int bus, int devfn)
+ {
+     struct pci_ats_dev *pdev = NULL;
+     u32 value;
+@@ -66,6 +66,7 @@ int enable_ats_device(int seg, int bus, 
+         pdev->seg = seg;
+         pdev->bus = bus;
+         pdev->devfn = devfn;
++        pdev->iommu = iommu;
+         value = pci_conf_read16(seg, bus, PCI_SLOT(devfn),
+                                 PCI_FUNC(devfn), pos + ATS_REG_CAP);
+         pdev->ats_queue_depth = value & ATS_QUEUE_DEPTH_MASK ?:
