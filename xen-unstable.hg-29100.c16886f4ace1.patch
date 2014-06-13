@@ -1,0 +1,67 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1401983006 -7200
+# Node ID c16886f4ace1cc7b516f489167512a99402f4ce8
+# Parent  c8e812e486c671c80d7cd2de0e587bea5cfcf016
+x86/hvm: correct hvm_ioreq_server_alloc_rangesets() failure path
+
+Coverity-ID: 1220092 "Unsigned compare against 0"
+Coverity-ID: 1220093 "Out-of-bounds read"
+
+Both of these are cased by the the while() loop in the fail path, which
+results in an infinite loop and memory corruption from rangeset_destroy().
+
+Move hvm_ioreq_server_free_rangesets() up and use it for cleanup on the
+failure path.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
+
+diff -r c8e812e486c6 -r c16886f4ace1 xen/arch/x86/hvm/hvm.c
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -824,6 +824,18 @@ static void hvm_ioreq_server_unmap_pages
+     }
+ }
+ 
++static void hvm_ioreq_server_free_rangesets(struct hvm_ioreq_server *s,
++                                            bool_t is_default)
++{
++    unsigned int i;
++
++    if ( is_default )
++        return;
++
++    for ( i = 0; i < NR_IO_RANGE_TYPES; i++ )
++        rangeset_destroy(s->range[i]);
++}
++
+ static int hvm_ioreq_server_alloc_rangesets(struct hvm_ioreq_server *s, 
+                                             bool_t is_default)
+ {
+@@ -861,24 +873,11 @@ static int hvm_ioreq_server_alloc_ranges
+     return 0;
+ 
+  fail:
+-    while ( --i >= 0 )
+-        rangeset_destroy(s->range[i]);
++    hvm_ioreq_server_free_rangesets(s, 0);
+ 
+     return rc;
+ }
+ 
+-static void hvm_ioreq_server_free_rangesets(struct hvm_ioreq_server *s, 
+-                                            bool_t is_default)
+-{
+-    unsigned int i;
+-
+-    if ( is_default )
+-        return;
+-
+-    for ( i = 0; i < NR_IO_RANGE_TYPES; i++ )
+-        rangeset_destroy(s->range[i]);
+-}
+-
+ static void hvm_ioreq_server_enable(struct hvm_ioreq_server *s,
+                                     bool_t is_default)
+ {
