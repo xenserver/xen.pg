@@ -1,7 +1,7 @@
 # HG changeset patch
-# Parent c9be87cc8e17eaf6907698d889f293fb27d752ea
+# Parent c79ea831be446370d87b58e0193b1c2d3e62d3ca
 
-diff -r c9be87cc8e17 .hgignore
+diff -r c79ea831be44 .hgignore
 --- a/.hgignore
 +++ b/.hgignore
 @@ -243,6 +243,7 @@
@@ -12,7 +12,7 @@ diff -r c9be87cc8e17 .hgignore
  ^tools/xcutils/lsevtchn$
  ^tools/xcutils/xc_restore$
  ^tools/xcutils/xc_save$
-diff -r c9be87cc8e17 mk/xen-4.4.spec.in
+diff -r c79ea831be44 mk/xen-4.4.spec.in
 --- a/mk/xen-4.4.spec.in
 +++ b/mk/xen-4.4.spec.in
 @@ -420,6 +420,7 @@ rm -rf $RPM_BUILD_ROOT
@@ -23,7 +23,7 @@ diff -r c9be87cc8e17 mk/xen-4.4.spec.in
  %{_libdir}/%{name}/bin/xenpaging
  %{_libdir}/%{name}/bin/xenpvnetboot
  
-diff -r c9be87cc8e17 tools/Makefile
+diff -r c79ea831be44 tools/Makefile
 --- a/tools/Makefile
 +++ b/tools/Makefile
 @@ -22,6 +22,7 @@ SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
@@ -34,7 +34,7 @@ diff -r c9be87cc8e17 tools/Makefile
  
  # do not recurse in to a dir we are about to delete
  ifneq "$(MAKECMDGOALS)" "distclean"
-diff -r c9be87cc8e17 tools/xenguest/Makefile
+diff -r c79ea831be44 tools/xenguest/Makefile
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,29 @@
@@ -54,8 +54,8 @@ diff -r c9be87cc8e17 tools/xenguest/Makefile
 +.PHONY: build
 +build: $(PROGRAMS)
 +
-+xenguest: xenguest.o xenguest_stubs.o xenguest_posix.c
-+	$(CC) $(CFLAGS) -o $@ $(LDFLAGS) $^ -pthread \
++xenguest: xenguest.o xenguest_stubs.o
++	$(CC) $(CFLAGS) -o $@ $(LDFLAGS) $^ \
 +		$(LDLIBS_libxenctrl) $(LDLIBS_libxenguest) $(LDLIBS_libxenstore)
 +
 +.PHONY: install
@@ -67,10 +67,10 @@ diff -r c9be87cc8e17 tools/xenguest/Makefile
 +clean:
 +	$(RM) *.o $(ALL_TARGETS)
 +	$(RM) $(DEPS)
-diff -r c9be87cc8e17 tools/xenguest/xenguest.c
+diff -r c79ea831be44 tools/xenguest/xenguest.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
-@@ -0,0 +1,630 @@
+@@ -0,0 +1,600 @@
 +#include <getopt.h>
 +#include <errno.h>
 +#include <syslog.h>
@@ -130,7 +130,6 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest.c
 +    XG_OPT_MEM_START_MIB, /* int */
 +    XG_OPT_FORK, /* bool */
 +    XG_OPT_NO_INC_GENID, /* bool */
-+    XG_OPT_LEGACY_STREAM, /* bool */
 +};
 +
 +static int opt_mode = -1;
@@ -150,7 +149,6 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest.c
 +static int opt_flags = 0;
 +static int opt_mem_max_mib = -1;
 +static int opt_mem_start_mib = -1;
-+static bool opt_legacy_stream = false;
 +
 +static const char *xg_mode_names[] = {
 +    [XG_MODE_SAVE] = "save",
@@ -162,8 +160,6 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest.c
 +    [XG_MODE_HVM_BUILD] = "hvm_build",
 +    [XG_MODE_TEST] = "test",
 +};
-+
-+static pthread_mutex_t logging_mutex = PTHREAD_MUTEX_INITIALIZER;
 +
 +void err(const char *msg, ...)
 +{
@@ -177,14 +173,10 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest.c
 +
 +    if ( rc != -1 )
 +    {
-+        pthread_mutex_lock(&logging_mutex);
-+
 +        if ( opt_debugfile )
 +            fputs(buf, opt_debugfile);
 +        fputs(buf, stderr);
 +        syslog(LOG_ERR|LOG_DAEMON, "%s", buf);
-+
-+        pthread_mutex_unlock(&logging_mutex);
 +    }
 +
 +    free(buf);
@@ -202,13 +194,9 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest.c
 +
 +    if ( rc != -1 )
 +    {
-+        pthread_mutex_lock(&logging_mutex);
-+
 +        if ( opt_debugfile )
 +            fputs(buf, opt_debugfile);
 +        syslog(LOG_INFO|LOG_DAEMON, "%s", buf);
-+
-+        pthread_mutex_unlock(&logging_mutex);
 +    }
 +
 +    free(buf);
@@ -285,7 +273,6 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest.c
 +        { "mem_start_mib", required_argument, NULL, XG_OPT_MEM_START_MIB, },
 +        { "fork", no_argument, NULL, XG_OPT_FORK, },
 +        { "no_incr_generationid", no_argument, NULL, XG_OPT_NO_INC_GENID, },
-+        { "legacy_stream", required_argument, NULL, XG_OPT_LEGACY_STREAM, },
 +        { NULL },
 +    };
 +
@@ -384,10 +371,6 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest.c
 +            /* ignored */
 +            break;
 +
-+        case XG_OPT_LEGACY_STREAM:
-+            opt_legacy_stream = !!parse_int(optarg);
-+            break;
-+
 +        default:
 +            err("xenguest: invalid command line\n");
 +            exit(1);
@@ -442,21 +425,8 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest.c
 +        exit(1);
 +    }
 +
-+    /*
-+     * For a legacy incoming stream, we need to fork ourselves the converstion
-+     * script and replumb the pipe fds.
-+     */
-+    if ( opt_legacy_stream )
-+    {
-+        info("Performing conversion of legacy stream");
-+        setup_legacy_conversion(opt_fd, opt_mode);
-+    }
-+
 +    stub_xc_domain_restore(xch, xsh, opt_fd, opt_domid, opt_store_port, opt_console_port, is_hvm,
 +                           &store_mfn, &console_mfn);
-+
-+    if ( opt_legacy_stream )
-+        cleanup_legacy_conversion();
 +
 +    write_status(store_mfn, console_mfn, NULL);
 +}
@@ -701,282 +671,7 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r c9be87cc8e17 tools/xenguest/xenguest_posix.c
---- /dev/null
-+++ b/tools/xenguest/xenguest_posix.c
-@@ -0,0 +1,271 @@
-+#include <stdlib.h>
-+#include <stdio.h>
-+#include <string.h>
-+#include <stdarg.h>
-+#include <stdbool.h>
-+#include <errno.h>
-+#include <assert.h>
-+
-+#include <unistd.h>
-+#include <pthread.h>
-+#include <fcntl.h>
-+#include <sys/wait.h>
-+#include <poll.h>
-+
-+#include <xenctrl.h>
-+#include "xg_internal.h"
-+
-+#define CHK_SYSCALL(call) ({                                            \
-+            if ( (call) == -1 ) {                                       \
-+                err("FATAL: '%s' failed: %d %s\n",                      \
-+                    #call, errno, strerror(errno));                     \
-+                exit(1);                                                \
-+            } })
-+
-+static int stdout_pipe[2], stderr_pipe[2], data_pipe[2];
-+static pid_t child;
-+static pthread_t logging_thread;
-+static bool child_alive;
-+
-+struct stdbuffer
-+{
-+    char buffer[2048];
-+    unsigned prod, cons;
-+    bool valid_line;
-+} stdoutbuf, stderrbuf;
-+
-+static void check_for_line(struct stdbuffer *buf)
-+{
-+    char *nl;
-+
-+    /* assert(buf->cons == 0); */
-+    if ( buf->cons != 0 )
-+    {
-+        err("cons %u - bailing", buf->cons);
-+        exit(1);
-+    }
-+
-+    nl = strchr(buf->buffer, '\n');
-+
-+    if ( nl )
-+    {
-+        buf->valid_line = true;
-+        nl[0] = '\0';
-+        buf->cons = nl + 1 - buf->buffer;
-+    }
-+    else if ( buf->prod == (sizeof buf->buffer - 1) )
-+    {
-+        buf->valid_line = true;
-+        strcpy(&buf->buffer[sizeof buf->buffer - 4], "...\0");
-+        buf->cons = buf->prod;
-+    }
-+    else
-+        buf->valid_line = false;
-+
-+    /* info("cfl() = %u, prod %u, cons %u", buf->valid_line, buf->prod, buf->cons); */
-+}
-+
-+static int read_into_buffer(int fd, struct stdbuffer *buf)
-+{
-+    ssize_t nr;
-+
-+    /* info("rib()..."); */
-+
-+    /* assert(buf->prod < (sizeof buf->buffer - 1)); */
-+    if ( buf->prod >= (sizeof buf->buffer - 1) )
-+    {
-+        err("prod %u - bailing", buf->prod);
-+        exit(1);
-+    }
-+
-+    nr = read(fd, &buf->buffer[buf->prod], sizeof buf->buffer - buf->prod);
-+
-+    if ( nr < 0 )
-+    {
-+        if ( errno != EAGAIN )
-+            err("failed read: %d %s", errno, strerror(errno));
-+    }
-+    else
-+        buf->prod += nr;
-+    check_for_line(buf);
-+
-+    /* info("... %ld", nr); */
-+
-+    return nr;
-+}
-+
-+static void advance_buffer(struct stdbuffer *buf)
-+{
-+    /* info("advancing: cons %u, prod %u", buf->cons, buf->prod); */
-+
-+    memmove(buf->buffer, &buf->buffer[buf->cons], buf->prod - buf->cons);
-+    memset(&buf->buffer[buf->prod - buf->cons], 0, buf->prod - buf->cons);
-+
-+    buf->prod -= buf->cons;
-+    buf->cons = 0;
-+
-+    check_for_line(buf);
-+}
-+
-+static void *logging_loop(void *arg)
-+{
-+    int rc, status;
-+    struct pollfd fds[] =
-+    {
-+        { stdout_pipe[0], POLLIN | POLLRDHUP },
-+        { stderr_pipe[0], POLLIN | POLLRDHUP },
-+    };
-+
-+    assert(child_alive);
-+
-+    while ( child_alive )
-+    {
-+        rc = poll(fds, sizeof fds / sizeof fds[0], -1);
-+
-+        if ( rc < 0 )
-+        {
-+            err("poll() returned %d %s", errno, strerror(errno));
-+            exit(1);
-+        }
-+
-+        if ( (fds[0].revents | fds[1].revents) & POLLHUP )
-+        {
-+            info("Child exited - reaping\n");
-+
-+            CHK_SYSCALL(waitpid(child, &status, 0));
-+
-+            if ( WIFEXITED(status) )
-+                info("wait complete: exit %d\n", WEXITSTATUS(status));
-+            else if ( WIFSIGNALED(status) )
-+                err("wait complete: terminated by signal %d", WTERMSIG(status));
-+
-+            child_alive = false;
-+        }
-+
-+        if ( fds[0].revents & POLLIN )
-+        {
-+            while ( read_into_buffer(fds[0].fd, &stdoutbuf) > 0 )
-+            {
-+                while ( stdoutbuf.valid_line )
-+                {
-+                    info("conv: %s\n", stdoutbuf.buffer);
-+                    advance_buffer(&stdoutbuf);
-+                }
-+            }
-+        }
-+
-+        if ( fds[1].revents & POLLIN )
-+        {
-+            while ( read_into_buffer(fds[1].fd, &stderrbuf) > 0 )
-+            {
-+                while ( stderrbuf.valid_line )
-+                {
-+                    err("conv: %s\n", stderrbuf.buffer);
-+                    advance_buffer(&stderrbuf);
-+                }
-+            }
-+        }
-+
-+    }
-+
-+    return NULL;
-+}
-+
-+void atexit_reap_child(void)
-+{
-+    int status;
-+
-+    if ( child_alive )
-+    {
-+        kill(child, SIGTERM);
-+        waitpid(child, &status, 0);
-+        child_alive = false;
-+    }
-+}
-+
-+void setup_legacy_conversion(int opt_fd, enum xenguest_mode opt_mode)
-+{
-+    CHK_SYSCALL(pipe2(stdout_pipe, O_NONBLOCK));
-+    CHK_SYSCALL(pipe2(stderr_pipe, O_NONBLOCK));
-+    CHK_SYSCALL(pipe(data_pipe));
-+
-+    /* info("stdout pipe: %d %d\n", stdout_pipe[0], stdout_pipe[1]); */
-+    /* info("stderr pipe: %d %d\n", stderr_pipe[0], stderr_pipe[1]); */
-+    /* info("data pipe: %d %d\n", data_pipe[0], data_pipe[1]); */
-+    /* info("child pipe: %d %d\n", child_pipe[0], child_pipe[1]); */
-+
-+    child_alive = true;
-+    CHK_SYSCALL(child = fork());
-+
-+    if ( child != 0 )
-+    {   /* Parent process */
-+        CHK_SYSCALL(close(stdout_pipe[1]));
-+        CHK_SYSCALL(close(stderr_pipe[1]));
-+        CHK_SYSCALL(close(data_pipe[1]));
-+
-+        /* Close our input pipe and replace it with the output from conversion. */
-+        CHK_SYSCALL(dup2(data_pipe[0], opt_fd));
-+
-+        atexit(atexit_reap_child);
-+
-+        if ( pthread_create(&logging_thread, NULL, &logging_loop, NULL) != 0 )
-+        {
-+            err("pthread_create() failed ;(\n");
-+            exit(1);
-+        }
-+    }
-+    else
-+    {   /* Child process.  Set up pipes and exec the conversion script */
-+        int devnull;
-+        char infd[16] = "", outfd[16] = "";
-+        char *argv[] =
-+            {
-+                "legacy.py",
-+                "--in", infd,
-+                "--out", outfd,
-+                "--width", getenv("XG_CONV_64TS") ? "64" : "32",
-+                "--guest", opt_mode == XG_MODE_RESTORE ? "pv" : "hvm",
-+                NULL
-+            };
-+
-+        CHK_SYSCALL(close(stdout_pipe[0]));
-+        CHK_SYSCALL(close(stderr_pipe[0]));
-+        CHK_SYSCALL(close(data_pipe[0]));
-+
-+        CHK_SYSCALL(devnull = open("/dev/null", O_RDONLY));
-+
-+        /* Hook stdin/out/err */
-+        CHK_SYSCALL(dup2(devnull, 0));
-+        CHK_SYSCALL(dup2(stdout_pipe[1], 1));
-+        CHK_SYSCALL(dup2(stderr_pipe[1], 2));
-+
-+        CHK_SYSCALL(close(devnull));
-+
-+        /* Contruct fd references for script */
-+        snprintf(infd, sizeof infd, "%d", opt_fd);
-+        snprintf(outfd, sizeof outfd, "%d", data_pipe[1]);
-+
-+        CHK_SYSCALL(execv("/usr/lib64/xen/bin/legacy.py", argv));
-+    }
-+}
-+
-+void cleanup_legacy_conversion(void)
-+{
-+    int rc = pthread_join(logging_thread, NULL);
-+
-+    if ( rc != 0 )
-+        err("pthread_join() failed: %d", rc);
-+
-+    CHK_SYSCALL(close(stdout_pipe[0]));
-+    CHK_SYSCALL(close(stderr_pipe[0]));
-+}
-+
-+/*
-+ * Local variables:
-+ * mode: C
-+ * c-file-style: "BSD"
-+ * c-basic-offset: 4
-+ * tab-width: 4
-+ * indent-tabs-mode: nil
-+ * End:
-+ */
-diff -r c9be87cc8e17 tools/xenguest/xenguest_stubs.c
+diff -r c79ea831be44 tools/xenguest/xenguest_stubs.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
 @@ -0,0 +1,606 @@
@@ -1586,7 +1281,7 @@ diff -r c9be87cc8e17 tools/xenguest/xenguest_stubs.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r c9be87cc8e17 tools/xenguest/xg_internal.h
+diff -r c79ea831be44 tools/xenguest/xg_internal.h
 --- /dev/null
 +++ b/tools/xenguest/xg_internal.h
 @@ -0,0 +1,59 @@
