@@ -1,12 +1,20 @@
-From 99433f7e5e8839836497bde2240ed581d11b8ad1 Mon Sep 17 00:00:00 2001
+From 08dc4794d15861e483c205f4503d7a7378ecf85d Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 15 Mar 2014 20:18:45 +0000
 Subject: [PATCH 04/14] tools/libxc: C implementation of stream format
 
+Provide the C structures matching the binary (wire) format of the new
+stream format.  All header/record fields are naturally aligned and
+explicit padding fields are used to ensure the correct layout (i.e.,
+there is no need for any non-standard structure packing pragma or
+attribute).
+
+Provide some helper functions for converting types to string for
+diagnostic purposes.
+
 Still TODO: Consider namespacing/prefixing
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
  tools/libxc/saverestore/common.c        |   79 +++++++++++++++++
  tools/libxc/saverestore/common.h        |    8 ++
@@ -17,7 +25,7 @@ Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 
 diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
 new file mode 100644
-index 0000000..de86a90
+index 0000000..70d874b
 --- /dev/null
 +++ b/tools/libxc/saverestore/common.c
 @@ -0,0 +1,79 @@
@@ -78,17 +86,17 @@ index 0000000..de86a90
 +
 +static void __attribute__((unused)) build_assertions(void)
 +{
-+    XC_BUILD_BUG_ON(sizeof(struct ihdr) != 24);
-+    XC_BUILD_BUG_ON(sizeof(struct dhdr) != 16);
-+    XC_BUILD_BUG_ON(sizeof(struct rhdr) != 8);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_ihdr) != 24);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_dhdr) != 16);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_rhdr) != 8);
 +
-+    XC_BUILD_BUG_ON(sizeof(struct rec_page_data_header)  != 8);
-+    XC_BUILD_BUG_ON(sizeof(struct rec_x86_pv_info)       != 8);
-+    XC_BUILD_BUG_ON(sizeof(struct rec_x86_pv_p2m_frames) != 8);
-+    XC_BUILD_BUG_ON(sizeof(struct rec_x86_pv_vcpu_hdr)   != 8);
-+    XC_BUILD_BUG_ON(sizeof(struct rec_tsc_info)          != 24);
-+    XC_BUILD_BUG_ON(sizeof(struct rec_hvm_params_entry)  != 16);
-+    XC_BUILD_BUG_ON(sizeof(struct rec_hvm_params)        != 8);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_rec_page_data_header)  != 8);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_rec_x86_pv_info)       != 8);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_rec_x86_pv_p2m_frames) != 8);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_rec_x86_pv_vcpu_hdr)   != 8);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_rec_tsc_info)          != 24);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_rec_hvm_params_entry)  != 16);
++    XC_BUILD_BUG_ON(sizeof(struct xc_sr_rec_hvm_params)        != 8);
 +}
 +
 +/*
@@ -121,7 +129,7 @@ index f1aff44..cbecf0a 100644
   * Local variables:
 diff --git a/tools/libxc/saverestore/stream_format.h b/tools/libxc/saverestore/stream_format.h
 new file mode 100644
-index 0000000..7e1ab76
+index 0000000..50be82e
 --- /dev/null
 +++ b/tools/libxc/saverestore/stream_format.h
 @@ -0,0 +1,147 @@
@@ -138,7 +146,7 @@ index 0000000..7e1ab76
 +/*
 + * Image Header
 + */
-+struct ihdr
++struct xc_sr_ihdr
 +{
 +    uint64_t marker;
 +    uint32_t id;
@@ -150,7 +158,7 @@ index 0000000..7e1ab76
 +
 +#define IHDR_MARKER  0xffffffffffffffffULL
 +#define IHDR_ID      0x58454E46U
-+#define IHDR_VERSION 1
++#define IHDR_VERSION 2
 +
 +#define _IHDR_OPT_ENDIAN 0
 +#define IHDR_OPT_LITTLE_ENDIAN (0 << _IHDR_OPT_ENDIAN)
@@ -159,7 +167,7 @@ index 0000000..7e1ab76
 +/*
 + * Domain Header
 + */
-+struct dhdr
++struct xc_sr_dhdr
 +{
 +    uint32_t type;
 +    uint16_t page_shift;
@@ -176,7 +184,7 @@ index 0000000..7e1ab76
 +/*
 + * Record Header
 + */
-+struct rhdr
++struct xc_sr_rhdr
 +{
 +    uint32_t type;
 +    uint32_t length;
@@ -204,7 +212,7 @@ index 0000000..7e1ab76
 +#define REC_TYPE_OPTIONAL             0x80000000U
 +
 +/* PAGE_DATA */
-+struct rec_page_data_header
++struct xc_sr_rec_page_data_header
 +{
 +    uint32_t count;
 +    uint32_t _res1;
@@ -215,7 +223,7 @@ index 0000000..7e1ab76
 +#define PAGE_DATA_TYPE_MASK 0xf000000000000000ULL
 +
 +/* X86_PV_INFO */
-+struct rec_x86_pv_info
++struct xc_sr_rec_x86_pv_info
 +{
 +    uint8_t guest_width;
 +    uint8_t pt_levels;
@@ -223,7 +231,7 @@ index 0000000..7e1ab76
 +};
 +
 +/* X86_PV_P2M_FRAMES */
-+struct rec_x86_pv_p2m_frames
++struct xc_sr_rec_x86_pv_p2m_frames
 +{
 +    uint32_t start_pfn;
 +    uint32_t end_pfn;
@@ -231,7 +239,7 @@ index 0000000..7e1ab76
 +};
 +
 +/* X86_PV_VCPU_{BASIC,EXTENDED,XSAVE,MSRS} */
-+struct rec_x86_pv_vcpu_hdr
++struct xc_sr_rec_x86_pv_vcpu_hdr
 +{
 +    uint32_t vcpu_id;
 +    uint32_t _res1;
@@ -239,7 +247,7 @@ index 0000000..7e1ab76
 +};
 +
 +/* TSC_INFO */
-+struct rec_tsc_info
++struct xc_sr_rec_tsc_info
 +{
 +    uint32_t mode;
 +    uint32_t khz;
@@ -249,17 +257,17 @@ index 0000000..7e1ab76
 +};
 +
 +/* HVM_PARAMS */
-+struct rec_hvm_params_entry
++struct xc_sr_rec_hvm_params_entry
 +{
 +    uint64_t index;
 +    uint64_t value;
 +};
 +
-+struct rec_hvm_params
++struct xc_sr_rec_hvm_params
 +{
 +    uint32_t count;
 +    uint32_t _res1;
-+    struct rec_hvm_params_entry param[0];
++    struct xc_sr_rec_hvm_params_entry param[0];
 +};
 +
 +#endif

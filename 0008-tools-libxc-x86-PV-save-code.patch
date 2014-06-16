@@ -1,11 +1,16 @@
-From d27025641455d8bc4b0d1ce53a9e47b33391608d Mon Sep 17 00:00:00 2001
+From c2fe6a8a6481c34c5ffd51641a8e98fbbf590be4 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:02 +0100
 Subject: [PATCH 08/14] tools/libxc: x86 PV save code
 
+Save the x86 PV specific parts of a domain.  This is the X86_PV_INFO record,
+the P2M_FRAMES, the X86_PV_SHARED_INFO, the three different VCPU context
+records, and the MSR records.
+
+The normalise_page callback used by the common code when writing the PAGE_DATA
+records, converts MFNs in page tables to PFNs.
+
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
-Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
  tools/libxc/saverestore/common.h      |    2 +
  tools/libxc/saverestore/save_x86_pv.c |  839 +++++++++++++++++++++++++++++++++
@@ -27,7 +32,7 @@ index 5f6af00..5c8a370 100644
      uint32_t type;
 diff --git a/tools/libxc/saverestore/save_x86_pv.c b/tools/libxc/saverestore/save_x86_pv.c
 new file mode 100644
-index 0000000..1def92e
+index 0000000..a366599
 --- /dev/null
 +++ b/tools/libxc/saverestore/save_x86_pv.c
 @@ -0,0 +1,839 @@
@@ -236,7 +241,7 @@ index 0000000..1def92e
 +    unsigned i;
 +    int rc = -1;
 +    vcpu_guest_context_any_t vcpu;
-+    struct rec_x86_pv_vcpu_hdr vhdr =
++    struct xc_sr_rec_x86_pv_vcpu_hdr vhdr =
 +    {
 +        .vcpu_id = id,
 +    };
@@ -331,7 +336,7 @@ index 0000000..1def92e
 +{
 +    xc_interface *xch = ctx->xch;
 +    int rc;
-+    struct rec_x86_pv_vcpu_hdr vhdr =
++    struct xc_sr_rec_x86_pv_vcpu_hdr vhdr =
 +    {
 +        .vcpu_id = id,
 +    };
@@ -373,7 +378,7 @@ index 0000000..1def92e
 +    xc_interface *xch = ctx->xch;
 +    int rc = -1;
 +    DECLARE_HYPERCALL_BUFFER(void, buffer);
-+    struct rec_x86_pv_vcpu_hdr vhdr =
++    struct xc_sr_rec_x86_pv_vcpu_hdr vhdr =
 +    {
 +        .vcpu_id = id,
 +    };
@@ -442,7 +447,7 @@ index 0000000..1def92e
 +    int rc = -1;
 +    size_t buffersz;
 +    DECLARE_HYPERCALL_BUFFER(void, buffer);
-+    struct rec_x86_pv_vcpu_hdr vhdr =
++    struct xc_sr_rec_x86_pv_vcpu_hdr vhdr =
 +    {
 +        .vcpu_id = id,
 +    };
@@ -554,7 +559,7 @@ index 0000000..1def92e
 + */
 +static int write_x86_pv_info(struct context *ctx)
 +{
-+    struct rec_x86_pv_info info =
++    struct xc_sr_rec_x86_pv_info info =
 +        {
 +            .guest_width = ctx->x86_pv.width,
 +            .pt_levels = ctx->x86_pv.levels,
@@ -579,7 +584,7 @@ index 0000000..1def92e
 +    int rc; unsigned i;
 +    size_t datasz = ctx->x86_pv.p2m_frames * sizeof(uint64_t);
 +    uint64_t *data = NULL;
-+    struct rec_x86_pv_p2m_frames hdr =
++    struct xc_sr_rec_x86_pv_p2m_frames hdr =
 +        {
 +            .start_pfn = 0,
 +            .end_pfn = ctx->x86_pv.max_pfn,

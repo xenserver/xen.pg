@@ -1,29 +1,36 @@
-From a64fe30f99b06647812250aef1f6d4f392db3c66 Mon Sep 17 00:00:00 2001
+From 6c5d12caf151b0d2290e18dabb5aef98e17c6176 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 6 Mar 2014 00:03:18 +0000
 Subject: [PATCH 02/14] scripts: Scripts for inspection/valdiation of legacy
  and new streams
 
+Add python scripts to manage image formats.
+
+legacy.py converts a legacy format image into the new format.  This avoids
+having to retain the restore code for the legacy format.  Toolstacks will
+identify a legacy image and call the conversion script prior to restoring the
+domain.
+
+verify.py validates that a new format image complies with the specification.
+
 TODO: move to tools/python and install properly...
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
-Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
- tools/libxc/saverestore/scripts/legacy.py     |  576 +++++++++++++++++++++++++
- tools/libxc/saverestore/scripts/streamspec.py |  136 ++++++
+ tools/libxc/saverestore/scripts/legacy.py     |  584 +++++++++++++++++++++++++
+ tools/libxc/saverestore/scripts/streamspec.py |  137 ++++++
  tools/libxc/saverestore/scripts/verify.py     |  377 ++++++++++++++++
- 3 files changed, 1089 insertions(+)
+ 3 files changed, 1098 insertions(+)
  create mode 100755 tools/libxc/saverestore/scripts/legacy.py
  create mode 100644 tools/libxc/saverestore/scripts/streamspec.py
  create mode 100755 tools/libxc/saverestore/scripts/verify.py
 
 diff --git a/tools/libxc/saverestore/scripts/legacy.py b/tools/libxc/saverestore/scripts/legacy.py
 new file mode 100755
-index 0000000..a1b0070
+index 0000000..defa2a6
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/legacy.py
-@@ -0,0 +1,576 @@
+@@ -0,0 +1,584 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -38,6 +45,7 @@ index 0000000..a1b0070
 +fout = None    # Output file/fd
 +twidth = 0     # Legacy toolstack bitness (32 or 64)
 +pv = None      # Boolean (pv or hvm)
++qemu = True    # Boolean - process qemu record?
 +
 +def stream_read(_ = None):
 +    return fin.read(_)
@@ -505,7 +513,9 @@ index 0000000..a1b0070
 +            read_pv_tail(vm)
 +        else:
 +            read_hvm_tail(vm)
-+            read_qemu(vm)
++
++            if qemu:
++                read_qemu(vm)
 +
 +    except (IOError, StreamError, ) as e:
 +        print >> sys.stderr, "Error: ", e
@@ -548,7 +558,7 @@ index 0000000..a1b0070
 +
 +def main(argv):
 +    from optparse import OptionParser
-+    global fin, fout, twidth, pv
++    global fin, fout, twidth, pv, qemu
 +
 +    # Change stdout to be line-buffered.
 +    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 1)
@@ -576,6 +586,9 @@ index 0000000..a1b0070
 +    parser.add_option("-x", "--xl", action = "store_true", default = False,
 +                      help = ("Is an `xl` header present in the stream?"
 +                              " (default no)"))
++    parser.add_option("--skip-qemu", action = "store_true", default = False,
++                      help = ("Skip processing of the qemu tail?"
++                              " (default no)"))
 +
 +    opts, args = parser.parse_args()
 +
@@ -589,6 +602,8 @@ index 0000000..a1b0070
 +    fout   = open_file_or_fd(opts.fout, "wb")
 +    twidth = int(opts.twidth)
 +    pv     = opts.gtype == "pv"
++    if opts.skip_qemu:
++        qemu = False
 +
 +    if opts.xl:
 +        skip_xl_header()
@@ -602,10 +617,10 @@ index 0000000..a1b0070
 +    sys.exit(main(sys.argv))
 diff --git a/tools/libxc/saverestore/scripts/streamspec.py b/tools/libxc/saverestore/scripts/streamspec.py
 new file mode 100644
-index 0000000..9f97b46
+index 0000000..292ac8c
 --- /dev/null
 +++ b/tools/libxc/saverestore/scripts/streamspec.py
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,137 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -615,8 +630,9 @@ index 0000000..9f97b46
 +# Image Header
 +IHDR_FORMAT = "!QIIHHI"
 +
-+IHDR_MARKER = 0xffffffffffffffff
-+IHDR_IDENT  = 0x58454E46 # "XENF" in ASCII
++IHDR_MARKER  = 0xffffffffffffffff
++IHDR_IDENT   = 0x58454E46 # "XENF" in ASCII
++IHDR_VERSION = 2
 +
 +IHDR_OPT_ENDIAN_ = 0
 +IHDR_OPT_LE = (0 << IHDR_OPT_ENDIAN_)

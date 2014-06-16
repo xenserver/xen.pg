@@ -1,11 +1,18 @@
-From 3ad7b8e18e1e0a6f9fe3a1f2d128559a20eacb11 Mon Sep 17 00:00:00 2001
+From 19537c27537744e2147f6ef24ad5f4dfa3bb6884 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:09 +0100
 Subject: [PATCH 09/14] tools/libxc: x86 PV restore code
 
+Restore the x86 PV specific parts.  The X86_PV_INFO, the P2M_FRAMES,
+SHARED_INFO, and VCPU context records.
+
+The localise_page callback is called from the common PAGE_DATA code to convert
+PFNs in page tables to MFNs.
+
+Page tables are pinned and the guest's P2M is updated when the stream is
+complete.
+
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
-Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 ---
  tools/libxc/saverestore/common.h         |    2 +
  tools/libxc/saverestore/restore_x86_pv.c |  965 ++++++++++++++++++++++++++++++
@@ -27,7 +34,7 @@ index 5c8a370..bb21e01 100644
      uint32_t type;
 diff --git a/tools/libxc/saverestore/restore_x86_pv.c b/tools/libxc/saverestore/restore_x86_pv.c
 new file mode 100644
-index 0000000..7808a18
+index 0000000..d3a50ef
 --- /dev/null
 +++ b/tools/libxc/saverestore/restore_x86_pv.c
 @@ -0,0 +1,965 @@
@@ -322,7 +329,7 @@ index 0000000..7808a18
 +static int handle_x86_pv_info(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_x86_pv_info *info = rec->data;
++    struct xc_sr_rec_x86_pv_info *info = rec->data;
 +
 +    if ( rec->length < sizeof(*info) )
 +    {
@@ -391,7 +398,7 @@ index 0000000..7808a18
 +static int handle_x86_pv_p2m_frames(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_x86_pv_p2m_frames *data = rec->data;
++    struct xc_sr_rec_x86_pv_p2m_frames *data = rec->data;
 +    unsigned start, end, x, fpp = PAGE_SIZE / ctx->x86_pv.width;
 +    int rc;
 +
@@ -442,7 +449,7 @@ index 0000000..7808a18
 +static int handle_x86_pv_vcpu_basic(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_x86_pv_vcpu_hdr *vhdr = rec->data;
++    struct xc_sr_rec_x86_pv_vcpu_hdr *vhdr = rec->data;
 +    vcpu_guest_context_any_t vcpu;
 +    size_t vcpusz = ctx->x86_pv.width == 8 ? sizeof(vcpu.x64) : sizeof(vcpu.x32);
 +    xen_pfn_t pfn, mfn;
@@ -592,7 +599,7 @@ index 0000000..7808a18
 +static int handle_x86_pv_vcpu_extended(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_x86_pv_vcpu_hdr *vcpu = rec->data;
++    struct xc_sr_rec_x86_pv_vcpu_hdr *vcpu = rec->data;
 +    DECLARE_DOMCTL;
 +
 +    if ( rec->length <= sizeof(*vcpu) )
@@ -636,7 +643,7 @@ index 0000000..7808a18
 +static int handle_x86_pv_vcpu_xsave(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_x86_pv_vcpu_hdr *vhdr = rec->data;
++    struct xc_sr_rec_x86_pv_vcpu_hdr *vhdr = rec->data;
 +    int rc;
 +    DECLARE_DOMCTL;
 +    DECLARE_HYPERCALL_BUFFER(void, buffer);
@@ -691,7 +698,7 @@ index 0000000..7808a18
 +static int handle_x86_pv_vcpu_msrs(struct context *ctx, struct record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct rec_x86_pv_vcpu_hdr *vhdr = rec->data;
++    struct xc_sr_rec_x86_pv_vcpu_hdr *vhdr = rec->data;
 +    int rc;
 +    DECLARE_DOMCTL;
 +    DECLARE_HYPERCALL_BUFFER(void, buffer);
