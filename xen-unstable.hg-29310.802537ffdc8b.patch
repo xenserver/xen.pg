@@ -1,7 +1,26 @@
 # HG changeset patch
-# Parent 3a36973cd880f8d734a7ce08f60e9d65c6fda568
+# User Jerome Maloberti <jerome.maloberti@citrix.com>
+# Date 1404463749 -3600
+# Node ID 802537ffdc8bc2596956c0460554d89b2bd80d54
+# Parent  c7f7a8819530cfc0c88149f6acae69e8cf5ac7fe
+oxenstored: perform a 3-way merge of the quota after a transaction
 
-diff -r 3a36973cd880 tools/ocaml/xenstored/quota.ml
+At a beginning of a transaction, the quotas from the global store
+are duplicated and modified by the transaction. If during the
+transaction, an action associated to no transaction is concurrently
+executed, the quotas of the global store are updated, and then the
+updates are lost when the transaction merges.
+
+We fix this problem by keeping another copy of the quota at the
+beginning of the transaction, and performing a 3-way merge between
+the quotas from the transaction and the "original" copy of the quota
+onto the quota of the global store.
+
+Signed-off-by: Jerome Maloberti <jerome.maloberti@citrix.com>
+Signed-off-by: Euan Harris <euan.harris@citrix.com>
+Acked-by: David Scott <dave.scott@citrix.com>
+
+diff -r c7f7a8819530 -r 802537ffdc8b tools/ocaml/xenstored/quota.ml
 --- a/tools/ocaml/xenstored/quota.ml
 +++ b/tools/ocaml/xenstored/quota.ml
 @@ -81,3 +81,8 @@ let add_entry quota id =
@@ -13,7 +32,7 @@ diff -r 3a36973cd880 tools/ocaml/xenstored/quota.ml
 +	  Hashtbl.iter (fun id nb -> let diff = nb - (get_entry orig_quota id) in
 +				if diff <> 0 then
 +					set_entry dest_quota id ((get_entry dest_quota id) + diff)) mod_quota.cur
-diff -r 3a36973cd880 tools/ocaml/xenstored/store.ml
+diff -r c7f7a8819530 -r 802537ffdc8b tools/ocaml/xenstored/store.ml
 --- a/tools/ocaml/xenstored/store.ml
 +++ b/tools/ocaml/xenstored/store.ml
 @@ -188,20 +188,17 @@ let rec get_deepest_existing_node node =
@@ -53,7 +72,7 @@ diff -r 3a36973cd880 tools/ocaml/xenstored/store.ml
  
  let write store perm path value =
  	let node, existing = get_deepest_existing_node store path in
-diff -r 3a36973cd880 tools/ocaml/xenstored/transaction.ml
+diff -r c7f7a8819530 -r 802537ffdc8b tools/ocaml/xenstored/transaction.ml
 --- a/tools/ocaml/xenstored/transaction.ml
 +++ b/tools/ocaml/xenstored/transaction.ml
 @@ -74,6 +74,7 @@ type ty = No | Full of (int * Store.Node
