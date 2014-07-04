@@ -1,9 +1,9 @@
 # HG changeset patch
-# Parent 380b8d3e7826d204f0a2af2d9b7d953c33966830
+# Parent 6191e655b0713782ffb284df06a0f11ceb5269d6
 
-diff -r 380b8d3e7826 .hgignore
---- a/.hgignore	Fri Jun 20 14:44:59 2014 +0100
-+++ b/.hgignore	Fri Jun 20 15:18:34 2014 +0100
+diff -r 6191e655b071 .hgignore
+--- a/.hgignore
++++ b/.hgignore
 @@ -243,6 +243,7 @@
  ^tools/vtpm/tpm_emulator/.*$
  ^tools/vtpm/vtpm/.*$
@@ -12,9 +12,9 @@ diff -r 380b8d3e7826 .hgignore
  ^tools/xcutils/lsevtchn$
  ^tools/xcutils/xc_restore$
  ^tools/xcutils/xc_save$
-diff -r 380b8d3e7826 mk/xen-4.4.spec.in
---- a/mk/xen-4.4.spec.in	Fri Jun 20 14:44:59 2014 +0100
-+++ b/mk/xen-4.4.spec.in	Fri Jun 20 15:18:34 2014 +0100
+diff -r 6191e655b071 mk/xen-4.4.spec.in
+--- a/mk/xen-4.4.spec.in
++++ b/mk/xen-4.4.spec.in
 @@ -420,6 +420,7 @@ rm -rf $RPM_BUILD_ROOT
  %{_libdir}/%{name}/bin/xc_save
  %{_libdir}/%{name}/bin/xenconsole
@@ -23,9 +23,9 @@ diff -r 380b8d3e7826 mk/xen-4.4.spec.in
  %{_libdir}/%{name}/bin/xenpaging
  %{_libdir}/%{name}/bin/xenpvnetboot
  
-diff -r 380b8d3e7826 tools/Makefile
---- a/tools/Makefile	Fri Jun 20 14:44:59 2014 +0100
-+++ b/tools/Makefile	Fri Jun 20 15:18:34 2014 +0100
+diff -r 6191e655b071 tools/Makefile
+--- a/tools/Makefile
++++ b/tools/Makefile
 @@ -22,6 +22,7 @@ SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
  SUBDIRS-y += libfsimage
  SUBDIRS-$(LIBXENAPI_BINDINGS) += libxen
@@ -34,9 +34,9 @@ diff -r 380b8d3e7826 tools/Makefile
  
  # do not recurse in to a dir we are about to delete
  ifneq "$(MAKECMDGOALS)" "distclean"
-diff -r 380b8d3e7826 tools/xenguest/Makefile
---- /dev/null	Thu Jan 01 00:00:00 1970 +0000
-+++ b/tools/xenguest/Makefile	Fri Jun 20 15:18:34 2014 +0100
+diff -r 6191e655b071 tools/xenguest/Makefile
+--- /dev/null
++++ b/tools/xenguest/Makefile
 @@ -0,0 +1,29 @@
 +XEN_ROOT=$(CURDIR)/../..
 +include $(XEN_ROOT)/tools/Rules.mk
@@ -67,10 +67,10 @@ diff -r 380b8d3e7826 tools/xenguest/Makefile
 +clean:
 +	$(RM) *.o $(ALL_TARGETS)
 +	$(RM) $(DEPS)
-diff -r 380b8d3e7826 tools/xenguest/xenguest.c
---- /dev/null	Thu Jan 01 00:00:00 1970 +0000
-+++ b/tools/xenguest/xenguest.c	Fri Jun 20 15:18:34 2014 +0100
-@@ -0,0 +1,623 @@
+diff -r 6191e655b071 tools/xenguest/xenguest.c
+--- /dev/null
++++ b/tools/xenguest/xenguest.c
+@@ -0,0 +1,639 @@
 +#include <getopt.h>
 +#include <errno.h>
 +#include <syslog.h>
@@ -178,6 +178,14 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest.c
 +            fputs(buf, opt_debugfile);
 +        fputs(buf, stderr);
 +        syslog(LOG_ERR|LOG_DAEMON, "%s", buf);
++
++        if ( opt_controloutfd != -1 )
++        {
++            char reply[] = "error:";
++
++            write(opt_controloutfd, reply, strlen(reply));
++            write(opt_controloutfd, buf, rc);
++        }
 +    }
 +
 +    free(buf);
@@ -407,7 +415,7 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest.c
 +
 +    if ( fcntl(fd, flags | FD_CLOEXEC) == -1 )
 +    {
-+        err("Failed to set FD_CLOEXEC on fd %d: %d %s",
++        err("Failed to set FD_CLOEXEC on fd %d: %d %s\n",
 +            fd, errno, strerror(errno));
 +        exit(1);
 +    }
@@ -416,15 +424,20 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest.c
 +static void write_status(unsigned long store_mfn, unsigned long console_mfn,
 +                         const char *protocol)
 +{
-+    char buf[64];
-+    size_t len;
++    if ( opt_controloutfd != -1 )
++    {
++        char buf[64];
++        size_t len;
 +
-+    if (protocol)
-+        len = snprintf(buf, sizeof(buf), "result:%lu %lu %s\n", store_mfn, console_mfn, protocol);
++        if (protocol)
++            len = snprintf(buf, sizeof(buf), "result:%lu %lu %s\n", store_mfn, console_mfn, protocol);
++        else
++            len = snprintf(buf, sizeof(buf), "result:%lu %lu\n", store_mfn, console_mfn);
++        write(opt_controloutfd, buf, len);
++        info("Writing to control: '%s'\n", buf);
++    }
 +    else
-+        len = snprintf(buf, sizeof(buf), "result:%lu %lu\n", store_mfn, console_mfn);
-+    write(opt_controloutfd, buf, len);
-+    info("Writing to control: %s", buf);
++        err("No control fd to write success to\n");
 +}
 +
 +static void do_save(xc_interface *xch, xs_handle *xsh, bool is_hvm)
@@ -474,24 +487,24 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest.c
 +
 +        /* Read one line from control fd. */
 +        for (;;) {
-+            char buf[1];
-+            int len;
++            char buf[8];
++            ssize_t len, i;
 +
 +            len = read(opt_controlinfd, buf, sizeof(buf));
 +            if (len < 0 && errno == EINTR)
 +                continue;
 +            if (len < 0) {
 +                err("xenguest: read from control FD failed: %s\n", strerror(errno));
-+                break;
++                return 0;
 +            }
 +            if (len == 0) {
-+                err("xenguest: unexpected EOF on control FD\n", strerror(errno));
-+                break;
++                err("xenguest: unexpected EOF on control FD\n");
++                return 0;
 +            }
-+            if (buf[0] == '\n')
-+                break;
++            for ( i = 0; i < len; ++i )
++                if (buf[i] == '\n')
++                    return 1;
 +        }
-+        return 1;
 +    }
 +    return 0;
 +}
@@ -551,6 +564,9 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest.c
 +    static xentoollog_logger logger = { logfn, NULL, NULL };
 +    xc_interface *xch;
 +    xs_handle * xsh;
++
++    /* Force migration v2 all the time. */
++    setenv("XG_MIGRATION_V2", "", 1);
 +
 +    {   /* Conjoin the command line into a single string for logging */
 +        size_t sum, s;
@@ -694,10 +710,10 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
---- /dev/null	Thu Jan 01 00:00:00 1970 +0000
-+++ b/tools/xenguest/xenguest_stubs.c	Fri Jun 20 15:18:34 2014 +0100
-@@ -0,0 +1,629 @@
+diff -r 6191e655b071 tools/xenguest/xenguest_stubs.c
+--- /dev/null
++++ b/tools/xenguest/xenguest_stubs.c
+@@ -0,0 +1,667 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -721,6 +737,7 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +
 +#include <errno.h>
 +#include <sys/mman.h>
++#include <unistd.h>
 +
 +#include <xenctrl.h>
 +#include <xenguest.h>
@@ -870,7 +887,7 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +                ret = 0;
 +        }
 +
-+        err("HVMLoader error: Fixing up key '%s' from '%s' to '%d'", key, val, ret);
++        info("HVMLoader error: Fixing up key '%s' from '%s' to '%d'\n", key, val, ret);
 +        xenstore_putsv(xsh, domid, key, "%d", !!ret);
 +    }
 +    else
@@ -1057,6 +1074,9 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +                           console_evtchn, console_mfn);
 +
 +    if (r == 0)
++        r = xc_cpuid_apply_policy(xch, domid);
++
++    if (r == 0)
 +        r = xc_dom_gnttab_seed(xch, domid,
 +                               *console_mfn, *store_mfn,
 +                               console_domid, store_domid);
@@ -1135,6 +1155,9 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +                                mem_max_mib,
 +                                mem_start_mib,
 +                                image_name);
++    if (r == 0)
++        r = xc_cpuid_apply_policy(xch, domid);
++
 +    if (r)
 +        failwith_oss_xc(xch, "hvm_build");
 +
@@ -1167,19 +1190,51 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +static int switch_qemu_logdirty(int domid, unsigned enable, void *_data)
 +{
 +    struct save_callbacks_data * data = _data;
-+    char *path = NULL;
-+    bool rc;
++    char *cmd_path = NULL, *ret_path = NULL, *reply = NULL;
++    static const char cmd_enable[] = "enable";
++    static const char cmd_disable[] = "disable";
++    const char *cmd = enable ? cmd_enable : cmd_disable;
++    bool rc = 0;
 +
-+    asprintf(&path, "/local/domain/0/device-model/%u/logdirty/cmd", data->domid);
++    asprintf(&cmd_path, "/local/domain/0/device-model/%u/logdirty/cmd", data->domid);
++    if ( !cmd_path )
++    {
++        err("Out of memory attempting to %s qemu logdirty\n", cmd);
++        return 1;
++    }
 +
-+    if (enable)
-+        rc = xs_write(data->xsh, XBT_NULL, path, "enable", strlen("enable"));
-+    else
-+        rc = xs_write(data->xsh, XBT_NULL, path, "disable", strlen("disable"));
++    if ( !xs_write(data->xsh, XBT_NULL, cmd_path, cmd, strlen(cmd)) )
++    {
++        err("Failed to write logdirty %s command to xenstore\n", cmd);
++        return 1;
++    }
 +
-+    free(path);
-+    return rc ? 0 : 1;
++    free(cmd_path);
 +
++    asprintf(&ret_path, "/local/domain/0/device-model/%u/logdirty/ret", data->domid);
++    if ( !ret_path )
++    {
++        err("Out of memory attempting to %s qemu logdirty\n", cmd);
++        return 1;
++    }
++
++    info("Waiting for qemu to confirm logdirty %s\n", cmd);
++
++    do
++    {
++        usleep(100);
++        reply = xs_read(data->xsh, XBT_NULL, ret_path, NULL);
++
++        if ( reply )
++        {
++            rc = strcmp(cmd, reply) == 0;
++            free(reply);
++        }
++    } while ( !rc );
++
++    free(ret_path);
++
++    return 0;
 +}
 +
 +#define GENERATION_ID_ADDRESS "hvmloader/generation-id-address"
@@ -1197,9 +1252,6 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +            .switch_qemu_logdirty = switch_qemu_logdirty,
 +            .data = &cb_data
 +        };
-+
-+    err("stub save debug: cb_data %p, data->xsh %p, data->domid %d",
-+        &cb_data, (&cb_data)->xsh, (&cb_data)->domid);
 +
 +    r = xc_domain_save(xch, fd, domid,
 +                       max_iters, max_factors,
@@ -1251,7 +1303,7 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +    }
 +    else if ( genid[0] == 0 || genid[1] == 0 )
 +    {
-+        err("'%s' is not a valid generation id", genid_val_str);
++        err("'%s' is not a valid generation id\n", genid_val_str);
 +        goto out;
 +    }
 +
@@ -1259,7 +1311,7 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +                                 PROT_READ | PROT_WRITE,
 +                                 paddr >> XC_PAGE_SHIFT);
 +    if (vaddr == NULL) {
-+        err("Failed to map VM generation ID page: %s", strerror(errno));
++        err("Failed to map VM generation ID page: %s\n", strerror(errno));
 +        goto out;
 +    }
 +    memcpy(vaddr + (paddr & ~XC_PAGE_MASK), genid, 2 * sizeof(*genid));
@@ -1269,7 +1321,7 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +     * FIXME: Inject ACPI Notify event.
 +     */
 +
-+    info("Wrote generation ID %"PRId64":%"PRId64" at 0x%"PRIx64,
++    info("Wrote generation ID %"PRId64":%"PRId64" at 0x%"PRIx64"\n",
 +         genid[0], genid[1], paddr);
 +    rc = 0;
 +
@@ -1306,6 +1358,8 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 +                          store_evtchn, store_mfn, 0,
 +                          console_evtchn, console_mfn, 0,
 +                          hvm, f.pae, 0, 0, NULL);
++    if (r == 0)
++        r = xc_cpuid_apply_policy(xch, domid);
 +
 +    free_flags(&f);
 +    if (r)
@@ -1327,9 +1381,9 @@ diff -r 380b8d3e7826 tools/xenguest/xenguest_stubs.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r 380b8d3e7826 tools/xenguest/xg_internal.h
---- /dev/null	Thu Jan 01 00:00:00 1970 +0000
-+++ b/tools/xenguest/xg_internal.h	Fri Jun 20 15:18:34 2014 +0100
+diff -r 6191e655b071 tools/xenguest/xg_internal.h
+--- /dev/null
++++ b/tools/xenguest/xg_internal.h
 @@ -0,0 +1,59 @@
 +#ifndef __XG_INTERNAL_H__
 +#define __XG_INTERNAL_H__
@@ -1346,8 +1400,8 @@ diff -r 380b8d3e7826 tools/xenguest/xg_internal.h
 +    XG_MODE__END__,
 +};
 +
-+void err(const char *msg, ...);
-+void info(const char *msg, ...);
++void err(const char *msg, ...) __attribute__((format(printf, 1, 2)));
++void info(const char *msg, ...) __attribute__((format(printf, 1, 2)));
 +
 +typedef struct xs_handle xs_handle;
 +
