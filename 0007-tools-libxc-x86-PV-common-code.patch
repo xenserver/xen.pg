@@ -1,120 +1,141 @@
-From 475ef64e9d0023fdba03dfcdb31bfdc30288fe49 Mon Sep 17 00:00:00 2001
+From 08b7e2944a3192096a2cca6536a99b8734bb078d Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:16:33 +0100
-Subject: [PATCH 07/14] tools/libxc: x86 PV common code
+Subject: [PATCH 07/13] tools/libxc: x86 PV common code
 
 Add functions common to save and restore of x86 PV guests.  This includes
 functions for dealing with the P2M and M2P and the VCPU context.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 ---
- tools/libxc/saverestore/common.h        |    5 +
- tools/libxc/saverestore/common_x86_pv.c |  250 +++++++++++++++++++++++++++++++
- tools/libxc/saverestore/common_x86_pv.h |  144 ++++++++++++++++++
- 3 files changed, 399 insertions(+)
+ tools/libxc/saverestore/common_x86.c    |   79 ------------
+ tools/libxc/saverestore/common_x86_pv.c |  198 +++++++++++++++++++++++++++++++
+ tools/libxc/saverestore/common_x86_pv.h |  102 ++++++++++++++++
+ 3 files changed, 300 insertions(+), 79 deletions(-)
  create mode 100644 tools/libxc/saverestore/common_x86_pv.c
  create mode 100644 tools/libxc/saverestore/common_x86_pv.h
 
-diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index d9a3655..5f6af00 100644
---- a/tools/libxc/saverestore/common.h
-+++ b/tools/libxc/saverestore/common.h
-@@ -14,6 +14,10 @@
+diff --git a/tools/libxc/saverestore/common_x86.c b/tools/libxc/saverestore/common_x86.c
+index b64b291..aa9dbed 100644
+--- a/tools/libxc/saverestore/common_x86.c
++++ b/tools/libxc/saverestore/common_x86.c
+@@ -1,38 +1,5 @@
+ #include "common_x86.h"
  
- #undef mfn_to_pfn
- #undef pfn_to_mfn
-+#undef GET_FIELD
-+#undef SET_FIELD
-+#undef MEMCPY_FIELD
-+#undef MEMSET_ARRAY_FIELD
- 
- 
- #include "stream_format.h"
-@@ -240,6 +244,7 @@ struct context
-     };
- };
- 
-+extern struct common_ops common_ops_x86_pv;
- 
- struct record
+-static void cpuid_count(uint32_t leaf, uint32_t subleaf,
+-                        uint32_t *eax, uint32_t *ebx,
+-                        uint32_t *ecx, uint32_t *edx)
+-{
+-    asm volatile ("cpuid"
+-                  : "=a" (*eax), "=b" (*ebx), "=c" (*ecx), "=d" (*edx)
+-                  : "a" (leaf), "c" (subleaf));
+-}
+-
+-static void cpuid(uint32_t leaf,
+-                  uint32_t *eax, uint32_t *ebx,
+-                  uint32_t *ecx, uint32_t *edx)
+-{
+-    cpuid_count(leaf, 0, eax, ebx, ecx, edx);
+-}
+-
+-static int get_processor_brand_string(char *str)
+-{
+-    uint32_t *parts = (uint32_t*)str;
+-    uint32_t max_extd_leaf, dummy;
+-
+-    cpuid(0x80000000, &max_extd_leaf, &dummy, &dummy, &dummy);
+-
+-    if ( max_extd_leaf < 0x80000004 )
+-        return -1;
+-
+-    cpuid(0x80000002, &parts[0], &parts[1], &parts[2],  &parts[3]);
+-    cpuid(0x80000003, &parts[4], &parts[5], &parts[6],  &parts[7]);
+-    cpuid(0x80000004, &parts[8], &parts[9], &parts[10], &parts[11]);
+-
+-    return 0;
+-}
+-
+ int write_tsc_info(struct xc_sr_context *ctx)
  {
+     xc_interface *xch = ctx->xch;
+@@ -76,52 +43,6 @@ int handle_tsc_info(struct xc_sr_context *ctx, struct xc_sr_record *rec)
+     return 0;
+ }
+ 
+-int arch_write_saving_cpu(struct xc_sr_context *ctx)
+-{
+-    xc_interface *xch = ctx->xch;
+-    char *brand_string = alloca(49); /* 48 from cpuid, and NUL. */
+-    struct xc_sr_record rec;
+-
+-    if ( get_processor_brand_string(brand_string) )
+-    {
+-        ERROR("Failed to obtain cpuid long processor brand string");
+-        return -1;
+-    }
+-
+-    brand_string[48] = '\0';
+-    while ( *brand_string == ' ' ) /* Strip leading spaces. */
+-        brand_string++;
+-
+-    rec.type = REC_TYPE_SAVING_CPU;
+-    rec.length = strlen(brand_string);
+-    rec.data = brand_string;
+-
+-    return write_record(ctx, &rec);
+-}
+-
+-int arch_handle_saving_cpu(struct xc_sr_context *ctx, struct xc_sr_record *rec)
+-{
+-    xc_interface *xch = ctx->xch;
+-    char *brand_string = alloca(49); /* 48 from cpuid, and NUL. */
+-
+-    if ( rec->length == 0 )
+-        return 0;
+-
+-    DPRINTF("Saving cpu was '%*s'",
+-            (int)rec->length, (char*)rec->data);
+-
+-    if ( !get_processor_brand_string(brand_string) )
+-    {
+-        brand_string[48] = '\0';
+-        while ( *brand_string == ' ' ) /* Strip leading spaces. */
+-            brand_string++;
+-
+-        DPRINTF("Current cpu is '%s'", brand_string);
+-    }
+-
+-    return 0;
+-}
+-
+ /*
+  * Local variables:
+  * mode: C
 diff --git a/tools/libxc/saverestore/common_x86_pv.c b/tools/libxc/saverestore/common_x86_pv.c
 new file mode 100644
-index 0000000..2f1417d
+index 0000000..d82d7e1
 --- /dev/null
 +++ b/tools/libxc/saverestore/common_x86_pv.c
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,198 @@
 +#include <assert.h>
 +
 +#include "common_x86_pv.h"
 +
-+/* common_ops function */
-+static bool x86_pv_pfn_is_valid(const struct context *ctx, xen_pfn_t pfn)
-+{
-+    return pfn <= ctx->x86_pv.max_pfn;
-+}
-+
-+/* common_ops function */
-+static xen_pfn_t x86_pv_pfn_to_gfn(const struct context *ctx, xen_pfn_t pfn)
-+{
-+    assert(pfn <= ctx->x86_pv.max_pfn);
-+
-+    if ( ctx->x86_pv.width == sizeof(uint64_t) )
-+        /* 64 bit guest.  Need to truncate their pfns for 32 bit toolstacks */
-+        return ((uint64_t *)ctx->x86_pv.p2m)[pfn];
-+    else
-+    {
-+        /* 32 bit guest.  Need to expand INVALID_MFN for 64 bit toolstacks */
-+        uint32_t mfn = ((uint32_t *)ctx->x86_pv.p2m)[pfn];
-+
-+        return mfn == ~0U ? INVALID_MFN : mfn;
-+    }
-+}
-+
-+/* common_ops function */
-+static void x86_pv_set_page_type(struct context *ctx, xen_pfn_t pfn,
-+                                 unsigned long type)
-+{
-+    assert(pfn <= ctx->x86_pv.max_pfn);
-+
-+    ctx->x86_pv.pfn_types[pfn] = type;
-+}
-+
-+/* common_ops function */
-+static void x86_pv_set_gfn(struct context *ctx, xen_pfn_t pfn,
-+                           xen_pfn_t mfn)
-+{
-+    assert(pfn <= ctx->x86_pv.max_pfn);
-+
-+    if ( ctx->x86_pv.width == sizeof(uint64_t) )
-+        /* 64 bit guest.  Need to expand INVALID_MFN for 32 bit toolstacks */
-+        ((uint64_t *)ctx->x86_pv.p2m)[pfn] = mfn == INVALID_MFN ? ~0ULL : mfn;
-+    else
-+        /* 32 bit guest.  Can safely truncate INVALID_MFN for 64 bit toolstacks */
-+        ((uint32_t *)ctx->x86_pv.p2m)[pfn] = mfn;
-+}
-+
-+struct common_ops common_ops_x86_pv = {
-+    .pfn_is_valid   = x86_pv_pfn_is_valid,
-+    .pfn_to_gfn     = x86_pv_pfn_to_gfn,
-+    .set_page_type  = x86_pv_set_page_type,
-+    .set_gfn        = x86_pv_set_gfn,
-+};
-+
-+xen_pfn_t mfn_to_pfn(struct context *ctx, xen_pfn_t mfn)
++xen_pfn_t mfn_to_pfn(struct xc_sr_context *ctx, xen_pfn_t mfn)
 +{
 +    assert(mfn <= ctx->x86_pv.max_mfn);
 +    return ctx->x86_pv.m2p[mfn];
 +}
 +
-+bool mfn_in_pseudophysmap(struct context *ctx, xen_pfn_t mfn)
++bool mfn_in_pseudophysmap(struct xc_sr_context *ctx, xen_pfn_t mfn)
 +{
 +    return ( (mfn <= ctx->x86_pv.max_mfn) &&
 +             (mfn_to_pfn(ctx, mfn) <= ctx->x86_pv.max_pfn) &&
-+             (ctx->ops.pfn_to_gfn(ctx, mfn_to_pfn(ctx, mfn) == mfn)) );
++             (xc_pfn_to_mfn(mfn_to_pfn(ctx, mfn), ctx->x86_pv.p2m,
++                            ctx->x86_pv.width) == mfn) );
 +}
 +
-+void dump_bad_pseudophysmap_entry(struct context *ctx, xen_pfn_t mfn)
++void dump_bad_pseudophysmap_entry(struct xc_sr_context *ctx, xen_pfn_t mfn)
 +{
 +    xc_interface *xch = ctx->xch;
 +    xen_pfn_t pfn = ~0UL;
@@ -130,10 +151,10 @@ index 0000000..2f1417d
 +
 +    if ( (pfn != ~0UL) && (pfn <= ctx->x86_pv.max_pfn) )
 +        ERROR("  p2m[%#lx] = %#lx",
-+              pfn, ctx->ops.pfn_to_gfn(ctx, pfn));
++              pfn, xc_pfn_to_mfn(pfn, ctx->x86_pv.p2m, ctx->x86_pv.width));
 +}
 +
-+xen_pfn_t cr3_to_mfn(struct context *ctx, uint64_t cr3)
++xen_pfn_t cr3_to_mfn(struct xc_sr_context *ctx, uint64_t cr3)
 +{
 +    if ( ctx->x86_pv.width == 8 )
 +        return cr3 >> 12;
@@ -141,7 +162,7 @@ index 0000000..2f1417d
 +        return (((uint32_t)cr3 >> 12) | ((uint32_t)cr3 << 20));
 +}
 +
-+uint64_t mfn_to_cr3(struct context *ctx, xen_pfn_t mfn)
++uint64_t mfn_to_cr3(struct xc_sr_context *ctx, xen_pfn_t mfn)
 +{
 +    if ( ctx->x86_pv.width == 8 )
 +        return ((uint64_t)mfn) << 12;
@@ -149,7 +170,7 @@ index 0000000..2f1417d
 +        return (((uint32_t)mfn << 12) | ((uint32_t)mfn >> 20));
 +}
 +
-+int x86_pv_domain_info(struct context *ctx)
++int x86_pv_domain_info(struct xc_sr_context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
 +    unsigned int guest_width, guest_levels, fpp;
@@ -196,7 +217,7 @@ index 0000000..2f1417d
 +    return 0;
 +}
 +
-+int x86_pv_map_m2p(struct context *ctx)
++int x86_pv_map_m2p(struct xc_sr_context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
 +    long max_page = xc_maximum_ram_page(xch);
@@ -296,76 +317,31 @@ index 0000000..2f1417d
 + */
 diff --git a/tools/libxc/saverestore/common_x86_pv.h b/tools/libxc/saverestore/common_x86_pv.h
 new file mode 100644
-index 0000000..bb2e9fc
+index 0000000..c36927a
 --- /dev/null
 +++ b/tools/libxc/saverestore/common_x86_pv.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,102 @@
 +#ifndef __COMMON_X86_PV_H
 +#define __COMMON_X86_PV_H
 +
 +#include "common_x86.h"
-+
-+/* Gets a field from an *_any union */
-+#define GET_FIELD(_c, _p, _f)                   \
-+    ({ (_c)->x86_pv.width == 8 ?                \
-+            (_p)->x64._f:                       \
-+            (_p)->x32._f;                       \
-+    })                                          \
-+
-+/* Gets a field from an *_any union */
-+#define SET_FIELD(_c, _p, _f, _v)               \
-+    ({ if ( (_c)->x86_pv.width == 8 )           \
-+            (_p)->x64._f = (_v);                \
-+        else                                    \
-+            (_p)->x32._f = (_v);                \
-+    })
-+
-+/* memcpy field _f from _s to _d, of an *_any union */
-+#define MEMCPY_FIELD(_c, _d, _s, _f)                                    \
-+    ({ if ( (_c)->x86_pv.width == 8 )                                   \
-+            memcpy(&(_d)->x64._f, &(_s)->x64._f, sizeof((_d)->x64._f)); \
-+        else                                                            \
-+            memcpy(&(_d)->x32._f, &(_s)->x32._f, sizeof((_d)->x32._f)); \
-+    })
-+
-+/* memset array field _f with value _v, from an *_any union */
-+#define MEMSET_ARRAY_FIELD(_c, _d, _f, _v)                              \
-+    ({ if ( (_c)->x86_pv.width == 8 )                                   \
-+           memset(&(_d)->x64._f[0], (_v), sizeof((_d)->x64._f));        \
-+       else                                                             \
-+           memset(&(_d)->x32._f[0], (_v), sizeof((_d)->x32._f));        \
-+    })
 +
 +/*
 + * Convert an mfn to a pfn, given Xens m2p table.
 + *
 + * Caller must ensure that the requested mfn is in range.
 + */
-+xen_pfn_t mfn_to_pfn(struct context *ctx, xen_pfn_t mfn);
-+
-+/*
-+ * Convert a pfn to an mfn, given the guests p2m table.
-+ *
-+ * Caller must ensure that the requested pfn is in range.
-+ */
-+xen_pfn_t pfn_to_mfn(struct context *ctx, xen_pfn_t pfn);
-+
-+/*
-+ * Set a mapping in the p2m table.
-+ *
-+ * Caller must ensure that the requested pfn is in range.
-+ */
-+void set_p2m(struct context *ctx, xen_pfn_t pfn, xen_pfn_t mfn);
++xen_pfn_t mfn_to_pfn(struct xc_sr_context *ctx, xen_pfn_t mfn);
 +
 +/*
 + * Query whether a particular mfn is valid in the physmap of a guest.
 + */
-+bool mfn_in_pseudophysmap(struct context *ctx, xen_pfn_t mfn);
++bool mfn_in_pseudophysmap(struct xc_sr_context *ctx, xen_pfn_t mfn);
 +
 +/*
 + * Debug a particular mfn by walking the p2m and m2p.
 + */
-+void dump_bad_pseudophysmap_entry(struct context *ctx, xen_pfn_t mfn);
++void dump_bad_pseudophysmap_entry(struct xc_sr_context *ctx, xen_pfn_t mfn);
 +
 +/*
 + * Convert a PV cr3 field to an mfn.
@@ -373,7 +349,7 @@ index 0000000..bb2e9fc
 + * Adjusts for Xen's extended-cr3 format to pack a 44bit physical address into
 + * a 32bit architectural cr3.
 + */
-+xen_pfn_t cr3_to_mfn(struct context *ctx, uint64_t cr3);
++xen_pfn_t cr3_to_mfn(struct xc_sr_context *ctx, uint64_t cr3);
 +
 +/*
 + * Convert an mfn to a PV cr3 field.
@@ -381,30 +357,33 @@ index 0000000..bb2e9fc
 + * Adjusts for Xen's extended-cr3 format to pack a 44bit physical address into
 + * a 32bit architectural cr3.
 + */
-+uint64_t mfn_to_cr3(struct context *ctx, xen_pfn_t mfn);
++uint64_t mfn_to_cr3(struct xc_sr_context *ctx, xen_pfn_t mfn);
++
++/* Bits 12 thru 51 of a PTE point at the frame */
++#define PTE_FRAME_MASK 0x000ffffffffff000ULL
 +
 +/*
-+ * Extract an mfn from a Pagetable Entry.
++ * Extract an mfn from a Pagetable Entry.  May return INVALID_MFN if the pte
++ * would overflow a 32bit xen_pfn_t.
 + */
-+static inline xen_pfn_t pte_to_frame(struct context *ctx, uint64_t pte)
++static inline xen_pfn_t pte_to_frame(uint64_t pte)
 +{
-+    if ( ctx->x86_pv.width == 8 )
-+        return (pte >> PAGE_SHIFT) & ((1ULL << (52 - PAGE_SHIFT)) - 1);
-+    else
-+        return (pte >> PAGE_SHIFT) & ((1ULL << (44 - PAGE_SHIFT)) - 1);
++    uint64_t frame = (pte & PTE_FRAME_MASK) >> PAGE_SHIFT;
++
++#ifdef __i386__
++    if ( frame >= INVALID_MFN )
++        return INVALID_MFN;
++#endif
++
++    return frame;
 +}
 +
 +/*
-+ * Change the mfn in a Pagetable Entry while leaving the flags alone.
++ * Change the frame in a Pagetable Entry while leaving the flags alone.
 + */
-+static inline void update_pte(struct context *ctx, uint64_t *pte, xen_pfn_t mfn)
++static inline uint64_t merge_pte(uint64_t pte, xen_pfn_t mfn)
 +{
-+    if ( ctx->x86_pv.width == 8 )
-+        *pte &= ~(((1ULL << (52 - PAGE_SHIFT)) - 1) << PAGE_SHIFT);
-+    else
-+        *pte &= ~(((1ULL << (44 - PAGE_SHIFT)) - 1) << PAGE_SHIFT);
-+
-+    *pte |= (uint64_t)mfn << PAGE_SHIFT;
++    return (pte & ~PTE_FRAME_MASK) | ((uint64_t)mfn << PAGE_SHIFT);
 +}
 +
 +/*
@@ -421,7 +400,7 @@ index 0000000..bb2e9fc
 + *
 + * Returns 0 on success and non-zero on error.
 + */
-+int x86_pv_domain_info(struct context *ctx);
++int x86_pv_domain_info(struct xc_sr_context *ctx);
 +
 +/*
 + * Maps the Xen M2P.
@@ -432,7 +411,7 @@ index 0000000..bb2e9fc
 + *
 + * Returns 0 on success and non-zero on error.
 + */
-+int x86_pv_map_m2p(struct context *ctx);
++int x86_pv_map_m2p(struct xc_sr_context *ctx);
 +
 +#endif
 +/*

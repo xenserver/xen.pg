@@ -1,7 +1,7 @@
-From 8731165d0ae9eb5f795b0f19e809c7be6140083a Mon Sep 17 00:00:00 2001
+From 31d34edd628050f19f43c14a57f1f3aab20efe88 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sun, 8 Jun 2014 03:03:38 +0100
-Subject: [PATCH 14/14] tools/libxc: noarch restore code
+Subject: [PATCH 13/13] tools/libxc: noarch restore code
 
 Restore a domain from the new format.  This reads and validates the domain and
 image header and loads the guest memory from the PAGE_DATA records, populating
@@ -11,33 +11,40 @@ This provides the xc_domain_restore2() function as an alternative to the
 existing xc_domain_restore().
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+---
+v7:
+ * Support population of pfns with no typedata.
+v6:
+ * Fix error path with rc = 0.
+ * Fix undefined memory issue with creating the populated_pfns array.
 ---
  tools/libxc/saverestore/common.h  |    6 +
- tools/libxc/saverestore/restore.c |  556 ++++++++++++++++++++++++++++++++++++-
- 2 files changed, 561 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/restore.c |  627 ++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 632 insertions(+), 1 deletion(-)
 
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index e16e0de..2d44961 100644
+index 34850e1..22e5b06 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -292,6 +292,12 @@ static inline int write_record(struct context *ctx, struct record *rec)
+@@ -277,6 +277,12 @@ static inline int write_record(struct xc_sr_context *ctx,
      return write_split_record(ctx, rec, NULL, 0);
  }
  
 +/* TODO - find a better way of hiding this.  It should be private to
 + * restore.c, but is needed by x86_pv_localise_page()
 + */
-+int populate_pfns(struct context *ctx, unsigned count,
++int populate_pfns(struct xc_sr_context *ctx, unsigned count,
 +                  const xen_pfn_t *original_pfns, const uint32_t *types);
 +
  #endif
  /*
   * Local variables:
 diff --git a/tools/libxc/saverestore/restore.c b/tools/libxc/saverestore/restore.c
-index 6624baa..4a0bc86 100644
+index 6624baa..21ba816 100644
 --- a/tools/libxc/saverestore/restore.c
 +++ b/tools/libxc/saverestore/restore.c
-@@ -1,5 +1,499 @@
+@@ -1,5 +1,569 @@
 +#include <arpa/inet.h>
 +
  #include "common.h"
@@ -45,7 +52,7 @@ index 6624baa..4a0bc86 100644
 +/*
 + * Read and validate the Image and Domain headers.
 + */
-+static int read_headers(struct context *ctx)
++static int read_headers(struct xc_sr_context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
 +    struct xc_sr_ihdr ihdr;
@@ -94,8 +101,15 @@ index 6624baa..4a0bc86 100644
 +    ctx->restore.guest_type = dhdr.type;
 +    ctx->restore.guest_page_size = (1U << dhdr.page_shift);
 +
-+    IPRINTF("Found %s domain from Xen %d.%d",
-+            dhdr_type_to_str(dhdr.type), dhdr.xen_major, dhdr.xen_minor);
++    if ( dhdr.xen_major == 0 )
++    {
++        IPRINTF("Found %s domain, converted from legacy stream format",
++                dhdr_type_to_str(dhdr.type));
++        DPRINTF("  Legacy conversion script version %u", dhdr.xen_minor);
++    }
++    else
++        IPRINTF("Found %s domain from Xen %u.%u",
++                dhdr_type_to_str(dhdr.type), dhdr.xen_major, dhdr.xen_minor);
 +    return 0;
 +}
 +
@@ -111,7 +125,7 @@ index 6624baa..4a0bc86 100644
 + *
 + * On failure, the contents of the record structure are undefined.
 + */
-+static int read_record(struct context *ctx, struct record *rec)
++static int read_record(struct xc_sr_context *ctx, struct xc_sr_record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    struct xc_sr_rhdr rhdr;
@@ -165,40 +179,53 @@ index 6624baa..4a0bc86 100644
 +/*
 + * Is a pfn populated?
 + */
-+static bool pfn_is_populated(const struct context *ctx, xen_pfn_t pfn)
++static bool pfn_is_populated(const struct xc_sr_context *ctx, xen_pfn_t pfn)
 +{
-+    if ( !ctx->restore.populated_pfns || pfn > ctx->restore.max_populated_pfn )
++    if ( pfn > ctx->restore.max_populated_pfn )
 +        return false;
 +    return test_bit(pfn, ctx->restore.populated_pfns);
 +}
 +
 +/*
-+ * Set a pfn as populated, expanding the tracking structures if needed.
++ * Set a pfn as populated, expanding the tracking structures if needed. To
++ * avoid realloc()ing too excessivly, the size increased to the nearest power
++ * of two large enough to contain the required pfn.
 + */
-+static int pfn_set_populated(struct context *ctx, xen_pfn_t pfn)
++static int pfn_set_populated(struct xc_sr_context *ctx, xen_pfn_t pfn)
 +{
 +    xc_interface *xch = ctx->xch;
 +
-+    if ( !ctx->restore.populated_pfns || pfn > ctx->restore.max_populated_pfn )
++    if ( pfn > ctx->restore.max_populated_pfn )
 +    {
-+        unsigned long new_max_pfn = ((pfn + 1024) & ~1023) - 1;
++        xen_pfn_t new_max;
 +        size_t old_sz, new_sz;
 +        unsigned long *p;
 +
-+        old_sz = bitmap_size(ctx->restore.max_populated_pfn + 1);
-+        new_sz = bitmap_size(new_max_pfn + 1);
++        /* Round up to the nearest power of two larger than pfn, less 1. */
++        new_max = pfn;
++        new_max |= new_max >> 1;
++        new_max |= new_max >> 2;
++        new_max |= new_max >> 4;
++        new_max |= new_max >> 8;
++        new_max |= new_max >> 16;
++#ifdef __x86_64__
++        new_max |= new_max >> 32;
++#endif
 +
++        old_sz = bitmap_size(ctx->restore.max_populated_pfn + 1);
++        new_sz = bitmap_size(new_max + 1);
 +        p = realloc(ctx->restore.populated_pfns, new_sz);
 +        if ( !p )
 +        {
-+            PERROR("Failed to realloc populated bitmap");
++            ERROR("Failed to realloc populated bitmap");
++            errno = ENOMEM;
 +            return -1;
 +        }
 +
 +        memset((uint8_t *)p + old_sz, 0x00, new_sz - old_sz);
 +
 +        ctx->restore.populated_pfns    = p;
-+        ctx->restore.max_populated_pfn = new_max_pfn;
++        ctx->restore.max_populated_pfn = new_max;
 +    }
 +
 +    set_bit(pfn, ctx->restore.populated_pfns);
@@ -208,9 +235,10 @@ index 6624baa..4a0bc86 100644
 +
 +/*
 + * Given a set of pfns, obtain memory from Xen to fill the physmap for the
-+ * unpopulated subset.
++ * unpopulated subset.  If types is NULL, no page typechecking is performed
++ * and all unpopulated pfns are populated.
 + */
-+int populate_pfns(struct context *ctx, unsigned count,
++int populate_pfns(struct xc_sr_context *ctx, unsigned count,
 +                  const xen_pfn_t *original_pfns, const uint32_t *types)
 +{
 +    xc_interface *xch = ctx->xch;
@@ -228,8 +256,9 @@ index 6624baa..4a0bc86 100644
 +
 +    for ( i = 0; i < count; ++i )
 +    {
-+        if ( types[i] != XEN_DOMCTL_PFINFO_XTAB &&
-+             types[i] != XEN_DOMCTL_PFINFO_BROKEN &&
++        if ( (!types || (types &&
++                         (types[i] != XEN_DOMCTL_PFINFO_XTAB &&
++                          types[i] != XEN_DOMCTL_PFINFO_BROKEN))) &&
 +             !pfn_is_populated(ctx, original_pfns[i]) )
 +        {
 +            pfns[nr_pfns] = mfns[nr_pfns] = original_pfns[i];
@@ -248,10 +277,17 @@ index 6624baa..4a0bc86 100644
 +
 +        for ( i = 0; i < nr_pfns; ++i )
 +        {
++            if ( mfns[i] == INVALID_MFN )
++            {
++                ERROR("Populate physmap failed for pfn %u", i);
++                rc = -1;
++                goto err;
++            }
++
 +            rc = pfn_set_populated(ctx, pfns[i]);
 +            if ( rc )
 +                goto err;
-+            ctx->ops.set_gfn(ctx, pfns[i], mfns[i]);
++            ctx->restore.ops.set_gfn(ctx, pfns[i], mfns[i]);
 +        }
 +    }
 +
@@ -269,13 +305,13 @@ index 6624baa..4a0bc86 100644
 + * stream, populate and record their types, map the relevent subset and copy
 + * the data into the guest.
 + */
-+static int process_page_data(struct context *ctx, unsigned count,
++static int process_page_data(struct xc_sr_context *ctx, unsigned count,
 +                             xen_pfn_t *pfns, uint32_t *types, void *page_data)
 +{
 +    xc_interface *xch = ctx->xch;
 +    xen_pfn_t *mfns = malloc(count * sizeof(*mfns));
 +    int *map_errs = malloc(count * sizeof(*map_errs));
-+    int rc = -1;
++    int rc;
 +    void *mapping = NULL, *guest_page = NULL;
 +    unsigned i,    /* i indexes the pfns from the record. */
 +        j,         /* j indexes the subset of pfns we decide to map. */
@@ -283,6 +319,7 @@ index 6624baa..4a0bc86 100644
 +
 +    if ( !mfns || !map_errs )
 +    {
++        rc = -1;
 +        ERROR("Failed to allocate %zu bytes to process page data",
 +              count * (sizeof(*mfns) + sizeof(*map_errs)));
 +        goto err;
@@ -294,11 +331,10 @@ index 6624baa..4a0bc86 100644
 +        ERROR("Failed to populate pfns for batch of %u pages", count);
 +        goto err;
 +    }
-+    rc = -1;
 +
 +    for ( i = 0, nr_pages = 0; i < count; ++i )
 +    {
-+        ctx->ops.set_page_type(ctx, pfns[i], types[i]);
++        ctx->restore.ops.set_page_type(ctx, pfns[i], types[i]);
 +
 +        switch ( types[i] )
 +        {
@@ -316,7 +352,7 @@ index 6624baa..4a0bc86 100644
 +        case XEN_DOMCTL_PFINFO_L4TAB:
 +        case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
 +
-+            mfns[nr_pages++] = ctx->ops.pfn_to_gfn(ctx, pfns[i]);
++            mfns[nr_pages++] = ctx->restore.ops.pfn_to_gfn(ctx, pfns[i]);
 +            break;
 +        }
 +
@@ -329,6 +365,7 @@ index 6624baa..4a0bc86 100644
 +            mfns, map_errs, nr_pages);
 +        if ( !mapping )
 +        {
++            rc = -1;
 +            PERROR("Unable to map %u mfns for %u pages of data",
 +                   nr_pages, count);
 +            goto err;
@@ -348,19 +385,31 @@ index 6624baa..4a0bc86 100644
 +
 +        if ( map_errs[j] )
 +        {
++            rc = -1;
 +            ERROR("Mapping pfn %lx (mfn %lx, type %#"PRIx32")failed with %d",
 +                  pfns[i], mfns[j], types[i], map_errs[j]);
 +            goto err;
 +        }
 +
-+        memcpy(guest_page, page_data, PAGE_SIZE);
-+
 +        /* Undo page normalisation done by the saver. */
-+        rc = ctx->restore.ops.localise_page(ctx, types[i], guest_page);
++        rc = ctx->restore.ops.localise_page(ctx, types[i], page_data);
 +        if ( rc )
 +        {
 +            DPRINTF("Failed to localise");
 +            goto err;
++        }
++
++        if ( ctx->restore.verify )
++        {
++            /* Verify mode - compare incoming data to what we already have. */
++            if ( memcmp(guest_page, page_data, PAGE_SIZE) )
++                ERROR("verify pfn %lx failed (type %#x)",
++                      pfns[i], types[i] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
++        }
++        else
++        {
++            /* Regular mode - copy incoming data into place. */
++            memcpy(guest_page, page_data, PAGE_SIZE);
 +        }
 +
 +        ++j;
@@ -384,7 +433,7 @@ index 6624baa..4a0bc86 100644
 + * Validate a PAGE_DATA record from the stream, and pass the results to
 + * process_page_data() to actually perform the legwork.
 + */
-+static int handle_page_data(struct context *ctx, struct record *rec)
++static int handle_page_data(struct xc_sr_context *ctx, struct xc_sr_record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    struct xc_sr_rec_page_data_header *pages = rec->data;
@@ -424,7 +473,7 @@ index 6624baa..4a0bc86 100644
 +    for ( i = 0; i < pages->count; ++i )
 +    {
 +        pfn = pages->pfn[i] & PAGE_DATA_PFN_MASK;
-+        if ( !ctx->ops.pfn_is_valid(ctx, pfn) )
++        if ( !ctx->restore.ops.pfn_is_valid(ctx, pfn) )
 +        {
 +            ERROR("pfn %#lx (index %u) outside domain maximum", pfn, i);
 +            goto err;
@@ -468,10 +517,10 @@ index 6624baa..4a0bc86 100644
 +/*
 + * Restore a domain.
 + */
-+static int restore(struct context *ctx)
++static int restore(struct xc_sr_context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
-+    struct record rec;
++    struct xc_sr_record rec;
 +    int rc, saved_rc = 0, saved_errno = 0;
 +
 +    IPRINTF("Restoring domain");
@@ -479,6 +528,15 @@ index 6624baa..4a0bc86 100644
 +    rc = ctx->restore.ops.setup(ctx);
 +    if ( rc )
 +        goto err;
++
++    ctx->restore.max_populated_pfn = (32 * 1024 / 4) - 1;
++    ctx->restore.populated_pfns = bitmap_alloc(
++        ctx->restore.max_populated_pfn + 1);
++    if ( !ctx->restore.populated_pfns )
++    {
++        ERROR("Unable to allocate memory for populated_pfns bitmap");
++        goto err;
++    }
 +
 +    do
 +    {
@@ -496,12 +554,31 @@ index 6624baa..4a0bc86 100644
 +            rc = handle_page_data(ctx, &rec);
 +            break;
 +
++        case REC_TYPE_VERIFY:
++            DPRINTF("Verify mode enabled");
++            ctx->restore.verify = true;
++            break;
++
 +        default:
 +            rc = ctx->restore.ops.process_record(ctx, &rec);
 +            break;
 +        }
 +
 +        free(rec.data);
++
++        if ( rc == RECORD_NOT_PROCESSED )
++        {
++            if ( rec.type & REC_TYPE_OPTIONAL )
++                DPRINTF("Ignoring optional record %#x (%s)",
++                        rec.type, rec_type_to_str(rec.type));
++            else
++            {
++                ERROR("Manditory record %#x (%s) not handled",
++                      rec.type, rec_type_to_str(rec.type));
++                rc = -1;
++            }
++        }
++
 +        if ( rc )
 +            goto err;
 +
@@ -537,11 +614,11 @@ index 6624baa..4a0bc86 100644
  int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
                         unsigned int store_evtchn, unsigned long *store_mfn,
                         domid_t store_domid, unsigned int console_evtchn,
-@@ -8,8 +502,68 @@ int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
+@@ -8,8 +572,69 @@ int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
                         int checkpointed_stream,
                         struct restore_callbacks *callbacks)
  {
-+    struct context ctx =
++    struct xc_sr_context ctx =
 +        {
 +            .xch = xch,
 +            .fd = io_fd,
@@ -556,6 +633,9 @@ index 6624baa..4a0bc86 100644
 +
      IPRINTF("In experimental %s", __func__);
 -    return -1;
++    DPRINTF("fd %d, dom %"PRIu32", hvm %u, pae %u, superpages %d"
++            ", checkpointed_stream %d", io_fd, dom, hvm, pae,
++            superpages, checkpointed_stream);
 +
 +    if ( xc_domain_getinfo(xch, dom, 1, &ctx.dominfo) != 1 )
 +    {
@@ -565,26 +645,24 @@ index 6624baa..4a0bc86 100644
 +
 +    if ( ctx.dominfo.domid != dom )
 +    {
-+        ERROR("Domain %d does not exist", dom);
++        ERROR("Domain %"PRIu32" does not exist", dom);
 +        return -1;
 +    }
 +
 +    ctx.domid = dom;
-+    IPRINTF("Restoring domain %d", dom);
++    IPRINTF("Restoring domain %"PRIu32, dom);
 +
 +    if ( read_headers(&ctx) )
 +        return -1;
 +
 +    if ( ctx.dominfo.hvm )
 +    {
-+        ctx.ops = common_ops_x86_hvm;
 +        ctx.restore.ops = restore_ops_x86_hvm;
 +        if ( restore(&ctx) )
 +            return -1;
 +    }
 +    else
 +    {
-+        ctx.ops = common_ops_x86_pv;
 +        ctx.restore.ops = restore_ops_x86_pv;
 +        if ( restore(&ctx) )
 +            return -1;

@@ -1,7 +1,7 @@
-From 20672ea05f0c9862cb69484058e885037e082be8 Mon Sep 17 00:00:00 2001
+From 688f486b1a524cff58d117b0b3d386564f814f73 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Tue, 3 Jun 2014 14:48:12 +0100
-Subject: [PATCH 01/14] docs: libxc migration stream specification
+Subject: [PATCH 01/13] docs: libxc migration stream specification
 
 Add the specification for a new migration stream format.  The document
 includes all the details but to summarize:
@@ -19,29 +19,32 @@ records for the image data.
 
 The format will be used for future domain types (such as on ARM).
 
-The specification is pandoc format (an extended markdown format) and
-the documentation build system is extended to generate PDFs from pandoc
-documents.
+The specification is pandoc format (an extended markdown format) and the
+documentation build system is extended to support pandoc format documents.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 CC: Ian Campbell <Ian.Campbell@citrix.com>
 CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
 
 ---
-
-In some copious free time (a doc day perhaps), I will see about getting pandoc
--> html working, but I don't have time right now.
+v7:
+ * Remove SAVING_CPU.
+ * More clear statements regarding record order and interleaving.
+v6:
+ * Add pandoc -> txt/html conversion.
+ * Spelling fixes.
+ * Introduce SAVING_CPU record.
 ---
- docs/Makefile                            |    9 +-
- docs/specs/libxc-migration-stream.pandoc |  640 ++++++++++++++++++++++++++++++
- 2 files changed, 648 insertions(+), 1 deletion(-)
+ docs/Makefile                            |   11 +-
+ docs/specs/libxc-migration-stream.pandoc |  672 ++++++++++++++++++++++++++++++
+ 2 files changed, 682 insertions(+), 1 deletion(-)
  create mode 100644 docs/specs/libxc-migration-stream.pandoc
 
 diff --git a/docs/Makefile b/docs/Makefile
-index 46e8f22..126aa04 100644
+index 46e8f22..2345421 100644
 --- a/docs/Makefile
 +++ b/docs/Makefile
-@@ -14,6 +14,8 @@ MAN5SRC-y := $(wildcard man/xl*.pod.5)
+@@ -14,21 +14,26 @@ MAN5SRC-y := $(wildcard man/xl*.pod.5)
  
  MARKDOWNSRC-y := $(wildcard misc/*.markdown)
  
@@ -50,8 +53,17 @@ index 46e8f22..126aa04 100644
  TXTSRC-y := $(wildcard misc/*.txt)
  
  
-@@ -28,7 +30,8 @@ DOC_TXT  := $(patsubst %.txt,txt/%.txt,$(TXTSRC-y)) \
+ DOC_MAN1 := $(patsubst man/%.pod.1,man1/%.1,$(MAN1SRC-y))
+ DOC_MAN5 := $(patsubst man/%.pod.5,man5/%.5,$(MAN5SRC-y))
+ DOC_HTML := $(patsubst %.markdown,html/%.html,$(MARKDOWNSRC-y)) \
++            $(patsubst %.pandoc,html/%.html,$(PANDOCSRC-y)) \
+             $(patsubst man/%.pod.1,html/man/%.1.html,$(MAN1SRC-y)) \
+             $(patsubst man/%.pod.5,html/man/%.5.html,$(MAN5SRC-y)) \
+             $(patsubst %.txt,html/%.txt,$(TXTSRC-y)) \
+             $(patsubst %,html/hypercall/%/index.html,$(DOC_ARCHES))
+ DOC_TXT  := $(patsubst %.txt,txt/%.txt,$(TXTSRC-y)) \
              $(patsubst %.markdown,txt/%.txt,$(MARKDOWNSRC-y)) \
++            $(patsubst %.pandoc,txt/%.txt,$(PANDOCSRC-y)) \
              $(patsubst man/%.pod.1,txt/man/%.1.txt,$(MAN1SRC-y)) \
              $(patsubst man/%.pod.5,txt/man/%.5.txt,$(MAN5SRC-y))
 -DOC_PDF  := $(patsubst %.markdown,pdf/%.pdf,$(MARKDOWNSRC-y))
@@ -60,11 +72,11 @@ index 46e8f22..126aa04 100644
  
  .PHONY: all
  all: build
-@@ -191,6 +194,10 @@ pdf/%.pdf: %.markdown
+@@ -191,6 +196,10 @@ pdf/%.pdf: %.markdown
  	$(INSTALL_DIR) $(@D)
  	pandoc -N --toc --standalone $< --output $@
  
-+pdf/%.pdf: %.pandoc
++pdf/%.pdf txt/%.txt html/%.html: %.pandoc
 +	$(INSTALL_DIR) $(@D)
 +	pandoc --number-sections --toc --standalone $< --output $@
 +
@@ -73,10 +85,10 @@ index 46e8f22..126aa04 100644
  	$(error You have to run ./configure before building docs)
 diff --git a/docs/specs/libxc-migration-stream.pandoc b/docs/specs/libxc-migration-stream.pandoc
 new file mode 100644
-index 0000000..a161694
+index 0000000..2c7a02c
 --- /dev/null
 +++ b/docs/specs/libxc-migration-stream.pandoc
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,672 @@
 +% LibXenCtrl Domain Image Format
 +% David Vrabel <<david.vrabel@citrix.com>>
 +  Andrew Cooper <<andrew.cooper3@citrix.com>>
@@ -304,7 +316,9 @@ index 0000000..a161694
 +
 +             0x0000000C: X86_PV_VCPU_MSRS
 +
-+             0x0000000D - 0x7FFFFFFF: Reserved for future _mandatory_
++             0x0000000D: VERIFY
++
++             0x0000000E - 0x7FFFFFFF: Reserved for future _mandatory_
 +             records.
 +
 +             0x80000000 - 0xFFFFFFFF: Reserved for future _optional_
@@ -319,7 +333,7 @@ index 0000000..a161694
 +--------------------------------------------------------------------
 +
 +Records may be _mandatory_ or _optional_.  Optional records have bit
-+31 set in their type.  Restoring an image that has unrecognized or
++31 set in their type.  Restoring an image that has unrecognised or
 +unsupported mandatory record must fail.  The contents of optional
 +records may be ignored during a restore.
 +
@@ -331,7 +345,8 @@ index 0000000..a161694
 +END
 +----
 +
-+A end record marks the end of the image.
++A end record marks the end of the image, and shall be the final record
++in the stream.
 +
 +     0     1     2     3     4     5     6     7 octet
 +    +-------------------------------------------------+
@@ -422,7 +437,7 @@ index 0000000..a161694
 +The saver uses the `XTAB` type for PFNs that become invalid in the
 +guest's P2M table during a live migration[^2].
 +
-+Restoring an image with unrecognized page types shall fail.
++Restoring an image with unrecognised page types shall fail.
 +
 +[^2]: In the legacy format, this is the list of unmapped PFNs in the
 +tail.
@@ -605,7 +620,7 @@ index 0000000..a161694
 +--------------------------------------------------------------------
 +Field            Description
 +-----------      ---------------------------------------------------
-+count            The number of paramter contained in this record.
++count            The number of parameters contained in this record.
 +                 Each parameter in the record contains an index and
 +                 value.
 +
@@ -622,7 +637,7 @@ index 0000000..a161694
 +An opaque blob provided by and supplied to the higher layers of the
 +toolstack (e.g., libxl) during save and restore.
 +
-+> This is only temporary -- the intension is the toolstack takes care
++> This is only temporary -- the intention is the toolstack takes care
 +> of this itself.  This record is only present for early development
 +> purposes and will be removed before submissions, along with changes
 +> to libxl which cause libxl to handle this data itself.
@@ -641,15 +656,30 @@ index 0000000..a161694
 +
 +\clearpage
 +
++VERIFY
++------
++
++A verify record indicates that, while all memory has now been sent, the sender
++shall send further memory records for debugging purposes.
++
++     0     1     2     3     4     5     6     7 octet
++    +-------------------------------------------------+
++
++The verify record contains no fields; its body_length is 0.
++
++\clearpage
++
 +Layout
 +======
 +
-+The set of valid records depends on the guest architecture and type.
++The set of valid records depends on the guest architecture and type.  No
++assumptions should be made about the ordering or interleaving of
++independent records.  Record dependencies are noted below.
 +
 +x86 PV Guest
 +------------
 +
-+An x86 PV guest image will have this order of records:
++A typical save record for an x86 PV guest image would look like:
 +
 +1. Image header
 +2. Domain header
@@ -665,15 +695,29 @@ index 0000000..a161694
 +    d. X86\_PV\_VCPU\_MSRS record
 +9. END record
 +
++There are some strict ordering requirements.  The following records must
++be present in the following order as each of them depends on information
++present in the preceding ones.
++
++1. X86\_PV\_INFO record
++2. X86\_PV\_P2M\_FRAMES record
++3. PAGE\_DATA records
++4. VCPU records
++
 +x86 HVM Guest
 +-------------
++
++A typical save record for an x86 HVM guest image would look like:
 +
 +1. Image header
 +2. Domain header
 +3. Many PAGE\_DATA records
 +4. TSC\_INFO
-+5. HVM\_CONTEXT
-+6. HVM\_PARAMS
++5. HVM\_PARAMS
++6. HVM\_CONTEXT
++
++HVM\_PARAMS must preceed HVM\_CONTEXT, as certain parameters can affect
++the validity of architectural state in the context.
 +
 +
 +Legacy Images (x86 only)

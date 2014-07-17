@@ -1,7 +1,7 @@
-From da3da53f9da7139be95086ff437952ef00006741 Mon Sep 17 00:00:00 2001
+From b285c35784581e22ba8794e255bb4cb8cb179823 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sun, 8 Jun 2014 03:03:29 +0100
-Subject: [PATCH 13/14] tools/libxc: noarch save code
+Subject: [PATCH 12/13] tools/libxc: noarch save code
 
 Save a domain, calling domain type specific function at the appropriate
 points.  This implements the xc_domain_save2() API function which is
@@ -11,15 +11,21 @@ This writes the image and domain headers, and writes all the PAGE_DATA records
 using a "live" process.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
 ---
- tools/libxc/saverestore/save.c |  545 +++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 544 insertions(+), 1 deletion(-)
+v6:
+ * Use writev() instead of write() for PAGE_DATA.
+ * Introduce separate non-live suspend which avoids playing with logdirty.
+ * Fix a bug which would clobber the penultimate logdirty bitmap.
+---
+ tools/libxc/saverestore/save.c |  683 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 682 insertions(+), 1 deletion(-)
 
 diff --git a/tools/libxc/saverestore/save.c b/tools/libxc/saverestore/save.c
-index f6ad734..96ca5f8 100644
+index f6ad734..05947fe 100644
 --- a/tools/libxc/saverestore/save.c
 +++ b/tools/libxc/saverestore/save.c
-@@ -1,11 +1,554 @@
+@@ -1,11 +1,692 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -28,7 +34,7 @@ index f6ad734..96ca5f8 100644
 +/*
 + * Writes an Image header and Domain header into the stream.
 + */
-+static int write_headers(struct context *ctx, uint16_t guest_type)
++static int write_headers(struct xc_sr_context *ctx, uint16_t guest_type)
 +{
 +    xc_interface *xch = ctx->xch;
 +    int32_t xen_version = xc_version(xch, XENVER_version, NULL);
@@ -71,9 +77,9 @@ index f6ad734..96ca5f8 100644
 +/*
 + * Writes an END record into the stream.
 + */
-+static int write_end_record(struct context *ctx)
++static int write_end_record(struct xc_sr_context *ctx)
 +{
-+    struct record end = { REC_TYPE_END, 0, NULL };
++    struct xc_sr_record end = { REC_TYPE_END, 0, NULL };
 +
 +    return write_record(ctx, &end);
 +}
@@ -88,7 +94,7 @@ index f6ad734..96ca5f8 100644
 + *   - maps and attempts to localise the pages.
 + * - construct and writes a PAGE_DATA record into the stream.
 + */
-+static int write_batch(struct context *ctx)
++static int write_batch(struct xc_sr_context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
 +    xen_pfn_t *mfns = NULL, *types = NULL;
@@ -100,8 +106,9 @@ index f6ad734..96ca5f8 100644
 +    unsigned nr_pfns = ctx->save.nr_batch_pfns;
 +    void *page, *orig_page;
 +    uint64_t *rec_pfns = NULL;
++    struct iovec *iov = NULL; int iovcnt = 0;
 +    struct xc_sr_rec_page_data_header hdr = { 0 };
-+    struct record rec =
++    struct xc_sr_record rec =
 +    {
 +        .type = REC_TYPE_PAGE_DATA,
 +    };
@@ -118,8 +125,10 @@ index f6ad734..96ca5f8 100644
 +    guest_data = calloc(nr_pfns, sizeof(*guest_data));
 +    /* Pointers to locally allocated pages.  Need freeing. */
 +    local_pages = calloc(nr_pfns, sizeof(*local_pages));
++    /* iovec[] for writev(). */
++    iov = malloc((nr_pfns + 4) * sizeof(*iov));
 +
-+    if ( !mfns || !types || !errors || !guest_data || !local_pages )
++    if ( !mfns || !types || !errors || !guest_data || !local_pages || !iov )
 +    {
 +        ERROR("Unable to allocate arrays for a batch of %u pages",
 +              nr_pfns);
@@ -128,7 +137,7 @@ index f6ad734..96ca5f8 100644
 +
 +    for ( i = 0; i < nr_pfns; ++i )
 +    {
-+        types[i] = mfns[i] = ctx->ops.pfn_to_gfn(ctx, ctx->save.batch_pfns[i]);
++        types[i] = mfns[i] = ctx->save.ops.pfn_to_gfn(ctx, ctx->save.batch_pfns[i]);
 +
 +        /* Likely a ballooned page. */
 +        if ( mfns[i] == INVALID_MFN )
@@ -224,26 +233,33 @@ index f6ad734..96ca5f8 100644
 +    for ( i = 0; i < nr_pfns; ++i )
 +        rec_pfns[i] = ((uint64_t)(types[i]) << 32) | ctx->save.batch_pfns[i];
 +
-+    if ( write_record_header(ctx, &rec) ||
-+         write_exact(ctx->fd, &hdr, sizeof(hdr)) ||
-+         write_exact(ctx->fd, rec_pfns, nr_pfns * sizeof(*rec_pfns)) )
-+    {
-+        PERROR("Failed to write page_type header to stream");
-+        goto err;
-+    }
++    iov[0].iov_base = &rec.type;
++    iov[0].iov_len = sizeof(rec.type);
 +
-+    for ( i = 0; i < nr_pfns; ++i )
++    iov[1].iov_base = &rec.length;
++    iov[1].iov_len = sizeof(rec.length);
++
++    iov[2].iov_base = &hdr;
++    iov[2].iov_len = sizeof(hdr);
++
++    iov[3].iov_base = rec_pfns;
++    iov[3].iov_len = nr_pfns * sizeof(*rec_pfns);
++
++    for ( i = 0, iovcnt = 4; i < nr_pfns; ++i )
 +    {
 +        if ( guest_data[i] )
 +        {
-+            if ( write_exact(ctx->fd, guest_data[i], PAGE_SIZE) )
-+            {
-+                PERROR("Failed to write page into stream");
-+                goto err;
-+            }
-+
++            iov[iovcnt].iov_base = guest_data[i];
++            iov[iovcnt].iov_len = PAGE_SIZE;
++            iovcnt++;
 +            --nr_pages;
 +        }
++    }
++
++    if ( writev_exact(ctx->fd, iov, iovcnt) )
++    {
++        PERROR("Failed to write page data to stream");
++        goto err;
 +    }
 +
 +    /* Sanity check we have sent all the pages we expected to. */
@@ -256,6 +272,7 @@ index f6ad734..96ca5f8 100644
 +        munmap(guest_mapping, nr_pages * PAGE_SIZE);
 +    for ( i = 0; local_pages && i < nr_pfns; ++i )
 +            free(local_pages[i]);
++    free(iov);
 +    free(local_pages);
 +    free(guest_data);
 +    free(errors);
@@ -268,7 +285,7 @@ index f6ad734..96ca5f8 100644
 +/*
 + * Flush a batch of pfns into the stream.
 + */
-+static int flush_batch(struct context *ctx)
++static int flush_batch(struct xc_sr_context *ctx)
 +{
 +    int rc = 0;
 +
@@ -289,7 +306,7 @@ index f6ad734..96ca5f8 100644
 +/*
 + * Add a single pfn to the batch, flushing the batch if full.
 + */
-+static int add_to_batch(struct context *ctx, xen_pfn_t pfn)
++static int add_to_batch(struct xc_sr_context *ctx, xen_pfn_t pfn)
 +{
 +    int rc = 0;
 +
@@ -303,38 +320,74 @@ index f6ad734..96ca5f8 100644
 +}
 +
 +/*
-+ * Pause the domain.
++ * Pause/suspend the domain, and refresh ctx->dominfo if required.
 + */
-+static int pause_domain(struct context *ctx)
++static int suspend_domain(struct xc_sr_context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
-+    int rc;
 +
-+    if ( !ctx->dominfo.paused )
++    /* TODO: Properly specify the return value from this callback.  All
++     * implementations currently appear to return 1 for success, whereas
++     * the legacy code checks for != 0. */
++    int cb_rc = ctx->save.callbacks->suspend(ctx->save.callbacks->data);
++
++    if ( cb_rc == 0 )
 +    {
-+        /* TODO: Properly specify the return value from this callback. */
-+        rc = (ctx->save.callbacks->suspend(ctx->save.callbacks->data) != 1);
-+        if ( rc )
-+        {
-+            ERROR("Failed to suspend domain");
-+            return rc;
-+        }
++        ERROR("save callback suspend() failed: %d", cb_rc);
++        return -1;
++    }
++
++    /* Refresh domain information. */
++    if ( (xc_domain_getinfo(xch, ctx->domid, 1, &ctx->dominfo) != 1) ||
++         (ctx->dominfo.domid != ctx->domid) )
++    {
++        PERROR("Unable to refresh domain information");
++        return -1;
++    }
++
++    /* Confirm the domain has actually been paused. */
++    if ( !ctx->dominfo.shutdown ||
++         (ctx->dominfo.shutdown_reason != SHUTDOWN_suspend) )
++    {
++        ERROR("Domain has not been suspended: shutdown %d, reason %d",
++              ctx->dominfo.shutdown, ctx->dominfo.shutdown_reason);
++        return -1;
 +    }
 +
 +    IPRINTF("Domain now paused");
++
 +    return 0;
++}
++
++/*
++ * Send all pages in the guests p2m.  Used as the first iteration of the live
++ * migration loop, and for a non-live save.
++ */
++static int send_all_pages(struct xc_sr_context *ctx)
++{
++    xen_pfn_t p;
++    int rc;
++
++    for ( p = 0; p < ctx->save.p2m_size; ++p )
++    {
++        rc = add_to_batch(ctx, p);
++        if ( rc )
++            return rc;
++    }
++
++    return flush_batch(ctx);
 +}
 +
 +/*
 + * Send all domain memory.  This is the heart of the live migration loop.
 + */
-+static int send_domain_memory(struct context *ctx)
++static int send_domain_memory_live(struct xc_sr_context *ctx)
 +{
 +    xc_interface *xch = ctx->xch;
 +    DECLARE_HYPERCALL_BUFFER(unsigned long, to_send);
 +    xc_shadow_op_stats_t stats = { -1, -1 };
 +    unsigned pages_written;
-+    unsigned x, max_iter = 5, dirty_threshold = 50;
++    unsigned x = 0, max_iter = 5, dirty_threshold = 50;
 +    xen_pfn_t p;
 +    int rc = -1;
 +
@@ -350,43 +403,47 @@ index f6ad734..96ca5f8 100644
 +        goto out;
 +    }
 +
++    /* This juggling is required if logdirty is already on, e.g. VRAM tracking */
 +    if ( xc_shadow_control(xch, ctx->domid,
 +                           XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
 +                           NULL, 0, NULL, 0, NULL) < 0 )
 +    {
-+        PERROR("Failed to enable logdirty");
-+        goto out;
++        int frc = xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
++                                    NULL, 0, NULL, 0, NULL);
++        if ( frc >= 0 )
++            frc = xc_shadow_control(xch, ctx->domid,
++                                    XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
++                                    NULL, 0, NULL, 0, NULL);
++        if ( frc < 0 )
++        {
++            PERROR("Failed to enable logdirty: rc %d", frc);
++            goto out;
++        }
 +    }
 +
-+    for ( x = 0, pages_written = 0; x < max_iter ; ++x )
++    DPRINTF("Iteration %u", x);
++    rc = send_all_pages(ctx);
++    if ( rc )
++        goto out;
++    pages_written = ctx->save.p2m_size - 1;
++
++    for ( x = 1; x < max_iter ; ++x )
 +    {
-+        if ( x == 0 )
++        DPRINTF("Iteration %u", x);
++
++        if ( xc_shadow_control(
++                 xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
++                 HYPERCALL_BUFFER(to_send), ctx->save.p2m_size,
++                 NULL, 0, &stats) != ctx->save.p2m_size )
 +        {
-+            /* First iteration, send all pages. */
-+            memset(to_send, 0xff, bitmap_size(ctx->save.p2m_size));
++            PERROR("Failed to retrieve logdirty bitmap");
++            rc = -1;
++            goto out;
 +        }
 +        else
-+        {
-+            /* Else consult the dirty bitmap. */
-+            if ( xc_shadow_control(
-+                     xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
-+                     HYPERCALL_BUFFER(to_send), ctx->save.p2m_size,
-+                     NULL, 0, &stats) != ctx->save.p2m_size )
-+            {
-+                PERROR("Failed to retrieve logdirty bitmap");
-+                rc = -1;
-+                goto out;
-+            }
-+            else
-+                DPRINTF("  Wrote %u pages; stats: faults %"PRIu32", dirty %"PRIu32,
-+                        pages_written, stats.fault_count, stats.dirty_count);
-+            pages_written = 0;
-+
-+            if ( stats.dirty_count < dirty_threshold )
-+                break;
-+        }
-+
-+        DPRINTF("Iteration %u", x);
++            DPRINTF("  Wrote %u pages; stats: faults %"PRIu32", dirty %"PRIu32,
++                    pages_written, stats.fault_count, stats.dirty_count);
++        pages_written = 0;
 +
 +        for ( p = 0 ; p < ctx->save.p2m_size; ++p )
 +        {
@@ -402,9 +459,12 @@ index f6ad734..96ca5f8 100644
 +        rc = flush_batch(ctx);
 +        if ( rc )
 +            goto out;
++
++        if ( stats.dirty_count < dirty_threshold )
++            break;
 +    }
 +
-+    rc = pause_domain(ctx);
++    rc = suspend_domain(ctx);
 +    if ( rc )
 +        goto out;
 +
@@ -436,6 +496,40 @@ index f6ad734..96ca5f8 100644
 +    DPRINTF("  Wrote %u pages", pages_written);
 +    IPRINTF("Sent all pages");
 +
++    if ( ctx->save.debug )
++    {
++        struct xc_sr_record rec =
++        {
++            .type = REC_TYPE_VERIFY,
++            .length = 0,
++        };
++
++        DPRINTF("Enabling verify mode");
++
++        rc = write_record(ctx, &rec);
++        if ( rc )
++            goto out;
++
++        rc = send_all_pages(ctx);
++        if ( rc )
++            goto out;
++
++        DPRINTF("  Wrote %lu verification pages", ctx->save.p2m_size - 1);
++
++        if ( xc_shadow_control(
++                 xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_PEEK,
++                 HYPERCALL_BUFFER(to_send), ctx->save.p2m_size,
++                 NULL, 0, &stats) != ctx->save.p2m_size )
++        {
++            PERROR("Failed to retrieve logdirty bitmap");
++            rc = -1;
++            goto out;
++        }
++
++        DPRINTF("  Further stats: faults %"PRIu32", dirty %"PRIu32,
++                stats.fault_count, stats.dirty_count);
++    }
++
 +  out:
 +    xc_hypercall_buffer_free_pages(xch, to_send,
 +                                   NRPAGES(bitmap_size(ctx->save.p2m_size)));
@@ -445,9 +539,46 @@ index f6ad734..96ca5f8 100644
 +}
 +
 +/*
++ * Send all domain memory, pausing the domain first.  Generally used for
++ * suspend-to-file.
++ */
++static int send_domain_memory_nonlive(struct xc_sr_context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int rc = -1;
++
++    ctx->save.batch_pfns = malloc(MAX_BATCH_SIZE *
++                                  sizeof(*ctx->save.batch_pfns));
++    ctx->save.deferred_pages = calloc(1, bitmap_size(ctx->save.p2m_size));
++
++    if ( !ctx->save.batch_pfns || !ctx->save.deferred_pages )
++    {
++        PERROR("Failed to allocate memory for nonlive tracking structures");
++        errno = ENOMEM;
++        goto err;
++    }
++
++    rc = suspend_domain(ctx);
++    if ( rc )
++        goto err;
++
++    rc = send_all_pages(ctx);
++    if ( rc )
++        goto err;
++
++    IPRINTF("Sent all %lu pages", ctx->save.p2m_size - 1);
++
++ err:
++    free(ctx->save.deferred_pages);
++    free(ctx->save.batch_pfns);
++
++    return rc;
++}
++
++/*
 + * Save a domain.
 + */
-+static int save(struct context *ctx, uint16_t guest_type)
++static int save(struct xc_sr_context *ctx, uint16_t guest_type)
 +{
 +    xc_interface *xch = ctx->xch;
 +    int rc, saved_rc = 0, saved_errno = 0;
@@ -467,7 +598,17 @@ index f6ad734..96ca5f8 100644
 +    if ( rc )
 +        goto err;
 +
-+    rc = send_domain_memory(ctx);
++    if ( ctx->save.live )
++    {
++        DPRINTF("Starting live migrate");
++        rc = send_domain_memory_live(ctx);
++    }
++    else
++    {
++        DPRINTF("Starting nonlive save");
++        rc = send_domain_memory_nonlive(ctx);
++    }
++
 +    if ( rc )
 +        goto err;
 +
@@ -496,9 +637,6 @@ index f6ad734..96ca5f8 100644
 +    if ( rc )
 +        goto err;
 +
-+    xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
-+                      NULL, 0, NULL, 0, NULL);
-+
 +    IPRINTF("Save successful");
 +    goto done;
 +
@@ -508,6 +646,9 @@ index f6ad734..96ca5f8 100644
 +    PERROR("Save failed");
 +
 + done:
++    xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
++                      NULL, 0, NULL, 0, NULL);
++
 +    rc = ctx->save.ops.cleanup(ctx);
 +    if ( rc )
 +        PERROR("Failed to clean up");
@@ -525,7 +666,7 @@ index f6ad734..96ca5f8 100644
                      uint32_t max_factor, uint32_t flags,
                      struct save_callbacks* callbacks, int hvm)
  {
-+    struct context ctx =
++    struct xc_sr_context ctx =
 +        {
 +            .xch = xch,
 +            .fd = io_fd,
@@ -533,9 +674,14 @@ index f6ad734..96ca5f8 100644
 +
 +    /* GCC 4.4 (of CentOS 6.x vintage) can' t initialise anonymous unions :( */
 +    ctx.save.callbacks = callbacks;
++    ctx.save.live  = !!(flags & XCFLAGS_LIVE);
++    ctx.save.debug = !!(flags & XCFLAGS_DEBUG);
 +
      IPRINTF("In experimental %s", __func__);
 -    return -1;
++    DPRINTF("fd %d, dom %"PRIu32", max_iters %"PRIu32", max_factor %"PRIu32
++            ", flags %"PRIu32", hvm %d", io_fd, dom, max_iters, max_factor,
++            flags, hvm);
 +
 +    if ( xc_domain_getinfo(xch, dom, 1, &ctx.dominfo) != 1 )
 +    {
@@ -545,12 +691,12 @@ index f6ad734..96ca5f8 100644
 +
 +    if ( ctx.dominfo.domid != dom )
 +    {
-+        ERROR("Domain %d does not exist", dom);
++        ERROR("Domain %"PRIu32" does not exist", dom);
 +        return -1;
 +    }
 +
 +    ctx.domid = dom;
-+    IPRINTF("Saving domain %d", dom);
++    IPRINTF("Saving domain %"PRIu32, dom);
 +
 +    ctx.save.p2m_size = xc_domain_maximum_gpfn(xch, dom) + 1;
 +    if ( ctx.save.p2m_size > ~XEN_DOMCTL_PFINFO_LTAB_MASK )
@@ -562,13 +708,11 @@ index f6ad734..96ca5f8 100644
 +
 +    if ( ctx.dominfo.hvm )
 +    {
-+        ctx.ops = common_ops_x86_hvm;
 +        ctx.save.ops = save_ops_x86_hvm;
 +        return save(&ctx, DHDR_TYPE_X86_HVM);
 +    }
 +    else
 +    {
-+        ctx.ops = common_ops_x86_pv;
 +        ctx.save.ops = save_ops_x86_pv;
 +        return save(&ctx, DHDR_TYPE_X86_PV);
 +    }

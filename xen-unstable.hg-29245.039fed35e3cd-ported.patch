@@ -1,0 +1,294 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1403874802 -3600
+# Node ID 039fed35e3cd82d1c2a8ddb4a546fe43f39ae97d
+# Parent ba2a37b8c34dd63ebe0715e15b4699e9f6fcbe7d
+tools/libxc: Improve the *_FIELD() macros
+
+The {GET,SET,MEMCPY,MEMSET_ARRAY}_FIELD() macros previously required
+'dinfo->guest_width' to exist in scope, which is somewhat antisocial, and
+makes them awkward to use in other contexts.
+
+Update these macros to take guest width as a parameter, and in all cases pass
+dinfo->guest_width.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+
+diff -r ba2a37b8c34d tools/libxc/xc_domain_restore.c
+--- a/tools/libxc/xc_domain_restore.c
++++ b/tools/libxc/xc_domain_restore.c
+@@ -319,7 +319,7 @@ static xen_pfn_t *load_p2m_frame_list(
+                 tot_bytes -= chunk_bytes;
+                 chunk_bytes = 0;
+ 
+-                if ( GET_FIELD(&ctxt, vm_assist) 
++                if ( GET_FIELD(&ctxt, vm_assist, dinfo->guest_width)
+                      & (1UL << VMASST_TYPE_pae_extended_cr3) )
+                     *pae_extended_cr3 = 1;
+             }
+@@ -2027,7 +2027,9 @@ int xc_domain_restore(xc_interface *xch,
+         DPRINTF("read VCPU %d\n", i);
+ 
+         if ( !new_ctxt_format )
+-            SET_FIELD(ctxt, flags, GET_FIELD(ctxt, flags) | VGCF_online);
++            SET_FIELD(ctxt, flags,
++                      GET_FIELD(ctxt, flags, dinfo->guest_width) | VGCF_online,
++                      dinfo->guest_width);
+ 
+         if ( i == 0 )
+         {
+@@ -2041,7 +2043,7 @@ int xc_domain_restore(xc_interface *xch,
+              * xc_domain_save and therefore the PFN is found in the
+              * edx register.
+              */
+-            pfn = GET_FIELD(ctxt, user_regs.edx);
++            pfn = GET_FIELD(ctxt, user_regs.edx, dinfo->guest_width);
+             if ( (pfn >= dinfo->p2m_size) ||
+                  (pfn_type[pfn] != XEN_DOMCTL_PFINFO_NOTAB) )
+             {
+@@ -2049,7 +2051,7 @@ int xc_domain_restore(xc_interface *xch,
+                 goto out;
+             }
+             mfn = ctx->p2m[pfn];
+-            SET_FIELD(ctxt, user_regs.edx, mfn);
++            SET_FIELD(ctxt, user_regs.edx, mfn, dinfo->guest_width);
+             start_info = xc_map_foreign_range(
+                 xch, dom, PAGE_SIZE, PROT_READ | PROT_WRITE, mfn);
+             if ( start_info == NULL )
+@@ -2058,39 +2060,39 @@ int xc_domain_restore(xc_interface *xch,
+                 goto out;
+             }
+ 
+-            SET_FIELD(start_info, nr_pages, dinfo->p2m_size);
+-            SET_FIELD(start_info, shared_info, shared_info_frame<<PAGE_SHIFT);
+-            SET_FIELD(start_info, flags, 0);
+-            if ( GET_FIELD(start_info, store_mfn) > dinfo->p2m_size )
++            SET_FIELD(start_info, nr_pages, dinfo->p2m_size, dinfo->guest_width);
++            SET_FIELD(start_info, shared_info, shared_info_frame<<PAGE_SHIFT, dinfo->guest_width);
++            SET_FIELD(start_info, flags, 0, dinfo->guest_width);
++            if ( GET_FIELD(start_info, store_mfn, dinfo->guest_width) > dinfo->p2m_size )
+             {
+                 ERROR("Suspend record xenstore frame number is bad");
+                 munmap(start_info, PAGE_SIZE);
+                 goto out;
+             }
+-            *store_mfn = ctx->p2m[GET_FIELD(start_info, store_mfn)];
+-            SET_FIELD(start_info, store_mfn, *store_mfn);
+-            SET_FIELD(start_info, store_evtchn, store_evtchn);
+-            if ( GET_FIELD(start_info, console.domU.mfn) > dinfo->p2m_size )
++            *store_mfn = ctx->p2m[GET_FIELD(start_info, store_mfn, dinfo->guest_width)];
++            SET_FIELD(start_info, store_mfn, *store_mfn, dinfo->guest_width);
++            SET_FIELD(start_info, store_evtchn, store_evtchn, dinfo->guest_width);
++            if ( GET_FIELD(start_info, console.domU.mfn, dinfo->guest_width) > dinfo->p2m_size )
+             {
+                 ERROR("Suspend record console frame number is bad");
+                 munmap(start_info, PAGE_SIZE);
+                 goto out;
+             }
+-            *console_mfn = ctx->p2m[GET_FIELD(start_info, console.domU.mfn)];
+-            SET_FIELD(start_info, console.domU.mfn, *console_mfn);
+-            SET_FIELD(start_info, console.domU.evtchn, console_evtchn);
++            *console_mfn = ctx->p2m[GET_FIELD(start_info, console.domU.mfn, dinfo->guest_width)];
++            SET_FIELD(start_info, console.domU.mfn, *console_mfn, dinfo->guest_width);
++            SET_FIELD(start_info, console.domU.evtchn, console_evtchn, dinfo->guest_width);
+             munmap(start_info, PAGE_SIZE);
+         }
+         /* Uncanonicalise each GDT frame number. */
+-        if ( GET_FIELD(ctxt, gdt_ents) > 8192 )
++        if ( GET_FIELD(ctxt, gdt_ents, dinfo->guest_width) > 8192 )
+         {
+             ERROR("GDT entry count out of range");
+             goto out;
+         }
+ 
+-        for ( j = 0; (512*j) < GET_FIELD(ctxt, gdt_ents); j++ )
++        for ( j = 0; (512*j) < GET_FIELD(ctxt, gdt_ents, dinfo->guest_width); j++ )
+         {
+-            pfn = GET_FIELD(ctxt, gdt_frames[j]);
++            pfn = GET_FIELD(ctxt, gdt_frames[j], dinfo->guest_width);
+             if ( (pfn >= dinfo->p2m_size) ||
+                  (pfn_type[pfn] != XEN_DOMCTL_PFINFO_NOTAB) )
+             {
+@@ -2098,10 +2100,10 @@ int xc_domain_restore(xc_interface *xch,
+                       j, (unsigned long)pfn);
+                 goto out;
+             }
+-            SET_FIELD(ctxt, gdt_frames[j], ctx->p2m[pfn]);
++            SET_FIELD(ctxt, gdt_frames[j], ctx->p2m[pfn], dinfo->guest_width);
+         }
+         /* Uncanonicalise the page table base pointer. */
+-        pfn = UNFOLD_CR3(GET_FIELD(ctxt, ctrlreg[3]));
++        pfn = UNFOLD_CR3(GET_FIELD(ctxt, ctrlreg[3], dinfo->guest_width));
+ 
+         if ( pfn >= dinfo->p2m_size )
+         {
+@@ -2118,7 +2120,7 @@ int xc_domain_restore(xc_interface *xch,
+                   (unsigned long)ctx->pt_levels<<XEN_DOMCTL_PFINFO_LTAB_SHIFT);
+             goto out;
+         }
+-        SET_FIELD(ctxt, ctrlreg[3], FOLD_CR3(ctx->p2m[pfn]));
++        SET_FIELD(ctxt, ctrlreg[3], FOLD_CR3(ctx->p2m[pfn]), dinfo->guest_width);
+ 
+         /* Guest pagetable (x86/64) stored in otherwise-unused CR1. */
+         if ( (ctx->pt_levels == 4) && (ctxt->x64.ctrlreg[1] & 1) )
+@@ -2208,16 +2210,16 @@ int xc_domain_restore(xc_interface *xch,
+     }
+ 
+     /* restore saved vcpu_info and arch specific info */
+-    MEMCPY_FIELD(new_shared_info, old_shared_info, vcpu_info);
+-    MEMCPY_FIELD(new_shared_info, old_shared_info, arch);
++    MEMCPY_FIELD(new_shared_info, old_shared_info, vcpu_info, dinfo->guest_width);
++    MEMCPY_FIELD(new_shared_info, old_shared_info, arch, dinfo->guest_width);
+ 
+     /* clear any pending events and the selector */
+-    MEMSET_ARRAY_FIELD(new_shared_info, evtchn_pending, 0);
++    MEMSET_ARRAY_FIELD(new_shared_info, evtchn_pending, 0, dinfo->guest_width);
+     for ( i = 0; i < XEN_LEGACY_MAX_VCPUS; i++ )
+-	    SET_FIELD(new_shared_info, vcpu_info[i].evtchn_pending_sel, 0);
++	    SET_FIELD(new_shared_info, vcpu_info[i].evtchn_pending_sel, 0, dinfo->guest_width);
+ 
+     /* mask event channels */
+-    MEMSET_ARRAY_FIELD(new_shared_info, evtchn_mask, 0xff);
++    MEMSET_ARRAY_FIELD(new_shared_info, evtchn_mask, 0xff, dinfo->guest_width);
+ 
+     /* leave wallclock time. set by hypervisor */
+     munmap(new_shared_info, PAGE_SIZE);
+diff -r ba2a37b8c34d tools/libxc/xc_domain_save.c
+--- a/tools/libxc/xc_domain_save.c
++++ b/tools/libxc/xc_domain_save.c
+@@ -387,12 +387,12 @@ static void *map_frame_list_list(xc_inte
+     int count = 100;
+     void *p;
+     struct domain_info_context *dinfo = &ctx->dinfo;
+-    uint64_t fll = GET_FIELD(shinfo, arch.pfn_to_mfn_frame_list_list);
++    uint64_t fll = GET_FIELD(shinfo, arch.pfn_to_mfn_frame_list_list, dinfo->guest_width);
+ 
+     while ( count-- && (fll == 0) )
+     {
+         usleep(10000);
+-        fll = GET_FIELD(shinfo, arch.pfn_to_mfn_frame_list_list);
++        fll = GET_FIELD(shinfo, arch.pfn_to_mfn_frame_list_list, dinfo->guest_width);
+     }
+ 
+     if ( fll == 0 )
+@@ -1895,13 +1895,13 @@ int xc_domain_save(xc_interface *xch, in
+      * reason==SHUTDOWN_suspend and is therefore found in the edx
+      * register.
+      */
+-    mfn = GET_FIELD(&ctxt, user_regs.edx);
++    mfn = GET_FIELD(&ctxt, user_regs.edx, dinfo->guest_width);
+     if ( !MFN_IS_IN_PSEUDOPHYS_MAP(mfn) )
+     {
+         ERROR("Suspend record is not in range of pseudophys map");
+         goto out;
+     }
+-    SET_FIELD(&ctxt, user_regs.edx, mfn_to_pfn(mfn));
++    SET_FIELD(&ctxt, user_regs.edx, mfn_to_pfn(mfn), dinfo->guest_width);
+ 
+     for ( i = 0; i <= info.max_vcpu_id; i++ )
+     {
+@@ -1915,26 +1915,28 @@ int xc_domain_save(xc_interface *xch, in
+         }
+ 
+         /* Canonicalise each GDT frame number. */
+-        for ( j = 0; (512*j) < GET_FIELD(&ctxt, gdt_ents); j++ )
++        for ( j = 0; (512*j) < GET_FIELD(&ctxt, gdt_ents, dinfo->guest_width); j++ )
+         {
+-            mfn = GET_FIELD(&ctxt, gdt_frames[j]);
++            mfn = GET_FIELD(&ctxt, gdt_frames[j], dinfo->guest_width);
+             if ( !MFN_IS_IN_PSEUDOPHYS_MAP(mfn) )
+             {
+                 ERROR("GDT frame is not in range of pseudophys map");
+                 goto out;
+             }
+-            SET_FIELD(&ctxt, gdt_frames[j], mfn_to_pfn(mfn));
++            SET_FIELD(&ctxt, gdt_frames[j], mfn_to_pfn(mfn), dinfo->guest_width);
+         }
+ 
+         /* Canonicalise the page table base pointer. */
+-        if ( !MFN_IS_IN_PSEUDOPHYS_MAP(UNFOLD_CR3(
+-                                           GET_FIELD(&ctxt, ctrlreg[3]))) )
++        if ( !MFN_IS_IN_PSEUDOPHYS_MAP(
++                 UNFOLD_CR3(GET_FIELD(&ctxt, ctrlreg[3], dinfo->guest_width))) )
+         {
+             ERROR("PT base is not in range of pseudophys map");
+             goto out;
+         }
+         SET_FIELD(&ctxt, ctrlreg[3], 
+-            FOLD_CR3(mfn_to_pfn(UNFOLD_CR3(GET_FIELD(&ctxt, ctrlreg[3])))));
++                  FOLD_CR3(mfn_to_pfn(UNFOLD_CR3(
++                                          GET_FIELD(&ctxt, ctrlreg[3], dinfo->guest_width)
++                                          ))), dinfo->guest_width);
+ 
+         /* Guest pagetable (x86/64) stored in otherwise-unused CR1. */
+         if ( (ctx->pt_levels == 4) && ctxt.x64.ctrlreg[1] )
+@@ -2042,7 +2044,7 @@ int xc_domain_save(xc_interface *xch, in
+      */
+     memcpy(page, live_shinfo, PAGE_SIZE);
+     SET_FIELD(((shared_info_any_t *)page), 
+-              arch.pfn_to_mfn_frame_list_list, 0);
++              arch.pfn_to_mfn_frame_list_list, 0, dinfo->guest_width);
+     if ( wrexact(io_fd, page, PAGE_SIZE) )
+     {
+         PERROR("Error when writing to state file (1)");
+diff -r ba2a37b8c34d tools/libxc/xc_resume.c
+--- a/tools/libxc/xc_resume.c
++++ b/tools/libxc/xc_resume.c
+@@ -74,7 +74,7 @@ static int modify_returncode(xc_interfac
+     if ( (rc = xc_vcpu_getcontext(xch, domid, 0, &ctxt)) != 0 )
+         return rc;
+ 
+-    SET_FIELD(&ctxt, user_regs.eax, 1);
++    SET_FIELD(&ctxt, user_regs.eax, 1, dinfo->guest_width);
+ 
+     if ( (rc = xc_vcpu_setcontext(xch, domid, 0, &ctxt)) != 0 )
+         return rc;
+@@ -202,7 +202,7 @@ static int xc_domain_resume_any(xc_inter
+         goto out;
+     }
+ 
+-    mfn = GET_FIELD(&ctxt, user_regs.edx);
++    mfn = GET_FIELD(&ctxt, user_regs.edx, dinfo->guest_width);
+ 
+     start_info = xc_map_foreign_range(xch, domid, PAGE_SIZE,
+                                       PROT_READ | PROT_WRITE, mfn);
+diff -r ba2a37b8c34d tools/libxc/xg_save_restore.h
+--- a/tools/libxc/xg_save_restore.h
++++ b/tools/libxc/xg_save_restore.h
+@@ -360,10 +360,10 @@ static inline int get_platform_info(xc_i
+ #define is_mapped(pfn_type) (!((pfn_type) & 0x80000000UL))
+ 
+ 
+-#define GET_FIELD(_p, _f) ((dinfo->guest_width==8) ? ((_p)->x64._f) : ((_p)->x32._f))
++#define GET_FIELD(_p, _f, _w) (((_w) == 8) ? ((_p)->x64._f) : ((_p)->x32._f))
+ 
+-#define SET_FIELD(_p, _f, _v) do {              \
+-    if (dinfo->guest_width == 8)                \
++#define SET_FIELD(_p, _f, _v, _w) do {          \
++    if ((_w) == 8)                              \
+         (_p)->x64._f = (_v);                    \
+     else                                        \
+         (_p)->x32._f = (_v);                    \
+@@ -379,15 +379,15 @@ static inline int get_platform_info(xc_i
+               ? ((uint64_t)(_c)) << 12                                  \
+               : (((uint32_t)(_c) << 12) | ((uint32_t)(_c) >> 20))))
+ 
+-#define MEMCPY_FIELD(_d, _s, _f) do {                              \
+-    if (dinfo->guest_width == 8)                                   \
++#define MEMCPY_FIELD(_d, _s, _f, _w) do {                          \
++    if ((_w) == 8)                                                 \
+         memcpy(&(_d)->x64._f, &(_s)->x64._f,sizeof((_d)->x64._f)); \
+     else                                                           \
+         memcpy(&(_d)->x32._f, &(_s)->x32._f,sizeof((_d)->x32._f)); \
+ } while (0)
+ 
+-#define MEMSET_ARRAY_FIELD(_p, _f, _v) do {                        \
+-    if (dinfo->guest_width == 8)                                   \
++#define MEMSET_ARRAY_FIELD(_p, _f, _v, _w) do {                    \
++    if ((_w) == 8)                                                 \
+         memset(&(_p)->x64._f[0], (_v), sizeof((_p)->x64._f));      \
+     else                                                           \
+         memset(&(_p)->x32._f[0], (_v), sizeof((_p)->x32._f));      \

@@ -1,24 +1,28 @@
-From db0a921ccb863a68c3961b2358b0728a27fc6377 Mon Sep 17 00:00:00 2001
+From 8b45af68016f9b1a604bee96a61416348972d462 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sun, 8 Jun 2014 03:05:40 +0100
-Subject: [PATCH 05/14] tools/libxc: noarch common code
+Subject: [PATCH 05/13] tools/libxc: noarch common code
 
 Add the context structure used to keep state during the save/restore
 process.
 
 Define the set of architecture or domain type specific operations with a
-set of callbacks (common_ops, save_ops, and restore_ops).
+set of callbacks (save_ops, and restore_ops).
 
 Add common functions for writing records.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
 ---
- tools/libxc/saverestore/common.c |   50 +++++++
- tools/libxc/saverestore/common.h |  269 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 319 insertions(+)
+v6:
+ * Use writev() instead of write()
+---
+ tools/libxc/saverestore/common.c |   42 ++++++
+ tools/libxc/saverestore/common.h |  273 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 315 insertions(+)
 
 diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
-index 70d874b..2c46fb7 100644
+index d9e47ef..9144c8b 100644
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
 @@ -1,3 +1,5 @@
@@ -27,17 +31,26 @@ index 70d874b..2c46fb7 100644
  #include "common.h"
  
  static const char *dhdr_types[] =
-@@ -53,6 +55,54 @@ const char *rec_type_to_str(uint32_t type)
+@@ -46,6 +48,46 @@ const char *rec_type_to_str(uint32_t type)
      return "Reserved";
  }
  
-+int write_split_record(struct context *ctx, struct record *rec,
++int write_split_record(struct xc_sr_context *ctx, struct xc_sr_record *rec,
 +                       void *buf, size_t sz)
 +{
-+    static const char zeroes[7] = { 0 };
++    static const char zeroes[(1u << REC_ALIGN_ORDER) - 1] = { 0 };
++
 +    xc_interface *xch = ctx->xch;
-+    uint32_t combined_length = rec->length + sz;
++    typeof(rec->length) combined_length = rec->length + sz;
 +    size_t record_length = ROUNDUP(combined_length, REC_ALIGN_ORDER);
++    struct iovec parts[] =
++    {
++        { &rec->type, sizeof(rec->type) },
++        { &combined_length, sizeof(combined_length) },
++        { rec->data, rec->length },
++        { buf, sz },
++        { (void*)zeroes, record_length - combined_length },
++    };
 +
 +    if ( record_length > REC_LENGTH_MAX )
 +    {
@@ -52,87 +65,42 @@ index 70d874b..2c46fb7 100644
 +    if ( sz )
 +        assert(buf);
 +
-+    if ( write_exact(ctx->fd, &rec->type, sizeof(rec->type)) ||
-+         write_exact(ctx->fd, &combined_length, sizeof(rec->length)) ||
-+         (rec->length && write_exact(ctx->fd, rec->data, rec->length)) ||
-+         (sz && write_exact(ctx->fd, buf, sz)) ||
-+         write_exact(ctx->fd, zeroes, record_length - combined_length) )
-+    {
-+        PERROR("Unable to write record to stream");
-+        return -1;
-+    }
++    if ( writev_exact(ctx->fd, parts, ARRAY_SIZE(parts)) )
++        goto err;
 +
 +    return 0;
-+}
 +
-+int write_record_header(struct context *ctx, struct record *rec)
-+{
-+    xc_interface *xch = ctx->xch;
-+
-+    if ( write_exact(ctx->fd, &rec->type, sizeof(rec->type)) ||
-+         write_exact(ctx->fd, &rec->length, sizeof(rec->length)) )
-+    {
-+        PERROR("Unable to write record to stream");
-+        return -1;
-+    }
-+
-+    return 0;
++ err:
++    PERROR("Unable to write record to stream");
++    return -1;
 +}
 +
  static void __attribute__((unused)) build_assertions(void)
  {
      XC_BUILD_BUG_ON(sizeof(struct xc_sr_ihdr) != 24);
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index cbecf0a..d9a3655 100644
+index cbecf0a..5021c15 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -1,7 +1,20 @@
+@@ -1,7 +1,12 @@
  #ifndef __COMMON__H
  #define __COMMON__H
  
 +#include <stdbool.h>
 +
-+// Hack out junk from the namespace
-+#define mfn_to_pfn __UNUSED_mfn_to_pfn
-+#define pfn_to_mfn __UNUSED_pfn_to_mfn
-+
  #include "../xg_private.h"
 +#include "../xg_save_restore.h"
 +#include "../xc_dom.h"
 +#include "../xc_bitops.h"
-+
-+#undef mfn_to_pfn
-+#undef pfn_to_mfn
-+
  
  #include "stream_format.h"
  
-@@ -11,6 +24,262 @@ const char *dhdr_type_to_str(uint32_t type);
+@@ -11,6 +16,274 @@ const char *dhdr_type_to_str(uint32_t type);
  /* String representation of Record types. */
  const char *rec_type_to_str(uint32_t type);
  
-+struct context;
-+struct record;
-+
-+/**
-+ * Guest common operations, to be implemented for each type of domain. Used by
-+ * both the save and restore code.
-+ */
-+struct common_ops
-+{
-+    /* Check to see whether a PFN is valid. */
-+    bool (*pfn_is_valid)(const struct context *ctx, xen_pfn_t pfn);
-+
-+    /* Convert a PFN to GFN.  May return ~0UL for an invalid mapping. */
-+    xen_pfn_t (*pfn_to_gfn)(const struct context *ctx, xen_pfn_t pfn);
-+
-+    /* Set the GFN of a PFN. */
-+    void (*set_gfn)(struct context *ctx, xen_pfn_t pfn, xen_pfn_t gfn);
-+
-+    /* Set the type of a PFN. */
-+    void (*set_page_type)(struct context *ctx, xen_pfn_t pfn, xen_pfn_t type);
-+};
-+
++struct xc_sr_context;
++struct xc_sr_record;
 +
 +/**
 + * Save operations.  To be implemented for each type of guest, for use by the
@@ -140,8 +108,11 @@ index cbecf0a..d9a3655 100644
 + *
 + * Every function must be implemented, even if only with a no-op stub.
 + */
-+struct save_ops
++struct xc_sr_save_ops
 +{
++    /* Convert a PFN to GFN.  May return ~0UL for an invalid mapping. */
++    xen_pfn_t (*pfn_to_gfn)(const struct xc_sr_context *ctx, xen_pfn_t pfn);
++
 +    /**
 +     * Optionally transform the contents of a page from being specific to the
 +     * sending environment, to being generic for the stream.
@@ -162,21 +133,22 @@ index cbecf0a..d9a3655 100644
 +     *
 +     * @returns 0 for success, -1 for failure, with errno appropriately set.
 +     */
-+    int (*normalise_page)(struct context *ctx, xen_pfn_t type, void **page);
++    int (*normalise_page)(struct xc_sr_context *ctx, xen_pfn_t type,
++                          void **page);
 +
 +    /**
 +     * Set up local environment to restore a domain.  This is called before
 +     * any records are written to the stream.  (Typically querying running
 +     * domain state, setting up mappings etc.)
 +     */
-+    int (*setup)(struct context *ctx);
++    int (*setup)(struct xc_sr_context *ctx);
 +
 +    /**
 +     * Write records which need to be at the start of the stream.  This is
 +     * called after the Image and Domain headers are written.  (Any records
 +     * which need to be ahead of the memory.)
 +     */
-+    int (*start_of_stream)(struct context *ctx);
++    int (*start_of_stream)(struct xc_sr_context *ctx);
 +
 +    /**
 +     * Write records which need to be at the end of the stream, following the
@@ -184,13 +156,13 @@ index cbecf0a..d9a3655 100644
 +     * record into the stream.  (Any records which need to be after the memory
 +     * is complete.)
 +     */
-+    int (*end_of_stream)(struct context *ctx);
++    int (*end_of_stream)(struct xc_sr_context *ctx);
 +
 +    /**
 +     * Clean up the local environment.  Will be called exactly once, either
 +     * after a successful save, or upon encountering an error.
 +     */
-+    int (*cleanup)(struct context *ctx);
++    int (*cleanup)(struct xc_sr_context *ctx);
 +};
 +
 +
@@ -200,8 +172,21 @@ index cbecf0a..d9a3655 100644
 + *
 + * Every function must be implemented, even if only with a no-op stub.
 + */
-+struct restore_ops
++struct xc_sr_restore_ops
 +{
++    /* Convert a PFN to GFN.  May return ~0UL for an invalid mapping. */
++    xen_pfn_t (*pfn_to_gfn)(const struct xc_sr_context *ctx, xen_pfn_t pfn);
++
++    /* Check to see whether a PFN is valid. */
++    bool (*pfn_is_valid)(const struct xc_sr_context *ctx, xen_pfn_t pfn);
++
++    /* Set the GFN of a PFN. */
++    void (*set_gfn)(struct xc_sr_context *ctx, xen_pfn_t pfn, xen_pfn_t gfn);
++
++    /* Set the type of a PFN. */
++    void (*set_page_type)(struct xc_sr_context *ctx, xen_pfn_t pfn,
++                          xen_pfn_t type);
++
 +    /**
 +     * Optionally transform the contents of a page from being generic in the
 +     * stream, to being specific to the restoring environment.
@@ -211,38 +196,39 @@ index cbecf0a..d9a3655 100644
 +     *
 +     * @returns 0 for success, -1 for failure, with errno appropriately set.
 +     */
-+    int (*localise_page)(struct context *ctx, uint32_t type, void *page);
++    int (*localise_page)(struct xc_sr_context *ctx, uint32_t type, void *page);
 +
 +    /**
 +     * Set up local environment to restore a domain.  This is called before
 +     * any records are read from the stream.
 +     */
-+    int (*setup)(struct context *ctx);
++    int (*setup)(struct xc_sr_context *ctx);
 +
 +    /**
 +     * Process an individual record from the stream.  The caller shall take
-+     * care of processing the END and PAGE_DATA records.
++     * care of processing common records (e.g. END, PAGE_DATA).
 +     *
-+     * Unknown mandatory records, or invalid records for the type of domain
-+     * should result in failure.
++     * @return 0 for success, -1 for failure, or the sentinal value
++     * RECORD_NOT_PROCESSED.
 +     */
-+    int (*process_record)(struct context *ctx, struct record *rec);
++#define RECORD_NOT_PROCESSED 1
++    int (*process_record)(struct xc_sr_context *ctx, struct xc_sr_record *rec);
 +
 +    /**
 +     * Perform any actions required after the stream has been finished. Called
 +     * after the END record has been received.
 +     */
-+    int (*stream_complete)(struct context *ctx);
++    int (*stream_complete)(struct xc_sr_context *ctx);
 +
 +    /**
 +     * Clean up the local environment.  Will be called exactly once, either
 +     * after a successful restore, or upon encountering an error.
 +     */
-+    int (*cleanup)(struct context *ctx);
++    int (*cleanup)(struct xc_sr_context *ctx);
 +};
 +
 +
-+struct context
++struct xc_sr_context
 +{
 +    xc_interface *xch;
 +    uint32_t domid;
@@ -250,19 +236,35 @@ index cbecf0a..d9a3655 100644
 +
 +    xc_dominfo_t dominfo;
 +
-+    struct common_ops ops;
-+
 +    union
 +    {
 +        struct
 +        {
-+            struct restore_ops ops;
++            struct xc_sr_save_ops ops;
++            struct save_callbacks *callbacks;
++
++            /* Live migrate vs nonlive suspend. */
++            bool live;
++
++            /* Further debugging information in the stream. */
++            bool debug;
++
++            unsigned long p2m_size;
++
++            xen_pfn_t *batch_pfns;
++            unsigned nr_batch_pfns;
++            unsigned long *deferred_pages;
++        } save;
++
++        struct
++        {
++            struct xc_sr_restore_ops ops;
 +            struct restore_callbacks *callbacks;
 +
-+            /* From Image Header */
++            /* From Image Header. */
 +            uint32_t format_version;
 +
-+            /* From Domain Header */
++            /* From Domain Header. */
 +            uint32_t guest_type;
 +            uint32_t guest_page_size;
 +
@@ -274,20 +276,11 @@ index cbecf0a..d9a3655 100644
 +
 +            /* Bitmap of currently populated PFNs during restore. */
 +            unsigned long *populated_pfns;
-+            unsigned int max_populated_pfn;
++            xen_pfn_t max_populated_pfn;
++
++            /* Sender has invoked verify mode on the stream. */
++            bool verify;
 +        } restore;
-+
-+        struct
-+        {
-+            struct save_ops ops;
-+            struct save_callbacks *callbacks;
-+
-+            unsigned long p2m_size;
-+
-+            xen_pfn_t *batch_pfns;
-+            unsigned nr_batch_pfns;
-+            unsigned long *deferred_pages;
-+        } save;
 +    };
 +
 +    union
@@ -328,19 +321,12 @@ index cbecf0a..d9a3655 100644
 +};
 +
 +
-+struct record
++struct xc_sr_record
 +{
 +    uint32_t type;
 +    uint32_t length;
 +    void *data;
 +};
-+
-+/*
-+ * Writes a record header into the stream.  The caller is responsible for
-+ * ensuring that they subseqently write the correct amount of data into the
-+ * stream, including appropriate padding.
-+ */
-+int write_record_header(struct context *ctx, struct record *rec);
 +
 +/*
 + * Writes a split record to the stream, applying correct padding where
@@ -353,7 +339,8 @@ index cbecf0a..d9a3655 100644
 + *
 + * Returns 0 on success and non0 on failure.
 + */
-+int write_split_record(struct context *ctx, struct record *rec, void *buf, size_t sz);
++int write_split_record(struct xc_sr_context *ctx, struct xc_sr_record *rec,
++                       void *buf, size_t sz);
 +
 +/*
 + * Writes a record to the stream, applying correct padding where appropriate.
@@ -362,10 +349,23 @@ index cbecf0a..d9a3655 100644
 + *
 + * Returns 0 on success and non0 on failure.
 + */
-+static inline int write_record(struct context *ctx, struct record *rec)
++static inline int write_record(struct xc_sr_context *ctx,
++                               struct xc_sr_record *rec)
 +{
 +    return write_split_record(ctx, rec, NULL, 0);
 +}
++
++/*
++ * Architecture specific function to write a SAVING_CPU record into the stream.
++ * May be stub.
++ */
++int arch_write_saving_cpu(struct xc_sr_context *ctx);
++
++/*
++ * Architecture specific function to handle a SAVING_CPU record from the stream.
++ * May be stub.
++ */
++int arch_handle_saving_cpu(struct xc_sr_context *ctx, struct xc_sr_record *rec);
 +
  #endif
  /*
