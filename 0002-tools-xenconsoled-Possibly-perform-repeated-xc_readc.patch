@@ -1,0 +1,64 @@
+From ecff57c772ce739d4d021cbd22483d0bc127e0af Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 22 Jul 2014 15:36:02 +0100
+Subject: [PATCH 2/3] tools/xenconsoled: Possibly perform repeated
+ xc_readconsolering() hypercalls
+
+The size of the Xen console ring is runtime configurable, so the statically
+sized 16k buffer is not necesserily sufficient.  Make repeated
+xc_readconsolering() hypercalls while Xen managed to completely fill the
+provided buffer.
+
+Also, change the buffer to being static to save on stack space.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+---
+ tools/console/daemon/io.c |   15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/tools/console/daemon/io.c b/tools/console/daemon/io.c
+index 313b256..b1268fa 100644
+--- a/tools/console/daemon/io.c
++++ b/tools/console/daemon/io.c
+@@ -909,17 +909,24 @@ static void handle_xs(void)
+ 
+ static void handle_hv_logs(xc_evtchn *xce_handle)
+ {
+-	char buffer[1024*16];
++	static char buffer[1024*16];
+ 	char *bufptr = buffer;
+-	unsigned int size = sizeof(buffer);
++	unsigned int size;
+ 	static uint32_t index = 0;
+ 	evtchn_port_or_error_t port;
+ 
+ 	if ((port = xc_evtchn_pending(xce_handle)) == -1)
+ 		return;
+ 
+-	if (xc_readconsolering(xc, bufptr, &size, 0, 1, &index) == 0 && size > 0) {
++	do
++	{
+ 		int logret;
++
++		size = sizeof(buffer);
++		if (xc_readconsolering(xc, bufptr, &size, 0, 1, &index) != 0 ||
++		    size == 0)
++			break;
++
+ 		if (log_time_hv)
+ 			logret = write_with_timestamp(log_hv_fd, buffer, size,
+ 						      &log_time_hv_needts);
+@@ -929,7 +936,7 @@ static void handle_hv_logs(xc_evtchn *xce_handle)
+ 		if (logret < 0)
+ 			dolog(LOG_ERR, "Failed to write hypervisor log: "
+ 				       "%d (%s)", errno, strerror(errno));
+-	}
++	} while (size == sizeof(buffer));
+ 
+ 	(void)xc_evtchn_unmask(xce_handle, port);
+ }
+-- 
+1.7.10.4
+

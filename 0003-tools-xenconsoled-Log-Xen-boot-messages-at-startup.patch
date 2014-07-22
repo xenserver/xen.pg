@@ -1,0 +1,73 @@
+From ed39881589f838a48c7aa253aaaeb5565eb7d8a2 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 22 Jul 2014 14:58:50 +0100
+Subject: [PATCH 3/3] tools/xenconsoled: Log Xen boot messages at startup.
+
+When xenconsoled starts, there will be log lines in the Xen console ring from
+boot, even though VIRQ_CON_RING is not yet pending.
+
+Add a force option to handle_hv_logs() which bypasses the event channel check,
+allowing xenconsoled to drain the Xen boot messages when it starts, rather
+than at the first subsequent time that VIRQ_CON_RING becomes set.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+---
+ tools/console/daemon/io.c |   13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/tools/console/daemon/io.c b/tools/console/daemon/io.c
+index b1268fa..ac08b5b 100644
+--- a/tools/console/daemon/io.c
++++ b/tools/console/daemon/io.c
+@@ -907,15 +907,15 @@ static void handle_xs(void)
+ 	free(vec);
+ }
+ 
+-static void handle_hv_logs(xc_evtchn *xce_handle)
++static void handle_hv_logs(xc_evtchn *xce_handle, bool force)
+ {
+ 	static char buffer[1024*16];
+ 	char *bufptr = buffer;
+ 	unsigned int size;
+ 	static uint32_t index = 0;
+-	evtchn_port_or_error_t port;
++	evtchn_port_or_error_t port = -1;
+ 
+-	if ((port = xc_evtchn_pending(xce_handle)) == -1)
++	if (!force && ((port = xc_evtchn_pending(xce_handle)) == -1))
+ 		return;
+ 
+ 	do
+@@ -938,7 +938,8 @@ static void handle_hv_logs(xc_evtchn *xce_handle)
+ 				       "%d (%s)", errno, strerror(errno));
+ 	} while (size == sizeof(buffer));
+ 
+-	(void)xc_evtchn_unmask(xce_handle, port);
++	if (port != -1)
++		(void)xc_evtchn_unmask(xce_handle, port);
+ }
+ 
+ static void handle_log_reload(void)
+@@ -1024,6 +1025,8 @@ void handle_io(void)
+ 			      "%d (%s)", errno, strerror(errno));
+ 			goto out;
+ 		}
++		/* Log the boot dmesg even if VIRQ_CON_RING isn't pending. */
++		handle_hv_logs(xce_handle, true);
+ 	}
+ 
+ 	xcg_handle = xc_gnttab_open(NULL, 0);
+@@ -1134,7 +1137,7 @@ void handle_io(void)
+ 				      errno, strerror(errno));
+ 				break;
+ 			} else if (fds[xce_pollfd_idx].revents & POLLIN)
+-				handle_hv_logs(xce_handle);
++				handle_hv_logs(xce_handle, false);
+ 
+ 			xce_pollfd_idx = -1;
+ 		}
+-- 
+1.7.10.4
+
