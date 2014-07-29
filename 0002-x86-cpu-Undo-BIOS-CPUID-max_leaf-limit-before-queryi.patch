@@ -1,0 +1,54 @@
+From 528318e523a48b849c7afbef28297a0f5d05e794 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 29 Jul 2014 13:41:56 +0100
+Subject: [PATCH 2/5] x86/cpu: Undo BIOS CPUID max_leaf limit before querying
+ for features.
+
+If IA32_MISC_ENABLE[22] is set by the BIOS, CPUID.0.EAX will be limited to 3.
+Lift this limit before considering whether to query CPUID.7[ECX=0].EBX for
+features.
+
+Without this change, dom0 is able to see this feature leaf (as the limit was
+subsequently lifted), and will set features appropriately in HVM domain cpuid
+policies.
+
+The specific bug XenServer observed was the advertisement of the FSGSBASE
+feature, but an inability to set CR4.FSGSBASE as Xen considered the bit to be
+reserved as cpu_has_fsgsbase incorrectly evaluated as false.
+
+This is a regression introduced by c/s 44e24f8567 "x86: don't call
+generic_identify() redundantly" where the redundant call actually resampled
+CPUID.7[ECX=0] properly to obtain the feature flags.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Jan Beulich <JBeulich@suse.com>
+
+---
+
+This fix should be backported as far as Xen 4.2
+---
+ xen/arch/x86/cpu/common.c |    5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff -r b23eae2b4abb xen/arch/x86/cpu/common.c
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -232,6 +232,9 @@ static void __cpuinit generic_identify(s
+ 			paddr_bits = cpuid_eax(0x80000008) & 0xff;
+ 	}
+ 
++	/* Might lift BIOS max_leaf=3 limit. */
++	early_intel_workaround(c);
++
+ 	/* Intel-defined flags: level 0x00000007 */
+ 	if ( c->cpuid_level >= 0x00000007 ) {
+ 		u32 dummy;
+@@ -239,8 +242,6 @@ static void __cpuinit generic_identify(s
+ 		c->x86_capability[X86_FEATURE_FSGSBASE / 32] = ebx;
+ 	}
+ 
+-	early_intel_workaround(c);
+-
+ #ifdef CONFIG_X86_HT
+ 	c->phys_proc_id = (cpuid_ebx(1) >> 24) & 0xff;
+ #endif
