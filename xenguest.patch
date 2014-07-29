@@ -1,7 +1,7 @@
 # HG changeset patch
-# Parent b43890427fd755a070726af278f7b03b13dacf25
+# Parent 85d18daf48c8e5aa815353fd4006bdac2679afaf
 
-diff -r b43890427fd7 .hgignore
+diff -r 85d18daf48c8 .hgignore
 --- a/.hgignore
 +++ b/.hgignore
 @@ -243,6 +243,7 @@
@@ -12,10 +12,10 @@ diff -r b43890427fd7 .hgignore
  ^tools/xcutils/lsevtchn$
  ^tools/xcutils/xc_restore$
  ^tools/xcutils/xc_save$
-diff -r b43890427fd7 mk/xen-4.4.spec.in
+diff -r 85d18daf48c8 mk/xen-4.4.spec.in
 --- a/mk/xen-4.4.spec.in
 +++ b/mk/xen-4.4.spec.in
-@@ -420,6 +420,7 @@ rm -rf $RPM_BUILD_ROOT
+@@ -427,6 +427,7 @@ rm -rf $RPM_BUILD_ROOT
  %{_libdir}/%{name}/bin/xc_save
  %{_libdir}/%{name}/bin/xenconsole
  %{_libdir}/%{name}/bin/xenctx
@@ -23,7 +23,7 @@ diff -r b43890427fd7 mk/xen-4.4.spec.in
  %{_libdir}/%{name}/bin/xenpaging
  %{_libdir}/%{name}/bin/xenpvnetboot
  
-diff -r b43890427fd7 tools/Makefile
+diff -r 85d18daf48c8 tools/Makefile
 --- a/tools/Makefile
 +++ b/tools/Makefile
 @@ -22,6 +22,7 @@ SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
@@ -34,7 +34,7 @@ diff -r b43890427fd7 tools/Makefile
  
  # do not recurse in to a dir we are about to delete
  ifneq "$(MAKECMDGOALS)" "distclean"
-diff -r b43890427fd7 tools/xenguest/Makefile
+diff -r 85d18daf48c8 tools/xenguest/Makefile
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,29 @@
@@ -67,7 +67,7 @@ diff -r b43890427fd7 tools/xenguest/Makefile
 +clean:
 +	$(RM) *.o $(ALL_TARGETS)
 +	$(RM) $(DEPS)
-diff -r b43890427fd7 tools/xenguest/xenguest.c
+diff -r 85d18daf48c8 tools/xenguest/xenguest.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
 @@ -0,0 +1,639 @@
@@ -710,10 +710,10 @@ diff -r b43890427fd7 tools/xenguest/xenguest.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r b43890427fd7 tools/xenguest/xenguest_stubs.c
+diff -r 85d18daf48c8 tools/xenguest/xenguest_stubs.c
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,670 @@
+@@ -0,0 +1,690 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1194,18 +1194,24 @@ diff -r b43890427fd7 tools/xenguest/xenguest_stubs.c
 +    static const char cmd_enable[] = "enable";
 +    static const char cmd_disable[] = "disable";
 +    const char *cmd = enable ? cmd_enable : cmd_disable;
++    struct timeval start, now;
++    uint64_t timeout_us = 15 * 1000 * 1000; /* 15 seconds, in microseconds. */
 +    bool rc = 0;
 +
 +    asprintf(&cmd_path, "/local/domain/0/device-model/%u/logdirty/cmd", data->domid);
 +    if ( !cmd_path )
 +    {
-+        err("Out of memory attempting to %s qemu logdirty\n", cmd);
++        err("Out of memory attempting to '%s' qemu logdirty\n", cmd);
++        errno = ENOMEM;
 +        return 1;
 +    }
 +
 +    if ( !xs_write(data->xsh, XBT_NULL, cmd_path, cmd, strlen(cmd)) )
 +    {
-+        err("Failed to write logdirty %s command to xenstore\n", cmd);
++        int saved_errno = errno;
++
++        err("Failed to write logdirty '%s' command to xenstore\n", cmd);
++        errno = saved_errno;
 +        return 1;
 +    }
 +
@@ -1214,15 +1220,18 @@ diff -r b43890427fd7 tools/xenguest/xenguest_stubs.c
 +    asprintf(&ret_path, "/local/domain/0/device-model/%u/logdirty/ret", data->domid);
 +    if ( !ret_path )
 +    {
-+        err("Out of memory attempting to %s qemu logdirty\n", cmd);
++        err("Out of memory attempting to '%s' qemu logdirty\n", cmd);
++        errno = ENOMEM;
 +        return 1;
 +    }
 +
-+    info("Waiting for qemu to confirm logdirty %s\n", cmd);
++    info("Waiting for qemu to confirm logdirty '%s'\n", cmd);
 +
++    gettimeofday(&start, NULL);
 +    do
 +    {
-+        usleep(100);
++        usleep(100000); /* Wait a short while for Qemu to reply. */
++
 +        reply = xs_read(data->xsh, XBT_NULL, ret_path, NULL);
 +
 +        if ( reply )
@@ -1230,11 +1239,22 @@ diff -r b43890427fd7 tools/xenguest/xenguest_stubs.c
 +            rc = strcmp(cmd, reply) == 0;
 +            free(reply);
 +        }
-+    } while ( !rc );
++
++        if ( !rc )
++            gettimeofday(&now, NULL);
++    } while ( !rc && (tv_delta_us(&now, &start) < timeout_us) );
 +
 +    free(ret_path);
 +
-+    return 0;
++    if ( !rc )
++    {
++        err("Timeout waiting for qemu to acknowledge logdirty '%s'\n", cmd);
++        errno = ETIMEDOUT;
++    }
++    else
++        info("  got reply\n");
++
++    return !rc;
 +}
 +
 +#define GENERATION_ID_ADDRESS "hvmloader/generation-id-address"
@@ -1384,12 +1404,15 @@ diff -r b43890427fd7 tools/xenguest/xenguest_stubs.c
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff -r b43890427fd7 tools/xenguest/xg_internal.h
+diff -r 85d18daf48c8 tools/xenguest/xg_internal.h
 --- /dev/null
 +++ b/tools/xenguest/xg_internal.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,70 @@
 +#ifndef __XG_INTERNAL_H__
 +#define __XG_INTERNAL_H__
++
++#include <inttypes.h>
++#include <sys/time.h>
 +
 +enum xenguest_mode {
 +    XG_MODE_SAVE,
@@ -1435,6 +1458,14 @@ diff -r b43890427fd7 tools/xenguest/xg_internal.h
 +void cleanup_legacy_conversion(void);
 +
 +extern char *xs_domain_path;
++
++/* Calcluate the difference between two timevals, in microseconds. */
++static inline uint64_t tv_delta_us(const struct timeval *new,
++                                   const struct timeval *old)
++{
++    return (((new->tv_sec - old->tv_sec)*1000000) +
++            (new->tv_usec - old->tv_usec));
++}
 +
 +#endif
 +
