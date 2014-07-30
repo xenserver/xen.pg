@@ -1,7 +1,7 @@
 Expose vcpus as multiple cores in a smaller number of sockets,
 by adjusting the cpuid responses appropriately.
 
-diff -r e8178487c3a8 tools/libxc/xc_domain.c
+diff -r 1f89ecf20229 tools/libxc/xc_domain.c
 --- a/tools/libxc/xc_domain.c
 +++ b/tools/libxc/xc_domain.c
 @@ -740,6 +740,20 @@ int xc_domain_get_tsc_info(xc_interface 
@@ -25,7 +25,7 @@ diff -r e8178487c3a8 tools/libxc/xc_domain.c
  int xc_domain_maximum_gpfn(xc_interface *xch, domid_t domid)
  {
      return do_memory_op(xch, XENMEM_maximum_gpfn, &domid, sizeof(domid));
-diff -r e8178487c3a8 tools/libxc/xenctrl.h
+diff -r 1f89ecf20229 tools/libxc/xenctrl.h
 --- a/tools/libxc/xenctrl.h
 +++ b/tools/libxc/xenctrl.h
 @@ -1239,6 +1239,10 @@ int xc_domain_get_tsc_info(xc_interface 
@@ -39,10 +39,10 @@ diff -r e8178487c3a8 tools/libxc/xenctrl.h
  int xc_domain_maximum_gpfn(xc_interface *xch, domid_t domid);
  
  int xc_domain_increase_reservation(xc_interface *xch,
-diff -r e8178487c3a8 xen/arch/x86/hvm/svm/svm.c
+diff -r 1f89ecf20229 xen/arch/x86/hvm/svm/svm.c
 --- a/xen/arch/x86/hvm/svm/svm.c
 +++ b/xen/arch/x86/hvm/svm/svm.c
-@@ -1374,14 +1374,34 @@ static void svm_cpuid_intercept(
+@@ -1374,14 +1374,52 @@ static void svm_cpuid_intercept(
  {
      unsigned int input = *eax;
      struct vcpu *v = current;
@@ -58,7 +58,16 @@ diff -r e8178487c3a8 xen/arch/x86/hvm/svm/svm.c
 +            *edx |= cpufeat_mask(X86_FEATURE_HT);
 +            /* fake out #vcpus and inform guest of #cores per package */
 +            *ebx &= 0xFF00FFFF;
-+            *ebx |= ((cps & 0xFF) << 16);
++            /*
++             * This (cps * 2) is wrong, and contrary to the statement in the
++             * AMD manual.  However, Xen unconditionally offers Intel-style
++             * APIC IDs (odd IDs for hyperthreads) which breaks the AMD APIC
++             * Enumeration Requirements.
++             *
++             * Fake up cores-per-socket as a socket with twice as many cores
++             * as expected, with every odd core offline.
++             */
++            *ebx |= (((cps * 2) & 0xFF) << 16);
 +        }
 +        break;
      case 0x80000001:
@@ -72,12 +81,21 @@ diff -r e8178487c3a8 xen/arch/x86/hvm/svm/svm.c
 +        if ( cps > 0 )
 +        {
 +            *ecx &= 0xFFFF0F00;
-+            *ecx |= (cps - 1) & 0xFF;
++            /*
++             * This (cps * 2) is wrong, and contrary to the statement in the
++             * AMD manual.  However, Xen unconditionally offers Intel-style
++             * APIC IDs (odd IDs for hyperthreads) which breaks the AMD APIC
++             * Enumeration Requirements.
++             *
++             * Fake up cores-per-socket as a socket with twice as many cores
++             * as expected, with every odd core offline.
++             */
++            *ecx |= ((cps * 2) - 1) & 0xFF;
 +        }
          break;
      case 0x8000001c: 
      {
-diff -r e8178487c3a8 xen/arch/x86/hvm/vmx/vmx.c
+diff -r 1f89ecf20229 xen/arch/x86/hvm/vmx/vmx.c
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
 @@ -1773,11 +1773,32 @@ static void vmx_cpuid_intercept(
@@ -113,10 +131,10 @@ diff -r e8178487c3a8 xen/arch/x86/hvm/vmx/vmx.c
          case 0x80000001:
              /* SYSCALL is visible iff running in long mode. */
              vmx_get_segment_register(v, x86_seg_cs, &cs);
-diff -r e8178487c3a8 xen/common/domctl.c
+diff -r 1f89ecf20229 xen/common/domctl.c
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -900,6 +900,44 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xe
+@@ -892,6 +892,44 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xe
          break;
      }
  
@@ -161,7 +179,7 @@ diff -r e8178487c3a8 xen/common/domctl.c
      default:
          ret = arch_do_domctl(op, d, u_domctl);
          break;
-diff -r e8178487c3a8 xen/include/public/domctl.h
+diff -r 1f89ecf20229 xen/include/public/domctl.h
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
 @@ -971,6 +971,12 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runst
@@ -193,10 +211,10 @@ diff -r e8178487c3a8 xen/include/public/domctl.h
          struct xen_domctl_gdbsx_memio       gdbsx_guest_memio;
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
-diff -r e8178487c3a8 xen/include/xen/sched.h
+diff -r 1f89ecf20229 xen/include/xen/sched.h
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -426,6 +426,8 @@ struct domain
+@@ -429,6 +429,8 @@ struct domain
      spinlock_t runstate_lock;
      atomic_t runstate_missed_changes;
      domain_runstate_info_t runstate;
