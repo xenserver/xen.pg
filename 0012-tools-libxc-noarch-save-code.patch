@@ -1,4 +1,4 @@
-From b285c35784581e22ba8794e255bb4cb8cb179823 Mon Sep 17 00:00:00 2001
+From 06269b8c632526fbc4733bbee7abf3e6f4aac39b Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sun, 8 Jun 2014 03:03:29 +0100
 Subject: [PATCH 12/13] tools/libxc: noarch save code
@@ -18,14 +18,14 @@ v6:
  * Introduce separate non-live suspend which avoids playing with logdirty.
  * Fix a bug which would clobber the penultimate logdirty bitmap.
 ---
- tools/libxc/saverestore/save.c |  683 +++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 682 insertions(+), 1 deletion(-)
+ tools/libxc/saverestore/save.c |  737 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 736 insertions(+), 1 deletion(-)
 
 diff --git a/tools/libxc/saverestore/save.c b/tools/libxc/saverestore/save.c
-index f6ad734..05947fe 100644
+index f6ad734..1517759 100644
 --- a/tools/libxc/saverestore/save.c
 +++ b/tools/libxc/saverestore/save.c
-@@ -1,11 +1,692 @@
+@@ -1,11 +1,746 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -141,7 +141,10 @@ index f6ad734..05947fe 100644
 +
 +        /* Likely a ballooned page. */
 +        if ( mfns[i] == INVALID_MFN )
++        {
 +            set_bit(ctx->save.batch_pfns[i], ctx->save.deferred_pages);
++            ++ctx->save.nr_deferred_pages;
++        }
 +    }
 +
 +    rc = xc_get_pfn_type_batch(xch, ctx->domid, nr_pfns, types);
@@ -200,6 +203,7 @@ index f6ad734..05947fe 100644
 +            if ( rc == -1 && errno == EAGAIN )
 +            {
 +                set_bit(ctx->save.batch_pfns[i], ctx->save.deferred_pages);
++                ++ctx->save.nr_deferred_pages;
 +                types[i] = XEN_DOMCTL_PFINFO_XTAB;
 +                --nr_pages;
 +            }
@@ -354,7 +358,7 @@ index f6ad734..05947fe 100644
 +        return -1;
 +    }
 +
-+    IPRINTF("Domain now paused");
++    xc_report_progress_single(xch, "Domain now suspended");
 +
 +    return 0;
 +}
@@ -365,6 +369,7 @@ index f6ad734..05947fe 100644
 + */
 +static int send_all_pages(struct xc_sr_context *ctx)
 +{
++    xc_interface *xch = ctx->xch;
 +    xen_pfn_t p;
 +    int rc;
 +
@@ -373,9 +378,78 @@ index f6ad734..05947fe 100644
 +        rc = add_to_batch(ctx, p);
 +        if ( rc )
 +            return rc;
++
++        /* Update progress every 4MB worth of memory sent. */
++        if ( (p & ((1U << (22 - 12)) - 1)) == 0 )
++            xc_report_progress_step(xch, p, ctx->save.p2m_size);
 +    }
 +
-+    return flush_batch(ctx);
++    rc = flush_batch(ctx);
++    if ( rc )
++        return rc;
++
++    xc_report_progress_step(xch, ctx->save.p2m_size,
++                            ctx->save.p2m_size);
++    return 0;
++}
++
++/*
++ * Send a subset of pages in the guests p2m, according to the provided bitmap.
++ * Used for each subsequent iteration of the live migration loop.
++ *
++ * Bitmap is bounded by p2m_size.
++ */
++static int send_some_pages(struct xc_sr_context *ctx,
++                           unsigned long *bitmap,
++                           unsigned long entries)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t p;
++    unsigned long written;
++    int rc;
++
++    for ( p = 0, written = 0; p < ctx->save.p2m_size; ++p )
++    {
++        if ( !test_bit(p, bitmap) )
++            continue;
++
++        rc = add_to_batch(ctx, p);
++        if ( rc )
++            return rc;
++
++        /* Update progress every 4MB worth of memory sent. */
++        if ( (written & ((1U << (22 - 12)) - 1)) == 0 )
++            xc_report_progress_step(xch, written, entries);
++
++        ++written;
++    }
++
++    rc = flush_batch(ctx);
++    if ( rc )
++        return rc;
++
++    if ( written > entries )
++        DPRINTF("Bitmap contained more entries than expected...");
++
++    xc_report_progress_step(xch, entries, entries);
++    return 0;
++}
++
++static int update_progress_string(struct xc_sr_context *ctx,
++                                  char **str, unsigned iter)
++{
++    xc_interface *xch = ctx->xch;
++
++    free(*str);
++    if ( asprintf(str, "Memory iteration %u of %u",
++                  iter, ctx->save.max_iterations) == -1 )
++    {
++        ERROR("Unable to allocate progress string");
++        return -1;
++    }
++
++    xc_report_progress_set(xch, *str);
++    return 0;
 +}
 +
 +/*
@@ -385,10 +459,9 @@ index f6ad734..05947fe 100644
 +{
 +    xc_interface *xch = ctx->xch;
 +    DECLARE_HYPERCALL_BUFFER(unsigned long, to_send);
-+    xc_shadow_op_stats_t stats = { -1, -1 };
-+    unsigned pages_written;
-+    unsigned x = 0, max_iter = 5, dirty_threshold = 50;
-+    xen_pfn_t p;
++    xc_shadow_op_stats_t stats = { 0, ctx->save.p2m_size };
++    char *progress_str = NULL;
++    unsigned x;
 +    int rc = -1;
 +
 +    to_send = xc_hypercall_buffer_alloc_pages(
@@ -403,7 +476,7 @@ index f6ad734..05947fe 100644
 +        goto out;
 +    }
 +
-+    /* This juggling is required if logdirty is already on, e.g. VRAM tracking */
++    /* This juggling is required if logdirty is enabled for VRAM tracking. */
 +    if ( xc_shadow_control(xch, ctx->domid,
 +                           XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
 +                           NULL, 0, NULL, 0, NULL) < 0 )
@@ -421,16 +494,18 @@ index f6ad734..05947fe 100644
 +        }
 +    }
 +
-+    DPRINTF("Iteration %u", x);
++    rc = update_progress_string(ctx, &progress_str, 0);
++    if ( rc )
++        goto out;
++
 +    rc = send_all_pages(ctx);
 +    if ( rc )
 +        goto out;
-+    pages_written = ctx->save.p2m_size - 1;
 +
-+    for ( x = 1; x < max_iter ; ++x )
++    for ( x = 1;
++          ((x < ctx->save.max_iterations) &&
++           (stats.dirty_count > ctx->save.dirty_threshold)); ++x )
 +    {
-+        DPRINTF("Iteration %u", x);
-+
 +        if ( xc_shadow_control(
 +                 xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
 +                 HYPERCALL_BUFFER(to_send), ctx->save.p2m_size,
@@ -440,28 +515,17 @@ index f6ad734..05947fe 100644
 +            rc = -1;
 +            goto out;
 +        }
-+        else
-+            DPRINTF("  Wrote %u pages; stats: faults %"PRIu32", dirty %"PRIu32,
-+                    pages_written, stats.fault_count, stats.dirty_count);
-+        pages_written = 0;
 +
-+        for ( p = 0 ; p < ctx->save.p2m_size; ++p )
-+        {
-+            if ( test_bit(p, to_send) )
-+            {
-+                rc = add_to_batch(ctx, p);
-+                if ( rc )
-+                    goto out;
-+                ++pages_written;
-+            }
-+        }
++        if ( stats.dirty_count == 0 )
++            break;
 +
-+        rc = flush_batch(ctx);
++        rc = update_progress_string(ctx, &progress_str, x);
 +        if ( rc )
 +            goto out;
 +
-+        if ( stats.dirty_count < dirty_threshold )
-+            break;
++        rc = send_some_pages(ctx, to_send, stats.dirty_count);
++        if ( rc )
++            goto out;
 +    }
 +
 +    rc = suspend_domain(ctx);
@@ -478,23 +542,16 @@ index f6ad734..05947fe 100644
 +        goto out;
 +    }
 +
-+    for ( p = 0, pages_written = 0 ; p < ctx->save.p2m_size; ++p )
-+    {
-+        if ( test_bit(p, to_send) || test_bit(p, ctx->save.deferred_pages) )
-+        {
-+            rc = add_to_batch(ctx, p);
-+            if ( rc )
-+                goto out;
-+            ++pages_written;
-+        }
-+    }
-+
-+    rc = flush_batch(ctx);
++    rc = update_progress_string(ctx, &progress_str, ctx->save.max_iterations);
 +    if ( rc )
 +        goto out;
 +
-+    DPRINTF("  Wrote %u pages", pages_written);
-+    IPRINTF("Sent all pages");
++    bitmap_or(to_send, ctx->save.deferred_pages, ctx->save.p2m_size);
++
++    rc = send_some_pages(ctx, to_send,
++                         stats.dirty_count + ctx->save.nr_deferred_pages);
++    if ( rc )
++        goto out;
 +
 +    if ( ctx->save.debug )
 +    {
@@ -510,11 +567,10 @@ index f6ad734..05947fe 100644
 +        if ( rc )
 +            goto out;
 +
++        xc_report_progress_set(xch, "Memory verify");
 +        rc = send_all_pages(ctx);
 +        if ( rc )
 +            goto out;
-+
-+        DPRINTF("  Wrote %lu verification pages", ctx->save.p2m_size - 1);
 +
 +        if ( xc_shadow_control(
 +                 xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_PEEK,
@@ -526,11 +582,13 @@ index f6ad734..05947fe 100644
 +            goto out;
 +        }
 +
-+        DPRINTF("  Further stats: faults %"PRIu32", dirty %"PRIu32,
++        DPRINTF("  Further stats: faults %u, dirty %u",
 +                stats.fault_count, stats.dirty_count);
 +    }
 +
 +  out:
++    xc_report_progress_set(xch, NULL);
++    free(progress_str);
 +    xc_hypercall_buffer_free_pages(xch, to_send,
 +                                   NRPAGES(bitmap_size(ctx->save.p2m_size)));
 +    free(ctx->save.deferred_pages);
@@ -562,11 +620,11 @@ index f6ad734..05947fe 100644
 +    if ( rc )
 +        goto err;
 +
++    xc_report_progress_set(xch, "Memory");
++
 +    rc = send_all_pages(ctx);
 +    if ( rc )
 +        goto err;
-+
-+    IPRINTF("Sent all %lu pages", ctx->save.p2m_size - 1);
 +
 + err:
 +    free(ctx->save.deferred_pages);
@@ -590,6 +648,8 @@ index f6ad734..05947fe 100644
 +    if ( rc )
 +        goto err;
 +
++    xc_report_progress_single(xch, "Start of stream");
++
 +    rc = write_headers(ctx, guest_type);
 +    if ( rc )
 +        goto err;
@@ -599,35 +659,22 @@ index f6ad734..05947fe 100644
 +        goto err;
 +
 +    if ( ctx->save.live )
-+    {
-+        DPRINTF("Starting live migrate");
 +        rc = send_domain_memory_live(ctx);
-+    }
 +    else
-+    {
-+        DPRINTF("Starting nonlive save");
 +        rc = send_domain_memory_nonlive(ctx);
-+    }
 +
 +    if ( rc )
 +        goto err;
 +
-+    /* Refresh domain information now it has paused. */
-+    if ( (xc_domain_getinfo(xch, ctx->domid, 1, &ctx->dominfo) != 1) ||
-+         (ctx->dominfo.domid != ctx->domid) )
-+    {
-+        PERROR("Unable to refresh domain information");
-+        rc = -1;
-+        goto err;
-+    }
-+    else if ( (!ctx->dominfo.shutdown ||
-+               ctx->dominfo.shutdown_reason != SHUTDOWN_suspend ) &&
-+              !ctx->dominfo.paused )
++    if ( !ctx->dominfo.shutdown ||
++         (ctx->dominfo.shutdown_reason != SHUTDOWN_suspend) )
 +    {
 +        ERROR("Domain has not been suspended");
 +        rc = -1;
 +        goto err;
 +    }
++
++    xc_report_progress_single(xch, "End of stream");
 +
 +    rc = ctx->save.ops.end_of_stream(ctx);
 +    if ( rc )
@@ -637,7 +684,7 @@ index f6ad734..05947fe 100644
 +    if ( rc )
 +        goto err;
 +
-+    IPRINTF("Save successful");
++    xc_report_progress_single(xch, "Complete");
 +    goto done;
 +
 + err:
@@ -677,11 +724,19 @@ index f6ad734..05947fe 100644
 +    ctx.save.live  = !!(flags & XCFLAGS_LIVE);
 +    ctx.save.debug = !!(flags & XCFLAGS_DEBUG);
 +
++    /*
++     * TODO: Find some time to better tweak the live migration algorithm.
++     *
++     * These parameters are better than the legacy algorithm especially for
++     * busy guests.
++     */
++    ctx.save.max_iterations = 5;
++    ctx.save.dirty_threshold = 50;
++
      IPRINTF("In experimental %s", __func__);
 -    return -1;
-+    DPRINTF("fd %d, dom %"PRIu32", max_iters %"PRIu32", max_factor %"PRIu32
-+            ", flags %"PRIu32", hvm %d", io_fd, dom, max_iters, max_factor,
-+            flags, hvm);
++    DPRINTF("fd %d, dom %u, max_iters %u, max_factor %u, flags %u, hvm %d",
++            io_fd, dom, max_iters, max_factor, flags, hvm);
 +
 +    if ( xc_domain_getinfo(xch, dom, 1, &ctx.dominfo) != 1 )
 +    {
@@ -691,12 +746,11 @@ index f6ad734..05947fe 100644
 +
 +    if ( ctx.dominfo.domid != dom )
 +    {
-+        ERROR("Domain %"PRIu32" does not exist", dom);
++        ERROR("Domain %u does not exist", dom);
 +        return -1;
 +    }
 +
 +    ctx.domid = dom;
-+    IPRINTF("Saving domain %"PRIu32, dom);
 +
 +    ctx.save.p2m_size = xc_domain_maximum_gpfn(xch, dom) + 1;
 +    if ( ctx.save.p2m_size > ~XEN_DOMCTL_PFINFO_LTAB_MASK )

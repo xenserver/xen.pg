@@ -1,4 +1,4 @@
-From 8b45af68016f9b1a604bee96a61416348972d462 Mon Sep 17 00:00:00 2001
+From 109c59cfb4d36b7c0e51d0b12b9210f585ebfe54 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sun, 8 Jun 2014 03:05:40 +0100
 Subject: [PATCH 05/13] tools/libxc: noarch common code
@@ -17,12 +17,12 @@ Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 v6:
  * Use writev() instead of write()
 ---
- tools/libxc/saverestore/common.c |   42 ++++++
- tools/libxc/saverestore/common.h |  273 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 315 insertions(+)
+ tools/libxc/saverestore/common.c |   41 +++++
+ tools/libxc/saverestore/common.h |  304 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 345 insertions(+)
 
 diff --git a/tools/libxc/saverestore/common.c b/tools/libxc/saverestore/common.c
-index d9e47ef..9144c8b 100644
+index d9e47ef..cacca17 100644
 --- a/tools/libxc/saverestore/common.c
 +++ b/tools/libxc/saverestore/common.c
 @@ -1,3 +1,5 @@
@@ -31,7 +31,7 @@ index d9e47ef..9144c8b 100644
  #include "common.h"
  
  static const char *dhdr_types[] =
-@@ -46,6 +48,46 @@ const char *rec_type_to_str(uint32_t type)
+@@ -46,6 +48,45 @@ const char *rec_type_to_str(uint32_t type)
      return "Reserved";
  }
  
@@ -54,8 +54,7 @@ index d9e47ef..9144c8b 100644
 +
 +    if ( record_length > REC_LENGTH_MAX )
 +    {
-+        ERROR("Record (0x%08"PRIx32", %s) length 0x%"PRIx32
-+              " exceeds max (0x%"PRIx32")", rec->type,
++        ERROR("Record (0x%08x, %s) length %#x exceeds max (%#x)", rec->type,
 +              rec_type_to_str(rec->type), rec->length, REC_LENGTH_MAX);
 +        return -1;
 +    }
@@ -79,7 +78,7 @@ index d9e47ef..9144c8b 100644
  {
      XC_BUILD_BUG_ON(sizeof(struct xc_sr_ihdr) != 24);
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index cbecf0a..5021c15 100644
+index cbecf0a..7c0f5b5 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
 @@ -1,7 +1,12 @@
@@ -95,7 +94,7 @@ index cbecf0a..5021c15 100644
  
  #include "stream_format.h"
  
-@@ -11,6 +16,274 @@ const char *dhdr_type_to_str(uint32_t type);
+@@ -11,6 +16,305 @@ const char *dhdr_type_to_str(uint32_t type);
  /* String representation of Record types. */
  const char *rec_type_to_str(uint32_t type);
  
@@ -227,6 +226,12 @@ index cbecf0a..5021c15 100644
 +    int (*cleanup)(struct xc_sr_context *ctx);
 +};
 +
++/* x86 PV per-vcpu storage structure for blobs heading Xen-wards. */
++struct xc_sr_x86_pv_restore_vcpu
++{
++    void *basic, *extd, *xsave, *msr;
++    size_t basicsz, extdsz, xsavesz, msrsz;
++};
 +
 +struct xc_sr_context
 +{
@@ -249,11 +254,16 @@ index cbecf0a..5021c15 100644
 +            /* Further debugging information in the stream. */
 +            bool debug;
 +
++            /* Parameters for tweaking live migration. */
++            unsigned max_iterations;
++            unsigned dirty_threshold;
++
 +            unsigned long p2m_size;
 +
 +            xen_pfn_t *batch_pfns;
 +            unsigned nr_batch_pfns;
 +            unsigned long *deferred_pages;
++            unsigned long nr_deferred_pages;
 +        } save;
 +
 +        struct
@@ -311,12 +321,44 @@ index cbecf0a..5021c15 100644
 +            void *p2m;
 +            /* The guest pfns containing the p2m leaves */
 +            xen_pfn_t *p2m_pfns;
-+            /* Types for each page */
-+            uint32_t *pfn_types;
 +
 +            /* Read-only mapping of guests shared info page */
 +            shared_info_any_t *shinfo;
++
++            union
++            {
++                struct
++                {
++                    /* State machine for the order of received records. */
++                    bool seen_pv_info;
++
++                    /* Types for each page (bounded by max_pfn). */
++                    uint32_t *pfn_types;
++
++                    /* Vcpu context blobs. */
++                    struct xc_sr_x86_pv_restore_vcpu *vcpus;
++                    unsigned nr_vcpus;
++                } restore;
++            };
 +        } x86_pv;
++
++        struct
++        {
++            union
++            {
++                struct
++                {
++                    /* Whether qemu enabled logdirty mode, and we should
++                     * disable on cleanup. */
++                    bool qemu_enabled_logdirty;
++
++                    /* HVM context blob. */
++                    void *context;
++                    size_t contextsz;
++
++                } restore;
++            };
++        } x86_hvm;
 +    };
 +};
 +
@@ -354,18 +396,6 @@ index cbecf0a..5021c15 100644
 +{
 +    return write_split_record(ctx, rec, NULL, 0);
 +}
-+
-+/*
-+ * Architecture specific function to write a SAVING_CPU record into the stream.
-+ * May be stub.
-+ */
-+int arch_write_saving_cpu(struct xc_sr_context *ctx);
-+
-+/*
-+ * Architecture specific function to handle a SAVING_CPU record from the stream.
-+ * May be stub.
-+ */
-+int arch_handle_saving_cpu(struct xc_sr_context *ctx, struct xc_sr_record *rec);
 +
  #endif
  /*

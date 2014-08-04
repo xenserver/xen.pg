@@ -1,4 +1,4 @@
-From 43556041ddfd24fb7a6f1f37f88f85151922e96b Mon Sep 17 00:00:00 2001
+From f4ccc7e947b36a30319484d968241f1833d94aab Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:32:07 +0100
 Subject: [PATCH 06/13] tools/libxc: x86 common code
@@ -10,76 +10,19 @@ This is only the TSC_INFO record.
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Acked-by: Ian Campbell <ian.campbell@citrix.com>
 ---
- tools/libxc/saverestore/common.h     |   12 ---
- tools/libxc/saverestore/common_x86.c |  133 ++++++++++++++++++++++++++++++++++
- tools/libxc/saverestore/common_x86.h |   26 +++++++
- 3 files changed, 159 insertions(+), 12 deletions(-)
+ tools/libxc/saverestore/common_x86.c |   54 ++++++++++++++++++++++++++++++++++
+ tools/libxc/saverestore/common_x86.h |   26 ++++++++++++++++
+ 2 files changed, 80 insertions(+)
  create mode 100644 tools/libxc/saverestore/common_x86.c
  create mode 100644 tools/libxc/saverestore/common_x86.h
 
-diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index 5021c15..af0a41f 100644
---- a/tools/libxc/saverestore/common.h
-+++ b/tools/libxc/saverestore/common.h
-@@ -272,18 +272,6 @@ static inline int write_record(struct xc_sr_context *ctx,
-     return write_split_record(ctx, rec, NULL, 0);
- }
- 
--/*
-- * Architecture specific function to write a SAVING_CPU record into the stream.
-- * May be stub.
-- */
--int arch_write_saving_cpu(struct xc_sr_context *ctx);
--
--/*
-- * Architecture specific function to handle a SAVING_CPU record from the stream.
-- * May be stub.
-- */
--int arch_handle_saving_cpu(struct xc_sr_context *ctx, struct xc_sr_record *rec);
--
- #endif
- /*
-  * Local variables:
 diff --git a/tools/libxc/saverestore/common_x86.c b/tools/libxc/saverestore/common_x86.c
 new file mode 100644
-index 0000000..b64b291
+index 0000000..d76c11f
 --- /dev/null
 +++ b/tools/libxc/saverestore/common_x86.c
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,54 @@
 +#include "common_x86.h"
-+
-+static void cpuid_count(uint32_t leaf, uint32_t subleaf,
-+                        uint32_t *eax, uint32_t *ebx,
-+                        uint32_t *ecx, uint32_t *edx)
-+{
-+    asm volatile ("cpuid"
-+                  : "=a" (*eax), "=b" (*ebx), "=c" (*ecx), "=d" (*edx)
-+                  : "a" (leaf), "c" (subleaf));
-+}
-+
-+static void cpuid(uint32_t leaf,
-+                  uint32_t *eax, uint32_t *ebx,
-+                  uint32_t *ecx, uint32_t *edx)
-+{
-+    cpuid_count(leaf, 0, eax, ebx, ecx, edx);
-+}
-+
-+static int get_processor_brand_string(char *str)
-+{
-+    uint32_t *parts = (uint32_t*)str;
-+    uint32_t max_extd_leaf, dummy;
-+
-+    cpuid(0x80000000, &max_extd_leaf, &dummy, &dummy, &dummy);
-+
-+    if ( max_extd_leaf < 0x80000004 )
-+        return -1;
-+
-+    cpuid(0x80000002, &parts[0], &parts[1], &parts[2],  &parts[3]);
-+    cpuid(0x80000003, &parts[4], &parts[5], &parts[6],  &parts[7]);
-+    cpuid(0x80000004, &parts[8], &parts[9], &parts[10], &parts[11]);
-+
-+    return 0;
-+}
 +
 +int write_tsc_info(struct xc_sr_context *ctx)
 +{
@@ -109,7 +52,7 @@ index 0000000..b64b291
 +
 +    if ( rec->length != sizeof(*tsc) )
 +    {
-+        ERROR("TSC_INFO record wrong size: length %"PRIu32", expected %zu",
++        ERROR("TSC_INFO record wrong size: length %u, expected %zu",
 +              rec->length, sizeof(*tsc));
 +        return -1;
 +    }
@@ -119,52 +62,6 @@ index 0000000..b64b291
 +    {
 +        PERROR("Unable to set TSC information");
 +        return -1;
-+    }
-+
-+    return 0;
-+}
-+
-+int arch_write_saving_cpu(struct xc_sr_context *ctx)
-+{
-+    xc_interface *xch = ctx->xch;
-+    char *brand_string = alloca(49); /* 48 from cpuid, and NUL. */
-+    struct xc_sr_record rec;
-+
-+    if ( get_processor_brand_string(brand_string) )
-+    {
-+        ERROR("Failed to obtain cpuid long processor brand string");
-+        return -1;
-+    }
-+
-+    brand_string[48] = '\0';
-+    while ( *brand_string == ' ' ) /* Strip leading spaces. */
-+        brand_string++;
-+
-+    rec.type = REC_TYPE_SAVING_CPU;
-+    rec.length = strlen(brand_string);
-+    rec.data = brand_string;
-+
-+    return write_record(ctx, &rec);
-+}
-+
-+int arch_handle_saving_cpu(struct xc_sr_context *ctx, struct xc_sr_record *rec)
-+{
-+    xc_interface *xch = ctx->xch;
-+    char *brand_string = alloca(49); /* 48 from cpuid, and NUL. */
-+
-+    if ( rec->length == 0 )
-+        return 0;
-+
-+    DPRINTF("Saving cpu was '%*s'",
-+            (int)rec->length, (char*)rec->data);
-+
-+    if ( !get_processor_brand_string(brand_string) )
-+    {
-+        brand_string[48] = '\0';
-+        while ( *brand_string == ' ' ) /* Strip leading spaces. */
-+            brand_string++;
-+
-+        DPRINTF("Current cpu is '%s'", brand_string);
 +    }
 +
 +    return 0;

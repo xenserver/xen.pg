@@ -1,4 +1,4 @@
-From 320507f9d98619d94721cc71acda0210fe86f81c Mon Sep 17 00:00:00 2001
+From d5f40da6273404149813dd487958abf5f453026d Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:02 +0100
 Subject: [PATCH 08/13] tools/libxc: x86 PV save code
@@ -18,15 +18,15 @@ v6:
  * Type-change failures are not fatal if live.
 ---
  tools/libxc/saverestore/common.h      |    1 +
- tools/libxc/saverestore/save_x86_pv.c |  873 +++++++++++++++++++++++++++++++++
- 2 files changed, 874 insertions(+)
+ tools/libxc/saverestore/save_x86_pv.c |  850 +++++++++++++++++++++++++++++++++
+ 2 files changed, 851 insertions(+)
  create mode 100644 tools/libxc/saverestore/save_x86_pv.c
 
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index af0a41f..abcbe70 100644
+index 7c0f5b5..7e1198e 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -237,6 +237,7 @@ struct xc_sr_context
+@@ -280,6 +280,7 @@ struct xc_sr_context
      };
  };
  
@@ -36,10 +36,10 @@ index af0a41f..abcbe70 100644
  {
 diff --git a/tools/libxc/saverestore/save_x86_pv.c b/tools/libxc/saverestore/save_x86_pv.c
 new file mode 100644
-index 0000000..1de065d
+index 0000000..288ec64
 --- /dev/null
 +++ b/tools/libxc/saverestore/save_x86_pv.c
-@@ -0,0 +1,873 @@
+@@ -0,0 +1,850 @@
 +#include <assert.h>
 +#include <limits.h>
 +
@@ -329,13 +329,7 @@ index 0000000..1de065d
 +    else
 +        rc = write_split_record(ctx, &rec, &vcpu, sizeof(vcpu.x32));
 +
-+    if ( rc )
-+        goto err;
-+
-+    DPRINTF("Writing vcpu%u basic context", id);
-+    rc = 0;
 + err:
-+
 +    return rc;
 +}
 +
@@ -346,7 +340,6 @@ index 0000000..1de065d
 +static int write_one_vcpu_extended(struct xc_sr_context *ctx, uint32_t id)
 +{
 +    xc_interface *xch = ctx->xch;
-+    int rc;
 +    struct xc_sr_rec_x86_pv_vcpu_hdr vhdr =
 +    {
 +        .vcpu_id = id,
@@ -370,14 +363,8 @@ index 0000000..1de065d
 +        return -1;
 +    }
 +
-+    rc = write_split_record(ctx, &rec, &domctl.u.ext_vcpucontext,
-+                            domctl.u.ext_vcpucontext.size);
-+    if ( rc )
-+        return rc;
-+
-+    DPRINTF("Writing vcpu%u extended context", id);
-+
-+    return 0;
++    return write_split_record(ctx, &rec, &domctl.u.ext_vcpucontext,
++                              domctl.u.ext_vcpucontext.size);
 +}
 +
 +/*
@@ -412,17 +399,15 @@ index 0000000..1de065d
 +        goto err;
 +    }
 +
++    /* No xsave state? skip this record. */
 +    if ( !domctl.u.vcpuextstate.xfeature_mask )
-+    {
-+        DPRINTF("vcpu%u has no xsave context - skipping", id);
 +        goto out;
-+    }
 +
 +    buffer = xc_hypercall_buffer_alloc(xch, buffer, domctl.u.vcpuextstate.size);
 +    if ( !buffer )
 +    {
-+        ERROR("Unable to allocate %"PRIx64" bytes for vcpu%"PRIu32
-+              "'s xsave context", domctl.u.vcpuextstate.size, id);
++        ERROR("Unable to allocate %"PRIx64" bytes for vcpu%u's xsave context",
++              domctl.u.vcpuextstate.size, id);
 +        goto err;
 +    }
 +
@@ -436,8 +421,6 @@ index 0000000..1de065d
 +    rc = write_split_record(ctx, &rec, buffer, domctl.u.vcpuextstate.size);
 +    if ( rc )
 +        goto err;
-+
-+    DPRINTF("Writing vcpu%u xsave context", id);
 +
 + out:
 +    rc = 0;
@@ -481,11 +464,9 @@ index 0000000..1de065d
 +        goto err;
 +    }
 +
++    /* No MSRs? skip this record. */
 +    if ( !domctl.u.vcpu_msrs.msr_count )
-+    {
-+        DPRINTF("vcpu%u has no msrs - skipping", id);
 +        goto out;
-+    }
 +
 +    buffersz = domctl.u.vcpu_msrs.msr_count * sizeof(xen_domctl_vcpu_msr_t);
 +    buffer = xc_hypercall_buffer_alloc(xch, buffer, buffersz);
@@ -508,8 +489,6 @@ index 0000000..1de065d
 +                            sizeof(xen_domctl_vcpu_msr_t));
 +    if ( rc )
 +        goto err;
-+
-+    DPRINTF("Writing vcpu%u msrs", id);
 +
 + out:
 +    rc = 0;
@@ -539,11 +518,9 @@ index 0000000..1de065d
 +            return rc;
 +        }
 +
++        /* Vcpu offline? skip all these records. */
 +        if ( !vinfo.online )
-+        {
-+            DPRINTF("vcpu%u offline - skipping", i);
 +            continue;
-+        }
 +
 +        rc = write_one_vcpu_basic(ctx, i);
 +        if ( rc )
@@ -560,7 +537,7 @@ index 0000000..1de065d
 +        rc = write_one_vcpu_msrs(ctx, i);
 +        if ( rc )
 +            return rc;
-+    };
++    }
 +
 +    return 0;
 +}

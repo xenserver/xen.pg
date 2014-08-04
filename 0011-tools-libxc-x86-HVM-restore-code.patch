@@ -1,4 +1,4 @@
-From 89db92d73e25cb358be22da17943d383c5f3b4d7 Mon Sep 17 00:00:00 2001
+From 4bc2a9dd2df8d70094e73ec927c7b52fc1010f72 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:51 +0100
 Subject: [PATCH 11/13] tools/libxc: x86 HVM restore code
@@ -15,15 +15,15 @@ proper in the future.
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 ---
  tools/libxc/saverestore/common.h          |    1 +
- tools/libxc/saverestore/restore_x86_hvm.c |  336 +++++++++++++++++++++++++++++
- 2 files changed, 337 insertions(+)
+ tools/libxc/saverestore/restore_x86_hvm.c |  355 +++++++++++++++++++++++++++++
+ 2 files changed, 356 insertions(+)
  create mode 100644 tools/libxc/saverestore/restore_x86_hvm.c
 
 diff --git a/tools/libxc/saverestore/common.h b/tools/libxc/saverestore/common.h
-index 95642bd..34850e1 100644
+index 675fc66..3c6b62e 100644
 --- a/tools/libxc/saverestore/common.h
 +++ b/tools/libxc/saverestore/common.h
-@@ -241,6 +241,7 @@ extern struct xc_sr_save_ops save_ops_x86_pv;
+@@ -284,6 +284,7 @@ extern struct xc_sr_save_ops save_ops_x86_pv;
  extern struct xc_sr_save_ops save_ops_x86_hvm;
  
  extern struct xc_sr_restore_ops restore_ops_x86_pv;
@@ -33,10 +33,10 @@ index 95642bd..34850e1 100644
  {
 diff --git a/tools/libxc/saverestore/restore_x86_hvm.c b/tools/libxc/saverestore/restore_x86_hvm.c
 new file mode 100644
-index 0000000..0004dee
+index 0000000..c65f9ac
 --- /dev/null
 +++ b/tools/libxc/saverestore/restore_x86_hvm.c
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,355 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -64,12 +64,21 @@ index 0000000..0004dee
 +static int handle_hvm_context(struct xc_sr_context *ctx, struct xc_sr_record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
-+    int rc;
++    void *p;
 +
-+    rc = xc_domain_hvm_setcontext(xch, ctx->domid, rec->data, rec->length);
-+    if ( rc < 0 )
-+        PERROR("Unable to restore HVM context");
-+    return rc;
++    p = malloc(rec->length);
++    if ( !p )
++    {
++        ERROR("Unable to allocate %u bytes for hvm context", rec->length);
++        return -1;
++    }
++
++    free(ctx->x86_hvm.restore.context);
++
++    ctx->x86_hvm.restore.context = memcpy(p, rec->data, rec->length);
++    ctx->x86_hvm.restore.contextsz = rec->length;
++
++    return 0;
 +}
 +
 +/*
@@ -320,6 +329,15 @@ index 0000000..0004dee
 +        return rc;
 +    }
 +
++    rc = xc_domain_hvm_setcontext(xch, ctx->domid,
++                                  ctx->x86_hvm.restore.context,
++                                  ctx->x86_hvm.restore.contextsz);
++    if ( rc < 0 )
++    {
++        PERROR("Unable to restore HVM context");
++        return rc;
++    }
++
 +    rc = xc_dom_gnttab_hvm_seed(xch, ctx->domid,
 +                                ctx->restore.console_mfn,
 +                                ctx->restore.xenstore_mfn,
@@ -347,7 +365,8 @@ index 0000000..0004dee
 +
 +static int x86_hvm_cleanup(struct xc_sr_context *ctx)
 +{
-+    /* no-op */
++    free(ctx->x86_hvm.restore.context);
++
 +    return 0;
 +}
 +
