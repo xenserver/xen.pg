@@ -1,27 +1,23 @@
 # HG changeset patch
-# Parent e2cf1e986a4c903e5995de9a60bbba6029f526b7
+# Parent ec529a1d9fd0d0bf03db9be21c23b2700ad51fbb
 CA-49885: Restrict Intel Nehalem and Westmere class processors to a maximum
 c-state level of 1 to workaround various Intel errata assoicated with these
 processors.
 
-diff -r e2cf1e986a4c xen/arch/x86/acpi/cpu_idle.c
---- a/xen/arch/x86/acpi/cpu_idle.c
-+++ b/xen/arch/x86/acpi/cpu_idle.c
-@@ -885,6 +885,41 @@ static int check_cx(struct acpi_processo
- static unsigned int latency_factor = 2;
- integer_param("idle_latency_factor", latency_factor);
+diff -r ec529a1d9fd0 xen/arch/x86/cpu/intel.c
+--- a/xen/arch/x86/cpu/intel.c
++++ b/xen/arch/x86/cpu/intel.c
+@@ -146,6 +146,38 @@ void __devinit early_intel_workaround(st
+ }
  
-+/*
+ /*
 + * Detect Intel Nehalem CPU's with C-states enabled and restrict to C1 due to
 + * Intel Errata BA80, AAK120, AAM108, AAO67, BD59, AAY54
 + */
-+void nehalem_cpu_cstate_workaround(struct acpi_processor_cx *cx)
++static void __devinit nehalem_cpu_cstate_workaround(struct cpuinfo_x86 *c)
 +{
 +    static bool_t nehalem_cstate_errata_workaround_warning = 0;
-+    struct cpuinfo_x86 *c = &current_cpu_data;
 +
-+    if ( cx->entry_method == ACPI_CSTATE_EM_NONE )
-+	    return;
 +    if ( c->x86_vendor == X86_VENDOR_INTEL && c->x86 == 6 )
 +    {
 +        switch ( c->x86_model )
@@ -46,14 +42,27 @@ diff -r e2cf1e986a4c xen/arch/x86/acpi/cpu_idle.c
 +    }
 +}
 +
- static void set_cx(
-     struct acpi_processor_power *acpi_power,
-     xen_processor_cx_t *xen_cx)
-@@ -940,6 +975,8 @@ static void set_cx(
-         break;
-     }
- 
-+    nehalem_cpu_cstate_workaround(cx);
++/*
+  * P4 Xeon errata 037 workaround.
+  * Hardware prefetcher may cause stale data to be loaded into the cache.
+  *
+@@ -169,9 +201,10 @@ static void __devinit Intel_errata_worka
+ 	if (c->x86 == 6 && cpu_has_clflush &&
+ 	    (c->x86_model == 29 || c->x86_model == 46 || c->x86_model == 47))
+ 		set_bit(X86_FEATURE_CLFLUSH_MONITOR, c->x86_capability);
 +
-     cx->latency = xen_cx->latency;
-     cx->target_residency = cx->latency * latency_factor;
++	nehalem_cpu_cstate_workaround(c);
+ }
+ 
+-
+ /*
+  * find out the number of processor cores on the die
+  */
+@@ -190,6 +223,7 @@ static int __devinit num_cpu_cores(struc
+ 		return 1;
+ }
+ 
++
+ static void __devinit init_intel(struct cpuinfo_x86 *c)
+ {
+ 	unsigned int l2 = 0;
