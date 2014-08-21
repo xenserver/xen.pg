@@ -1,0 +1,196 @@
+# HG changeset patch
+# User Jan Beulich <jbeulich@suse.com>
+# Date 1407762015 -7200
+# Node ID f6625588f42bb91cb5049ba1039b430b3d7f61f4
+# Parent 21437df0a731f9bfcb02e809c2d16e2a9176b8a6
+x86/vHPET: use rwlock instead of simple one
+
+This namely benefits guests heavily reading the main counter, but not
+touching the HPET much otherwise. Note that due to the way
+hpet_get_comparator() works hpet_read() has to special cases reads from
+the comparator registers and use a write lock there instead of the read
+one used for all other registers.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 21437df0a731 xen/arch/x86/hvm/hpet.c
+--- a/xen/arch/x86/hvm/hpet.c
++++ b/xen/arch/x86/hvm/hpet.c
+@@ -75,7 +75,7 @@
+ 
+ static inline uint64_t hpet_read_maincounter(HPETState *h)
+ {
+-    ASSERT(spin_is_locked(&h->lock));
++    ASSERT(rw_is_locked(&h->lock));
+ 
+     if ( hpet_enabled(h) )
+         return guest_time_hpet(h) + h->mc_offset;
+@@ -88,6 +88,8 @@ static uint64_t hpet_get_comparator(HPET
+     uint64_t comparator;
+     uint64_t elapsed;
+ 
++    ASSERT(rw_is_write_locked(&h->lock));
++
+     comparator = h->hpet.comparator64[tn];
+     if ( timer_is_periodic(h, tn) )
+     {
+@@ -172,16 +174,24 @@ static int hpet_read(
+         goto out;
+     }
+ 
+-    spin_lock(&h->lock);
++    result = addr < HPET_Tn_CMP(0) ||
++             ((addr - HPET_Tn_CMP(0)) % (HPET_Tn_CMP(1) - HPET_Tn_CMP(0))) > 7;
++    if ( result )
++        read_lock(&h->lock);
++    else
++        write_lock(&h->lock);
+ 
+     val = hpet_read64(h, addr);
+ 
++    if ( result )
++        read_unlock(&h->lock);
++    else
++        write_unlock(&h->lock);
++
+     result = val;
+     if ( length != 8 )
+         result = (val >> ((addr & 7) * 8)) & ((1ULL << (length * 8)) - 1);
+ 
+-    spin_unlock(&h->lock);
+-
+  out:
+     *pval = result;
+     return X86EMUL_OKAY;
+@@ -190,7 +200,7 @@ static int hpet_read(
+ static void hpet_stop_timer(HPETState *h, unsigned int tn)
+ {
+     ASSERT(tn < HPET_TIMER_NUM);
+-    ASSERT(spin_is_locked(&h->lock));
++    ASSERT(rw_is_write_locked(&h->lock));
+     destroy_periodic_time(&h->pt[tn]);
+     /* read the comparator to get it updated so a read while stopped will
+      * return the expected value. */
+@@ -208,7 +218,7 @@ static void hpet_set_timer(HPETState *h,
+     unsigned int oneshot;
+ 
+     ASSERT(tn < HPET_TIMER_NUM);
+-    ASSERT(spin_is_locked(&h->lock));
++    ASSERT(rw_is_write_locked(&h->lock));
+ 
+     if ( (tn == 0) && (h->hpet.config & HPET_CFG_LEGACY) )
+     {
+@@ -289,7 +299,7 @@ static int hpet_write(
+     if ( hpet_check_access_length(addr, length) != 0 )
+         goto out;
+ 
+-    spin_lock(&h->lock);
++    write_lock(&h->lock);
+ 
+     old_val = hpet_read64(h, addr);
+     new_val = val;
+@@ -448,7 +458,7 @@ static int hpet_write(
+ #undef set_start_timer
+ #undef set_restart_timer
+ 
+-    spin_unlock(&h->lock);
++    write_unlock(&h->lock);
+ 
+  out:
+     return X86EMUL_OKAY;
+@@ -473,7 +483,7 @@ static int hpet_save(struct domain *d, h
+     HPETState *hp = domain_vhpet(d);
+     int rc;
+ 
+-    spin_lock(&hp->lock);
++    write_lock(&hp->lock);
+ 
+     /* Write the proper value into the main counter */
+     hp->hpet.mc64 = hp->mc_offset + guest_time_hpet(hp);
+@@ -507,7 +517,7 @@ static int hpet_save(struct domain *d, h
+         rec->timers[2].cmp = hp->hpet.comparator64[2];
+     }
+ 
+-    spin_unlock(&hp->lock);
++    write_unlock(&hp->lock);
+ 
+     return rc;
+ }
+@@ -519,12 +529,12 @@ static int hpet_load(struct domain *d, h
+     uint64_t cmp;
+     int i;
+ 
+-    spin_lock(&hp->lock);
++    write_lock(&hp->lock);
+ 
+     /* Reload the HPET registers */
+     if ( _hvm_check_entry(h, HVM_SAVE_CODE(HPET), HVM_SAVE_LENGTH(HPET), 1) )
+     {
+-        spin_unlock(&hp->lock);
++        write_unlock(&hp->lock);
+         return -EINVAL;
+     }
+ 
+@@ -564,7 +574,7 @@ static int hpet_load(struct domain *d, h
+             if ( timer_enabled(hp, i) )
+                 hpet_set_timer(hp, i);
+ 
+-    spin_unlock(&hp->lock);
++    write_unlock(&hp->lock);
+ 
+     return 0;
+ }
+@@ -578,7 +588,7 @@ void hpet_init(struct vcpu *v)
+ 
+     memset(h, 0, sizeof(HPETState));
+ 
+-    spin_lock_init(&h->lock);
++    rwlock_init(&h->lock);
+ 
+     h->stime_freq = S_TO_NS;
+ 
+@@ -607,14 +617,14 @@ void hpet_deinit(struct domain *d)
+     int i;
+     HPETState *h = domain_vhpet(d);
+ 
+-    spin_lock(&h->lock);
++    write_lock(&h->lock);
+ 
+     if ( hpet_enabled(h) )
+         for ( i = 0; i < HPET_TIMER_NUM; i++ )
+             if ( timer_enabled(h, i) )
+                 hpet_stop_timer(h, i);
+ 
+-    spin_unlock(&h->lock);
++    write_unlock(&h->lock);
+ }
+ 
+ void hpet_reset(struct domain *d)
+diff -r 21437df0a731 xen/arch/x86/hvm/vpt.c
+--- a/xen/arch/x86/hvm/vpt.c
++++ b/xen/arch/x86/hvm/vpt.c
+@@ -508,10 +508,10 @@ void pt_adjust_global_vcpu_target(struct
+     pt_adjust_vcpu(&pl_time->vrtc.pt, v);
+     spin_unlock(&pl_time->vrtc.lock);
+ 
+-    spin_lock(&pl_time->vhpet.lock);
++    write_lock(&pl_time->vhpet.lock);
+     for ( i = 0; i < HPET_TIMER_NUM; i++ )
+         pt_adjust_vcpu(&pl_time->vhpet.pt[i], v);
+-    spin_unlock(&pl_time->vhpet.lock);
++    write_unlock(&pl_time->vhpet.lock);
+ }
+ 
+ 
+diff -r 21437df0a731 xen/include/asm-x86/hvm/vpt.h
+--- a/xen/include/asm-x86/hvm/vpt.h
++++ b/xen/include/asm-x86/hvm/vpt.h
+@@ -96,7 +96,7 @@ typedef struct HPETState {
+     uint64_t hpet_to_ns_limit; /* max hpet ticks convertable to ns      */
+     uint64_t mc_offset;
+     struct periodic_time pt[HPET_TIMER_NUM];
+-    spinlock_t lock;
++    rwlock_t lock;
+ } HPETState;
+ 
+ typedef struct RTCState {

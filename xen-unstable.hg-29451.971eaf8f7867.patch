@@ -1,0 +1,113 @@
+# HG changeset patch
+# User Jan Beulich <jbeulich@suse.com>
+# Date 1407152763 -7200
+# Node ID 971eaf8f786783269917ea34cc5fd8ec9c271c2d
+# Parent  f9f600e8bf87084dbea4b0e5724240920bad7696
+x86/HVM: extend LAPIC shortcuts around P2M lookups
+
+... to all internally handled MMIO regions. It is in particular the
+HPET page that, e.g. on Windows Server 2012 R2, can get heavily
+accessed, and hence avoiding the unnecessary lookups is rather
+beneficial (in the reported case a 40+-vCPU guest would previously not
+have booted at all while with hvm_hap_nested_page_fault() shortcut
+alone it was able to boot up in 18 minutes [i.e. still room for
+improvement]).
+
+Note the apparently unrelated addition of a is_hvm_vcpu() check to the
+__hvm_copy() code: Afaict for PVH this shortcut should never have taken
+effect (since there's no LAPIC in that case).
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Tim Deegan <tim@xen.org>
+
+diff -r f9f600e8bf87 -r 971eaf8f7867 xen/arch/x86/hvm/hvm.c
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -2779,11 +2779,14 @@ int hvm_hap_nested_page_fault(paddr_t gp
+         }
+     }
+ 
+-    /* For the benefit of 32-bit WinXP (& older Windows) on AMD CPUs,
+-     * a fast path for LAPIC accesses, skipping the p2m lookup. */
++    /*
++     * No need to do the P2M lookup for internally handled MMIO, benefiting
++     * - 32-bit WinXP (& older Windows) on AMD CPUs for LAPIC accesses,
++     * - newer Windows (like Server 2012) for HPET accesses.
++     */
+     if ( !nestedhvm_vcpu_in_guestmode(v)
+          && is_hvm_vcpu(v)
+-         && gfn == PFN_DOWN(vlapic_base_address(vcpu_vlapic(v))) )
++         && hvm_mmio_internal(gpa) )
+     {
+         if ( !handle_mmio() )
+             hvm_inject_hw_exception(TRAP_gp_fault, 0);
+@@ -3892,7 +3895,9 @@ static enum hvm_copy_result __hvm_copy(
+ 
+     while ( todo > 0 )
+     {
+-        count = min_t(int, PAGE_SIZE - (addr & ~PAGE_MASK), todo);
++        paddr_t gpa = addr & ~PAGE_MASK;
++
++        count = min_t(int, PAGE_SIZE - gpa, todo);
+ 
+         if ( flags & HVMCOPY_virt )
+         {
+@@ -3907,16 +3912,22 @@ static enum hvm_copy_result __hvm_copy(
+                     hvm_inject_page_fault(pfec, addr);
+                 return HVMCOPY_bad_gva_to_gfn;
+             }
++            gpa |= (paddr_t)gfn << PAGE_SHIFT;
+         }
+         else
+         {
+             gfn = addr >> PAGE_SHIFT;
++            gpa = addr;
+         }
+ 
+-        /* For the benefit of 32-bit WinXP (& older Windows) on AMD CPUs,
+-         * a fast path for LAPIC accesses, skipping the p2m lookup. */
++        /*
++         * No need to do the P2M lookup for internally handled MMIO, benefiting
++         * - 32-bit WinXP (& older Windows) on AMD CPUs for LAPIC accesses,
++         * - newer Windows (like Server 2012) for HPET accesses.
++         */
+         if ( !nestedhvm_vcpu_in_guestmode(curr)
+-             && gfn == PFN_DOWN(vlapic_base_address(vcpu_vlapic(curr))) )
++             && is_hvm_vcpu(curr)
++             && hvm_mmio_internal(gpa) )
+             return HVMCOPY_bad_gfn_to_mfn;
+ 
+         page = get_page_from_gfn(curr->domain, gfn, &p2mt, P2M_UNSHARE);
+diff -r f9f600e8bf87 -r 971eaf8f7867 xen/arch/x86/hvm/intercept.c
+--- a/xen/arch/x86/hvm/intercept.c
++++ b/xen/arch/x86/hvm/intercept.c
+@@ -163,6 +163,18 @@ static int hvm_mmio_access(struct vcpu *
+     return rc;
+ }
+ 
++bool_t hvm_mmio_internal(paddr_t gpa)
++{
++    struct vcpu *curr = current;
++    unsigned int i;
++
++    for ( i = 0; i < HVM_MMIO_HANDLER_NR; ++i )
++        if ( hvm_mmio_handlers[i]->check_handler(curr, gpa) )
++            return 1;
++
++    return 0;
++}
++
+ int hvm_mmio_intercept(ioreq_t *p)
+ {
+     struct vcpu *v = current;
+diff -r f9f600e8bf87 -r 971eaf8f7867 xen/include/asm-x86/hvm/io.h
+--- a/xen/include/asm-x86/hvm/io.h
++++ b/xen/include/asm-x86/hvm/io.h
+@@ -91,6 +91,7 @@ static inline int hvm_buffered_io_interc
+     return hvm_io_intercept(p, HVM_BUFFERED_IO);
+ }
+ 
++bool_t hvm_mmio_internal(paddr_t gpa);
+ int hvm_mmio_intercept(ioreq_t *p);
+ int hvm_buffered_io_send(ioreq_t *p);
+ 
