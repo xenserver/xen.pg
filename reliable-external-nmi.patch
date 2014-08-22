@@ -1,0 +1,179 @@
+# HG changeset patch
+# Parent 08acfb056a69259dc7b7ee641d65c6b846d107f7
+CP-9388: Make external NMI injection reliably crash the host
+
+Change the watchdog handler to only "tick" if the corresponding perf
+counter has overflowed; otherwise, return false from the NMI handler to
+indicate that the NMI is not a watchdog tick and let the other handlers
+handle it.  This allows externally injected NMIs to reliably crash the
+host rather than be swallowed by the watchdog handler.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+
+diff --git a/xen/arch/x86/nmi.c b/xen/arch/x86/nmi.c
+--- a/xen/arch/x86/nmi.c
++++ b/xen/arch/x86/nmi.c
+@@ -15,6 +15,7 @@
+ 
+ #include <xen/config.h>
+ #include <xen/init.h>
++#include <xen/stdbool.h>
+ #include <xen/lib.h>
+ #include <xen/mm.h>
+ #include <xen/irq.h>
+@@ -82,6 +83,7 @@
+ #define K7_EVNTSEL_USR		(1 << 16)
+ #define K7_EVENT_CYCLES_PROCESSOR_IS_RUNNING	0x76
+ #define K7_NMI_EVENT		K7_EVENT_CYCLES_PROCESSOR_IS_RUNNING
++#define K7_EVENT_WIDTH          32
+ 
+ #define P6_EVNTSEL0_ENABLE	(1 << 22)
+ #define P6_EVNTSEL_INT		(1 << 20)
+@@ -89,10 +91,12 @@
+ #define P6_EVNTSEL_USR		(1 << 16)
+ #define P6_EVENT_CPU_CLOCKS_NOT_HALTED	 0x79
+ #define CORE_EVENT_CPU_CLOCKS_NOT_HALTED 0x3c
++#define P6_EVENT_WIDTH          32
+ 
+ #define P4_ESCR_EVENT_SELECT(N)	((N)<<25)
+ #define P4_CCCR_OVF_PMI0	(1<<26)
+ #define P4_CCCR_OVF_PMI1	(1<<27)
++#define P4_CCCR_OVF		(1<<31)
+ #define P4_CCCR_THRESHOLD(N)	((N)<<20)
+ #define P4_CCCR_COMPLEMENT	(1<<19)
+ #define P4_CCCR_COMPARE		(1<<18)
+@@ -432,35 +436,23 @@
+     return 0;
+ }
+ 
+-void nmi_watchdog_tick(struct cpu_user_regs * regs)
++/* Returns true if this was a watchdog NMI, false otherwise */
++bool_t nmi_watchdog_tick(struct cpu_user_regs * regs)
+ {
++    bool_t watchdog_tick = 0;
+     unsigned int sum = this_cpu(nmi_timer_ticks);
+ 
+-    if ( (this_cpu(last_irq_sums) == sum) && watchdog_enabled() )
+-    {
+-        /*
+-         * Ayiee, looks like this CPU is stuck ... wait for the timeout
+-         * before doing the oops ...
+-         */
+-        this_cpu(alert_counter)++;
+-        if ( this_cpu(alert_counter) == opt_watchdog_timeout*nmi_hz )
+-        {
+-            console_force_unlock();
+-            printk("Watchdog timer detects that CPU%d is stuck!\n",
+-                   smp_processor_id());
+-            fatal_trap(TRAP_nmi, regs);
+-        }
+-    } 
+-    else 
+-    {
+-        this_cpu(last_irq_sums) = sum;
+-        this_cpu(alert_counter) = 0;
+-    }
+-
+     if ( nmi_perfctr_msr )
+     {
++        uint64_t msr_content;
++
++        /* Work out if this is a watchdog tick by checking for overflow. */
+         if ( nmi_perfctr_msr == MSR_P4_IQ_PERFCTR0 )
+         {
++            rdmsrl(MSR_P4_IQ_CCCR0, msr_content);
++            if ( msr_content & P4_CCCR_OVF )
++                watchdog_tick = 1;
++
+             /*
+              * P4 quirks:
+              * - An overflown perfctr will assert its interrupt
+@@ -473,14 +465,52 @@
+         }
+         else if ( nmi_perfctr_msr == MSR_P6_PERFCTR0 )
+         {
++            rdmsrl(MSR_P6_PERFCTR0, msr_content);
++            watchdog_tick = !(msr_content & (1ULL << P6_EVENT_WIDTH));
++
+             /*
+              * Only P6 based Pentium M need to re-unmask the apic vector but
+              * it doesn't hurt other P6 variants.
+              */
+             apic_write(APIC_LVTPC, APIC_DM_NMI);
+         }
+-        write_watchdog_counter(NULL);
++        else if ( nmi_perfctr_msr == MSR_K7_PERFCTR0 )
++        {
++            rdmsrl(MSR_K7_PERFCTR0, msr_content);
++            watchdog_tick = !(msr_content & (1ULL << K7_EVENT_WIDTH));
++        }
++
++        if ( watchdog_tick )
++        {
++            unsigned int *this_alert_counter = &this_cpu(alert_counter);
++            unsigned int *this_last_irq_sums = &this_cpu(last_irq_sums);
++
++            write_watchdog_counter(NULL);
++
++            if ( (*this_last_irq_sums == sum) && watchdog_enabled() )
++            {
++                /*
++                 * Ayiee, looks like this CPU is stuck ... wait for the timeout
++                 * before doing the oops ...
++                 */
++                ++*this_alert_counter;
++                if ( *this_alert_counter == opt_watchdog_timeout * nmi_hz )
++                {
++                    console_force_unlock();
++                    printk("Watchdog timer detects that CPU%d is stuck!\n",
++                           smp_processor_id());
++                    fatal_trap(TRAP_nmi, regs);
++                }
++            }
++            else
++            {
++                *this_last_irq_sums = sum;
++                this_alert_counter = 0;
++            }
++        }
+     }
++
++    return watchdog_tick;
+ }
+ 
+ /*
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -3232,8 +3232,8 @@
+     if ( nmi_callback(regs, cpu) )
+         return;
+ 
+-    if ( nmi_watchdog )
+-        nmi_watchdog_tick(regs);
++    if ( nmi_watchdog && nmi_watchdog_tick(regs) )
++        return;
+ 
+     /* Only the BSP gets external NMIs from the system. */
+     if ( cpu == 0 )
+@@ -3243,7 +3243,7 @@
+             pci_serr_error(regs);
+         if ( reason & 0x40 )
+             io_check_error(regs);
+-        if ( !(reason & 0xc0) && !nmi_watchdog )
++        if ( !(reason & 0xc0) )
+             unknown_nmi_error(regs, reason);
+     }
+ }
+diff --git a/xen/include/asm-x86/apic.h b/xen/include/asm-x86/apic.h
+--- a/xen/include/asm-x86/apic.h
++++ b/xen/include/asm-x86/apic.h
+@@ -206,7 +206,7 @@
+ extern void self_nmi(void);
+ extern void disable_timer_nmi_watchdog(void);
+ extern void enable_timer_nmi_watchdog(void);
+-extern void nmi_watchdog_tick (struct cpu_user_regs *regs);
++extern bool_t nmi_watchdog_tick (struct cpu_user_regs *regs);
+ extern int APIC_init_uniprocessor (void);
+ extern void disable_APIC_timer(void);
+ extern void enable_APIC_timer(void);
