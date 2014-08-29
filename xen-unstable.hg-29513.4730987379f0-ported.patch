@@ -1,0 +1,206 @@
+# HG changeset patch
+# User Ross Lagerwall <ross.lagerwall@citrix.com>
+# Date 1409235097 -7200
+# Node ID 4730987379f0deb5bae9a1777f259e146ecb2f28
+# Parent 6d50b82f19cc8bed87e321a53081092848101b5a
+x86/NMI: allow processing unknown NMIs when watchdog is enabled
+
+Change NMI processing so that if watchdog=force is passed on the
+command-line and the NMI is not caused by a perf counter overflow (i.e.
+likely not a watchdog "tick"), the NMI is handled by the unknown NMI
+handler.
+
+This allows injection of NMIs from IPMI controllers that don't set the
+IOCK/SERR bits to trigger the unknown NMI handler rather than be
+ignored.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+Fix command line parsing (don't enable the watchdog on e.g.
+"watchdog=xyz").
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 6d50b82f19cc docs/misc/xen-command-line.markdown
+--- a/docs/misc/xen-command-line.markdown
++++ b/docs/misc/xen-command-line.markdown
+@@ -1053,12 +1053,14 @@ As the BTS virtualisation is not 100% sa
+ don't use the vpmu flag on production systems with Intel cpus!
+ 
+ ### watchdog
+-> `= <boolean>`
++> `= force | <boolean>`
+ 
+ > Default: `false`
+ 
+ Run an NMI watchdog on each processor.  If a processor is stuck for
+-longer than the **watchdog\_timeout**, a panic occurs.
++longer than the **watchdog\_timeout**, a panic occurs.  When `force` is
++specified, in addition to running an NMI watchdog on each processor,
++unknown NMIs will still be processed.
+ 
+ ### watchdog\_timeout
+ > `= <integer>`
+diff -r 6d50b82f19cc xen/arch/x86/nmi.c
+--- a/xen/arch/x86/nmi.c
++++ b/xen/arch/x86/nmi.c
+@@ -43,7 +43,26 @@ static DEFINE_PER_CPU(unsigned int, nmi_
+ 
+ /* opt_watchdog: If true, run a watchdog NMI on each processor. */
+ bool_t __initdata opt_watchdog = 0;
+-boolean_param("watchdog", opt_watchdog);
++
++/* watchdog_force: If true, process unknown NMIs when running the watchdog. */
++bool_t watchdog_force = 0;
++
++static void __init parse_watchdog(char *s)
++{
++    switch ( parse_bool(s) )
++    {
++    case 0:
++        opt_watchdog = 0;
++        return;
++    case 1:
++        opt_watchdog = 1;
++        return;
++    }
++
++    if ( !strcmp(s, "force") )
++        watchdog_force = opt_watchdog = 1;
++}
++custom_param("watchdog", parse_watchdog);
+ 
+ /* opt_watchdog_timeout: Number of seconds to wait before panic. */
+ static unsigned int opt_watchdog_timeout = 5;
+@@ -82,6 +101,7 @@ int nmi_active;
+ #define K7_EVNTSEL_USR		(1 << 16)
+ #define K7_EVENT_CYCLES_PROCESSOR_IS_RUNNING	0x76
+ #define K7_NMI_EVENT		K7_EVENT_CYCLES_PROCESSOR_IS_RUNNING
++#define K7_EVENT_WIDTH          32
+ 
+ #define P6_EVNTSEL0_ENABLE	(1 << 22)
+ #define P6_EVNTSEL_INT		(1 << 20)
+@@ -89,10 +109,12 @@ int nmi_active;
+ #define P6_EVNTSEL_USR		(1 << 16)
+ #define P6_EVENT_CPU_CLOCKS_NOT_HALTED	 0x79
+ #define CORE_EVENT_CPU_CLOCKS_NOT_HALTED 0x3c
++#define P6_EVENT_WIDTH          32
+ 
+ #define P4_ESCR_EVENT_SELECT(N)	((N)<<25)
+ #define P4_CCCR_OVF_PMI0	(1<<26)
+ #define P4_CCCR_OVF_PMI1	(1<<27)
++#define P4_CCCR_OVF		(1<<31)
+ #define P4_CCCR_THRESHOLD(N)	((N)<<20)
+ #define P4_CCCR_COMPLEMENT	(1<<19)
+ #define P4_CCCR_COMPARE		(1<<18)
+@@ -432,8 +454,10 @@ int __init watchdog_setup(void)
+     return 0;
+ }
+ 
+-void nmi_watchdog_tick(struct cpu_user_regs * regs)
++/* Returns false if this was not a watchdog NMI, true otherwise */
++bool_t nmi_watchdog_tick(struct cpu_user_regs * regs)
+ {
++    bool_t watchdog_tick = 1;
+     unsigned int sum = this_cpu(nmi_timer_ticks);
+ 
+     if ( (this_cpu(last_irq_sums) == sum) && watchdog_enabled() )
+@@ -459,8 +483,15 @@ void nmi_watchdog_tick(struct cpu_user_r
+ 
+     if ( nmi_perfctr_msr )
+     {
++        uint64_t msr_content;
++
++        /* Work out if this is a watchdog tick by checking for overflow. */
+         if ( nmi_perfctr_msr == MSR_P4_IQ_PERFCTR0 )
+         {
++            rdmsrl(MSR_P4_IQ_CCCR0, msr_content);
++            if ( !(msr_content & P4_CCCR_OVF) )
++                watchdog_tick = 0;
++
+             /*
+              * P4 quirks:
+              * - An overflown perfctr will assert its interrupt
+@@ -473,14 +504,26 @@ void nmi_watchdog_tick(struct cpu_user_r
+         }
+         else if ( nmi_perfctr_msr == MSR_P6_PERFCTR0 )
+         {
++            rdmsrl(MSR_P6_PERFCTR0, msr_content);
++            if ( msr_content & (1ULL << P6_EVENT_WIDTH) )
++                watchdog_tick = 0;
++
+             /*
+              * Only P6 based Pentium M need to re-unmask the apic vector but
+              * it doesn't hurt other P6 variants.
+              */
+             apic_write(APIC_LVTPC, APIC_DM_NMI);
+         }
++        else if ( nmi_perfctr_msr == MSR_K7_PERFCTR0 )
++        {
++            rdmsrl(MSR_K7_PERFCTR0, msr_content);
++            if ( msr_content & (1ULL << K7_EVENT_WIDTH) )
++                watchdog_tick = 0;
++        }
+         write_watchdog_counter(NULL);
+     }
++
++    return watchdog_tick;
+ }
+ 
+ /*
+diff -r 6d50b82f19cc xen/arch/x86/traps.c
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -3226,14 +3226,15 @@ void do_nmi(struct cpu_user_regs *regs)
+ {
+     unsigned int cpu = smp_processor_id();
+     unsigned char reason;
++    bool_t handle_unknown = 0;
+ 
+     ++nmi_count(cpu);
+ 
+     if ( nmi_callback(regs, cpu) )
+         return;
+ 
+-    if ( nmi_watchdog )
+-        nmi_watchdog_tick(regs);
++    if ( !nmi_watchdog || (!nmi_watchdog_tick(regs) && watchdog_force) )
++        handle_unknown = 1;
+ 
+     /* Only the BSP gets external NMIs from the system. */
+     if ( cpu == 0 )
+@@ -3243,7 +3244,7 @@ void do_nmi(struct cpu_user_regs *regs)
+             pci_serr_error(regs);
+         if ( reason & 0x40 )
+             io_check_error(regs);
+-        if ( !(reason & 0xc0) && !nmi_watchdog )
++        if ( !(reason & 0xc0) && handle_unknown )
+             unknown_nmi_error(regs, reason);
+     }
+ }
+diff -r 6d50b82f19cc xen/include/asm-x86/apic.h
+--- a/xen/include/asm-x86/apic.h
++++ b/xen/include/asm-x86/apic.h
+@@ -206,7 +206,7 @@ extern void release_lapic_nmi(void);
+ extern void self_nmi(void);
+ extern void disable_timer_nmi_watchdog(void);
+ extern void enable_timer_nmi_watchdog(void);
+-extern void nmi_watchdog_tick (struct cpu_user_regs *regs);
++extern bool_t nmi_watchdog_tick (struct cpu_user_regs *regs);
+ extern int APIC_init_uniprocessor (void);
+ extern void disable_APIC_timer(void);
+ extern void enable_APIC_timer(void);
+diff -r 6d50b82f19cc xen/include/asm-x86/nmi.h
+--- a/xen/include/asm-x86/nmi.h
++++ b/xen/include/asm-x86/nmi.h
+@@ -8,6 +8,9 @@ struct cpu_user_regs;
+ 
+ /* Watchdog boolean from the command line */
+ extern bool_t opt_watchdog;
++
++/* Watchdog force parameter from the command line */
++extern bool_t watchdog_force;
+  
+ typedef int (*nmi_callback_t)(struct cpu_user_regs *regs, int cpu);
+  

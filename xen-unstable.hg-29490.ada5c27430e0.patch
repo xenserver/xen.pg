@@ -1,7 +1,9 @@
-From 4406ee20d1f5b6e1549d99386019a7691c767ae2 Mon Sep 17 00:00:00 2001
-From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Thu, 5 Jun 2014 00:09:32 +0100
-Subject: [PATCH] x86/intel: Protect set_cpuidmask() against #GP faults
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1408710492 -7200
+# Node ID ada5c27430e0af076710c61f74a203ff3cd411a3
+# Parent  952ffa020f5fcd44fac7c59f779235e0332ba06d
+x86/intel: protect set_cpuidmask() against #GP faults
 
 Virtual environments such as Xen HVM containers and VirtualBox do not
 necessarily provide support for feature masking MSRs.
@@ -18,32 +20,17 @@ While playing in this function, make some further improvements.
   steppings of 0x17 and 0x1a are stated to have masking MSRs.
 * Provide log messages indicating the masks applied, or lack of masking
   capabilities.
-* Call set_cpuidmask() unconditionally so faulting-capable hardware still gets
-  a log message indicating to the user why their command line arguments are
-  not taking effect.
+* In the case of faulting support being available and masking command line
+  options specified, provide a log message indicating the lack of masking.
 
 References:
 http://www.intel.com/content/www/us/en/virtualization/virtualization-technology-flexmigration-application-note.html
 http://software.intel.com/en-us/articles/intel-architecture-and-processor-identification-with-cpuid-model-and-family-numbers
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-CC: Jan Beulich <JBeulich@suse.com>
-CC: Yang Zhang <yang.z.zhang@intel.com>
-CC: Kevin Tian <kevin.tian@intel.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
 
----
-v2: Correct msr_val manipulation for msr_xsave
-
-Can anyone shed light as to which CPU model 0x1f is?  It is specified in the
-flexmigrate document, and was present in the old code, but I can't find any
-further information online.
----
- xen/arch/x86/cpu/intel.c        |  150 +++++++++++++++++++++++++--------------
- xen/include/asm-x86/msr-index.h |   13 ++--
- 2 files changed, 102 insertions(+), 61 deletions(-)
-
-diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
-index e178b5c..36b06a6 100644
+diff -r 952ffa020f5f -r ada5c27430e0 xen/arch/x86/cpu/intel.c
 --- a/xen/arch/x86/cpu/intel.c
 +++ b/xen/arch/x86/cpu/intel.c
 @@ -51,68 +51,109 @@ void set_cpuid_faulting(bool_t enable)
@@ -87,17 +74,7 @@ index e178b5c..36b06a6 100644
 -			extra = "xsave ";
 -		else
 -			return;
-+	/* Only family 6 supports this feature. */
-+	if (c->x86 != 6) {
-+		printk("No CPUID feature masking support available\n");
-+		return;
-+	}
-+
-+	switch (c->x86_model) {
-+	case 0x17: /* Yorkfield, Wolfdale, Penryn, Harpertown(DP) */
-+	case 0x1d: /* Dunnington(MP) */
-+		msr_basic = MSR_INTEL_MASK_V1_CPUID1;
- 		break;
+-		break;
 -/* 
 - * CPU supports this feature if the processor signature meets the following:
 - * (CPUID.(EAX=01h):EAX) > 000106A2h, or
@@ -119,24 +96,7 @@ index e178b5c..36b06a6 100644
 -		if (!~opt_cpuid_mask_xsave_eax)
 -			return;
 -		extra = "xsave ";
-+
-+	case 0x1a: /* Bloomfield, Nehalem-EP */
-+	case 0x1e: /* Clarksfield, Lynnfield, Jasper Forest */
-+	case 0x1f: /* ??? */
-+	case 0x25: /* Arrandale, Clarksdale */
-+	case 0x2c: /* Gulftown, Westmere-EP */
-+	case 0x2e: /* Nehalem-EX */
-+	case 0x2f: /* Westmere-EX */
-+		msr_basic = MSR_INTEL_MASK_V2_CPUID1;
-+		msr_ext   = MSR_INTEL_MASK_V2_CPUID80000001;
-+		break;
-+
-+	case 0x2a: /* SandyBridge */
-+	case 0x2d: /* SandyBridge-E, SandyBridge-EN, SandyBridge-EP */
-+		msr_basic = MSR_INTEL_MASK_V3_CPUID1;
-+		msr_ext   = MSR_INTEL_MASK_V3_CPUID80000001;
-+		msr_xsave = MSR_INTEL_MASK_V3_CPUIDD_01;
- 		break;
+-		break;
 -	case 0x2a: case 0x2d:
 -		wrmsr(MSR_INTEL_CPUID1_FEATURE_MASK_V2,
 -		      opt_cpuid_mask_ecx,
@@ -147,11 +107,39 @@ index e178b5c..36b06a6 100644
 -		wrmsr(MSR_INTEL_CPUID80000001_FEATURE_MASK_V2,
 -		      opt_cpuid_mask_ext_ecx,
 -		      opt_cpuid_mask_ext_edx);
--		return;
++	/* Only family 6 supports this feature. */
++	if (c->x86 != 6) {
++		printk("No CPUID feature masking support available\n");
+ 		return;
  	}
  
 -	printk(XENLOG_ERR "Cannot set CPU %sfeature mask on CPU#%d\n",
 -	       extra, smp_processor_id());
++	switch (c->x86_model) {
++	case 0x17: /* Yorkfield, Wolfdale, Penryn, Harpertown(DP) */
++	case 0x1d: /* Dunnington(MP) */
++		msr_basic = MSR_INTEL_MASK_V1_CPUID1;
++		break;
++
++	case 0x1a: /* Bloomfield, Nehalem-EP(Gainestown) */
++	case 0x1e: /* Clarksfield, Lynnfield, Jasper Forest */
++	case 0x1f: /* Something Nehalem-based - perhaps Auburndale/Havendale? */
++	case 0x25: /* Arrandale, Clarksdale */
++	case 0x2c: /* Gulftown, Westmere-EP */
++	case 0x2e: /* Nehalem-EX(Beckton) */
++	case 0x2f: /* Westmere-EX */
++		msr_basic = MSR_INTEL_MASK_V2_CPUID1;
++		msr_ext   = MSR_INTEL_MASK_V2_CPUID80000001;
++		break;
++
++	case 0x2a: /* SandyBridge */
++	case 0x2d: /* SandyBridge-E, SandyBridge-EN, SandyBridge-EP */
++		msr_basic = MSR_INTEL_MASK_V3_CPUID1;
++		msr_ext   = MSR_INTEL_MASK_V3_CPUID80000001;
++		msr_xsave = MSR_INTEL_MASK_V3_CPUIDD_01;
++		break;
++	}
++
 +	status = set_mask;
 +
 +	if (~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx)) {
@@ -209,18 +197,19 @@ index e178b5c..36b06a6 100644
  }
  
  void __devinit early_intel_workaround(struct cpuinfo_x86 *c)
-@@ -220,8 +261,7 @@ static void __devinit init_intel(struct cpuinfo_x86 *c)
- 		set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
- 	}
+@@ -222,6 +263,11 @@ static void __devinit init_intel(struct 
  
--	if (!cpu_has_cpuid_faulting)
--		set_cpuidmask(c);
-+	set_cpuidmask(c);
+ 	if (!cpu_has_cpuid_faulting)
+ 		set_cpuidmask(c);
++	else if ((c == &boot_cpu_data) &&
++		 (~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx &
++		    opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx &
++		    opt_cpuid_mask_xsave_eax)))
++		printk("No CPUID feature masking support available\n");
  
  	/* Work around errata */
  	Intel_errata_workarounds(c);
-diff --git a/xen/include/asm-x86/msr-index.h b/xen/include/asm-x86/msr-index.h
-index 70a8201..7d38bcb 100644
+diff -r 952ffa020f5f -r ada5c27430e0 xen/include/asm-x86/msr-index.h
 --- a/xen/include/asm-x86/msr-index.h
 +++ b/xen/include/asm-x86/msr-index.h
 @@ -469,13 +469,14 @@
@@ -230,20 +219,17 @@ index 70a8201..7d38bcb 100644
 -#define MSR_INTEL_CPUID_FEATURE_MASK	0x00000478
 -#define MSR_INTEL_CPUID1_FEATURE_MASK	0x00000130
 -#define MSR_INTEL_CPUID80000001_FEATURE_MASK 0x00000131
-+#define MSR_INTEL_MASK_V1_CPUID1	0x00000478
++#define MSR_INTEL_MASK_V1_CPUID1        0x00000478
  
 -#define MSR_INTEL_CPUID1_FEATURE_MASK_V2        0x00000132
 -#define MSR_INTEL_CPUID80000001_FEATURE_MASK_V2 0x00000133
 -#define MSR_INTEL_CPUIDD_01_FEATURE_MASK        0x00000134
-+#define MSR_INTEL_MASK_V2_CPUID1	0x00000130
++#define MSR_INTEL_MASK_V2_CPUID1        0x00000130
 +#define MSR_INTEL_MASK_V2_CPUID80000001 0x00000131
 +
-+#define MSR_INTEL_MASK_V3_CPUID1	0x00000132
++#define MSR_INTEL_MASK_V3_CPUID1        0x00000132
 +#define MSR_INTEL_MASK_V3_CPUID80000001 0x00000133
-+#define MSR_INTEL_MASK_V3_CPUIDD_01	0x00000134
++#define MSR_INTEL_MASK_V3_CPUIDD_01     0x00000134
  
  /* Intel cpuid faulting MSRs */
  #define MSR_INTEL_PLATFORM_INFO		0x000000ce
--- 
-1.7.10.4
-
