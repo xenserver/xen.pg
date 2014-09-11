@@ -1,0 +1,60 @@
+# HG changeset patch
+# User Len Brown <len.brown@intel.com>
+# Date 1404305377 -7200
+#      Wed Jul 02 14:49:37 2014 +0200
+# Node ID f0a55e6a1447f7e0dfc4614971c7b2f9d2a57003
+# Parent  9d0d7d44514f9d55ac644687b2d7a6cdea2d55d5
+mwait-idle: allow sparse sub-state numbering, for Bay Trail
+
+Like acpi_idle, mwait-idle compared sub-state numbers
+to the number of supported sub-states -- discarding
+sub-states numbers that were numbered >= the number of states.
+
+But some Bay Trail SOCs use sparse sub-state numbers,
+so we can't make such a comparison if we are going
+to access those states.
+
+So now we simply check that _some_ sub-states are
+supported for the given state, and assume that the
+sub-state number in our driver is valid.
+
+In practice, the driver is correct, and even if it were not,
+the hardware clips invalid sub-state requests to valid ones.
+
+No entries in the driver require this change,
+but Bay Trail will need it.
+
+Signed-off-by: Len Brown <len.brown@intel.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu/mwait-idle.c b/xen/arch/x86/cpu/mwait-idle.c
+--- a/xen/arch/x86/cpu/mwait-idle.c
++++ b/xen/arch/x86/cpu/mwait-idle.c
+@@ -555,23 +555,22 @@
+ 	dev->count = 1;
+ 
+ 	for (cstate = 0; cpuidle_state_table[cstate].target_residency; ++cstate) {
+-		unsigned int num_substates, hint, state, substate;
++		unsigned int num_substates, hint, state;
+ 		struct acpi_processor_cx *cx;
+ 
+ 		hint = flg2MWAIT(cpuidle_state_table[cstate].flags);
+ 		state = MWAIT_HINT2CSTATE(hint) + 1;
+-		substate = MWAIT_HINT2SUBSTATE(hint);
+ 
+ 		if (state > max_cstate) {
+ 			printk(PREFIX "max C-state %u reached\n", max_cstate);
+ 			break;
+ 		}
+ 
+-		/* Does the state exist in CPUID.MWAIT? */
++		/* Number of sub-states for this state in CPUID.MWAIT. */
+ 		num_substates = (mwait_substates >> (state * 4))
+ 		                & MWAIT_SUBSTATE_MASK;
+-		/* if sub-state in table is not enumerated by CPUID */
+-		if (substate >= num_substates)
++		/* If NO sub-states for this state in CPUID, skip it. */
++		if (num_substates == 0)
+ 			continue;
+ 
+ 		if (dev->count >= ACPI_PROCESSOR_MAX_POWER) {
