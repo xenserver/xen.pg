@@ -1,0 +1,68 @@
+# HG changeset patch
+# User Vitaly Kuznetsov <vkuznets@redhat.com>
+# Date 1411744801 -7200
+# Node ID 5839350af9ddbeea5626c39f1dad442191201cdf
+# Parent  1d189438a23823ff6bdc6874c804333aab923445
+x86/hvm: remove stray lock release from hvm_ioreq_server_init()
+
+If HVM_PARAM_IOREQ_PFN, HVM_PARAM_BUFIOREQ_PFN, or HVM_PARAM_BUFIOREQ_EVTCHN
+parameters are read when guest domain is dying it leads to the following
+ASSERT:
+
+(XEN) Assertion '_raw_spin_is_locked(lock)' failed at ...workspace/KERNEL/xen/xen/include/asm/spinlock.h:18
+(XEN) ----[ Xen-4.5-unstable  x86_64  debug=y  Not tainted ]----
+...
+(XEN) Xen call trace:
+(XEN)    [<ffff82d08012b07f>] _spin_unlock+0x27/0x30
+(XEN)    [<ffff82d0801b6103>] hvm_create_ioreq_server+0x3df/0x49a
+(XEN)    [<ffff82d0801bcceb>] do_hvm_op+0x12bf/0x27a0
+(XEN)    [<ffff82d08022b9bb>] syscall_enter+0xeb/0x145
+
+The root cause of this issue is the fact that ioreq_server.lock is being
+released twice - first in hvm_ioreq_server_init() and then in hvm_create_ioreq_server().
+Drop the lock release from hvm_ioreq_server_init() as we don't take it here, do minor
+label cleanup.
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff -r 1d189438a238 -r 5839350af9dd xen/arch/x86/hvm/hvm.c
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -918,30 +918,28 @@ static int hvm_ioreq_server_init(struct 
+ 
+     rc = hvm_ioreq_server_alloc_rangesets(s, is_default);
+     if ( rc )
+-        goto fail1;
++        return rc;
+ 
+     rc = hvm_ioreq_server_map_pages(s, is_default, handle_bufioreq);
+     if ( rc )
+-        goto fail2;
++        goto fail_map;
+ 
+     for_each_vcpu ( d, v )
+     {
+         rc = hvm_ioreq_server_add_vcpu(s, is_default, v);
+         if ( rc )
+-            goto fail3;
++            goto fail_add;
+     }
+ 
+     return 0;
+ 
+- fail3:
++ fail_add:
+     hvm_ioreq_server_remove_all_vcpus(s);
+     hvm_ioreq_server_unmap_pages(s, is_default);
+ 
+- fail2:
++ fail_map:
+     hvm_ioreq_server_free_rangesets(s, is_default);
+ 
+- fail1:
+-    spin_unlock(&d->arch.hvm_domain.ioreq_server.lock);
+     return rc;
+ }
+ 
