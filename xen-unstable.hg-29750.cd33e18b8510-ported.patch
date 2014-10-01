@@ -1,0 +1,113 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1412156170 -7200
+# Node ID cd33e18b8510e910007c6d30d715d07089f8c070
+# Parent 72bf01363c591a6152c1b42f5fd9b57ffeee40f6
+x86/hvm: improve "Emulation failed @" error messages
+
+* Introduce hvm_dump_emulation_state() to be a common implementation rather
+  than having the printk() open-coded slightly differently in 3 separate
+  places.
+* Identify the vcpu operating mode to allow for unambiguous decoding of the
+  instruction bytes.
+* A valid instruction can be up to 15 bytes long, but may also be shorter than
+  the current arbitrary 10 bytes.  Print only the fetched bytes, which could
+  include nothing if the emulation failed due to an inability to fetch the
+  instruction.
+
+A sample new error message looks like:
+
+(d1) MMIO emulation failed: d1v0 64bit @ 0008:ffff82d0802c4f20 -> 48 8b b8 e8 7f 00 00
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Tim Deegan <tim@xen.org>
+Release-acked-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
+
+diff -r 72bf01363c59 xen/arch/x86/hvm/emulate.c
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -1279,6 +1279,32 @@ struct segment_register *hvmemul_get_seg
+     return &hvmemul_ctxt->seg_reg[seg];
+ }
+ 
++static const char *guest_x86_mode_to_str(int mode)
++{
++    switch ( mode )
++    {
++    case 0:  return "Real";
++    case 1:  return "v86";
++    case 2:  return "16bit";
++    case 4:  return "32bit";
++    case 8:  return "64bit";
++    default: return "Unknown";
++    }
++}
++
++void hvm_dump_emulation_state(const char *prefix,
++                              struct hvm_emulate_ctxt *hvmemul_ctxt)
++{
++    struct vcpu *curr = current;
++    const char *mode_str = guest_x86_mode_to_str(hvm_guest_x86_mode(curr));
++    const struct segment_register *cs =
++        hvmemul_get_seg_reg(x86_seg_cs, hvmemul_ctxt);
++
++    printk("%s emulation failed: %pv %s @ %04x:%08lx -> %*ph\n",
++           prefix, curr, mode_str, cs->sel, hvmemul_ctxt->insn_buf_eip,
++           hvmemul_ctxt->insn_buf_bytes, hvmemul_ctxt->insn_buf);
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff -r 72bf01363c59 xen/arch/x86/hvm/io.c
+--- a/xen/arch/x86/hvm/io.c
++++ b/xen/arch/x86/hvm/io.c
+@@ -100,16 +100,7 @@ int handle_mmio(void)
+     switch ( rc )
+     {
+     case X86EMUL_UNHANDLEABLE:
+-        gdprintk(XENLOG_WARNING,
+-                 "MMIO emulation failed @ %04x:%lx: "
+-                 "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-                 hvmemul_get_seg_reg(x86_seg_cs, &ctxt)->sel,
+-                 ctxt.insn_buf_eip,
+-                 ctxt.insn_buf[0], ctxt.insn_buf[1],
+-                 ctxt.insn_buf[2], ctxt.insn_buf[3],
+-                 ctxt.insn_buf[4], ctxt.insn_buf[5],
+-                 ctxt.insn_buf[6], ctxt.insn_buf[7],
+-                 ctxt.insn_buf[8], ctxt.insn_buf[9]);
++        hvm_dump_emulation_state(XENLOG_G_WARNING "MMIO", &ctxt);
+         return 0;
+     case X86EMUL_EXCEPTION:
+         if ( ctxt.exn_pending )
+diff -r 72bf01363c59 xen/arch/x86/hvm/vmx/realmode.c
+--- a/xen/arch/x86/hvm/vmx/realmode.c
++++ b/xen/arch/x86/hvm/vmx/realmode.c
+@@ -157,14 +157,7 @@ static void realmode_emulate_one(struct 
+     return;
+ 
+  fail:
+-    gdprintk(XENLOG_ERR,
+-             "Real-mode emulation failed @ %04x:%08lx: "
+-             "%02x %02x %02x %02x %02x %02x\n",
+-             hvmemul_get_seg_reg(x86_seg_cs, hvmemul_ctxt)->sel,
+-             hvmemul_ctxt->insn_buf_eip,
+-             hvmemul_ctxt->insn_buf[0], hvmemul_ctxt->insn_buf[1],
+-             hvmemul_ctxt->insn_buf[2], hvmemul_ctxt->insn_buf[3],
+-             hvmemul_ctxt->insn_buf[4], hvmemul_ctxt->insn_buf[5]);
++    hvm_dump_emulation_state(XENLOG_G_ERR "Real-mode", hvmemul_ctxt);
+     domain_crash(curr->domain);
+ }
+ 
+diff -r 72bf01363c59 xen/include/asm-x86/hvm/emulate.h
+--- a/xen/include/asm-x86/hvm/emulate.h
++++ b/xen/include/asm-x86/hvm/emulate.h
+@@ -50,4 +50,7 @@ int hvmemul_do_pio(
+     unsigned long port, unsigned long *reps, int size,
+     paddr_t ram_gpa, int dir, int df, void *p_data);
+ 
++void hvm_dump_emulation_state(const char *prefix,
++                              struct hvm_emulate_ctxt *hvmemul_ctxt);
++
+ #endif /* __ASM_X86_HVM_EMULATE_H__ */
