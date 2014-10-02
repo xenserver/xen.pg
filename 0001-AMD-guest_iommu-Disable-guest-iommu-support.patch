@@ -1,0 +1,53 @@
+From d38e1a6a2dc50f031018167c6653da35d2fbfcd8 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 2 Oct 2014 14:30:14 +0100
+Subject: [PATCH] AMD/guest_iommu: Disable guest iommu support
+
+AMD Guest IOMMU support was added to allow correct use of PASID and PRI
+hardware support with an ATS-aware guest driver.
+
+However, support cannot possibly function as guest_iommu_set_base() has no
+callers.  This means that its MMIO region's P2M pages are not set to
+p2m_mmio_dm, preventing any invocation of the MMIO read/write handlers.
+
+c/s fd186384 "x86/HVM: extend LAPIC shortcuts around P2M lookups" introduces a
+path (via hvm_mmio_internal()) where iommu_mmio_handler claims its MMIO range,
+and causes __hvm_copy() to fail with HVMCOPY_bad_gfn_to_mfn.
+
+iommu->mmio_base defaults to 0, with a range of 8 pages, and is unilaterally
+enabled in any HVM guests when the host IOMMU(s) supports any extended
+features.
+
+Unfortunately, HVMLoader's AP boot trampoline executes an `lmsw` instruction
+at linear address 0x100c which unconditionally requires emulation.  The
+instruction fetch in turn fails as __hvm_copy() fails with
+HVMCOPY_bad_gfn_to_mfn.
+
+The result is that multi-vcpu HVM guests do not work on newer AMD hardware, if
+IOMMU support is enabled in the BIOS.
+
+Change the default mmio_base address to ~0ULL.  This prevents
+guest_iommu_mmio_range() from actually claiming any physical range
+whatsoever, which allows the emulation of `lmsw` to succeed.
+
+Reported-by: Roberto Luongo <rluongo@ready.it>
+Suggested-by: Jan Beulich <JBeulich@suse.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Tested-by: Roberto Luongo <rluongo@ready.it>
+CC: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+CC: Aravind Gopalakrishnan <Aravind.Gopalakrishnan@amd.com>
+---
+ xen/drivers/passthrough/amd/iommu_guest.c |    1 +
+ 1 file changed, 1 insertion(+)
+
+diff -r b88f5637bfb1 xen/drivers/passthrough/amd/iommu_guest.c
+--- a/xen/drivers/passthrough/amd/iommu_guest.c
++++ b/xen/drivers/passthrough/amd/iommu_guest.c
+@@ -885,6 +885,7 @@ int guest_iommu_init(struct domain* d)
+     }
+ 
+     guest_iommu_reg_init(iommu);
++    iommu->mmio_base = ~0ULL;
+     iommu->domain = d;
+     hd->g_iommu = iommu;
+ 
