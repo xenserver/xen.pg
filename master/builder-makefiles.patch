@@ -1,4 +1,20 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..7e70d4c
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,9 @@
++.bk-to-hg export-ignore
++.hg-to-bk export-ignore
++.hgignore export-ignore
++.hgsigs export-ignore
++.hgtags export-ignore
++.rootkeys export-ignore
++.gitignore export-ignore
++.gitattributes export-ignore
++mk/ export-ignore
 diff --git a/.hgignore b/.hgignore
+index da27f80..5603df8 100644
 --- a/.hgignore
 +++ b/.hgignore
 @@ -23,6 +23,8 @@
@@ -12,9 +28,10 @@ diff --git a/.hgignore b/.hgignore
  ^\.config$
 diff --git a/mk/Makefile b/mk/Makefile
 new file mode 100644
+index 0000000..224c59f
 --- /dev/null
 +++ b/mk/Makefile
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,136 @@
 +USE_BRANDING := yes
 +IMPORT_BRANDING := yes
 +# makefile for xen component in build system
@@ -32,15 +49,19 @@ new file mode 100644
 +  Q :=
 +endif
 +
-+REPO_NAME := xen-4.4
++.PHONY: %var
++%var:
++	@echo "$* = $($*)"
++
++REPO_NAME := xen-4.5
 +IPXE_REPO_NAME := ipxe
 +RPM_BUILD_COOKIE := $(MY_OBJ_DIR)/.rpm_build_cookie
-+REPO_STAMP := $(call hg_req,$(REPO_NAME))
++REPO_STAMP := $(call git_req,$(REPO_NAME))
 +
 +CDFILES_COOKIE = $(MY_OBJ_DIR)/.cdfiles.cookie
 +
-+$(eval $(shell $(call hg_cset_number,$(REPO_NAME)))) # Defines CSET_NUMBER for us
-+XEN_VERSION := $(shell $(MAKE) -C $(call hg_loc,$(REPO_NAME)) --no-print-directory xenversion)
++$(eval $(shell $(call git_cset_number,$(REPO_NAME)))) # Defines CSET_NUMBER for us
++XEN_VERSION := $(shell $(MAKE) -C $(call git_loc,$(REPO_NAME)) --no-print-directory xenversion)
 +XEN_RELEASE := $(PLATFORM_VERSION).$(CSET_NUMBER)
 +
 +ifeq ($(BUILD_NUMBER),0x)
@@ -49,12 +70,10 @@ new file mode 100644
 +XEN_VENDORVERSION := -xs$(shell echo $(BUILD_NUMBER) | tr -dc [:digit:])
 +endif
 +
-+cset_template := --template "{rev}:{node|short}"
-+cset_loc      := "$(call hg_loc,$(REPO_NAME))"
++REPO_LOC := $(call git_loc,$(REPO_NAME))
++BASE_CSET_STR := $(shell { git rev-parse --verify --short=12 qparent --git-dir=$(REPO_LOC)/.git; } )
++PQ_CSET_STR   := $(shell { git rev-parse --verify --short=12 HEAD    --git-dir=$(REPO_LOC)/.git/patches/.git; } )
 +
-+BASE_CSET_STR := $(shell { hg log -R "$(cset_loc)" -r qparent $(cset_template) || \
-+	hg log -R "$(cset_loc)" -r tip $(cset_template); } 2>/dev/null )
-+PQ_CSET_STR   := $(shell { hg log -R "$(cset_loc)/.hg/patches" -r tip $(cset_template); } 2>/dev/null )
 +XEN_CHANGESET := "$(BASE_CSET_STR), pq $(PQ_CSET_STR)"
 +
 +.PHONY: build
@@ -75,13 +94,14 @@ new file mode 100644
 +
 +XEN_HG_EXCLUDE := -X mk
 +
-+$(RPM_SOURCESDIR)/xen-$(XEN_VERSION).tar.bz2: $(RPM_SOURCESDIRSTAMP)
++$(RPM_SOURCESDIR)/xen-$(XEN_VERSION).tar.bz2: $(RPM_SOURCESDIR)/.dirstamp
 +	{ set -e; set -o pipefail; \
-+	hg -R "$(call hg_loc,$(REPO_NAME))" archive $(XEN_HG_EXCLUDE) -p xen-$(XEN_VERSION) -t tbz2 $@.tmp; \
++	cd $(REPO_LOC); \
++	git archive --format=tar --prefix=xen-$(XEN_VERSION)/ HEAD | bzip2 -9 > $@.tmp; \
 +	mv -f $@.tmp $@; \
 +	}
 +
-+$(RPM_SOURCESDIR)/ipxe.tar.gz: $(RPM_SOURCESDIRSTAMP)
++$(RPM_SOURCESDIR)/ipxe.tar.gz: $(RPM_SOURCESDIR)/.dirstamp
 +	{ set -e; set -o pipefail; \
 +	cd "$(call git_loc,$(IPXE_REPO_NAME))"; \
 +	git archive --format=tar --prefix=ipxe/ HEAD | gzip -9 > $@.tmp; \
@@ -91,13 +111,14 @@ new file mode 100644
 +$(RPM_SOURCESDIR)/%: %
 +	cp $^ $@
 +
-+$(RPM_SOURCESDIR)/xen-development.patch: $(RPM_SOURCESDIRSTAMP)
++$(RPM_SOURCESDIR)/xen-development.patch: $(RPM_SOURCESDIR)/.dirstamp
 +	{ set -e; set -o pipefail; \
-+	hg -R "$(call hg_loc,$(REPO_NAME))" diff $(XEN_HG_EXCLUDE) > $@.tmp; \
++	cd $(REPO_LOC); \
++	git diff HEAD > $@.tmp; \
 +	mv -f $@.tmp $@; \
 +	}
 +
-+$(RPM_SPECSDIR)/xen.spec: $(REPO_NAME).spec.in $(RPM_SPECSDIRSTAMP) Makefile
++$(RPM_SPECSDIR)/xen.spec: xen.spec.in $(RPM_SPECSDIR)/.dirstamp Makefile
 +	{ set -e; set -o pipefail; \
 +	sed -e s/@XEN_VERSION@/$(XEN_VERSION)/g \
 +	    -e s/@XEN_RELEASE@/$(XEN_RELEASE)/g \
@@ -135,7 +156,7 @@ new file mode 100644
 +	}
 +
 +.PHONY: $(BRANDING)
-+$(BRANDING): $(MY_OUTPUT_DIRSTAMP)
++$(BRANDING): $(MY_OUTPUT_DIR)/.dirstamp
 +	{ set -e; set -o pipefail; \
 +	$(Q)echo "XEN_VERSION := $(XEN_VERSION)" > $@.tmp; \
 +	mv -f $@.tmp $@; \
@@ -149,6 +170,7 @@ new file mode 100644
 +	rm -f $(MY_OUTPUT_DIR)/xen.inc
 diff --git a/mk/Makefile.uclibc b/mk/Makefile.uclibc
 new file mode 100644
+index 0000000..5414577
 --- /dev/null
 +++ b/mk/Makefile.uclibc
 @@ -0,0 +1,98 @@
@@ -252,6 +274,7 @@ new file mode 100644
 +	tar --create --bzip2 --file $@ --directory $(BINARY_INSTALL_DIR) .
 diff --git a/mk/gen-spec-file.sh b/mk/gen-spec-file.sh
 new file mode 100755
+index 0000000..8616bca
 --- /dev/null
 +++ b/mk/gen-spec-file.sh
 @@ -0,0 +1,25 @@
@@ -282,6 +305,7 @@ new file mode 100755
 +echo "Wrote xen-$xen_version.spec to $xen_repo";
 diff --git a/mk/sysconfig_kernel-xen b/mk/sysconfig_kernel-xen
 new file mode 100644
+index 0000000..660b280
 --- /dev/null
 +++ b/mk/sysconfig_kernel-xen
 @@ -0,0 +1,6 @@
@@ -293,6 +317,7 @@ new file mode 100644
 +HYPERVISOR_ARGS="$HYPERVISOR_ARGS watchdog"
 diff --git a/mk/upstart_xenconsoled.conf b/mk/upstart_xenconsoled.conf
 new file mode 100644
+index 0000000..1b5015b
 --- /dev/null
 +++ b/mk/upstart_xenconsoled.conf
 @@ -0,0 +1,20 @@
@@ -318,6 +343,7 @@ new file mode 100644
 +exec xenconsoled
 diff --git a/mk/upstart_xenstored.conf b/mk/upstart_xenstored.conf
 new file mode 100644
+index 0000000..6f58725
 --- /dev/null
 +++ b/mk/upstart_xenstored.conf
 @@ -0,0 +1,24 @@
@@ -345,11 +371,12 @@ new file mode 100644
 +post_start script
 +	grep -q control_d /proc/xen/capabilities && xenstore write domid 0
 +end script
-diff --git a/mk/xen-4.4.spec.in b/mk/xen-4.4.spec.in
+diff --git a/mk/xen.spec.in b/mk/xen.spec.in
 new file mode 100644
+index 0000000..52c2c52
 --- /dev/null
-+++ b/mk/xen-4.4.spec.in
-@@ -0,0 +1,589 @@
++++ b/mk/xen.spec.in
+@@ -0,0 +1,583 @@
 +# -*- rpm-spec -*-
 +
 +%{!?python_sitearch: %define python_sitearch %(%{__python} -c "from distutils.sysconfig import get_python_lib; print get_python_lib(1)")}
@@ -516,9 +543,9 @@ new file mode 100644
 +%patch0 -p1 -b ~development
 +echo "@XEN_CHANGESET@" > .scmversion
 +
-+./configure --prefix="/usr" --libdir="%{_libdir}" \
-+	--disable-kernels --disable-seabios --disable-stubdom --disable-xsmpolicy \
-+	--with-system-qemu=%{_libdir}/xen/bin/qemu-system-i386
++%configure \
++        --disable-seabios --disable-stubdom --disable-xsmpolicy --disable-blktap2 \
++	--with-system-qemu=%{_libdir}/xen/bin/qemu-system-i386 --with-xenstored=oxenstored
 +
 +# this line is required as some version of rpmbuild does
 +# not compile debuginfo package if this section is not present
@@ -549,6 +576,9 @@ new file mode 100644
 +cp xen/System.map %{buildroot}/boot/%{name}-%{version}%{vendor_version}-d.map
 +cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}%{vendor_version}-d
 +
++# do not strip the hypervisor-debuginfo targerts
++chmod -x %{buildroot}/boot/xen-syms-*
++
 +# Build tools and man pages
 +%{__make} %{TOOLS_OPTIONS} -C tools install
 +%{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
@@ -576,9 +606,6 @@ new file mode 100644
 +rm -rf %{buildroot}%{_libdir}/ocaml/xentoollog
 +rm -rf %{buildroot}%{_libdir}/ocaml/stublibs/dllxenlight*
 +rm -rf %{buildroot}%{_libdir}/ocaml/stublibs/dllxentoollog*
-+
-+# do not strip symbols some unstripped xen
-+chmod -x %{buildroot}/boot/xen-syms-*
 +
 +%clean
 +rm -rf $RPM_BUILD_ROOT
@@ -722,6 +749,7 @@ new file mode 100644
 +%config %{_sysconfdir}/xen/oxenstored.conf
 +%{_sysconfdir}/xen/scripts/block
 +%{_sysconfdir}/xen/scripts/block-common.sh
++%{_sysconfdir}/xen/scripts/block-drbd-probe
 +%{_sysconfdir}/xen/scripts/block-enbd
 +%{_sysconfdir}/xen/scripts/block-iscsi
 +%{_sysconfdir}/xen/scripts/block-nbd
@@ -729,9 +757,6 @@ new file mode 100644
 +%{_sysconfdir}/xen/scripts/hotplugpath.sh
 +%{_sysconfdir}/xen/scripts/locking.sh
 +%{_sysconfdir}/xen/scripts/logging.sh
-+%{_sysconfdir}/xen/scripts/network-bridge
-+%{_sysconfdir}/xen/scripts/network-nat
-+%{_sysconfdir}/xen/scripts/network-route
 +%{_sysconfdir}/xen/scripts/vif-bridge
 +%{_sysconfdir}/xen/scripts/vif-common.sh
 +%{_sysconfdir}/xen/scripts/vif-nat
@@ -762,23 +787,19 @@ new file mode 100644
 +%{python_sitearch}/xen-3.0-py2.6.egg-info
 +%{python_sitearch}/xen/__init__.py*
 +%{python_sitearch}/xen/lowlevel/__init__.py*
-+%{python_sitearch}/xen/lowlevel/ptsname.so
 +%{python_sitearch}/xen/lowlevel/xc.so
 +/lib/udev/rules.d/90-xen-backend.rules
-+%{_libdir}/%{name}/bin/libxl-save-helper
-+%{_libdir}/%{name}/bin/lsevtchn
-+%{_libdir}/%{name}/bin/pygrub
-+%{_libdir}/%{name}/bin/readnotes
-+%{_libdir}/%{name}/bin/xc_restore
-+%{_libdir}/%{name}/bin/xc_save
-+%{_libdir}/%{name}/bin/xenconsole
-+%{_libdir}/%{name}/bin/xenctx
-+%{_libdir}/%{name}/bin/xenpaging
-+%{_libdir}/%{name}/bin/xenpvnetboot
-+
-+# This is currently hard coded in the Xen build system, which breaks for 64bit builds
-+/usr/lib/xen/boot/hvmloader
-+
++%{_libexecdir}/%{name}/bin/libxl-save-helper
++%{_libexecdir}/%{name}/bin/lsevtchn
++%{_libexecdir}/%{name}/bin/pygrub
++%{_libexecdir}/%{name}/bin/readnotes
++%{_libexecdir}/%{name}/bin/xen-init-dom0
++%{_libexecdir}/%{name}/bin/xenconsole
++%{_libexecdir}/%{name}/bin/xenctx
++%{_libexecdir}/%{name}/bin/xendomains
++%{_libexecdir}/%{name}/bin/xenpaging
++%{_libexecdir}/%{name}/bin/xenpvnetboot
++%{_libexecdir}/%{name}/boot/hvmloader
 +%{_sbindir}/kdd
 +%{_sbindir}/oxenstored
 +%{_sbindir}/xen-hptool
@@ -824,12 +845,12 @@ new file mode 100644
 +%{_libdir}/fs/zfs/fsimage.so
 +%{_libdir}/libfsimage.so.1.0
 +%{_libdir}/libfsimage.so.1.0.0
-+%{_libdir}/libxenctrl.so.4.4
-+%{_libdir}/libxenctrl.so.4.4.0
-+%{_libdir}/libxenguest.so.4.4
-+%{_libdir}/libxenguest.so.4.4.0
-+%{_libdir}/libxenlight.so.4.4
-+%{_libdir}/libxenlight.so.4.4.0
++%{_libdir}/libxenctrl.so.4.5
++%{_libdir}/libxenctrl.so.4.5.0
++%{_libdir}/libxenguest.so.4.5
++%{_libdir}/libxenguest.so.4.5.0
++%{_libdir}/libxenlight.so.4.5
++%{_libdir}/libxenlight.so.4.5.0
 +%{_libdir}/libxenstat.so.0
 +%{_libdir}/libxenstat.so.0.0
 +%{_libdir}/libxlutil.so.4.3
@@ -913,10 +934,10 @@ new file mode 100644
 +%{_libdir}/ocaml/xenmmap/xenmmap.cmxa
 +
 +%files installer-files
-+%{_libdir}/libxenctrl.so.4.4
-+%{_libdir}/libxenctrl.so.4.4.0
-+%{_libdir}/libxenguest.so.4.4
-+%{_libdir}/libxenguest.so.4.4.0
++%{_libdir}/libxenctrl.so.4.5
++%{_libdir}/libxenctrl.so.4.5.0
++%{_libdir}/libxenguest.so.4.5
++%{_libdir}/libxenguest.so.4.5.0
 +%{python_sitearch}/xen/__init__.py*
 +%{python_sitearch}/xen/lowlevel/__init__.py*
 +%{python_sitearch}/xen/lowlevel/xc.so
@@ -941,7 +962,8 @@ new file mode 100644
 +%changelog
 diff --git a/mk/xl.conf b/mk/xl.conf
 new file mode 100644
+index 0000000..3da0a1e
 --- /dev/null
 +++ b/mk/xl.conf
-@@ -0,0 +1,1 @@
+@@ -0,0 +1 @@
 +autoballoon = 0
