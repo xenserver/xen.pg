@@ -1,10 +1,26 @@
 Expose vcpus as multiple cores in a smaller number of sockets,
 by adjusting the cpuid responses appropriately.
 
-diff -r 1f89ecf20229 tools/libxc/xc_domain.c
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index e05ddb1..2c1eefa 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1340,6 +1340,10 @@ int xc_domain_get_tsc_info(xc_interface *xch,
+ 
+ int xc_domain_disable_migrate(xc_interface *xch, uint32_t domid);
+ 
++int xc_domain_set_cores_per_socket(xc_interface *xch,
++                                   uint32_t domid,
++                                   uint32_t cores_per_socket);
++
+ int xc_domain_maximum_gpfn(xc_interface *xch, domid_t domid);
+ 
+ int xc_domain_increase_reservation(xc_interface *xch,
+diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
+index 0f2af23..4f9f3f4 100644
 --- a/tools/libxc/xc_domain.c
 +++ b/tools/libxc/xc_domain.c
-@@ -740,6 +740,20 @@ int xc_domain_get_tsc_info(xc_interface 
+@@ -773,6 +773,20 @@ int xc_domain_get_tsc_info(xc_interface *xch,
  }
  
  
@@ -25,24 +41,11 @@ diff -r 1f89ecf20229 tools/libxc/xc_domain.c
  int xc_domain_maximum_gpfn(xc_interface *xch, domid_t domid)
  {
      return do_memory_op(xch, XENMEM_maximum_gpfn, &domid, sizeof(domid));
-diff -r 1f89ecf20229 tools/libxc/xenctrl.h
---- a/tools/libxc/xenctrl.h
-+++ b/tools/libxc/xenctrl.h
-@@ -1239,6 +1239,10 @@ int xc_domain_get_tsc_info(xc_interface 
- 
- int xc_domain_disable_migrate(xc_interface *xch, uint32_t domid);
- 
-+int xc_domain_set_cores_per_socket(xc_interface *xch,
-+                                   uint32_t domid,
-+                                   uint32_t cores_per_socket);
-+
- int xc_domain_maximum_gpfn(xc_interface *xch, domid_t domid);
- 
- int xc_domain_increase_reservation(xc_interface *xch,
-diff -r 1f89ecf20229 xen/arch/x86/hvm/svm/svm.c
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index bc8a0d3..4e97d65 100644
 --- a/xen/arch/x86/hvm/svm/svm.c
 +++ b/xen/arch/x86/hvm/svm/svm.c
-@@ -1374,14 +1374,52 @@ static void svm_cpuid_intercept(
+@@ -1539,14 +1539,52 @@ static void svm_cpuid_intercept(
  {
      unsigned int input = *eax;
      struct vcpu *v = current;
@@ -95,10 +98,11 @@ diff -r 1f89ecf20229 xen/arch/x86/hvm/svm/svm.c
          break;
      case 0x8000001c: 
      {
-diff -r 1f89ecf20229 xen/arch/x86/hvm/vmx/vmx.c
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 304aeea..3342015 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -1773,11 +1773,32 @@ static void vmx_cpuid_intercept(
+@@ -1862,11 +1862,32 @@ static void vmx_cpuid_intercept(
      unsigned int input = *eax;
      struct segment_register cs;
      struct vcpu *v = current;
@@ -131,10 +135,11 @@ diff -r 1f89ecf20229 xen/arch/x86/hvm/vmx/vmx.c
          case 0x80000001:
              /* SYSCALL is visible iff running in long mode. */
              vmx_get_segment_register(v, x86_seg_cs, &cs);
-diff -r 1f89ecf20229 xen/common/domctl.c
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index fdd4845..01ba00d 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -892,6 +892,44 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xe
+@@ -1195,6 +1195,44 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
          break;
      }
  
@@ -179,10 +184,11 @@ diff -r 1f89ecf20229 xen/common/domctl.c
      default:
          ret = arch_do_domctl(op, d, u_domctl);
          break;
-diff -r 1f89ecf20229 xen/include/public/domctl.h
+diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
+index 969c65f..365913b 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -971,6 +971,12 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runst
+@@ -1011,6 +1011,13 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
  /* Some vcpus are runnable, some are blocked */
  #define DOMAIN_RUNSTATE_partial_contention 5
  
@@ -192,10 +198,11 @@ diff -r 1f89ecf20229 xen/include/public/domctl.h
 +
 +typedef struct xen_domctl_corespersocket xen_domctl_corespersocket_t;
 +DEFINE_XEN_GUEST_HANDLE(xen_domctl_corespersocket_t);
- 
++
  struct xen_domctl {
      uint32_t cmd;
-@@ -1049,6 +1055,7 @@ struct xen_domctl {
+ #define XEN_DOMCTL_createdomain                   1
+@@ -1089,6 +1096,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
  #define XEN_DOMCTL_gdbsx_domstatus             1003
@@ -203,7 +210,7 @@ diff -r 1f89ecf20229 xen/include/public/domctl.h
      uint32_t interface_version; /* XEN_DOMCTL_INTERFACE_VERSION */
      domid_t  domain;
      union {
-@@ -1103,6 +1110,7 @@ struct xen_domctl {
+@@ -1141,6 +1149,7 @@ struct xen_domctl {
          struct xen_domctl_set_virq_handler  set_virq_handler;
          struct xen_domctl_set_max_evtchn    set_max_evtchn;
          struct xen_domctl_runstate_info     domain_runstate;
@@ -211,10 +218,11 @@ diff -r 1f89ecf20229 xen/include/public/domctl.h
          struct xen_domctl_gdbsx_memio       gdbsx_guest_memio;
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
-diff -r 1f89ecf20229 xen/include/xen/sched.h
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index fc65bd3..e188fe3 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -429,6 +429,8 @@ struct domain
+@@ -463,6 +463,8 @@ struct domain
      spinlock_t runstate_lock;
      atomic_t runstate_missed_changes;
      domain_runstate_info_t runstate;
