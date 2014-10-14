@@ -1,0 +1,200 @@
+xen/gnttab: Avoid TLB flush if grant mapped page was not accessed
+
+Implement an optimisation to avoid a TLB flush if the grant mapped page was
+not accessed whilst it was mapped.
+
+Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
+
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 6cd7f45..a54a456 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -3885,7 +3885,8 @@ static int create_grant_va_mapping(
+ }
+ 
+ static int replace_grant_va_mapping(
+-    unsigned long addr, unsigned long frame, l1_pgentry_t nl1e, struct vcpu *v)
++    unsigned long addr, unsigned long frame, l1_pgentry_t nl1e, struct vcpu *v,
++    int *page_accessed)
+ {
+     l1_pgentry_t *pl1e, ol1e;
+     unsigned long gl1mfn;
+@@ -3931,12 +3932,13 @@ static int replace_grant_va_mapping(
+     }
+ 
+     /* Delete pagetable entry. */
+-    if ( unlikely(!UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, v, 0)) )
++    if ( unlikely(!UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, v, 1)) )
+     {
+         MEM_LOG("Cannot delete PTE entry at %p", (unsigned long *)pl1e);
+         rc = GNTST_general_error;
+         goto unlock_and_out;
+     }
++    *page_accessed = !!(l1e_get_flags(*pl1e) & _PAGE_ACCESSED);
+ 
+  unlock_and_out:
+     page_unlock(l1pg);
+@@ -3947,9 +3949,9 @@ static int replace_grant_va_mapping(
+ }
+ 
+ static int destroy_grant_va_mapping(
+-    unsigned long addr, unsigned long frame, struct vcpu *v)
++    unsigned long addr, unsigned long frame, struct vcpu *v, int *page_accessed)
+ {
+-    return replace_grant_va_mapping(addr, frame, l1e_empty(), v);
++    return replace_grant_va_mapping(addr, frame, l1e_empty(), v, page_accessed);
+ }
+ 
+ static int create_grant_p2m_mapping(uint64_t addr, unsigned long frame,
+@@ -3984,7 +3986,7 @@ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
+         return create_grant_p2m_mapping(addr, frame, flags, cache_flags);
+ 
+     grant_pte_flags =
+-        _PAGE_PRESENT | _PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_GNTTAB;
++        _PAGE_PRESENT | _PAGE_GNTTAB;
+     if ( cpu_has_nx )
+         grant_pte_flags |= _PAGE_NX_BIT;
+ 
+@@ -4032,7 +4034,8 @@ static int replace_grant_p2m_mapping(
+ }
+ 
+ int replace_grant_host_mapping(
+-    uint64_t addr, unsigned long frame, uint64_t new_addr, unsigned int flags)
++    uint64_t addr, unsigned long frame, uint64_t new_addr, unsigned int flags,
++    int *page_accessed)
+ {
+     struct vcpu *curr = current;
+     l1_pgentry_t *pl1e, ol1e;
+@@ -4053,7 +4056,7 @@ int replace_grant_host_mapping(
+     }
+ 
+     if ( !new_addr )
+-        return destroy_grant_va_mapping(addr, frame, curr);
++        return destroy_grant_va_mapping(addr, frame, curr, page_accessed);
+ 
+     pl1e = guest_map_l1e(curr, new_addr, &gl1mfn);
+     if ( !pl1e )
+@@ -4101,7 +4104,7 @@ int replace_grant_host_mapping(
+     put_page(l1pg);
+     guest_unmap_l1e(curr, pl1e);
+ 
+-    rc = replace_grant_va_mapping(addr, frame, ol1e, curr);
++    rc = replace_grant_va_mapping(addr, frame, ol1e, curr, page_accessed);
+     if ( rc && !paging_mode_refcounts(curr->domain) )
+         put_page_from_l1e(ol1e, curr->domain);
+ 
+diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
+index 23266c3..722a7ba 100644
+--- a/xen/common/grant_table.c
++++ b/xen/common/grant_table.c
+@@ -73,6 +73,7 @@ struct gnttab_unmap_common {
+ 
+     /* Return */
+     int16_t status;
++    int page_accessed;
+ 
+     /* Shared state beteen *_unmap and *_unmap_complete */
+     u16 flags;
+@@ -81,6 +82,12 @@ struct gnttab_unmap_common {
+     struct domain *rd;
+ };
+ 
++#ifndef NDEBUG
++atomic_t grant_unmap_tlb_flush_avoided;
++atomic_t grant_unmap_tlb_flush_done;
++atomic_t grant_unmap_operations;
++#endif
++
+ /* Number of unmap operations that are done between each tlb flush */
+ #define GNTTAB_UNMAP_BATCH_SIZE 32
+ 
+@@ -854,6 +861,7 @@ __gnttab_unmap_common(
+     ld = current->domain;
+     lgt = ld->grant_table;
+ 
++    op->page_accessed = 0;
+     op->frame = (unsigned long)(op->dev_bus_addr >> PAGE_SHIFT);
+ 
+     if ( unlikely(op->handle >= lgt->maptrack_limit) )
+@@ -934,7 +942,7 @@ __gnttab_unmap_common(
+     {
+         if ( (rc = replace_grant_host_mapping(op->host_addr,
+                                               op->frame, op->new_addr, 
+-                                              op->flags)) < 0 )
++                                              op->flags, &op->page_accessed)) < 0 )
+             goto unmap_out;
+ 
+         ASSERT(act->pin & (GNTPIN_hstw_mask | GNTPIN_hstr_mask));
+@@ -1102,20 +1110,25 @@ static long
+ gnttab_unmap_grant_ref(
+     XEN_GUEST_HANDLE_PARAM(gnttab_unmap_grant_ref_t) uop, unsigned int count)
+ {
+-    int i, c, partial_done, done = 0;
++    int i, c, partial_done, done = 0, grant_map_accessed = 0;
+     struct gnttab_unmap_grant_ref op;
+     struct gnttab_unmap_common common[GNTTAB_UNMAP_BATCH_SIZE];
+ 
++#ifndef NDEBUG
++    atomic_inc(&grant_unmap_operations);
++#endif
+     while ( count != 0 )
+     {
+         c = min(count, (unsigned int)GNTTAB_UNMAP_BATCH_SIZE);
+         partial_done = 0;
++        grant_map_accessed = 0;
+ 
+         for ( i = 0; i < c; i++ )
+         {
+             if ( unlikely(__copy_from_guest(&op, uop, 1)) )
+                 goto fault;
+             __gnttab_unmap_grant_ref(&op, &(common[i]));
++            grant_map_accessed |= common[i].page_accessed;
+             ++partial_done;
+             if ( unlikely(__copy_field_to_guest(uop, &op, status)) )
+                 goto fault;
+@@ -1123,7 +1136,17 @@ gnttab_unmap_grant_ref(
+         }
+ 
+         gnttab_flush_tlb(current->domain);
+-
++        if ( grant_map_accessed )
++        {
++            flush_tlb_mask(current->domain->domain_dirty_cpumask);
++#ifndef NDEBUG
++            atomic_inc(&grant_unmap_tlb_flush_done);
++        }
++        else
++        {
++            atomic_inc(&grant_unmap_tlb_flush_avoided);
++#endif
++        }
+         for ( i = 0; i < partial_done; i++ )
+             __gnttab_unmap_common_complete(&(common[i]));
+ 
+@@ -2919,7 +2942,12 @@ static void gnttab_usage_print_all(unsigned char key)
+     printk("%s [ key '%c' pressed\n", __FUNCTION__, key);
+     for_each_domain ( d )
+         gnttab_usage_print(d);
++#ifndef NDEBUG
++    printk("Grant unmap tlb flush performed %i\n", atomic_read(&grant_unmap_tlb_flush_done));
++    printk("Grant unmap tlb flush avoided %i\n", atomic_read(&grant_unmap_tlb_flush_avoided));
++    printk("Grant unmap operations %i\n", atomic_read(&grant_unmap_operations));
+     printk("%s ] done\n", __FUNCTION__);
++#endif
+ }
+ 
+ static struct keyhandler gnttab_usage_print_all_keyhandler = {
+diff --git a/xen/include/asm-x86/grant_table.h b/xen/include/asm-x86/grant_table.h
+index 8c9bbcf..e9606bf 100644
+--- a/xen/include/asm-x86/grant_table.h
++++ b/xen/include/asm-x86/grant_table.h
+@@ -16,7 +16,8 @@
+ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
+ 			      unsigned int flags, unsigned int cache_flags);
+ int replace_grant_host_mapping(
+-    uint64_t addr, unsigned long frame, uint64_t new_addr, unsigned int flags);
++    uint64_t addr, unsigned long frame, uint64_t new_addr, unsigned int flags,
++    int *page_accessed);
+ 
+ #define gnttab_create_shared_page(d, t, i)                               \
+     do {                                                                 \
