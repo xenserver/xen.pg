@@ -1,10 +1,30 @@
-# HG changeset patch
-# Parent d5c2b9c4a6d9638eedb0e8b80ad8f7999fb72c78
-
-diff -r d5c2b9c4a6d9 tools/libxc/xc_domain.c
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 596799c..8a46bf6 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1423,6 +1423,17 @@ int xc_domain_get_pod_target(xc_interface *xch,
+                              uint64_t *pod_cache_pages,
+                              uint64_t *pod_entries);
+ 
++int xc_domain_memory_translate_gpfn_list(xc_interface *xch,
++                                         uint32_t domid,
++                                         unsigned long nr_gpfns,
++                                         xen_pfn_t *gpfn_list,
++                                         xen_pfn_t *mfn_list);
++
++int xc_domain_memory_release_mfn_list(xc_interface *xch,
++                                      uint32_t domid,
++                                      unsigned long nr_mfns,
++                                      xen_pfn_t *mfn_list);
++
+ #define XENCTRL_HAS_GET_RUNSTATE_INFO 1
+ int xc_get_runstate_info(xc_interface *xch,
+ 			 uint32_t domid,
+diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
+index 4f9f3f4..4387f45 100644
 --- a/tools/libxc/xc_domain.c
 +++ b/tools/libxc/xc_domain.c
-@@ -1108,6 +1108,81 @@ int xc_domain_get_pod_target(xc_interfac
+@@ -1141,6 +1141,81 @@ int xc_domain_get_pod_target(xc_interface *xch,
  }
  #endif
  
@@ -32,7 +52,7 @@ diff -r d5c2b9c4a6d9 tools/libxc/xc_domain.c
 +    set_xen_guest_handle(translate_gpfn_list.gpfn_list, gpfn_list);
 +    set_xen_guest_handle(translate_gpfn_list.mfn_list, mfn_list);
 +
-+    err = do_memory_op(xch, XENMEM_translate_gpfn_list, 
++    err = do_memory_op(xch, XENMEM_translate_gpfn_list,
 +                       &translate_gpfn_list, sizeof(translate_gpfn_list));
 +
 +    if ( err != 0 )
@@ -67,7 +87,7 @@ diff -r d5c2b9c4a6d9 tools/libxc/xc_domain.c
 +
 +    set_xen_guest_handle(release_mfn_list.mfn_list, mfn_list);
 +
-+    err = do_memory_op(xch, XENMEM_release_mfn_list, 
++    err = do_memory_op(xch, XENMEM_release_mfn_list,
 +                       &release_mfn_list, sizeof(release_mfn_list));
 +
 +    if ( err != 0 )
@@ -86,31 +106,11 @@ diff -r d5c2b9c4a6d9 tools/libxc/xc_domain.c
  int xc_domain_max_vcpus(xc_interface *xch, uint32_t domid, unsigned int max)
  {
      DECLARE_DOMCTL;
-diff -r d5c2b9c4a6d9 tools/libxc/xenctrl.h
---- a/tools/libxc/xenctrl.h
-+++ b/tools/libxc/xenctrl.h
-@@ -1371,6 +1371,17 @@ int xc_domain_get_pod_target(xc_interfac
-                              uint64_t *pod_cache_pages,
-                              uint64_t *pod_entries);
- 
-+int xc_domain_memory_translate_gpfn_list(xc_interface *xch,
-+                                         uint32_t domid,
-+                                         unsigned long nr_gpfns,
-+                                         xen_pfn_t *gpfn_list,
-+                                         xen_pfn_t *mfn_list);
-+
-+int xc_domain_memory_release_mfn_list(xc_interface *xch,
-+                                      uint32_t domid,
-+                                      unsigned long nr_mfns,
-+                                      xen_pfn_t *mfn_list);
-+
- #define XENCTRL_HAS_GET_RUNSTATE_INFO 1
- int xc_get_runstate_info(xc_interface *xch,
- 			 uint32_t domid,
-diff -r d5c2b9c4a6d9 xen/arch/x86/domain.c
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index ad0a9f5..88cce78 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -1808,6 +1808,9 @@ static int relinquish_memory(
+@@ -1836,6 +1836,9 @@ static int relinquish_memory(
              continue;
          }
  
@@ -120,10 +120,11 @@ diff -r d5c2b9c4a6d9 xen/arch/x86/domain.c
          if ( test_and_clear_bit(_PGT_pinned, &page->u.inuse.type_info) )
              ret = put_page_and_type_preemptible(page);
          switch ( ret )
-diff -r d5c2b9c4a6d9 xen/common/compat/memory.c
+diff --git a/xen/common/compat/memory.c b/xen/common/compat/memory.c
+index 43d02bc..078adae 100644
 --- a/xen/common/compat/memory.c
 +++ b/xen/common/compat/memory.c
-@@ -29,12 +29,16 @@ int compat_memory_op(unsigned int cmd, X
+@@ -32,12 +32,16 @@ int compat_memory_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) compat)
              struct xen_add_to_physmap *atp;
              struct xen_add_to_physmap_batch *atpb;
              struct xen_remove_from_physmap *xrfp;
@@ -140,7 +141,7 @@ diff -r d5c2b9c4a6d9 xen/common/compat/memory.c
          } cmp;
  
          set_xen_guest_handle(nat.hnd, COMPAT_ARG_XLAT_VIRT_BASE);
-@@ -184,6 +188,90 @@ int compat_memory_op(unsigned int cmd, X
+@@ -187,6 +191,90 @@ int compat_memory_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) compat)
              break;
          }
  
@@ -231,7 +232,7 @@ diff -r d5c2b9c4a6d9 xen/common/compat/memory.c
          case XENMEM_current_reservation:
          case XENMEM_maximum_reservation:
          case XENMEM_maximum_gpfn:
-@@ -383,6 +471,48 @@ int compat_memory_op(unsigned int cmd, X
+@@ -390,6 +478,48 @@ int compat_memory_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) compat)
              start_extent = end_extent;
              break;
  
@@ -280,10 +281,11 @@ diff -r d5c2b9c4a6d9 xen/common/compat/memory.c
          case XENMEM_maximum_ram_page:
          case XENMEM_current_reservation:
          case XENMEM_maximum_reservation:
-diff -r d5c2b9c4a6d9 xen/common/memory.c
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index a7b0033..565a60c 100644
 --- a/xen/common/memory.c
 +++ b/xen/common/memory.c
-@@ -771,6 +771,164 @@ static unsigned int _quirks_transform_sp
+@@ -774,6 +774,164 @@ static unsigned int _quirks_transform_space(struct domain *d, unsigned int space
      }
  }
  
@@ -340,7 +342,7 @@ diff -r d5c2b9c4a6d9 xen/common/memory.c
 +        if ( p2m_is_shared(p2mt) )
 +        {
 +            put_gfn(d, gpfn);
-+            goto fail; 
++            goto fail;
 +        }
 +#else /* !CONFIG_X86 */
 +        mfn = gmfn_to_mfn(d, gpfn);
@@ -448,9 +450,9 @@ diff -r d5c2b9c4a6d9 xen/common/memory.c
  long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
  {
      struct domain *d;
-@@ -1057,6 +1215,24 @@ long do_memory_op(unsigned long cmd, XEN
- 
+@@ -1195,6 +1353,24 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
          break;
+     }
  
 +    case XENMEM_translate_gpfn_list:
 +        rc = translate_gpfn_list(guest_handle_cast(arg, xen_translate_gpfn_list_t),
@@ -471,9 +473,10 @@ diff -r d5c2b9c4a6d9 xen/common/memory.c
 +        break;
 +
      default:
-         rc = arch_memory_op(op, arg);
+         rc = arch_memory_op(cmd, arg);
          break;
-diff -r d5c2b9c4a6d9 xen/include/asm-x86/mm.h
+diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
+index dca298f..759f958 100644
 --- a/xen/include/asm-x86/mm.h
 +++ b/xen/include/asm-x86/mm.h
 @@ -224,8 +224,12 @@ struct page_info
@@ -490,7 +493,8 @@ diff -r d5c2b9c4a6d9 xen/include/asm-x86/mm.h
  #define PGC_count_mask    ((1UL<<PGC_count_width)-1)
  
  struct spage_info
-diff -r d5c2b9c4a6d9 xen/include/public/memory.h
+diff --git a/xen/include/public/memory.h b/xen/include/public/memory.h
+index 96f74cb..bedbcfd 100644
 --- a/xen/include/public/memory.h
 +++ b/xen/include/public/memory.h
 @@ -301,9 +301,6 @@ struct xen_remove_from_physmap {
@@ -503,9 +507,9 @@ diff -r d5c2b9c4a6d9 xen/include/public/memory.h
  /*
   * Returns the pseudo-physical memory map as it was when the domain
   * was started (specified by XENMEM_set_memory_map).
-@@ -485,6 +482,56 @@ DEFINE_XEN_GUEST_HANDLE(xen_mem_sharing_
+@@ -582,6 +579,56 @@ DEFINE_XEN_GUEST_HANDLE(vnuma_topology_info_t);
  
- /* Next available subop number is 26 */
+ /* Next available subop number is 27 */
  
 +/*
 + * MEMOPs can only be 6 bits wide (see hypercall.h). Set the top bit to
@@ -538,7 +542,7 @@ diff -r d5c2b9c4a6d9 xen/include/public/memory.h
 +};
 +typedef struct xen_translate_gpfn_list xen_translate_gpfn_list_t;
 +DEFINE_XEN_GUEST_HANDLE(xen_translate_gpfn_list_t);
-+ 
++
 +/*
 + * Decrement the ref count of a list of mfns (previously incremented with
 + * XENMEM_translate_gpfn_list).
@@ -560,11 +564,12 @@ diff -r d5c2b9c4a6d9 xen/include/public/memory.h
  #endif /* __XEN_PUBLIC_MEMORY_H__ */
  
  /*
-diff -r d5c2b9c4a6d9 xen/include/xlat.lst
+diff --git a/xen/include/xlat.lst b/xen/include/xlat.lst
+index 9a35dd7..b658afb 100644
 --- a/xen/include/xlat.lst
 +++ b/xen/include/xlat.lst
-@@ -62,6 +62,8 @@
- !	memory_reservation		memory.h
+@@ -63,6 +63,8 @@
+ ?	mem_access_op		memory.h
  !	pod_target			memory.h
  !	remove_from_physmap		memory.h
 +!	translate_gpfn_list             memory.h
