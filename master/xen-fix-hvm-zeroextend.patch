@@ -1,0 +1,65 @@
+From 13688c449256e8f5c0c056535a4d7594d0025d67 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 23 Oct 2014 11:31:30 +0100
+Subject: [PATCH] hvm/load: Correct length checks for zeroextended records
+
+In the case that Xen is attempting to load a zeroextended HVM record where the
+difference needing extending would overflow the data blob, _hvm_check_entry()
+will incorrectly fail before working out that it would have been safe.
+
+The "len + sizeof(*d)" check is wrong.  Consider zeroextending a 16 byte
+record into a 32 byte structure.  "32 + hdr" will fail the overall context
+length check even though the pre-extended record in the stream is 16 bytes.
+
+The first condition is reduced to just a length check for hvm save header,
+while the second condition is extended to include a check that the record in
+the stream not exceeding the stream length.
+
+The error messages are extended to include further useful information.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Paul Durrant <Paul.Durrant@citrix.com>
+CC: Keir Fraser <keir@xen.org>
+CC: Jan Beulich <JBeulich@suse.com>
+CC: Tim Deegan <tim@xen.org>
+---
+ xen/common/hvm/save.c |   17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/xen/common/hvm/save.c b/xen/common/hvm/save.c
+index 6c16399..e20b1e6 100644
+--- a/xen/common/hvm/save.c
++++ b/xen/common/hvm/save.c
+@@ -292,19 +292,22 @@ int _hvm_check_entry(struct hvm_domain_context *h,
+ {
+     struct hvm_save_descriptor *d 
+         = (struct hvm_save_descriptor *)&h->data[h->cur];
+-    if ( len + sizeof (*d) > h->size - h->cur)
++    if ( sizeof(*d) > h->size - h->cur)
+     {
+         printk(XENLOG_G_WARNING
+-               "HVM restore: not enough data left to read %u bytes "
+-               "for type %u\n", len, type);
++               "HVM restore: not enough data left to read %zu bytes "
++               "for type %u header\n", sizeof(*d), type);
+         return -1;
+-    }    
++    }
+     if ( (type != d->typecode) || (len < d->length) ||
+-         (strict_length && (len != d->length)) )
++         (strict_length && (len != d->length)) ||
++         (d->length > (h->size - h->cur - sizeof(*d))) )
+     {
+         printk(XENLOG_G_WARNING
+-               "HVM restore mismatch: expected type %u length %u, "
+-               "saw type %u length %u\n", type, len, d->typecode, d->length);
++               "HVM restore mismatch: expected %s type %u length %u, "
++               "saw type %u length %u.  %zu bytes remaining\n",
++               strict_length ? "strict" : "zeroextended", type, len,
++               d->typecode, d->length, h->size - h->cur - sizeof(*d));
+         return -1;
+     }
+     h->cur += sizeof(*d);
+-- 
+1.7.10.4
+
