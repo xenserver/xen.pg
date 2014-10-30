@@ -1,0 +1,111 @@
+# HG changeset patch
+# User Andrew Cooper <andrew.cooper3@citrix.com>
+# Date 1414052393 -7200
+# Node ID c418622ff2e24218566d5b5ce2084e1370e1d9b4
+# Parent  b1b85f0d2f8201152e7bb8bd5d0c747d2a6ac640
+fix listing of vcpus when domains lacking any vcpus exist
+
+On a system which looks like this:
+
+[root@st04 ~]# xl list
+Name                                        ID   Mem VCPUs      State   Time(s)
+Domain-0                                     0   752     4     r-----   46699.3
+(null)                                       1     0     0     --p---       0.0
+(null)                                       2     0     0     --p---       0.0
+(null)                                       3     0     0     --p---       0.0
+badger                                      25     0     1     --p---       0.0
+
+`xl vcpu-list` failes as so:
+
+[root@st04 ~]# xl vcpu-list
+Name                                ID  VCPU   CPU State   Time(s) CPU Affinity
+Domain-0                             0     0    0   -b-   12171.0  all
+Domain-0                             0     1    1   -b-   11779.6  all
+Domain-0                             0     2    2   -b-   11599.0  all
+Domain-0                             0     3    3   r--   11007.0  all
+libxl: critical: libxl__calloc: libxl: FATAL ERROR: memory allocation failure (libxl__calloc, 4294935299 x 40)
+: Cannot allocate memory
+libxl: FATAL ERROR: memory allocation failure (libxl__calloc, 4294935299 x 40)
+
+The root cause of this is in Xen.  getdomaininfo() has no way of expressing
+"this domain has no vcpus".  Previously, info->max_vcpu_id would be returned
+uninitialised in such a case.
+
+Unfortunately, setting it to 0 as a default is not appropriate.  A max_vcpu_id
+of 0 and nr_online_cpus of 0 is the valid state for a single vcpu domain which
+is in the process of being destroyed.
+
+As all components are required to add 1 to max_vcpu_id to get the number of
+vcpus, an id of ~0U is not valid to be used.  Explicitly define this as an
+invalid max vcpu value, and use it to express "no vcpus" in getdomaininfo()
+
+In libxl, the issue is seen as libxl_list_vcpu() attempts to use the
+uninitialised domaininfo.max_vcpu_id for memory allocation.
+
+Check domaininfo.max_vcpu_id against the new sentinel value
+XEN_INVALID_MAX_VCPU_ID, and return early.  This means that it is now valid
+for libxl_list_vcpu() to return NULL for a domain which lacks any vcpus.
+
+As part of this change, remove the pointless call to libxl_get_max_cpus(),
+whose returned value is unconditionally clobbered in the for() loop.
+
+Reported-by: Euan Harris <euan.harris@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Don Slutz <dslutz@verizon.com>
+Acked-by: Ian Campbell <Ian.Campbell@citrix.com>
+
+diff -r b1b85f0d2f82 -r c418622ff2e2 tools/libxl/libxl.c
+--- a/tools/libxl/libxl.c
++++ b/tools/libxl/libxl.c
+@@ -5246,7 +5246,12 @@ libxl_vcpuinfo *libxl_list_vcpu(libxl_ct
+         GC_FREE;
+         return NULL;
+     }
+-    *nr_cpus_out = libxl_get_max_cpus(ctx);
++
++    if (domaininfo.max_vcpu_id == XEN_INVALID_MAX_VCPU_ID) {
++        GC_FREE;
++        return NULL;
++    }
++
+     ret = ptr = libxl__calloc(NOGC, domaininfo.max_vcpu_id + 1,
+                               sizeof(libxl_vcpuinfo));
+ 
+diff -r b1b85f0d2f82 -r c418622ff2e2 tools/libxl/xl_cmdimpl.c
+--- a/tools/libxl/xl_cmdimpl.c
++++ b/tools/libxl/xl_cmdimpl.c
+@@ -4813,10 +4813,8 @@ static void print_domain_vcpuinfo(uint32
+ 
+     vcpuinfo = libxl_list_vcpu(ctx, domid, &nb_vcpu, &nrcpus);
+ 
+-    if (!vcpuinfo) {
+-        fprintf(stderr, "libxl_list_vcpu failed.\n");
++    if (!vcpuinfo)
+         return;
+-    }
+ 
+     for (i = 0; i < nb_vcpu; i++) {
+         print_vcpuinfo(domid, &vcpuinfo[i], nr_cpus);
+diff -r b1b85f0d2f82 -r c418622ff2e2 xen/common/domctl.c
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -156,6 +156,7 @@ void getdomaininfo(struct domain *d, str
+     struct vcpu_runstate_info runstate;
+     
+     info->domain = d->domain_id;
++    info->max_vcpu_id = XEN_INVALID_MAX_VCPU_ID;
+     info->nr_online_vcpus = 0;
+     info->ssidref = 0;
+     
+diff -r b1b85f0d2f82 -r c418622ff2e2 xen/include/public/domctl.h
+--- a/xen/include/public/domctl.h
++++ b/xen/include/public/domctl.h
+@@ -108,6 +108,7 @@ struct xen_domctl_getdomaininfo {
+     uint64_aligned_t shared_info_frame; /* GMFN of shared_info struct */
+     uint64_aligned_t cpu_time;
+     uint32_t nr_online_vcpus;    /* Number of VCPUs currently online. */
++#define XEN_INVALID_MAX_VCPU_ID (~0U) /* Domain has no vcpus? */
+     uint32_t max_vcpu_id;        /* Maximum VCPUID in use by this domain. */
+     uint32_t ssidref;
+     xen_domain_handle_t handle;
