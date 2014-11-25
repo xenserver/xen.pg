@@ -11,10 +11,10 @@ index b24e905..2a30c04 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index f38cecc..d82d742 100644
+index 0ad9fee..62ef433 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
-@@ -425,6 +425,7 @@ rm -rf $RPM_BUILD_ROOT
+@@ -423,6 +423,7 @@ rm -rf $RPM_BUILD_ROOT
  %{_libexecdir}/%{name}/bin/xenconsole
  %{_libexecdir}/%{name}/bin/xenctx
  %{_libexecdir}/%{name}/bin/xendomains
@@ -23,10 +23,10 @@ index f38cecc..d82d742 100644
  %{_libexecdir}/%{name}/bin/xenpvnetboot
  %{_libexecdir}/%{name}/boot/hvmloader
 diff --git a/tools/Makefile b/tools/Makefile
-index f2821d6..6cdc279 100644
+index 32cfc62..e5d6d4b 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
-@@ -20,6 +20,7 @@ SUBDIRS-$(CONFIG_BLKTAP2) += blktap2
+@@ -21,6 +21,7 @@ SUBDIRS-$(CONFIG_BLKTAP2) += blktap2
  SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
  SUBDIRS-y += libfsimage
  SUBDIRS-$(CONFIG_Linux) += libvchan
@@ -71,10 +71,10 @@ index 0000000..f859cfd
 +	$(RM) $(DEPS)
 diff --git a/tools/xenguest/xenguest.c b/tools/xenguest/xenguest.c
 new file mode 100644
-index 0000000..e0d2d30
+index 0000000..e7ff423
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
-@@ -0,0 +1,662 @@
+@@ -0,0 +1,673 @@
 +#include <getopt.h>
 +#include <errno.h>
 +#include <syslog.h>
@@ -337,9 +337,20 @@ index 0000000..e0d2d30
 +            break;
 +
 +        case XG_OPT_DEBUGLOG:
++            if ( opt_debugfile && fclose(opt_debugfile) )
++            {
++                err("Unable to close existing debug file: %d %s\n",
++                    errno, strerror(errno));
++                exit(1);
++            }
++
 +            opt_debugfile = fopen(optarg, "a");
 +            if ( !opt_debugfile )
-+                err("Unable to open debug file\n");
++            {
++                err("Unable to open debug file '%s': %d %s\n",
++                    optarg, errno, strerror(errno));
++                exit(1);
++            }
 +            break;
 +
 +        case XG_OPT_FD:
@@ -739,10 +750,10 @@ index 0000000..e0d2d30
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..22765ed
+index 0000000..f9ac109
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,691 @@
+@@ -0,0 +1,673 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1220,7 +1231,7 @@ index 0000000..22765ed
 +static int switch_qemu_logdirty(int domid, unsigned enable, void *_data)
 +{
 +    struct save_callbacks_data * data = _data;
-+    char *cmd_path = NULL, *ret_path = NULL, *reply = NULL;
++    char buf[64], *reply = NULL;
 +    static const char cmd_enable[] = "enable";
 +    static const char cmd_disable[] = "disable";
 +    const char *cmd = enable ? cmd_enable : cmd_disable;
@@ -1228,15 +1239,8 @@ index 0000000..22765ed
 +    uint64_t timeout_us = 15 * 1000 * 1000; /* 15 seconds, in microseconds. */
 +    bool rc = 0;
 +
-+    asprintf(&cmd_path, "/local/domain/0/device-model/%u/logdirty/cmd", data->domid);
-+    if ( !cmd_path )
-+    {
-+        err("Out of memory attempting to '%s' qemu logdirty\n", cmd);
-+        errno = ENOMEM;
-+        return 1;
-+    }
-+
-+    if ( !xs_write(data->xsh, XBT_NULL, cmd_path, cmd, strlen(cmd)) )
++    snprintf(buf, sizeof buf, "/local/domain/0/device-model/%u/logdirty/cmd", data->domid);
++    if ( !xs_write(data->xsh, XBT_NULL, buf, cmd, strlen(cmd)) )
 +    {
 +        int saved_errno = errno;
 +
@@ -1245,24 +1249,15 @@ index 0000000..22765ed
 +        return 1;
 +    }
 +
-+    free(cmd_path);
-+
-+    asprintf(&ret_path, "/local/domain/0/device-model/%u/logdirty/ret", data->domid);
-+    if ( !ret_path )
-+    {
-+        err("Out of memory attempting to '%s' qemu logdirty\n", cmd);
-+        errno = ENOMEM;
-+        return 1;
-+    }
-+
 +    info("Waiting for qemu to confirm logdirty '%s'\n", cmd);
 +
++    snprintf(buf, sizeof buf, "/local/domain/0/device-model/%u/logdirty/cmd", data->domid);
 +    gettimeofday(&start, NULL);
 +    do
 +    {
 +        usleep(100000); /* Wait a short while for Qemu to reply. */
 +
-+        reply = xs_read(data->xsh, XBT_NULL, ret_path, NULL);
++        reply = xs_read(data->xsh, XBT_NULL, buf, NULL);
 +
 +        if ( reply )
 +        {
@@ -1273,8 +1268,6 @@ index 0000000..22765ed
 +        if ( !rc )
 +            gettimeofday(&now, NULL);
 +    } while ( !rc && (tv_delta_us(&now, &start) < timeout_us) );
-+
-+    free(ret_path);
 +
 +    if ( !rc )
 +    {
