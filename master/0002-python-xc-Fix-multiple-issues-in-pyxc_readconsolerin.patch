@@ -1,0 +1,80 @@
+From 898bc422c113207fe46bc9420a049e6b671da7ab Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 26 Nov 2014 19:26:00 +0000
+Subject: [PATCH 2/3] python/xc: Fix multiple issues in pyxc_readconsolering()
+
+Don't leak a 16k allocation if PyArg_ParseTupleAndKeywords() or the first
+xc_readconsolering() fail.
+
+Use a substr pointer so the while loop doesn't mutate the str pointer to the
+limit of its allocation, then hand it back to free().
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+CC: Wei Liu <wei.liu2@citrix.com>
+---
+ tools/python/xen/lowlevel/xc/xc.c |   21 ++++++++++++---------
+ 1 file changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/tools/python/xen/lowlevel/xc/xc.c b/tools/python/xen/lowlevel/xc/xc.c
+index c70b388..857ca2a 100644
+--- a/tools/python/xen/lowlevel/xc/xc.c
++++ b/tools/python/xen/lowlevel/xc/xc.c
+@@ -1089,7 +1089,7 @@ static PyObject *pyxc_readconsolering(XcObject *self,
+ {
+     unsigned int clear = 0, index = 0, incremental = 0;
+     unsigned int count = 16384 + 1, size = count;
+-    char        *str = malloc(size), *ptr;
++    char        *str, *substr, *ptr;
+     PyObject    *obj;
+     int          ret;
+ 
+@@ -1097,13 +1097,16 @@ static PyObject *pyxc_readconsolering(XcObject *self,
+ 
+     if ( !PyArg_ParseTupleAndKeywords(args, kwds, "|iii", kwd_list,
+                                       &clear, &index, &incremental) ||
+-         !str )
++         !(str = malloc(size)) )
+         return NULL;
+ 
+-    ret = xc_readconsolering(self->xc_handle, str, &count, clear,
++    substr = str;
++    ret = xc_readconsolering(self->xc_handle, substr, &count, clear,
+                              incremental, &index);
+-    if ( ret < 0 )
++    if ( ret < 0 ) {
++        free(str);
+         return pyxc_error_to_exception(self->xc_handle);
++    }
+ 
+     while ( !incremental && count == size )
+     {
+@@ -1111,19 +1114,19 @@ static PyObject *pyxc_readconsolering(XcObject *self,
+         if ( size < count )
+             break;
+ 
+-        ptr = realloc(str, size);
++        ptr = realloc(substr, size);
+         if ( !ptr )
+             break;
+ 
+-        str = ptr + count;
++        substr = ptr + count;
+         count = size - count;
+-        ret = xc_readconsolering(self->xc_handle, str, &count, clear,
++        ret = xc_readconsolering(self->xc_handle, substr, &count, clear,
+                                  1, &index);
+         if ( ret < 0 )
+             break;
+ 
+-        count += str - ptr;
+-        str = ptr;
++        count += substr - ptr;
++        substr = ptr;
+     }
+ 
+     obj = PyString_FromStringAndSize(str, count);
+-- 
+1.7.10.4
+
