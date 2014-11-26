@@ -15,46 +15,11 @@ index c65f9ac..594dcfb 100644
          if ( rc < 0 )
          {
              PERROR("set HVM param %"PRId64" = 0x%016"PRIx64,
-diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
-index f9ac109..9b18cd2 100644
---- a/tools/xenguest/xenguest_stubs.c
-+++ b/tools/xenguest/xenguest_stubs.c
-@@ -657,6 +657,30 @@ int stub_xc_domain_restore(xc_interface *xch, xs_handle *xsh, int fd, int domid,
-         r = set_genid(xch, xsh, domid);
-         if (r)
-             exit(1);
-+
-+        /*
-+         * ### GROSS HACK ###
-+         *
-+         * Attempt to reinstate lost console pfn when migrating from versions
-+         * of XenServer which turned access of HVM_PARAM_CONSOLE_{PFN,EVTCHN}
-+         * into -EINVAL in a failed attempt to be more performant.
-+         */
-+        if ( console_evtchn && *console_mfn == 0 && *store_mfn != 0 )
-+        {
-+            *console_mfn = *store_mfn + 1;
-+
-+            info("Reinstating lost CONSOLE_PFN at %lx\n", *console_mfn);
-+
-+            r = xc_clear_domain_page(xch, domid, *console_mfn);
-+            if ( r )
-+                failwith_oss_xc(xch, "clear console page");
-+            r = xc_hvm_param_set(xch, domid, HVM_PARAM_CONSOLE_PFN, *console_mfn);
-+            if ( r )
-+                failwith_oss_xc(xch, "set console pfn");
-+            r = xc_hvm_param_set(xch, domid, HVM_PARAM_CONSOLE_EVTCHN, console_evtchn);
-+            if ( r )
-+                failwith_oss_xc(xch, "set console pfn");
-+        }
-     }
- 
-     return 0;
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index 89e6496..d0626c3 100644
+index 384d188..e646b5f 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
-@@ -5790,6 +5790,16 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -5800,6 +5800,16 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
              rc = __copy_to_guest(arg, &a, 1) ? -EFAULT : 0;
          }
  
