@@ -12,15 +12,19 @@ this hypervisor is put into 'disable voluntarily returned pages' mode
 and a hypercall is made by which a guest voluntarily attempting to
 return pages, then this call should fail with a defined error code."
 
+Unfortunately, 2 is not completely possible, as p2m holes are required to be
+able to access the shared info and grant status frames.  In these cases, Xen
+scrubs returned pages to avoid data leaks.
+
 Actually enabling these restrictions breaks many things (some PV
 kernels, any balloon drivers, v2v channels. etc) but should be OK for
 the particular configuration under test.
 
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 3bf66d0..6724e59 100644
+index ba516bc..a44ce68 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -4614,6 +4614,15 @@ int xenmem_add_to_physmap_one(
+@@ -4630,6 +4630,15 @@ int xenmem_add_to_physmap_one(
      prev_mfn = mfn_x(get_gfn(d, gpfn, &p2mt));
      if ( mfn_valid(prev_mfn) )
      {
@@ -81,10 +85,10 @@ index 0368289..9e5f9e8 100644
      cmd_op = cmd & GNTTABOP_CMD_MASK;
      switch ( cmd_op )
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index f1f725f..e7ae96a 100644
+index 0010715..f279868 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
-@@ -2723,6 +2723,14 @@ do_grant_table_op(
+@@ -2725,6 +2725,14 @@ do_grant_table_op(
      if ( (int)count < 0 )
          return -EINVAL;
      
@@ -100,18 +104,39 @@ index f1f725f..e7ae96a 100644
      switch ( cmd &= GNTTABOP_CMD_MASK )
      {
 diff --git a/xen/common/memory.c b/xen/common/memory.c
-index cc36e39..9e9f18f 100644
+index 9f21bd3..4736ccf 100644
 --- a/xen/common/memory.c
 +++ b/xen/common/memory.c
-@@ -703,6 +703,13 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -253,6 +253,16 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
+ 
+     guest_physmap_remove_page(d, gmfn, mfn, 0);
+ 
++    /*
++     * In CC restricted mode, unprivileged guests shouldn't be able to
++     * voluntarily return memory to Xen.  Unfortunately, a few decrease
++     * reservations are required to be able to access the shared info and
++     * grant status frames.  For unprivileged guests, scrub any released pages
++     * to avoid leaking any content.
++     */
++    if ( unlikely(opt_cc_restrictions) && !is_hardware_domain(d) )
++        clear_domain_page(mfn);
++
+     put_page(page);
+     put_gfn(d, gmfn);
+ 
+@@ -703,6 +713,17 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
      unsigned long start_extent = cmd >> MEMOP_EXTENT_SHIFT;
      int op = cmd & MEMOP_CMD_MASK;
  
-+    /* In CC restricted mode, unprivileged guests can't voluntarily
-+     * return memory to Xen. */
++    /*
++     * In CC restricted mode, unprivileged guests shouldn't be able to
++     * voluntarily return memory to Xen.  Unfortunately, a few decrease
++     * reservations are required to be able to access the shared info and
++     * grant status frames.  This is made safe in guest_remove_page().
++     */
 +    if ( unlikely(opt_cc_restrictions) &&
 +         !is_hardware_domain(current->domain) &&
-+         (op == XENMEM_decrease_reservation || op == XENMEM_exchange) )
++         (op == XENMEM_exchange) )
 +        return -EPERM;
 +
      switch ( op )
