@@ -1,14 +1,45 @@
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index 521e4d9..52ca198 100644
+index 521e4d9..293521b 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
-@@ -5741,6 +5741,16 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -5741,6 +5741,47 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
          {
              switch ( a.index )
              {
++                /*
++                 * In a naive (and failed) attempt to improve host VM density,
++                 * XenServers between 6.0 and 6.2 forced the getting of these
++                 * two params to be an unconditional EINVAL.
++                 *
++                 * For XenServer 6.5, HVM Linux VMs became formally supported,
++                 * and the restriction was lifted.  This however causes a
++                 * problem for domains which have migrated from an older
++                 * version of XenServer, where the console information is not
++                 * present in the migration stream, but the guest is now
++                 * capable of reading 0s from the parameters.
++                 *
++                 * Various OSes will re-sample the parameters and blindly use
++                 * the zeroes.  The legacy windows drivers will crash when
++                 * they attempt to use evtchn 0 and pfn 0 for a PV console.
++                 *
++                 * This compatibility fix causes the world view of VMs to
++                 * remain consistent.  When migrating from older XenServers,
++                 * the EINVALs are kept.  When booting freshly on newer
++                 * XenServers, the domain builder will set these params
++                 * appropriately, and the numbers will be available to the
++                 * domain.
++                 *
++                 * Note that the migration v2 code is more strict about error
++                 * checking than the legacy code was.  This causes an issue
++                 * when migrating a VM which has migrated from an older
++                 * XenServer without an intermediate reboot.  Domains other
++                 * than current are therefore immune to the EINVALs.
++                 * Propagating the zeroes is safe under these circumstances.
++                 */
 +            case HVM_PARAM_CONSOLE_PFN:
 +            case HVM_PARAM_CONSOLE_EVTCHN:
-+                if ( d->arch.hvm_domain.params[HVM_PARAM_CONSOLE_PFN] == 0 &&
++                if ( curr_d == d &&
++                     d->arch.hvm_domain.params[HVM_PARAM_CONSOLE_PFN] == 0 &&
 +                     d->arch.hvm_domain.params[HVM_PARAM_CONSOLE_EVTCHN] == 0 )
 +                {
 +                    rc = -EINVAL;
