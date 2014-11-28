@@ -6,28 +6,50 @@ The "legacy" drivers make the HVMOP_set_driver_version hypercall which
 has been included for donkey's years as a NOOP.  Finally now we need to
 use it to enable legacy quirks mode.
 
-The "newstyle" Tampa drivers for Vista and newer do not make this
+The "newstyle" XenServer 6.1 drivers for Vista and newer do not make this
 hypercall, but also do not use the old hacks we have in place and use
 the correct upstream ABI.
 
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index 2f28e72..ab75b40 100644
+index 4bd4e20..2ecb42c 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
-@@ -6100,6 +6100,13 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -5467,6 +5467,27 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+     unsigned long start_iter = op & ~HVMOP_op_mask;
+     long rc = 0;
+ 
++    if ( is_hvm_domain(curr_d) )
++    {
++        switch ( op )
++        {
++        case HVMOP_set_driver_version:
++            /*
++             * The XenServer 6.1 "newstyle" drivers do not make this
++             * hypercall.  All older drivers do make it.
++             *
++             * Xen-4.5 introduced the HVMOP_op_mask which truncates this op
++             * into HVMOP_set_isa_irq_level.  As HVMOP_set_isa_irq_level is
++             * ineligible for continuations, we can still distinguish legacy
++             * drivers.
++             */
++            curr_d->arch.hvm_domain._win_legacy_quirks = 1;
++            gdprintk(XENLOG_INFO, "Legacy windows driver quirks enabled. "
++                     "(HVMOP_set_driver_version)\n");
++            goto legacy_win_complete;
++        }
++    }
++
+     switch ( op &= HVMOP_op_mask )
+     {
+     case HVMOP_create_ioreq_server:
+@@ -6116,6 +6137,7 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
          break;
      }
+     }
++ legacy_win_complete:
  
-+    case HVMOP_set_driver_version:
-+        /* The tampa "newstyle" drivers do not make this hypercall.  All
-+         * older drivers do make it. */
-+        curr_d->arch.hvm_domain._win_legacy_quirks = 1;
-+        gdprintk(XENLOG_INFO, "Legacy windows driver quirks enabled. (HVMOP_set_driver_version)\n");
-+        break;
-+
-     default:
+     if ( rc == -ERESTART )
      {
-         gdprintk(XENLOG_DEBUG, "Bad HVM op %ld.\n", op);
 diff --git a/xen/include/asm-x86/hvm/domain.h b/xen/include/asm-x86/hvm/domain.h
 index 2757c7f..c9735f1 100644
 --- a/xen/include/asm-x86/hvm/domain.h
