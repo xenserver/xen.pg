@@ -1,0 +1,74 @@
+From 3ecbfbaa3b9ea38d1054c87fbd421f50e6ca8102 Mon Sep 17 00:00:00 2001
+From: David Vrabel <david.vrabel@citrix.com>
+Date: Wed, 3 Dec 2014 14:08:21 +0000
+Subject: [PATCH] xen: increase default number of PIRQs for hardware domains
+
+The default limit for the number of PIRQs for hardware domains (dom0)
+is not sufficient for some (x86) systems.
+
+Since the pirq structures are individually and dynamically allocated,
+the limit for hardware domains may be increased to the number of
+possible IRQs.
+
+The extra_guest_irqs command line option now only allows changes to
+the domU value.  Any argument for dom0 is ignored.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+---
+ docs/misc/xen-command-line.markdown |   11 ++++-------
+ xen/common/domain.c                 |    7 +------
+ 2 files changed, 5 insertions(+), 13 deletions(-)
+
+diff -r 837a3e191155 docs/misc/xen-command-line.markdown
+--- a/docs/misc/xen-command-line.markdown	Wed Dec 03 14:28:45 2014 +0000
++++ b/docs/misc/xen-command-line.markdown	Wed Dec 03 14:31:46 2014 +0000
+@@ -538,15 +538,12 @@ disable it (edid=no). This option should
+ except for debugging purposes.
+ 
+ ### extra\_guest\_irqs
+-> `= [<domU number>][,<dom0 number>]`
++> `= [<number>]`
+ 
+-> Default: `32,256`
++> Default: `32`
+ 
+-Change the number of PIRQs available for guests.  The optional first number is
+-common for all domUs, while the optional second number (preceded by a comma)
+-is for dom0.  Changing the setting for domU has no impact on dom0 and vice
+-versa.  For example to change dom0 without changing domU, use
+-`extra_guest_irqs=,512`
++Change the number of PIRQs available for guests. This limit does not
++apply to hardware domains (dom0).
+ 
+ ### flask\_enabled
+ > `= <integer>`
+diff -r 837a3e191155 xen/common/domain.c
+--- a/xen/common/domain.c	Wed Dec 03 14:28:45 2014 +0000
++++ b/xen/common/domain.c	Wed Dec 03 14:31:46 2014 +0000
+@@ -178,14 +178,11 @@ struct vcpu *alloc_vcpu(
+     return v;
+ }
+ 
+-static unsigned int __read_mostly extra_dom0_irqs = 256;
+ static unsigned int __read_mostly extra_domU_irqs = 32;
+ static void __init parse_extra_guest_irqs(const char *s)
+ {
+     if ( isdigit(*s) )
+         extra_domU_irqs = simple_strtoul(s, &s, 0);
+-    if ( *s == ',' && isdigit(*++s) )
+-        extra_dom0_irqs = simple_strtoul(s, &s, 0);
+ }
+ custom_param("extra_guest_irqs", parse_extra_guest_irqs);
+ 
+@@ -263,10 +260,8 @@ struct domain *domain_create(
+         atomic_inc(&d->pause_count);
+ 
+         if ( domid )
+-            d->nr_pirqs = nr_static_irqs + extra_domU_irqs;
++            d->nr_pirqs = min(nr_static_irqs + extra_domU_irqs, nr_irqs);
+         else
+-            d->nr_pirqs = nr_static_irqs + extra_dom0_irqs;
+-        if ( d->nr_pirqs > nr_irqs )
+             d->nr_pirqs = nr_irqs;
+ 
+         radix_tree_init(&d->pirq_tree);
