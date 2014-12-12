@@ -763,10 +763,10 @@ index 0000000..3427882
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..71e7364
+index 0000000..135663f
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,706 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -815,6 +815,7 @@ index 0000000..71e7364
 +    uint16_t vcpu_cap;      /* 0 is default (no cap) */
 +    int nx;
 +    int viridian;
++    int viridian_time_ref_count;
 +    int pae;
 +    int acpi;
 +    int apic;
@@ -967,6 +968,7 @@ index 0000000..71e7364
 +    f->vcpu_cap = xenstore_get(xsh, domid, "platform/vcpu/cap");
 +    f->nx       = xenstore_get(xsh, domid, "platform/nx");
 +    f->viridian = xenstore_get(xsh, domid, "platform/viridian");
++    f->viridian_time_ref_count = xenstore_get(xsh, domid, "platform/viridian_time_ref_count");
 +    f->apic     = xenstore_get(xsh, domid, "platform/apic");
 +    f->pae      = xenstore_get(xsh, domid, "platform/pae");
 +    f->tsc_mode = xenstore_get(xsh, domid, "platform/tsc_mode");
@@ -992,12 +994,14 @@ index 0000000..71e7364
 +    free(tmp);
 +
 +    xg_info("Determined the following parameters from xenstore:\n");
-+    xg_info("vcpu/number:%d vcpu/weight:%d vcpu/cap:%d nx: %d viridian: %d "
-+         "apic: %d acpi: %d pae: %d acpi_s4: %d acpi_s3: %d tsc_mode: %d "
-+         "hpet: %d cores-per-socket: %u\n",
-+         f->vcpus, f->vcpu_weight, f->vcpu_cap, f->nx, f->viridian, f->apic,
-+         f->acpi, f->pae, f->acpi_s4, f->acpi_s3, f->tsc_mode, f->hpet,
-+         f->cores_per_socket);
++    xg_info("vcpu/number:%d vcpu/weight:%d vcpu/cap:%d\n",
++            f->vcpus, f->vcpu_weight, f->vcpu_cap);
++    xg_info("nx: %d, pae %d, cores-per-socket %u\n",
++            f->nx, f->pae, f->cores_per_socket);
++    xg_info("apic: %d acpi: %d acpi_s4: %d acpi_s3: %d tsc_mode: %d hpet: %d\n",
++            f->apic, f->acpi, f->acpi_s4, f->acpi_s3, f->tsc_mode, f->hpet);
++    xg_info("viridian: %d, time_ref_count: %d\n",
++            f->viridian, f->viridian_time_ref_count);
 +    for (n = 0; n < f->vcpus; n++){
 +        xg_info("vcpu/%d/affinity:%s\n", n, (f->vcpu_affinity[n])?f->vcpu_affinity[n]:"unset");
 +    }
@@ -1151,6 +1155,20 @@ index 0000000..71e7364
 +    return 0;
 +}
 +
++static void hvm_set_viridian_features(xc_interface *xch, int domid,
++                                      struct flags *f)
++{
++    uint64_t feature_mask = HVMPV_base_freq;
++
++    xg_info("viridian base\n");
++
++    if (f->viridian_time_ref_count) {
++        xg_info("+ time_ref_count\n");
++        feature_mask |= HVMPV_time_ref_count;
++    }
++
++    xc_set_hvm_param(xch, domid, HVM_PARAM_VIRIDIAN, feature_mask);
++}
 +
 +static int hvm_build_set_params(xc_interface *xch, int domid,
 +                                int store_evtchn, unsigned long *store_mfn,
@@ -1182,7 +1200,10 @@ index 0000000..71e7364
 +
 +    xc_get_hvm_param(xch, domid, HVM_PARAM_STORE_PFN, store_mfn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_PAE_ENABLED, f.pae);
-+    xc_set_hvm_param(xch, domid, HVM_PARAM_VIRIDIAN, f.viridian);
++
++    if (f.viridian)
++        hvm_set_viridian_features(xch, domid, &f);
++
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_NESTEDHVM, f.nested_hvm);
@@ -1404,7 +1425,13 @@ index 0000000..71e7364
 +
 +    if ( hvm )
 +    {
-+        xc_set_hvm_param(xch, domid, HVM_PARAM_VIRIDIAN, f.viridian);
++        /*
++         * We have to do this even in the domain restore case as XenServers
++         * prior to 6.0.2 did not create a viridian save record.
++         */
++        if (f.viridian)
++            hvm_set_viridian_features(xch, domid, &f);
++
 +        xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
 +
 +        if ( f.cores_per_socket > 0 )
