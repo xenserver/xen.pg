@@ -1,0 +1,87 @@
+Subject: [Xen-devel] [PATCH v4 for 4.5] x86/VPMU: Clear last_vcpu when destroying VPMU
+From: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Date: 18/12/14 18:06
+To: <jbeulich@suse.com>, <keir@xen.org>, <konrad.wilk@oracle.com>
+CC: <boris.ostrovsky@oracle.com>, <xen-devel@lists.xen.org>
+
+We need to make sure that last_vcpu is not pointing to VCPU whose
+VPMU is being destroyed. Otherwise we may try to dereference it in
+the future, when VCPU is gone.
+
+We have to do this via IPI since otherwise there is a (somewheat
+theoretical) chance that between test and subsequent clearing
+of last_vcpu the remote processor (i.e. vpmu->last_pcpu) might do
+both vpmu_load() and then vpmu_save() for another VCPU. The former
+will clear last_vcpu and the latter will set it to something else.
+
+Performing this operation via IPI will guarantee that nothing can
+happen on the remote processor between testing and clearing of
+last_vcpu.
+
+We should also check for VPMU_CONTEXT_ALLOCATED in vpmu_destroy() to
+avoid unnecessary percpu tests and arch-specific destroy ops. Thus
+checks in AMD and Intel routines are no longer needed.
+
+Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+diff --git a/xen/arch/x86/hvm/svm/vpmu.c b/xen/arch/x86/hvm/svm/vpmu.c
+index 8e07a98..4c448bb 100644
+--- a/xen/arch/x86/hvm/svm/vpmu.c
++++ b/xen/arch/x86/hvm/svm/vpmu.c
+@@ -403,9 +403,6 @@ static void amd_vpmu_destroy(struct vcpu *v)
+ {
+     struct vpmu_struct *vpmu = vcpu_vpmu(v);
+ 
+-    if ( !vpmu_is_set(vpmu, VPMU_CONTEXT_ALLOCATED) )
+-        return;
+-
+     if ( ((struct amd_vpmu_context *)vpmu->context)->msr_bitmap_set )
+         amd_vpmu_unset_msr_bitmap(v);
+ 
+diff --git a/xen/arch/x86/hvm/vmx/vpmu_core2.c b/xen/arch/x86/hvm/vmx/vpmu_core2.c
+index 68b6272..590c2a9 100644
+--- a/xen/arch/x86/hvm/vmx/vpmu_core2.c
++++ b/xen/arch/x86/hvm/vmx/vpmu_core2.c
+@@ -818,8 +818,6 @@ static void core2_vpmu_destroy(struct vcpu *v)
+     struct vpmu_struct *vpmu = vcpu_vpmu(v);
+     struct core2_vpmu_context *core2_vpmu_cxt = vpmu->context;
+ 
+-    if ( !vpmu_is_set(vpmu, VPMU_CONTEXT_ALLOCATED) )
+-        return;
+     xfree(core2_vpmu_cxt->pmu_enable);
+     xfree(vpmu->context);
+     if ( cpu_has_vmx_msr_bitmap )
+diff --git a/xen/arch/x86/hvm/vpmu.c b/xen/arch/x86/hvm/vpmu.c
+index 1df74c2..37f0d9f 100644
+--- a/xen/arch/x86/hvm/vpmu.c
++++ b/xen/arch/x86/hvm/vpmu.c
+@@ -247,10 +247,30 @@ void vpmu_initialise(struct vcpu *v)
+     }
+ }
+ 
++static void vpmu_clear_last(void *arg)
++{
++    if ( this_cpu(last_vcpu) == arg )
++        this_cpu(last_vcpu) = NULL;
++}
++
+ void vpmu_destroy(struct vcpu *v)
+ {
+     struct vpmu_struct *vpmu = vcpu_vpmu(v);
+ 
++    if ( !vpmu_is_set(vpmu, VPMU_CONTEXT_ALLOCATED) )
++        return;
++
++    /*
++     * Need to clear last_vcpu in case it points to v.
++     * We can check here non-atomically whether it is 'v' since
++     * last_vcpu can never become 'v' again at this point.
++     * We will test it again in vpmu_clear_last() with interrupts
++     * disabled to make sure we don't clear someone else.
++     */
++    if ( per_cpu(last_vcpu, vpmu->last_pcpu) == v )
++        on_selected_cpus(cpumask_of(vpmu->last_pcpu),
++                         vpmu_clear_last, v, 1);
++
+     if ( vpmu->arch_vpmu_ops && vpmu->arch_vpmu_ops->arch_vpmu_destroy )
+         vpmu->arch_vpmu_ops->arch_vpmu_destroy(v);
+ }
