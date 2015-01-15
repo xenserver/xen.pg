@@ -24,8 +24,8 @@ while [[ $# -gt 0 ]]; do
     # Obtain date in absolute UTC without a Timezone shift
     DATE=`date -d @$(TZ=UTC git log -n1 --format="%ct" $1) "+%Y-%m-%d %T"`
 
-    git format-patch -N1 --stdout > .git/patches/$BRANCH/backport-$SHORTSHA.patch
-    echo "backport-$SHORTSHA.patch #   $DATE - $SUBJECT" >> .git/patches/$BRANCH/series.snippet
+    git format-patch $1 -N1 --stdout > .git/patches/$BRANCH/backport-$SHORTSHA.patch
+    echo "backport-$SHORTSHA.patch #   $DATE - $SUBJECT" >> .git/patches/$BRANCH/snippet-for-series
 
     shift
 done
