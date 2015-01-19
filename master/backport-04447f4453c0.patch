@@ -1,0 +1,147 @@
+From 04447f4453c008b36c3e3443f0fc44e66ddd821d Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Mon, 19 Jan 2015 12:18:03 +0100
+Subject: [PATCH] x86/hvm: add per-vcpu evtchn upcalls
+
+HVM guests have always been confined to using the domain callback
+via (see HVM_PARAM_CALLBACK_IRQ) to receive event notifications.
+This is usually an IOAPIC vector and is only used if the event
+channel is bound to vcpu 0.
+
+PVHVM Linux uses a pre-defined interrupt vector for the event
+channel upcall, set using HVM_PARAM_CALLBACK_IRQ by ORing in a
+special bit (bit 57) into the value (see params.h). However, it
+does not assert the interrupt via the emulated local APIC.
+
+This mechanism is not suitable in the general case since Windows
+(and potentially other OSes) because they:
+
+- cannot guarantee the same vector for all VCPUs
+- do require the upcall to be asserted via the local APIC
+
+This patch adds a new HVM op allowing a guest to specify a local
+APIC vector to use as an upcall notification for a specific vcpu
+therefore coping with the case of differing vector numbers.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+---
+ xen/arch/x86/hvm/hvm.c          |   30 ++++++++++++++++++++++++++++++
+ xen/arch/x86/hvm/irq.c          |    8 +++++++-
+ xen/include/asm-x86/hvm/vcpu.h  |    2 ++
+ xen/include/public/hvm/hvm_op.h |   19 +++++++++++++++++++
+ 4 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 8b06bfd..b03bb10 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -5514,6 +5514,31 @@ static int hvmop_destroy_ioreq_server(
+     return rc;
+ }
+ 
++static int hvmop_set_evtchn_upcall_vector(
++    XEN_GUEST_HANDLE_PARAM(xen_hvm_evtchn_upcall_vector_t) uop)
++{
++    xen_hvm_evtchn_upcall_vector_t op;
++    struct domain *d = current->domain;
++    struct vcpu *v;
++
++    if ( copy_from_guest(&op, uop, 1) )
++        return -EFAULT;
++
++    if ( !is_hvm_domain(d) )
++        return -EINVAL;
++
++    if ( op.vector < 0x10 )
++        return -EINVAL;
++
++    if ( op.vcpu >= d->max_vcpus || (v = d->vcpu[op.vcpu]) == NULL )
++        return -ENOENT;
++
++    printk(XENLOG_G_INFO "%pv: upcall vector %02x\n", v, op.vector);
++
++    v->arch.hvm_vcpu.evtchn_upcall_vector = op.vector;
++    return 0;
++}
++
+ /*
+  * Note that this value is effectively part of the ABI, even if we don't need
+  * to make it a formal part of it: A guest suspended for migration in the
+@@ -5573,6 +5598,11 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+             guest_handle_cast(arg, xen_hvm_destroy_ioreq_server_t));
+         break;
+     
++    case HVMOP_set_evtchn_upcall_vector:
++        rc = hvmop_set_evtchn_upcall_vector(
++            guest_handle_cast(arg, xen_hvm_evtchn_upcall_vector_t));
++        break;
++    
+     case HVMOP_set_param:
+     case HVMOP_get_param:
+     {
+diff --git a/xen/arch/x86/hvm/irq.c b/xen/arch/x86/hvm/irq.c
+index 35f4f94..743429e 100644
+--- a/xen/arch/x86/hvm/irq.c
++++ b/xen/arch/x86/hvm/irq.c
+@@ -218,7 +218,13 @@ void hvm_assert_evtchn_irq(struct vcpu *v)
+         return;
+     }
+ 
+-    if ( is_hvm_pv_evtchn_vcpu(v) )
++    if ( v->arch.hvm_vcpu.evtchn_upcall_vector != 0 )
++    {
++        uint8_t vector = v->arch.hvm_vcpu.evtchn_upcall_vector;
++
++        vlapic_set_irq(vcpu_vlapic(v), vector, 0);
++    }
++    else if ( is_hvm_pv_evtchn_vcpu(v) )
+         vcpu_kick(v);
+     else if ( v->vcpu_id == 0 )
+         hvm_set_callback_irq_level(v);
+diff --git a/xen/include/asm-x86/hvm/vcpu.h b/xen/include/asm-x86/hvm/vcpu.h
+index 01e0665..3d8f4dc 100644
+--- a/xen/include/asm-x86/hvm/vcpu.h
++++ b/xen/include/asm-x86/hvm/vcpu.h
+@@ -169,6 +169,8 @@ struct hvm_vcpu {
+     /* In mode delay_for_missed_ticks, VCPUs have differing guest times. */
+     int64_t             stime_offset;
+ 
++    u8                  evtchn_upcall_vector;
++
+     /* Which cache mode is this VCPU in (CR0:CD/NW)? */
+     u8                  cache_mode;
+ 
+diff --git a/xen/include/public/hvm/hvm_op.h b/xen/include/public/hvm/hvm_op.h
+index a4e5345..cde3571 100644
+--- a/xen/include/public/hvm/hvm_op.h
++++ b/xen/include/public/hvm/hvm_op.h
+@@ -370,6 +370,25 @@ DEFINE_XEN_GUEST_HANDLE(xen_hvm_set_ioreq_server_state_t);
+ 
+ #endif /* defined(__XEN__) || defined(__XEN_TOOLS__) */
+ 
++#if defined(__i386__) || defined(__x86_64__)
++
++/*
++ * HVMOP_set_evtchn_upcall_vector: Set a <vector> that should be used for event
++ *                                 channel upcalls on the specified <vcpu>. If set,
++ *                                 this vector will be used in preference to the
++ *                                 domain global callback via (see
++ *                                 HVM_PARAM_CALLBACK_IRQ).
++ */
++#define HVMOP_set_evtchn_upcall_vector 23
++struct xen_hvm_evtchn_upcall_vector {
++    uint32_t vcpu;
++    uint8_t vector;
++};
++typedef struct xen_hvm_evtchn_upcall_vector xen_hvm_evtchn_upcall_vector_t;
++DEFINE_XEN_GUEST_HANDLE(xen_hvm_evtchn_upcall_vector_t);
++
++#endif /* defined(__i386__) || defined(__x86_64__) */
++
+ #endif /* __XEN_PUBLIC_HVM_HVM_OP_H__ */
+ 
+ /*
+-- 
+1.7.10.4
+
