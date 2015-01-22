@@ -1,0 +1,83 @@
+From 92ac2d1aab517dd4cae59552b0e64743990f3cf2 Mon Sep 17 00:00:00 2001
+From: David Vrabel <david.vrabel@citrix.com>
+Date: Wed, 21 Jan 2015 14:18:48 +0000
+Subject: [PATCH 1/2] libxc: log all shadow op results if log dirty could not
+ be enabled
+
+We have seen occasional migration failures where log dirty could not
+be enabled.  But it is not clear from the logs which operation
+actually failed.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+diff --git a/tools/libxc/saverestore/save.c b/tools/libxc/saverestore/save.c
+index 1517759..7f34540 100644
+--- a/tools/libxc/saverestore/save.c
++++ b/tools/libxc/saverestore/save.c
+@@ -407,6 +407,40 @@ static int send_some_pages(struct xc_sr_context *ctx,
+     return 0;
+ }
+ 
++static int enable_logdirty(struct xc_sr_context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int on1 = 0, off = 0, on2 = 0;
++    int rc;
++
++    /* This juggling is required if logdirty is enabled for VRAM tracking. */
++    rc = xc_shadow_control(xch, ctx->domid,
++                           XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
++                           NULL, 0, NULL, 0, NULL);
++    if ( rc < 0 )
++    {
++        on1 = errno;
++        rc = xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
++                               NULL, 0, NULL, 0, NULL);
++        if ( rc < 0 )
++            off = errno;
++        else {
++            rc = xc_shadow_control(xch, ctx->domid,
++                                   XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
++                                   NULL, 0, NULL, 0, NULL);
++            if ( rc < 0 )
++                on2 = errno;
++        }
++        if ( rc < 0 )
++        {
++            PERROR("Failed to enable logdirty: %d,%d,%d", on1, off, on2);
++            return rc;
++        }
++    }
++
++    return 0;
++}
++
+ static int update_progress_string(struct xc_sr_context *ctx,
+                                   char **str, unsigned iter)
+ {
+@@ -448,23 +482,9 @@ static int send_domain_memory_live(struct xc_sr_context *ctx)
+         goto out;
+     }
+ 
+-    /* This juggling is required if logdirty is enabled for VRAM tracking. */
+-    if ( xc_shadow_control(xch, ctx->domid,
+-                           XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
+-                           NULL, 0, NULL, 0, NULL) < 0 )
+-    {
+-        int frc = xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
+-                                    NULL, 0, NULL, 0, NULL);
+-        if ( frc >= 0 )
+-            frc = xc_shadow_control(xch, ctx->domid,
+-                                    XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
+-                                    NULL, 0, NULL, 0, NULL);
+-        if ( frc < 0 )
+-        {
+-            PERROR("Failed to enable logdirty: rc %d", frc);
+-            goto out;
+-        }
+-    }
++    rc = enable_logdirty(ctx);
++    if ( rc )
++        goto out;
+ 
+     rc = update_progress_string(ctx, &progress_str, 0);
+     if ( rc )
