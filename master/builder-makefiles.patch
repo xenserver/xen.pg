@@ -13,25 +13,12 @@ index 0000000..7e70d4c
 +.gitignore export-ignore
 +.gitattributes export-ignore
 +mk/ export-ignore
-diff --git a/.hgignore b/.hgignore
-index da27f80..5603df8 100644
---- a/.hgignore
-+++ b/.hgignore
-@@ -23,6 +23,8 @@
- .*/a\.out$
- .*/Modules\.symvers$
- .*/cscope\..*$
-+.*\.ccache.*
-+^mk/
- ^cscope.*$
- ^[^/]*\.bz2$
- ^\.config$
 diff --git a/mk/Makefile b/mk/Makefile
 new file mode 100644
-index 0000000..7a2c970
+index 0000000..ec24fab
 --- /dev/null
 +++ b/mk/Makefile
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,135 @@
 +USE_BRANDING := yes
 +IMPORT_BRANDING := yes
 +# makefile for xen component in build system
@@ -88,8 +75,6 @@ index 0000000..7a2c970
 +SOURCES += $(RPM_SOURCESDIR)/ipxe.tar.gz
 +SOURCES += $(RPM_SOURCESDIR)/sysconfig_kernel-xen
 +SOURCES += $(RPM_SOURCESDIR)/xl.conf
-+SOURCES += $(RPM_SOURCESDIR)/upstart_xenstored.conf
-+SOURCES += $(RPM_SOURCESDIR)/upstart_xenconsoled.conf
 +SOURCES += $(RPM_SPECSDIR)/xen.spec
 +SOURCES += $(RPM_SOURCESDIR)/xen-development.patch
 +
@@ -316,74 +301,17 @@ index 0000000..660b280
 +# host-specific configuration belongs in /etc/sysconfig/kernel-xen-args
 +[ -e /etc/sysconfig/kernel-xen-args ] && . /etc/sysconfig/kernel-xen-args
 +HYPERVISOR_ARGS="$HYPERVISOR_ARGS watchdog"
-diff --git a/mk/upstart_xenconsoled.conf b/mk/upstart_xenconsoled.conf
-new file mode 100644
-index 0000000..1b5015b
---- /dev/null
-+++ b/mk/upstart_xenconsoled.conf
-@@ -0,0 +1,20 @@
-+description	"Xen console daemon"
-+
-+start on started xenstored
-+stop on runlevel [!2345]
-+
-+expect daemon
-+
-+pre-start script
-+	# COMPATIBILITY HACK
-+	test -f /etc/init.d/xenservices && { stop ; exit 0; }
-+	# COMPATIBILITY HACK
-+
-+	grep -q ' xenfs ' /proc/mounts || mount -t xenfs none /proc/xen
-+
-+	test -f /etc/sysconfig/xenconsoled && . /etc/sysconfig/xenconsoled
-+
-+	test "$ENABLED" != "0" || { stop; exit 0; }
-+end script
-+
-+exec xenconsoled
-diff --git a/mk/upstart_xenstored.conf b/mk/upstart_xenstored.conf
-new file mode 100644
-index 0000000..6f58725
---- /dev/null
-+++ b/mk/upstart_xenstored.conf
-@@ -0,0 +1,24 @@
-+description 	"XenStore daemon"
-+
-+start on stopped rc RUNLEVEL=[2345]
-+stop on runlevel [!2345]
-+
-+expect daemon
-+
-+pre-start script
-+	# COMPATIBILITY HACK
-+	test -f /etc/init.d/xenservices && { stop ; exit 0; }
-+	# COMPATIBILITY HACK
-+
-+	grep -q ' xenfs ' /proc/mounts || mount -t xenfs none /proc/xen
-+
-+	test -f /etc/sysconfig/xenstored && . /etc/sysconfig/xenstored
-+
-+	test "$ENABLED" != "0" || { stop; exit 0; }
-+end script
-+
-+exec oxenstored
-+
-+post_start script
-+	grep -q control_d /proc/xen/capabilities && xenstore write domid 0
-+end script
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
 new file mode 100644
-index 0000000..71ca9cf
+index 0000000..08f2335
 --- /dev/null
 +++ b/mk/xen.spec.in
-@@ -0,0 +1,671 @@
+@@ -0,0 +1,653 @@
 +# -*- rpm-spec -*-
 +
 +%{!?python_sitearch: %define python_sitearch %(%{__python} -c "from distutils.sysconfig import get_python_lib; print get_python_lib(1)")}
 +
 +%define with_sysv 0
-+%define with_upstart 0
 +%define with_systemd 1
 +
 +%define HV_COMMON_OPTIONS max_phys_cpus=256
@@ -414,10 +342,6 @@ index 0000000..71ca9cf
 +Source1: ipxe.tar.gz
 +Source2: sysconfig_kernel-xen
 +Source3: xl.conf
-+%if %with_upstart
-+Source4: upstart_xenstored.conf
-+Source5: upstart_xenconsoled.conf
-+%endif
 +Patch0:  xen-development.patch
 +BuildRoot: %{_tmppath}/%{name}-%{version}-root
 +
@@ -597,17 +521,8 @@ index 0000000..71ca9cf
 +%{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
 +%{__install} -D -m 644 %{SOURCE3} %{buildroot}%{_sysconfdir}/xen/xl.conf
 +
-+%if %with_upstart
-+%{__install} -D -m 644 %{SOURCE4} %{buildroot}%{_sysconfdir}/init/xenstored.conf
-+%{__install} -D -m 644 %{SOURCE5} %{buildroot}%{_sysconfdir}/init/xenconsoled.conf
-+%endif
-+
 +%{__install} -d -m 755 %{buildroot}/lib/udev/rules.d
 +%{__mv} %{buildroot}%{_sysconfdir}/udev/rules.d/xen-backend.rules %{buildroot}/lib/udev/rules.d/90-xen-backend.rules
-+
-+# Copy ocaml xenstored to legacy location until we can fix up the init scripts
-+mkdir -p $RPM_BUILD_ROOT/opt/xensource/bin/
-+cp -f %{buildroot}%{_sbindir}/oxenstored %{buildroot}/opt/xensource/bin/xenstored
 +
 +%if %with_systemd
 +# Our kernel has all the required Xen modules built in
@@ -748,9 +663,6 @@ index 0000000..71ca9cf
 +
 +%files dom0-tools
 +%defattr(-,root,root,-)
-+%if %with_upstart
-+%{_sysconfdir}/init/*
-+%endif
 +%{_sysconfdir}/bash_completion.d/xl.sh
 +%exclude %{_sysconfdir}/rc.d/init.d/xencommons
 +%exclude %{_sysconfdir}/rc.d/init.d/xendomains
@@ -790,7 +702,6 @@ index 0000000..71ca9cf
 +%exclude %{_sysconfdir}/%{name}/xlexample.hvm
 +%exclude %{_sysconfdir}/%{name}/xlexample.pvlinux
 +%config %{_sysconfdir}/xen/xl.conf
-+/opt/xensource/bin/xenstored
 +%{_bindir}/pygrub
 +%{_bindir}/xen-detect
 +%{_bindir}/xencons
