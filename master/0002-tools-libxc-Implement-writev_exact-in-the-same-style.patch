@@ -1,4 +1,4 @@
-From a4f5eedddb33f13c5d397beebabfd21e2a48db06 Mon Sep 17 00:00:00 2001
+From 26d8103c9cbf54345b4f659eac10b61ea63f7a2f Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Tue, 1 Jul 2014 19:10:35 +0100
 Subject: [PATCH 2/2] tools/libxc: Implement writev_exact() in the same style
@@ -15,13 +15,31 @@ CC: Ian Campbell <Ian.Campbell@citrix.com>
 CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
 
 diff --git a/tools/libxc/xc_private.c b/tools/libxc/xc_private.c
-index 1c214dd..0941b06 100644
+index e2441ad..60da046 100644
 --- a/tools/libxc/xc_private.c
 +++ b/tools/libxc/xc_private.c
-@@ -858,6 +858,66 @@ int write_exact(int fd, const void *data, size_t size)
+@@ -860,6 +860,85 @@ int write_exact(int fd, const void *data, size_t size)
      return 0;
  }
  
++#if defined(__MINIOS__)
++/*
++ * MiniOS's libc doesn't know about writev(). Implement it as multiple write()s.
++ */
++int writev_exact(int fd, const struct iovec *iov, int iovcnt)
++{
++    int rc, i;
++
++    for ( i = 0; i < iovcnt; ++i )
++    {
++        rc = write_exact(fd, iov[i].iov_base, iov[i].iov_len);
++        if ( rc )
++            return rc;
++    }
++
++    return 0;
++}
++#else
 +int writev_exact(int fd, const struct iovec *iov, int iovcnt)
 +{
 +    struct iovec *local_iov = NULL;
@@ -81,23 +99,36 @@ index 1c214dd..0941b06 100644
 +    errno = saved_errno;
 +    return rc;
 +}
++#endif
 +
  int xc_ffs8(uint8_t x)
  {
      int i;
 diff --git a/tools/libxc/xc_private.h b/tools/libxc/xc_private.h
-index 010e00f..5b3f04e 100644
+index 45b8644..f74f7d7 100644
 --- a/tools/libxc/xc_private.h
 +++ b/tools/libxc/xc_private.h
-@@ -28,6 +28,7 @@
- #include <sys/stat.h>
- #include <stdlib.h>
- #include <sys/ioctl.h>
-+#include <sys/uio.h>
+@@ -42,6 +42,19 @@
+ #define VALGRIND_MAKE_MEM_UNDEFINED(addr, len) /* addr, len */
+ #endif
  
- #include "_paths.h"
- #include "xenctrl.h"
-@@ -344,6 +345,7 @@ int xc_flush_mmu_updates(xc_interface *xch, struct xc_mmu *mmu);
++#if defined(__MINIOS__)
++/*
++ * MiniOS's libc doesn't know about sys/uio.h or writev().
++ * Declare enough of sys/uio.h to compile.
++ */
++struct iovec {
++    void *iov_base;
++    size_t iov_len;
++};
++#else
++#include <sys/uio.h>
++#endif
++
+ #define DECLARE_HYPERCALL privcmd_hypercall_t hypercall
+ #define DECLARE_DOMCTL struct xen_domctl domctl
+ #define DECLARE_SYSCTL struct xen_sysctl sysctl
+@@ -395,6 +408,7 @@ int xc_flush_mmu_updates(xc_interface *xch, struct xc_mmu *mmu);
  /* Return 0 on success; -1 on error setting errno. */
  int read_exact(int fd, void *data, size_t size); /* EOF => -1, errno=0 */
  int write_exact(int fd, const void *data, size_t size);
