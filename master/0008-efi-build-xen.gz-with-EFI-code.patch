@@ -1,0 +1,170 @@
+From ca59b51c70157f38397a09a4f5e91698303ba218 Mon Sep 17 00:00:00 2001
+From: Daniel Kiper <daniel.kiper@oracle.com>
+Date: Fri, 30 Jan 2015 18:54:12 +0100
+Subject: [PATCH 08/18] efi: build xen.gz with EFI code
+
+Build xen.gz with EFI code. We need this to support multiboot2
+protocol on EFI platforms.
+
+If we wish to load not ELF file using multiboot (v1) or multiboot2 then
+it must contain "linear" (or "flat") representation of code and data.
+Currently, PE file contains many sections which are not "linear" (one
+after another without any holes) or even do not have representation
+in a file (e.g. BSS). In theory there is a chance that we could build
+proper PE file using current build system. However, it means that
+xen.efi further diverge from xen ELF file (in terms of contents and
+build method). ELF have all needed properties. So, it means that this
+is good starting point for further development. Additionally, I think
+that this is also good starting point for further xen.efi code and
+build optimizations. It looks that there is a chance that finaly we
+can generate xen.efi directly from xen ELF using just simple objcopy.
+
+Signed-off-by: Daniel Kiper <daniel.kiper@oracle.com>
+---
+ xen/arch/x86/Makefile     |   17 +++++++----------
+ xen/arch/x86/efi/Makefile |   12 ++++++------
+ xen/arch/x86/efi/stub.c   |   42 ------------------------------------------
+ xen/arch/x86/xen.lds.S    |    2 --
+ 4 files changed, 13 insertions(+), 60 deletions(-)
+ delete mode 100644 xen/arch/x86/efi/stub.c
+
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index 86ca5f8..5d63a1f 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -88,29 +88,29 @@ prelink-efi_lto.o: $(ALL_OBJS) efi/runtime.o efi/compat.o
+ prelink.o: $(patsubst %/built_in.o,%/built_in_bin.o,$(ALL_OBJS)) prelink_lto.o
+ 	$(LD) $(LDFLAGS) -r -o $@ $^
+ 
+-prelink-efi.o: $(patsubst %/built_in.o,%/built_in_bin.o,$(ALL_OBJS)) prelink-efi_lto.o efi/boot.init.o
++prelink-efi.o: $(patsubst %/built_in.o,%/built_in_bin.o,$(ALL_OBJS)) prelink-efi_lto.o
+ 	$(guard) $(LD) $(LDFLAGS) -r -o $@ $^
+ else
+ prelink.o: $(ALL_OBJS)
+ 	$(LD) $(LDFLAGS) -r -o $@ $^
+ 
+-prelink-efi.o: $(ALL_OBJS) efi/boot.init.o efi/runtime.o efi/compat.o
+-	$(guard) $(LD) $(LDFLAGS) -r -o $@ $(filter-out %/efi/built_in.o,$^)
++prelink-efi.o: $(ALL_OBJS)
++	$(guard) $(LD) $(LDFLAGS) -r -o $@ $^
+ endif
+ 
+ $(BASEDIR)/common/symbols-dummy.o:
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk -C $(BASEDIR)/common symbols-dummy.o
+ 
+-$(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o
+-	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
++$(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o efi/relocs-dummy.o
++	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o efi/relocs-dummy.o \
+ 	    $(BASEDIR)/common/symbols-dummy.o -o $(@D)/.$(@F).0
+ 	$(NM) -n $(@D)/.$(@F).0 | $(BASEDIR)/tools/symbols >$(@D)/.$(@F).0.S
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).0.o
+-	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
++	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o efi/relocs-dummy.o \
+ 	    $(@D)/.$(@F).0.o -o $(@D)/.$(@F).1
+ 	$(NM) -n $(@D)/.$(@F).1 | $(BASEDIR)/tools/symbols >$(@D)/.$(@F).1.S
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1.o
+-	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
++	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o efi/relocs-dummy.o \
+ 	    $(@D)/.$(@F).1.o -o $@
+ 	rm -f $(@D)/.$(@F).[0-9]*
+ 
+@@ -144,9 +144,6 @@ $(TARGET).efi: prelink-efi.o efi.lds efi/relocs-dummy.o $(BASEDIR)/common/symbol
+ 	if $(guard) false; then rm -f $@; echo 'EFI support disabled'; fi
+ 	rm -f $(@D)/.$(@F).[0-9]*
+ 
+-efi/boot.init.o efi/runtime.o efi/compat.o: $(BASEDIR)/arch/x86/efi/built_in.o
+-efi/boot.init.o efi/runtime.o efi/compat.o: ;
+-
+ asm-offsets.s: $(TARGET_SUBARCH)/asm-offsets.c
+ 	$(CC) $(filter-out -flto,$(CFLAGS)) -S -o $@ $<
+ 
+diff --git a/xen/arch/x86/efi/Makefile b/xen/arch/x86/efi/Makefile
+index 1daa7ac..13e59dc 100644
+--- a/xen/arch/x86/efi/Makefile
++++ b/xen/arch/x86/efi/Makefile
+@@ -1,14 +1,14 @@
+ CFLAGS += -fshort-wchar
+ 
+-obj-y += stub.o
++obj-y += boot.o
++obj-y += compat.o
++obj-y += runtime.o
++
++extra-y += relocs-dummy.o
+ 
+ create = test -e $(1) || touch -t 199901010000 $(1)
+ 
+ efi := $(filter y,$(x86_64)$(shell rm -f disabled))
+ efi := $(if $(efi),$(shell $(CC) $(filter-out $(CFLAGS-y) .%.d,$(CFLAGS)) -c check.c 2>disabled && echo y))
+ efi := $(if $(efi),$(shell $(LD) -mi386pep --subsystem=10 -o check.efi check.o 2>disabled && echo y))
+-efi := $(if $(efi),$(shell rm disabled)y,$(shell $(call create,boot.init.o); $(call create,runtime.o)))
+-
+-extra-$(efi) += boot.init.o relocs-dummy.o runtime.o compat.o
+-
+-stub.o: $(extra-y)
++efi := $(if $(efi),$(shell rm disabled)y)
+diff --git a/xen/arch/x86/efi/stub.c b/xen/arch/x86/efi/stub.c
+deleted file mode 100644
+index 5060e6f..0000000
+--- a/xen/arch/x86/efi/stub.c
++++ /dev/null
+@@ -1,42 +0,0 @@
+-#include <xen/efi.h>
+-#include <xen/errno.h>
+-#include <xen/init.h>
+-#include <xen/lib.h>
+-
+-#ifndef efi_platform
+-bool_t efi_platform = 0;
+-bool_t efi_loader = 0;
+-#endif
+-
+-void __init efi_init_memory(void) { }
+-
+-paddr_t efi_rs_page_table(void)
+-{
+-    BUG();
+-    return 0;
+-}
+-
+-unsigned long efi_get_time(void)
+-{
+-    BUG();
+-    return 0;
+-}
+-
+-void efi_halt_system(void) { }
+-void efi_reset_system(bool_t warm) { }
+-
+-int efi_get_info(uint32_t idx, union xenpf_efi_info *info)
+-{
+-    return -ENOSYS;
+-}
+-
+-int efi_compat_get_info(uint32_t idx, union compat_pf_efi_info *)
+-    __attribute__((__alias__("efi_get_info")));
+-
+-int efi_runtime_call(struct xenpf_efi_runtime_call *op)
+-{
+-    return -ENOSYS;
+-}
+-
+-int efi_compat_runtime_call(struct compat_pf_efi_runtime_call *)
+-    __attribute__((__alias__("efi_runtime_call")));
+diff --git a/xen/arch/x86/xen.lds.S b/xen/arch/x86/xen.lds.S
+index d4b1f1a..8e4b144 100644
+--- a/xen/arch/x86/xen.lds.S
++++ b/xen/arch/x86/xen.lds.S
+@@ -188,8 +188,6 @@ SECTIONS
+   .pad : {
+     . = ALIGN(0x1000000);
+   } :text
+-#else
+-  efi = .;
+ #endif
+ 
+   /* Sections to be discarded */
+-- 
+1.7.10.4
+
