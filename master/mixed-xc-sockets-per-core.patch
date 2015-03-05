@@ -2,10 +2,10 @@ Expose vcpus as multiple cores in a smaller number of sockets,
 by adjusting the cpuid responses appropriately.
 
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index e05ddb1..2c1eefa 100644
+index a674825..0d14851 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
-@@ -1340,6 +1340,10 @@ int xc_domain_get_tsc_info(xc_interface *xch,
+@@ -1330,6 +1330,10 @@ int xc_domain_get_tsc_info(xc_interface *xch,
  
  int xc_domain_disable_migrate(xc_interface *xch, uint32_t domid);
  
@@ -17,10 +17,10 @@ index e05ddb1..2c1eefa 100644
  
  int xc_domain_increase_reservation(xc_interface *xch,
 diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
-index 0f2af23..4f9f3f4 100644
+index 3ec01a6..5f3b851 100644
 --- a/tools/libxc/xc_domain.c
 +++ b/tools/libxc/xc_domain.c
-@@ -773,6 +773,20 @@ int xc_domain_get_tsc_info(xc_interface *xch,
+@@ -804,6 +804,20 @@ int xc_domain_get_tsc_info(xc_interface *xch,
  }
  
  
@@ -42,10 +42,10 @@ index 0f2af23..4f9f3f4 100644
  {
      return do_memory_op(xch, XENMEM_maximum_gpfn, &domid, sizeof(domid));
 diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
-index bc8a0d3..4e97d65 100644
+index a7655bd..11285ec 100644
 --- a/xen/arch/x86/hvm/svm/svm.c
 +++ b/xen/arch/x86/hvm/svm/svm.c
-@@ -1539,14 +1539,52 @@ static void svm_cpuid_intercept(
+@@ -1545,14 +1545,52 @@ static void svm_cpuid_intercept(
  {
      unsigned int input = *eax;
      struct vcpu *v = current;
@@ -99,10 +99,10 @@ index bc8a0d3..4e97d65 100644
      case 0x8000001c: 
      {
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index 304aeea..3342015 100644
+index f40f89d..c331a96 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -1862,11 +1862,32 @@ static void vmx_cpuid_intercept(
+@@ -1886,11 +1886,32 @@ static void vmx_cpuid_intercept(
      unsigned int input = *eax;
      struct segment_register cs;
      struct vcpu *v = current;
@@ -136,59 +136,47 @@ index 304aeea..3342015 100644
              /* SYSCALL is visible iff running in long mode. */
              vmx_get_segment_register(v, x86_seg_cs, &cs);
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index fdd4845..01ba00d 100644
+index c0a87f9..933a344 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -1195,6 +1195,44 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+@@ -1185,6 +1185,32 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+         copyback = 1;
          break;
-     }
  
 +    case XEN_DOMCTL_setcorespersocket:
 +    {
-+        struct domain *d;
++        unsigned int cps = op->u.corespersocket.cores_per_socket;
 +
-+        ret = -ESRCH;
-+        d = rcu_lock_domain_by_id(op->domain);
++        /* Toolstack is permitted to set this value exactly once. */
++        if ( d->cores_per_socket != 0 )
++            ret = -EEXIST;
 +
-+        if ( d != NULL )
-+        {
-+            unsigned int cps = op->u.corespersocket.cores_per_socket;
++        /* Only meaningful for HVM domains. */
++        else if ( !has_hvm_container_domain(d) )
++            ret = -EOPNOTSUPP;
 +
-+            /* Toolstack is permitted to set this value exactly once. */
-+            if ( d->cores_per_socket != 0 )
-+                ret = -EEXIST;
++        /* Cores per socket is strictly within the bounds of max_vcpus. */
++        else if ( cps < 1 || cps > d->max_vcpus )
++            ret = -EINVAL;
 +
-+            /* Only meaningful for HVM domains. */
-+            else if ( !has_hvm_container_domain(d) )
-+                ret = -EOPNOTSUPP;
++        /* Cores per socket must exactly divide max_vcpus. */
++        else if ( d->max_vcpus % cps != 0 )
++            ret = -EDOM;
 +
-+            /* Cores per socket is strictly within the bounds of max_vcpus. */
-+            else if ( cps < 1 || cps > d->max_vcpus )
-+                ret = -EINVAL;
++        else
++            d->cores_per_socket = cps;
 +
-+            /* Cores per socket must exactly divide max_vcpus. */
-+            else if ( d->max_vcpus % cps != 0 )
-+                ret = -EDOM;
-+
-+            else
-+            {
-+                d->cores_per_socket = cps;
-+                ret = 0;
-+            }
-+
-+            rcu_unlock_domain(d);
-+        }
++        break;
 +    }
-+    break;
 +
      default:
          ret = arch_do_domctl(op, d, u_domctl);
          break;
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index 969c65f..365913b 100644
+index 50b3d90..3176953 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1011,6 +1011,13 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
+@@ -1035,6 +1035,13 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
  /* Some vcpus are runnable, some are blocked */
  #define DOMAIN_RUNSTATE_partial_contention 5
  
@@ -202,7 +190,7 @@ index 969c65f..365913b 100644
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1089,6 +1096,7 @@ struct xen_domctl {
+@@ -1115,6 +1122,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
  #define XEN_DOMCTL_gdbsx_domstatus             1003
@@ -210,7 +198,7 @@ index 969c65f..365913b 100644
      uint32_t interface_version; /* XEN_DOMCTL_INTERFACE_VERSION */
      domid_t  domain;
      union {
-@@ -1141,6 +1149,7 @@ struct xen_domctl {
+@@ -1170,6 +1178,7 @@ struct xen_domctl {
          struct xen_domctl_set_virq_handler  set_virq_handler;
          struct xen_domctl_set_max_evtchn    set_max_evtchn;
          struct xen_domctl_runstate_info     domain_runstate;
@@ -219,7 +207,7 @@ index 969c65f..365913b 100644
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index fc65bd3..e188fe3 100644
+index a4e322c..d1f512b 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
 @@ -463,6 +463,8 @@ struct domain
