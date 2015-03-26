@@ -1,0 +1,119 @@
+From 1781f00ea62edb72bed4fe1b6959eeed427e988f Mon Sep 17 00:00:00 2001
+From: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date: Wed, 18 Mar 2015 20:24:15 -0400
+Subject: [PATCH] libxc: Check xc_maximum_ram_page for negative return values.
+
+Instead of assuming everything is always OK. As such
+we return now the return value (or zero for success).
+The max_mfn is now passed in as the parameter.
+
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index f0211ee..65279df 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1509,7 +1509,7 @@ int xc_mmuext_op(xc_interface *xch, struct mmuext_op *op, unsigned int nr_ops,
+                  domid_t dom);
+ 
+ /* System wide memory properties */
+-long xc_maximum_ram_page(xc_interface *xch);
++int xc_maximum_ram_page(xc_interface *xch, unsigned long *max_mfn);
+ 
+ /* Get current total pages allocated to a domain. */
+ long xc_get_tot_pages(xc_interface *xch, uint32_t domid);
+diff --git a/tools/libxc/xc_offline_page.c b/tools/libxc/xc_offline_page.c
+index 3147203..f7aba77 100644
+--- a/tools/libxc/xc_offline_page.c
++++ b/tools/libxc/xc_offline_page.c
+@@ -406,7 +406,7 @@ int xc_exchange_page(xc_interface *xch, int domid, xen_pfn_t mfn)
+     uint32_t status;
+     xen_pfn_t new_mfn, gpfn;
+     xen_pfn_t *m2p_table;
+-    int max_mfn;
++    unsigned long max_mfn;
+ 
+     if ( xc_domain_getinfo(xch, domid, 1, &info) != 1 )
+     {
+@@ -427,8 +427,8 @@ int xc_exchange_page(xc_interface *xch, int domid, xen_pfn_t mfn)
+     }
+ 
+     /* Map M2P and obtain gpfn */
+-    max_mfn = xc_maximum_ram_page(xch);
+-    if ( !(m2p_table = xc_map_m2p(xch, max_mfn, PROT_READ, NULL)) )
++    rc = xc_maximum_ram_page(xch, &max_mfn);
++    if ( rc || !(m2p_table = xc_map_m2p(xch, max_mfn, PROT_READ, NULL)) )
+     {
+         PERROR("Failed to map live M2P table");
+         return -EFAULT;
+diff --git a/tools/libxc/xc_private.c b/tools/libxc/xc_private.c
+index df6cd9b..bd1faeb 100644
+--- a/tools/libxc/xc_private.c
++++ b/tools/libxc/xc_private.c
+@@ -535,9 +535,16 @@ int do_memory_op(xc_interface *xch, int cmd, void *arg, size_t len)
+     return ret;
+ }
+ 
+-long xc_maximum_ram_page(xc_interface *xch)
++int xc_maximum_ram_page(xc_interface *xch, unsigned long *max_mfn)
+ {
+-    return do_memory_op(xch, XENMEM_maximum_ram_page, NULL, 0);
++    long rc = do_memory_op(xch, XENMEM_maximum_ram_page, NULL, 0);
++
++    if ( rc >= 0 )
++    {
++        *max_mfn = rc;
++        rc = 0;
++    }
++    return rc;
+ }
+ 
+ long long xc_domain_get_cpu_usage( xc_interface *xch, domid_t domid, int vcpu )
+diff --git a/tools/libxc/xg_save_restore.h b/tools/libxc/xg_save_restore.h
+index bdd9009..832c329 100644
+--- a/tools/libxc/xg_save_restore.h
++++ b/tools/libxc/xg_save_restore.h
+@@ -311,7 +311,8 @@ static inline int get_platform_info(xc_interface *xch, uint32_t dom,
+     if (xc_version(xch, XENVER_capabilities, &xen_caps) != 0)
+         return 0;
+ 
+-    *max_mfn = xc_maximum_ram_page(xch);
++    if (xc_maximum_ram_page(xch, max_mfn))
++        return 0;
+ 
+     *hvirt_start = xen_params.virt_start;
+ 
+diff --git a/tools/misc/xen-mfndump.c b/tools/misc/xen-mfndump.c
+index 0761f6e..0c018e0 100644
+--- a/tools/misc/xen-mfndump.c
++++ b/tools/misc/xen-mfndump.c
+@@ -31,7 +31,7 @@ int help_func(int argc, char *argv[])
+ int dump_m2p_func(int argc, char *argv[])
+ {
+     unsigned long i;
+-    long max_mfn;
++    unsigned long max_mfn;
+     xen_pfn_t *m2p_table;
+ 
+     if ( argc > 0 )
+@@ -41,8 +41,7 @@ int dump_m2p_func(int argc, char *argv[])
+     }
+ 
+     /* Map M2P and obtain gpfn */
+-    max_mfn = xc_maximum_ram_page(xch);
+-    if ( max_mfn < 0 )
++    if ( xc_maximum_ram_page(xch, &max_mfn) < 0 );
+     {
+         ERROR("Failed to get the maximum mfn");
+         return -1;
+@@ -183,8 +182,8 @@ int dump_ptes_func(int argc, char *argv[])
+     }
+ 
+     /* Map M2P and obtain gpfn */
+-    max_mfn = xc_maximum_ram_page(xch);
+-    if ( (mfn > max_mfn) ||
++    rc = xc_maximum_ram_page(xch, &max_mfn);
++    if ( rc || (mfn > max_mfn) ||
+          !(m2p_table = xc_map_m2p(xch, max_mfn, PROT_READ, NULL)) )
+     {
+         xc_unmap_domain_meminfo(xch, &minfo);

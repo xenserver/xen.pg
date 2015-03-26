@@ -1,0 +1,81 @@
+From 1f5bb8737cb890d7edbac5bdcc44b018f6005afa Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 26 Mar 2015 12:17:26 +0000
+Subject: [PATCH] Fix migration v2 on top of recent libxc changes
+
+diff --git a/tools/libxc/xc_sr_common_x86_pv.c b/tools/libxc/xc_sr_common_x86_pv.c
+index 454d34b..c42f10f 100644
+--- a/tools/libxc/xc_sr_common_x86_pv.c
++++ b/tools/libxc/xc_sr_common_x86_pv.c
+@@ -69,7 +69,7 @@ int x86_pv_domain_info(struct xc_sr_context *ctx)
+ {
+     xc_interface *xch = ctx->xch;
+     unsigned int guest_width, guest_levels, fpp;
+-    int max_pfn;
++    xen_pfn_t max_pfn;
+ 
+     /* Get the domain width */
+     if ( xc_domain_get_guest_width(xch, ctx->domid, &guest_width) )
+@@ -94,8 +94,7 @@ int x86_pv_domain_info(struct xc_sr_context *ctx)
+     DPRINTF("%d bits, %d levels", guest_width * 8, guest_levels);
+ 
+     /* Get the domain's size */
+-    max_pfn = xc_domain_maximum_gpfn(xch, ctx->domid);
+-    if ( max_pfn < 0 )
++    if ( xc_domain_maximum_gpfn(xch, ctx->domid, &max_pfn) )
+     {
+         PERROR("Unable to obtain guests max pfn");
+         return -1;
+@@ -106,7 +105,7 @@ int x86_pv_domain_info(struct xc_sr_context *ctx)
+         ctx->x86_pv.max_pfn = max_pfn;
+         ctx->x86_pv.p2m_frames = (ctx->x86_pv.max_pfn + fpp) / fpp;
+ 
+-        DPRINTF("max_pfn %#x, p2m_frames %d", max_pfn, ctx->x86_pv.p2m_frames);
++        DPRINTF("max_pfn %#lx, p2m_frames %d", max_pfn, ctx->x86_pv.p2m_frames);
+     }
+ 
+     return 0;
+@@ -115,13 +114,12 @@ int x86_pv_domain_info(struct xc_sr_context *ctx)
+ int x86_pv_map_m2p(struct xc_sr_context *ctx)
+ {
+     xc_interface *xch = ctx->xch;
+-    long max_page = xc_maximum_ram_page(xch);
+-    unsigned long m2p_chunks, m2p_size;
++    unsigned long m2p_chunks, m2p_size, max_page;
+     privcmd_mmap_entry_t *entries = NULL;
+     xen_pfn_t *extents_start = NULL;
+     int rc = -1, i;
+ 
+-    if ( max_page < 0 )
++    if ( xc_maximum_ram_page(xch, &max_page) )
+     {
+         PERROR("Failed to get maximum ram page");
+         goto err;
+diff --git a/tools/libxc/xc_sr_save.c b/tools/libxc/xc_sr_save.c
+index 1634497..76a6931 100644
+--- a/tools/libxc/xc_sr_save.c
++++ b/tools/libxc/xc_sr_save.c
+@@ -685,6 +685,7 @@ int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_ite
+                     uint32_t max_factor, uint32_t flags,
+                     struct save_callbacks* callbacks, int hvm)
+ {
++    xen_pfn_t max_pfn;
+     struct xc_sr_context ctx =
+         {
+             .xch = xch,
+@@ -723,7 +724,14 @@ int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_ite
+ 
+     ctx.domid = dom;
+ 
+-    ctx.save.p2m_size = xc_domain_maximum_gpfn(xch, dom) + 1;
++    if ( xc_domain_maximum_gpfn(xch, dom, &max_pfn) )
++    {
++        PERROR("Unable to obtain guests max pfn");
++        return -1;
++    }
++
++    ctx.save.p2m_size = max_pfn + 1;
++
+     if ( ctx.save.p2m_size > ~XEN_DOMCTL_PFINFO_LTAB_MASK )
+     {
+         errno = E2BIG;
