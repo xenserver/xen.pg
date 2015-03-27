@@ -1,0 +1,105 @@
+From 236f676edbc6812df385e09589a97c8d46788092 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Fri, 27 Mar 2015 09:30:15 +0000
+Subject: [PATCH] efi: Reserve SMBIOS table region when EFI booting
+
+Some EFI firmware implementations may place the SMBIOS table in RAM
+marked as BootServicesData, which Xen does not consider as reserved.
+When dom0 tries to access the SMBIOS, the region is not contained in the
+initial P2M and it crashes with a page fault. To fix this, reserve the
+SMBIOS region.
+
+Also, fix the memcmp check for existence of the SMBIOS and the DMI
+checksum calculation.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+---
+ xen/arch/x86/dmi_scan.c | 32 ++++++++++++++++++++++++++------
+ xen/arch/x86/e820.c     |  5 +++++
+ xen/include/xen/dmi.h   |  1 +
+ 3 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/xen/arch/x86/dmi_scan.c b/xen/arch/x86/dmi_scan.c
+index 63b976c..7203b3e 100644
+--- a/xen/arch/x86/dmi_scan.c
++++ b/xen/arch/x86/dmi_scan.c
+@@ -125,6 +125,8 @@ static inline bool_t __init dmi_checksum(const void __iomem *buf,
+ 	return sum == 0;
+ }
+ 
++static u32 __initdata efi_smbios_address;
++static u32 __initdata efi_smbios_size;
+ static u32 __initdata efi_dmi_address;
+ static u32 __initdata efi_dmi_size;
+ 
+@@ -136,15 +138,33 @@ void __init dmi_efi_get_table(void *smbios)
+ {
+ 	struct smbios_eps *eps = smbios;
+ 
+-	if (memcmp(eps->anchor, "_SM_", 4) &&
+-	    dmi_checksum(eps, eps->length) &&
+-	    memcmp(eps->dmi.anchor, "_DMI_", 5) == 0 &&
+-	    dmi_checksum(&eps->dmi, sizeof(eps->dmi))) {
+-		efi_dmi_address = eps->dmi.address;
+-		efi_dmi_size = eps->dmi.size;
++	if (memcmp(eps->anchor, "_SM_", 4) == 0 &&
++	    dmi_checksum(eps, eps->length)) {
++		efi_smbios_address = (u32)(long)smbios;
++		efi_smbios_size = eps->length;
++
++		if ( memcmp(eps->dmi.anchor, "_DMI_", 5) == 0 &&
++		     dmi_checksum(&eps->dmi,
++				  eps->length - offsetof(struct smbios_eps, dmi)) ) {
++			efi_dmi_address = eps->dmi.address;
++			efi_dmi_size = eps->dmi.size;
++		}
+ 	}
+ }
+ 
++int __init smbios_get_table(u32 *base, u32 *len)
++{
++    if (efi_platform) {
++            if (!efi_smbios_size)
++                    return -1;
++            *base = efi_smbios_address;
++            *len = efi_smbios_size;
++            return 0;
++    }
++
++    return 1;
++}
++
+ int __init dmi_get_table(u32 *base, u32 *len)
+ {
+ 	struct dmi_eps eps;
+diff --git a/xen/arch/x86/e820.c b/xen/arch/x86/e820.c
+index 47920a3..bc9c4dd 100644
+--- a/xen/arch/x86/e820.c
++++ b/xen/arch/x86/e820.c
+@@ -496,6 +496,11 @@ static uint64_t __init mtrr_top_of_ram(void)
+ static void __init reserve_dmi_region(void)
+ {
+     u32 base, len;
++    if ( (smbios_get_table(&base, &len) == 0) && ((base + len) > base) &&
++         reserve_e820_ram(&e820, base, base + len) )
++        printk("WARNING: SMBIOS table located in E820 RAM %08x-%08x. Fixed.\n",
++               base, base+len);
++
+     if ( (dmi_get_table(&base, &len) == 0) && ((base + len) > base) &&
+          reserve_e820_ram(&e820, base, base + len) )
+         printk("WARNING: DMI table located in E820 RAM %08x-%08x. Fixed.\n",
+diff --git a/xen/include/xen/dmi.h b/xen/include/xen/dmi.h
+index 8205893..578fa41 100644
+--- a/xen/include/xen/dmi.h
++++ b/xen/include/xen/dmi.h
+@@ -34,6 +34,7 @@ struct dmi_system_id {
+ 
+ extern int dmi_check_system(struct dmi_system_id *list);
+ extern void dmi_scan_machine(void);
++extern int smbios_get_table(u32 *base, u32 *len);
+ extern int dmi_get_table(u32 *base, u32 *len);
+ extern void dmi_efi_get_table(void *);
+ bool_t dmi_get_date(int field, int *yearp, int *monthp, int *dayp);
+-- 
+2.1.0
+
