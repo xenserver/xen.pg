@@ -1,4 +1,4 @@
-From d3620bcb1873a60d55b6dc304e707ad109fd72ee Mon Sep 17 00:00:00 2001
+From bc5c246c8ba252ccd1141492305f8b5995bc522f Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:02 +0100
 Subject: [PATCH 08/13] tools/libxc: x86 PV save code
@@ -11,7 +11,9 @@ The normalise_page callback used by the common code when writing the PAGE_DATA
 records, converts MFNs in page tables to PFNs.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+CC: Wei Liu <wei.liu2@citrix.com>
 diff --git a/tools/libxc/Makefile b/tools/libxc/Makefile
 index 890d17a..26cffa5 100644
 --- a/tools/libxc/Makefile
@@ -38,10 +40,10 @@ index b96a6fe..896be07 100644
  {
 diff --git a/tools/libxc/xc_sr_save_x86_pv.c b/tools/libxc/xc_sr_save_x86_pv.c
 new file mode 100644
-index 0000000..baada97
+index 0000000..74ce379
 --- /dev/null
 +++ b/tools/libxc/xc_sr_save_x86_pv.c
-@@ -0,0 +1,850 @@
+@@ -0,0 +1,860 @@
 +#include <assert.h>
 +#include <limits.h>
 +
@@ -70,8 +72,8 @@ index 0000000..baada97
 + * Copy a list of mfns from a guest, accounting for differences between guest
 + * and toolstack width.
 + */
-+static void copy_mfns_from_guest(const struct xc_sr_context *ctx, xen_pfn_t *dst,
-+                                 const void *src, size_t count)
++static void copy_mfns_from_guest(const struct xc_sr_context *ctx,
++                                 xen_pfn_t *dst, const void *src, size_t count)
 +{
 +    size_t x;
 +
@@ -248,7 +250,7 @@ index 0000000..baada97
 +{
 +    xc_interface *xch = ctx->xch;
 +    xen_pfn_t mfn, pfn;
-+    unsigned i;
++    unsigned i, gdt_count;
 +    int rc = -1;
 +    vcpu_guest_context_any_t vcpu;
 +    struct xc_sr_rec_x86_pv_vcpu_hdr vhdr =
@@ -283,9 +285,18 @@ index 0000000..baada97
 +                  ctx->x86_pv.width);
 +    }
 +
++    gdt_count = GET_FIELD(&vcpu, gdt_ents, ctx->x86_pv.width);
++    if ( gdt_count > FIRST_RESERVED_GDT_ENTRY )
++    {
++        ERROR("GDT entry count (%u) out of range (max %u)",
++              gdt_count, FIRST_RESERVED_GDT_ENTRY);
++        errno = ERANGE;
++        goto err;
++    }
++    gdt_count = (gdt_count + 511) / 512; /* gdt_count now in units of frames. */
++
 +    /* Convert GDT frames to pfns. */
-+    for ( i = 0; (i * 512) < GET_FIELD(&vcpu, gdt_ents, ctx->x86_pv.width);
-+          ++i )
++    for ( i = 0; i < gdt_count; ++i )
 +    {
 +        mfn = GET_FIELD(&vcpu, gdt_frames[i], ctx->x86_pv.width);
 +        if ( !mfn_in_pseudophysmap(ctx, mfn) )
@@ -667,7 +678,7 @@ index 0000000..baada97
 +            /* It is hard to spot Xen mappings in a 32bit guest's L2.  Most
 +             * are normal but only a few will have Xen mappings.
 +             *
-+             * 428 = (HYPERVISOR_VIRT_START_PAE >> L2_PAGETABLE_SHIFT_PAE) & 0x1ff
++             * 428 = (HYPERVISOR_VIRT_START_PAE >> L2_PAGETABLE_SHIFT_PAE)&0x1ff
 +             *
 +             * ...which is conveniently unavailable to us in a 64bit build.
 +             */
@@ -749,7 +760,8 @@ index 0000000..baada97
 +}
 +
 +/* save_ops function. */
-+static xen_pfn_t x86_pv_pfn_to_gfn(const struct xc_sr_context *ctx, xen_pfn_t pfn)
++static xen_pfn_t x86_pv_pfn_to_gfn(const struct xc_sr_context *ctx,
++                                   xen_pfn_t pfn)
 +{
 +    assert(pfn <= ctx->x86_pv.max_pfn);
 +

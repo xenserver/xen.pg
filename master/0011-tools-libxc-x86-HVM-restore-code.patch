@@ -1,4 +1,4 @@
-From 086afff90567b95cf95297777a58283698a2794a Mon Sep 17 00:00:00 2001
+From 669bdef28d10d279e5fc8e37e868bf6ef22d8a44 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:51 +0100
 Subject: [PATCH 11/13] tools/libxc: x86 HVM restore code
@@ -13,6 +13,9 @@ this is what libxc currently does.  This is intended to be moved into libxl
 proper in the future.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+CC: Wei Liu <wei.liu2@citrix.com>
 diff --git a/tools/libxc/Makefile b/tools/libxc/Makefile
 index bf04991..b4aeb46 100644
 --- a/tools/libxc/Makefile
@@ -26,7 +29,7 @@ index bf04991..b4aeb46 100644
  GUEST_SRCS-$(CONFIG_X86) += xc_sr_save_x86_hvm.c
  GUEST_SRCS-y += xc_sr_restore.c
 diff --git a/tools/libxc/xc_sr_common.h b/tools/libxc/xc_sr_common.h
-index 510aa47..04d2ebd 100644
+index cd27246..3ec95da 100644
 --- a/tools/libxc/xc_sr_common.h
 +++ b/tools/libxc/xc_sr_common.h
 @@ -286,6 +286,7 @@ extern struct xc_sr_save_ops save_ops_x86_pv;
@@ -39,35 +42,20 @@ index 510aa47..04d2ebd 100644
  {
 diff --git a/tools/libxc/xc_sr_restore_x86_hvm.c b/tools/libxc/xc_sr_restore_x86_hvm.c
 new file mode 100644
-index 0000000..57b7d14
+index 0000000..cd0a004
 --- /dev/null
 +++ b/tools/libxc/xc_sr_restore_x86_hvm.c
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,225 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
 +#include "xc_sr_common_x86.h"
 +
-+/* TODO: remove */
-+static int handle_toolstack(struct xc_sr_context *ctx, struct xc_sr_record *rec)
-+{
-+    xc_interface *xch = ctx->xch;
-+    int rc;
-+
-+    if ( !ctx->restore.callbacks || !ctx->restore.callbacks->toolstack_restore )
-+        return 0;
-+
-+    rc = ctx->restore.callbacks->toolstack_restore(ctx->domid, rec->data, rec->length,
-+                                                   ctx->restore.callbacks->data);
-+    if ( rc < 0 )
-+        PERROR("restoring toolstack");
-+    return rc;
-+}
-+
 +/*
 + * Process an HVM_CONTEXT record from the stream.
 + */
-+static int handle_hvm_context(struct xc_sr_context *ctx, struct xc_sr_record *rec)
++static int handle_hvm_context(struct xc_sr_context *ctx,
++                              struct xc_sr_record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    void *p;
@@ -90,7 +78,8 @@ index 0000000..57b7d14
 +/*
 + * Process an HVM_PARAMS record from the stream.
 + */
-+static int handle_hvm_params(struct xc_sr_context *ctx, struct xc_sr_record *rec)
++static int handle_hvm_params(struct xc_sr_context *ctx,
++                             struct xc_sr_record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    struct xc_sr_rec_hvm_params *hdr = rec->data;
@@ -134,112 +123,6 @@ index 0000000..57b7d14
 +    return 0;
 +}
 +
-+/* TODO: remove */
-+static __attribute__((unused)) int dump_qemu(struct xc_sr_context *ctx)
-+{
-+#ifdef XG_DUMP_QEMU
-+    xc_interface *xch = ctx->xch;
-+    char qemusig[21], path[256];
-+    uint32_t qlen;
-+    void *qbuf = NULL;
-+    int rc = -1;
-+    FILE *fp = NULL;
-+
-+    if ( read_exact(ctx->fd, qemusig, sizeof(qemusig)) )
-+    {
-+        PERROR("Error reading QEMU signature");
-+        goto out;
-+    }
-+
-+    if ( !memcmp(qemusig, "DeviceModelRecord0002", sizeof(qemusig)) )
-+    {
-+        if ( read_exact(ctx->fd, &qlen, sizeof(qlen)) )
-+        {
-+            PERROR("Error reading QEMU record length");
-+            goto out;
-+        }
-+
-+        qbuf = malloc(qlen);
-+        if ( !qbuf )
-+        {
-+            PERROR("no memory for device model state");
-+            goto out;
-+        }
-+
-+        if ( read_exact(ctx->fd, qbuf, qlen) )
-+        {
-+            PERROR("Error reading device model state");
-+            goto out;
-+        }
-+    }
-+    /* XenServer hack, until Xapi compatibility code is written. */
-+    else if ( !memcmp(qemusig, "QemuDeviceModelRecord", sizeof(qemusig)) )
-+    {
-+        char head[9];
-+
-+        if ( read_exact(ctx->fd, &head, sizeof(head)) )
-+        {
-+            PERROR("Error reading QEMU record head");
-+            goto out;
-+        }
-+
-+        if ( head[0] == '\n' && !memcmp(&head[5], "QEVM", 4) )
-+            qlen = ntohl(*((uint32_t*)&head[1])) - 4;
-+        else
-+        {
-+            ERROR("Unrecongised data following %s", qemusig);
-+            goto out;
-+        }
-+
-+        qbuf = malloc(qlen);
-+        if ( !qbuf )
-+        {
-+            PERROR("no memory for device model state");
-+            goto out;
-+        }
-+
-+        memcpy(qbuf, "QEVM", 4);
-+        if ( read_exact(ctx->fd, &((uint8_t*)qbuf)[4], qlen - 4) )
-+        {
-+            PERROR("Error reading device model state");
-+            goto out;
-+        }
-+    }
-+    else
-+    {
-+        ERROR("Invalid device model state signature '%*.*s'",
-+              (int)sizeof(qemusig), (int)sizeof(qemusig), qemusig);
-+        goto out;
-+    }
-+
-+    sprintf(path, XC_DEVICE_MODEL_RESTORE_FILE".%u", ctx->domid);
-+    fp = fopen(path, "wb");
-+    if ( !fp )
-+    {
-+        PERROR("Failed to open '%s' for writing", path);
-+        goto out;
-+    }
-+
-+    DPRINTF("Writing %u bytes of QEMU data", qlen);
-+    if ( fwrite(qbuf, 1, qlen, fp) != qlen )
-+    {
-+        PERROR("Failed to write %u bytes of QEMU data", qlen);
-+        goto out;
-+    }
-+
-+    rc = 0;
-+
-+ out:
-+    if ( fp )
-+        fclose(fp);
-+    free(qbuf);
-+
-+    return rc;
-+#else
-+    return 0;
-+#endif
-+}
-+
 +/* restore_ops function. */
 +static bool x86_hvm_pfn_is_valid(const struct xc_sr_context *ctx, xen_pfn_t pfn)
 +{
@@ -247,7 +130,8 @@ index 0000000..57b7d14
 +}
 +
 +/* restore_ops function. */
-+static xen_pfn_t x86_hvm_pfn_to_gfn(const struct xc_sr_context *ctx, xen_pfn_t pfn)
++static xen_pfn_t x86_hvm_pfn_to_gfn(const struct xc_sr_context *ctx,
++                                    xen_pfn_t pfn)
 +{
 +    return pfn;
 +}
@@ -260,13 +144,15 @@ index 0000000..57b7d14
 +}
 +
 +/* restore_ops function. */
-+static void x86_hvm_set_page_type(struct xc_sr_context *ctx, xen_pfn_t pfn, xen_pfn_t type)
++static void x86_hvm_set_page_type(struct xc_sr_context *ctx,
++                                  xen_pfn_t pfn, xen_pfn_t type)
 +{
 +    /* no-op */
 +}
 +
 +/* restore_ops function. */
-+static int x86_hvm_localise_page(struct xc_sr_context *ctx, uint32_t type, void *page)
++static int x86_hvm_localise_page(struct xc_sr_context *ctx,
++                                 uint32_t type, void *page)
 +{
 +    /* no-op */
 +    return 0;
@@ -298,7 +184,8 @@ index 0000000..57b7d14
 +/*
 + * restore_ops function.
 + */
-+static int x86_hvm_process_record(struct xc_sr_context *ctx, struct xc_sr_record *rec)
++static int x86_hvm_process_record(struct xc_sr_context *ctx,
++                                  struct xc_sr_record *rec)
 +{
 +    switch ( rec->type )
 +    {
@@ -310,9 +197,6 @@ index 0000000..57b7d14
 +
 +    case REC_TYPE_HVM_PARAMS:
 +        return handle_hvm_params(ctx, rec);
-+
-+    case REC_TYPE_TOOLSTACK:
-+        return handle_toolstack(ctx, rec);
 +
 +    default:
 +        return RECORD_NOT_PROCESSED;
@@ -352,17 +236,6 @@ index 0000000..57b7d14
 +    if ( rc )
 +    {
 +        PERROR("Failed to seed grant table");
-+        return rc;
-+    }
-+
-+    /*
-+     * FIXME: reading the device model state from the stream should be
-+     * done by libxl.
-+     */
-+    rc = dump_qemu(ctx);
-+    if ( rc )
-+    {
-+        ERROR("Failed to dump qemu");
 +        return rc;
 +    }
 +

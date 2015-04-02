@@ -1,4 +1,4 @@
-From 8d3a0520f4bfdbb7b1bf3f54bf0c6f1a6b4c63e7 Mon Sep 17 00:00:00 2001
+From 4f4a8af0adb1fac4bd2d6f09737c8c21e81fc6ba Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:09 +0100
 Subject: [PATCH 09/13] tools/libxc: x86 PV restore code
@@ -13,7 +13,9 @@ Page tables are pinned and the guest's P2M is updated when the stream is
 complete.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+CC: Wei Liu <wei.liu2@citrix.com>
 diff --git a/tools/libxc/Makefile b/tools/libxc/Makefile
 index 26cffa5..d42ecce 100644
 --- a/tools/libxc/Makefile
@@ -27,7 +29,7 @@ index 26cffa5..d42ecce 100644
  GUEST_SRCS-y += xc_sr_restore.c
  GUEST_SRCS-y += xc_sr_save.c
 diff --git a/tools/libxc/xc_sr_common.h b/tools/libxc/xc_sr_common.h
-index 896be07..2f4cbd2 100644
+index 896be07..0488734 100644
 --- a/tools/libxc/xc_sr_common.h
 +++ b/tools/libxc/xc_sr_common.h
 @@ -284,6 +284,8 @@ struct xc_sr_context
@@ -39,12 +41,162 @@ index 896be07..2f4cbd2 100644
  struct xc_sr_record
  {
      uint32_t type;
+@@ -318,6 +320,14 @@ static inline int write_record(struct xc_sr_context *ctx,
+     return write_split_record(ctx, rec, NULL, 0);
+ }
+ 
++/*
++ * This would ideally be private in restore.c, but is needed by
++ * x86_pv_localise_page() if we receive pagetables frames ahead of the
++ * contents of the frames they point at.
++ */
++int populate_pfns(struct xc_sr_context *ctx, unsigned count,
++                  const xen_pfn_t *original_pfns, const uint32_t *types);
++
+ #endif
+ /*
+  * Local variables:
+diff --git a/tools/libxc/xc_sr_restore.c b/tools/libxc/xc_sr_restore.c
+index cdebc69..045f486 100644
+--- a/tools/libxc/xc_sr_restore.c
++++ b/tools/libxc/xc_sr_restore.c
+@@ -1,5 +1,130 @@
+ #include "xc_sr_common.h"
+ 
++/*
++ * Is a pfn populated?
++ */
++static bool pfn_is_populated(const struct xc_sr_context *ctx, xen_pfn_t pfn)
++{
++    if ( pfn > ctx->restore.max_populated_pfn )
++        return false;
++    return test_bit(pfn, ctx->restore.populated_pfns);
++}
++
++/*
++ * Set a pfn as populated, expanding the tracking structures if needed. To
++ * avoid realloc()ing too excessivly, the size increased to the nearest power
++ * of two large enough to contain the required pfn.
++ */
++static int pfn_set_populated(struct xc_sr_context *ctx, xen_pfn_t pfn)
++{
++    xc_interface *xch = ctx->xch;
++
++    if ( pfn > ctx->restore.max_populated_pfn )
++    {
++        xen_pfn_t new_max;
++        size_t old_sz, new_sz;
++        unsigned long *p;
++
++        /* Round up to the nearest power of two larger than pfn, less 1. */
++        new_max = pfn;
++        new_max |= new_max >> 1;
++        new_max |= new_max >> 2;
++        new_max |= new_max >> 4;
++        new_max |= new_max >> 8;
++        new_max |= new_max >> 16;
++#ifdef __x86_64__
++        new_max |= new_max >> 32;
++#endif
++
++        old_sz = bitmap_size(ctx->restore.max_populated_pfn + 1);
++        new_sz = bitmap_size(new_max + 1);
++        p = realloc(ctx->restore.populated_pfns, new_sz);
++        if ( !p )
++        {
++            ERROR("Failed to realloc populated bitmap");
++            errno = ENOMEM;
++            return -1;
++        }
++
++        memset((uint8_t *)p + old_sz, 0x00, new_sz - old_sz);
++
++        ctx->restore.populated_pfns    = p;
++        ctx->restore.max_populated_pfn = new_max;
++    }
++
++    set_bit(pfn, ctx->restore.populated_pfns);
++
++    return 0;
++}
++
++/*
++ * Given a set of pfns, obtain memory from Xen to fill the physmap for the
++ * unpopulated subset.  If types is NULL, no page typechecking is performed
++ * and all unpopulated pfns are populated.
++ */
++int populate_pfns(struct xc_sr_context *ctx, unsigned count,
++                  const xen_pfn_t *original_pfns, const uint32_t *types)
++{
++    xc_interface *xch = ctx->xch;
++    xen_pfn_t *mfns = malloc(count * sizeof(*mfns)),
++        *pfns = malloc(count * sizeof(*pfns));
++    unsigned i, nr_pfns = 0;
++    int rc = -1;
++
++    if ( !mfns || !pfns )
++    {
++        ERROR("Failed to allocate %zu bytes for populating the physmap",
++              2 * count * sizeof(*mfns));
++        goto err;
++    }
++
++    for ( i = 0; i < count; ++i )
++    {
++        if ( (!types || (types &&
++                         (types[i] != XEN_DOMCTL_PFINFO_XTAB &&
++                          types[i] != XEN_DOMCTL_PFINFO_BROKEN))) &&
++             !pfn_is_populated(ctx, original_pfns[i]) )
++        {
++            pfns[nr_pfns] = mfns[nr_pfns] = original_pfns[i];
++            ++nr_pfns;
++        }
++    }
++
++    if ( nr_pfns )
++    {
++        rc = xc_domain_populate_physmap_exact(
++            xch, ctx->domid, nr_pfns, 0, 0, mfns);
++        if ( rc )
++        {
++            PERROR("Failed to populate physmap");
++            goto err;
++        }
++
++        for ( i = 0; i < nr_pfns; ++i )
++        {
++            if ( mfns[i] == INVALID_MFN )
++            {
++                ERROR("Populate physmap failed for pfn %u", i);
++                rc = -1;
++                goto err;
++            }
++
++            rc = pfn_set_populated(ctx, pfns[i]);
++            if ( rc )
++                goto err;
++            ctx->restore.ops.set_gfn(ctx, pfns[i], mfns[i]);
++        }
++    }
++
++    rc = 0;
++
++ err:
++    free(pfns);
++    free(mfns);
++
++    return rc;
++}
++
+ int xc_domain_restore2(xc_interface *xch, int io_fd, uint32_t dom,
+                        unsigned int store_evtchn, unsigned long *store_mfn,
+                        domid_t store_domid, unsigned int console_evtchn,
 diff --git a/tools/libxc/xc_sr_restore_x86_pv.c b/tools/libxc/xc_sr_restore_x86_pv.c
 new file mode 100644
-index 0000000..58029c4
+index 0000000..86d5f96
 --- /dev/null
 +++ b/tools/libxc/xc_sr_restore_x86_pv.c
-@@ -0,0 +1,1150 @@
+@@ -0,0 +1,1153 @@
 +#include <assert.h>
 +
 +#include "xc_sr_common_x86_pv.h"
@@ -128,10 +280,12 @@ index 0000000..58029c4
 +
 +    for ( i = nr_pins = 0; i <= ctx->x86_pv.max_pfn; ++i )
 +    {
-+        if ( (ctx->x86_pv.restore.pfn_types[i] & XEN_DOMCTL_PFINFO_LPINTAB) == 0 )
++        if ( (ctx->x86_pv.restore.pfn_types[i] &
++              XEN_DOMCTL_PFINFO_LPINTAB) == 0 )
 +            continue;
 +
-+        switch ( ctx->x86_pv.restore.pfn_types[i] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK )
++        switch ( (ctx->x86_pv.restore.pfn_types[i] &
++                  XEN_DOMCTL_PFINFO_LTABTYPE_MASK) )
 +        {
 +        case XEN_DOMCTL_PFINFO_L1TAB:
 +            pin[nr_pins].cmd = MMUEXT_PIN_L1_TABLE;
@@ -175,7 +329,8 @@ index 0000000..58029c4
 +/*
 + * Update details in a guests start_info strucutre.
 + */
-+static int process_start_info(struct xc_sr_context *ctx, vcpu_guest_context_any_t *vcpu)
++static int process_start_info(struct xc_sr_context *ctx,
++                              vcpu_guest_context_any_t *vcpu)
 +{
 +    xc_interface *xch = ctx->xch;
 +    xen_pfn_t pfn, mfn;
@@ -192,7 +347,8 @@ index 0000000..58029c4
 +    else if ( ctx->x86_pv.restore.pfn_types[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
 +    {
 +        ERROR("Start Info pfn %#lx has bad type %u", pfn,
-+              ctx->x86_pv.restore.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
++              (ctx->x86_pv.restore.pfn_types[pfn] >>
++               XEN_DOMCTL_PFINFO_LTAB_SHIFT));
 +        goto err;
 +    }
 +
@@ -231,7 +387,8 @@ index 0000000..58029c4
 +
 +    ctx->restore.xenstore_mfn = mfn;
 +    SET_FIELD(guest_start_info, store_mfn, mfn, ctx->x86_pv.width);
-+    SET_FIELD(guest_start_info, store_evtchn, ctx->restore.xenstore_evtchn, ctx->x86_pv.width);
++    SET_FIELD(guest_start_info, store_evtchn,
++              ctx->restore.xenstore_evtchn, ctx->x86_pv.width);
 +
 +    /* Deal with console stuff */
 +    pfn = GET_FIELD(guest_start_info, console.domU.mfn, ctx->x86_pv.width);
@@ -251,10 +408,12 @@ index 0000000..58029c4
 +
 +    ctx->restore.console_mfn = mfn;
 +    SET_FIELD(guest_start_info, console.domU.mfn, mfn, ctx->x86_pv.width);
-+    SET_FIELD(guest_start_info, console.domU.evtchn, ctx->restore.console_evtchn, ctx->x86_pv.width);
++    SET_FIELD(guest_start_info, console.domU.evtchn,
++              ctx->restore.console_evtchn, ctx->x86_pv.width);
 +
 +    /* Set other information */
-+    SET_FIELD(guest_start_info, nr_pages, ctx->x86_pv.max_pfn + 1, ctx->x86_pv.width);
++    SET_FIELD(guest_start_info, nr_pages,
++              ctx->x86_pv.max_pfn + 1, ctx->x86_pv.width);
 +    SET_FIELD(guest_start_info, shared_info,
 +              ctx->dominfo.shared_info_frame << PAGE_SHIFT, ctx->x86_pv.width);
 +    SET_FIELD(guest_start_info, flags, 0, ctx->x86_pv.width);
@@ -277,8 +436,7 @@ index 0000000..58029c4
 +    xc_interface *xch = ctx->xch;
 +    vcpu_guest_context_any_t vcpu;
 +    xen_pfn_t pfn, mfn;
-+    unsigned long tmp;
-+    unsigned i;
++    unsigned i, gdt_count;
 +    int rc = -1;
 +
 +    memcpy(&vcpu, ctx->x86_pv.restore.vcpus[vcpuid].basic,
@@ -297,16 +455,18 @@ index 0000000..58029c4
 +              GET_FIELD(&vcpu, flags, ctx->x86_pv.width) | VGCF_online,
 +              ctx->x86_pv.width);
 +
-+    tmp = GET_FIELD(&vcpu, gdt_ents, ctx->x86_pv.width);
-+    if ( tmp > 8192 )
++    gdt_count = GET_FIELD(&vcpu, gdt_ents, ctx->x86_pv.width);
++    if ( gdt_count > FIRST_RESERVED_GDT_ENTRY )
 +    {
-+        ERROR("GDT entry count (%lu) out of range", tmp);
++        ERROR("GDT entry count (%u) out of range (max %u)",
++              gdt_count, FIRST_RESERVED_GDT_ENTRY);
 +        errno = ERANGE;
 +        goto err;
 +    }
++    gdt_count = (gdt_count + 511) / 512; /* gdt_count now in units of frames. */
 +
 +    /* Convert GDT frames to mfns. */
-+    for ( i = 0; (i * 512) < tmp; ++i )
++    for ( i = 0; i < gdt_count; ++i )
 +    {
 +        pfn = GET_FIELD(&vcpu, gdt_frames[i], ctx->x86_pv.width);
 +        if ( pfn > ctx->x86_pv.max_pfn )
@@ -314,10 +474,12 @@ index 0000000..58029c4
 +            ERROR("GDT frame %u (pfn %#lx) out of range", i, pfn);
 +            goto err;
 +        }
-+        else if ( ctx->x86_pv.restore.pfn_types[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
++        else if ( (ctx->x86_pv.restore.pfn_types[pfn] !=
++                   XEN_DOMCTL_PFINFO_NOTAB) )
 +        {
 +            ERROR("GDT frame %u (pfn %#lx) has bad type %u", i, pfn,
-+                  ctx->x86_pv.restore.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
++                  (ctx->x86_pv.restore.pfn_types[pfn] >>
++                   XEN_DOMCTL_PFINFO_LTAB_SHIFT));
 +            goto err;
 +        }
 +
@@ -339,11 +501,14 @@ index 0000000..58029c4
 +        ERROR("cr3 (pfn %#lx) out of range", pfn);
 +        goto err;
 +    }
-+    else if ( (ctx->x86_pv.restore.pfn_types[pfn] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK ) !=
-+              (((xen_pfn_t)ctx->x86_pv.levels) << XEN_DOMCTL_PFINFO_LTAB_SHIFT) )
++    else if ( (ctx->x86_pv.restore.pfn_types[pfn] &
++                XEN_DOMCTL_PFINFO_LTABTYPE_MASK) !=
++              (((xen_pfn_t)ctx->x86_pv.levels) <<
++               XEN_DOMCTL_PFINFO_LTAB_SHIFT) )
 +    {
 +        ERROR("cr3 (pfn %#lx) has bad type %u, expected %u", pfn,
-+              ctx->x86_pv.restore.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT,
++              (ctx->x86_pv.restore.pfn_types[pfn] >>
++               XEN_DOMCTL_PFINFO_LTAB_SHIFT),
 +              ctx->x86_pv.levels);
 +        goto err;
 +    }
@@ -368,11 +533,14 @@ index 0000000..58029c4
 +            ERROR("cr1 (pfn %#lx) out of range", pfn);
 +            goto err;
 +        }
-+        else if ( (ctx->x86_pv.restore.pfn_types[pfn] & XEN_DOMCTL_PFINFO_LTABTYPE_MASK) !=
-+                  (((xen_pfn_t)ctx->x86_pv.levels) << XEN_DOMCTL_PFINFO_LTAB_SHIFT) )
++        else if ( (ctx->x86_pv.restore.pfn_types[pfn] &
++                   XEN_DOMCTL_PFINFO_LTABTYPE_MASK) !=
++                  (((xen_pfn_t)ctx->x86_pv.levels) <<
++                   XEN_DOMCTL_PFINFO_LTAB_SHIFT) )
 +        {
 +            ERROR("cr1 (pfn %#lx) has bad type %u, expected %u", pfn,
-+                  ctx->x86_pv.restore.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT,
++                  (ctx->x86_pv.restore.pfn_types[pfn] >>
++                   XEN_DOMCTL_PFINFO_LTAB_SHIFT),
 +                  ctx->x86_pv.levels);
 +            goto err;
 +        }
@@ -573,10 +741,12 @@ index 0000000..58029c4
 +                  pfn, i);
 +            goto err;
 +        }
-+        else if ( ctx->x86_pv.restore.pfn_types[pfn] != XEN_DOMCTL_PFINFO_NOTAB )
++        else if ( (ctx->x86_pv.restore.pfn_types[pfn] !=
++                   XEN_DOMCTL_PFINFO_NOTAB) )
 +        {
 +            ERROR("pfn (%#lx) for p2m_frame_list[%u] has bad type %u", pfn, i,
-+                  ctx->x86_pv.restore.pfn_types[pfn] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
++                  (ctx->x86_pv.restore.pfn_types[pfn] >>
++                   XEN_DOMCTL_PFINFO_LTAB_SHIFT));
 +            goto err;
 +        }
 +
@@ -611,28 +781,10 @@ index 0000000..58029c4
 +}
 +
 +/*
-+ * Process a toolstack record.  TODO - remove from spec and code once libxl
-+ * framing is sorted.
-+ */
-+static int handle_toolstack(struct xc_sr_context *ctx, struct xc_sr_record *rec)
-+{
-+    xc_interface *xch = ctx->xch;
-+    int rc;
-+
-+    if ( !ctx->restore.callbacks || !ctx->restore.callbacks->toolstack_restore )
-+        return 0;
-+
-+    rc = ctx->restore.callbacks->toolstack_restore(ctx->domid, rec->data, rec->length,
-+                                                   ctx->restore.callbacks->data);
-+    if ( rc < 0 )
-+        PERROR("restoring toolstack");
-+    return rc;
-+}
-+
-+/*
 + * Process an X86_PV_INFO record.
 + */
-+static int handle_x86_pv_info(struct xc_sr_context *ctx, struct xc_sr_record *rec)
++static int handle_x86_pv_info(struct xc_sr_context *ctx,
++                              struct xc_sr_record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    struct xc_sr_rec_x86_pv_info *info = rec->data;
@@ -706,7 +858,8 @@ index 0000000..58029c4
 + * Process an X86_PV_P2M_FRAMES record.  Takes care of expanding the local p2m
 + * state if needed.
 + */
-+static int handle_x86_pv_p2m_frames(struct xc_sr_context *ctx, struct xc_sr_record *rec)
++static int handle_x86_pv_p2m_frames(struct xc_sr_context *ctx,
++                                    struct xc_sr_record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    struct xc_sr_rec_x86_pv_p2m_frames *data = rec->data;
@@ -876,7 +1029,8 @@ index 0000000..58029c4
 +/*
 + * Process a SHARED_INFO record from the stream.
 + */
-+static int handle_shared_info(struct xc_sr_context *ctx, struct xc_sr_record *rec)
++static int handle_shared_info(struct xc_sr_context *ctx,
++                              struct xc_sr_record *rec)
 +{
 +    xc_interface *xch = ctx->xch;
 +    unsigned i;
@@ -910,11 +1064,13 @@ index 0000000..58029c4
 +    MEMCPY_FIELD(guest_shinfo, old_shinfo, vcpu_info, ctx->x86_pv.width);
 +    MEMCPY_FIELD(guest_shinfo, old_shinfo, arch, ctx->x86_pv.width);
 +
-+    SET_FIELD(guest_shinfo, arch.pfn_to_mfn_frame_list_list, 0, ctx->x86_pv.width);
++    SET_FIELD(guest_shinfo, arch.pfn_to_mfn_frame_list_list,
++              0, ctx->x86_pv.width);
 +
 +    MEMSET_ARRAY_FIELD(guest_shinfo, evtchn_pending, 0, ctx->x86_pv.width);
 +    for ( i = 0; i < XEN_LEGACY_MAX_VCPUS; i++ )
-+        SET_FIELD(guest_shinfo, vcpu_info[i].evtchn_pending_sel, 0, ctx->x86_pv.width);
++        SET_FIELD(guest_shinfo, vcpu_info[i].evtchn_pending_sel,
++                  0, ctx->x86_pv.width);
 +
 +    MEMSET_ARRAY_FIELD(guest_shinfo, evtchn_mask, 0xff, ctx->x86_pv.width);
 +
@@ -952,7 +1108,7 @@ index 0000000..58029c4
 +        /* 64 bit guest.  Need to expand INVALID_MFN for 32 bit toolstacks. */
 +        ((uint64_t *)ctx->x86_pv.p2m)[pfn] = mfn == INVALID_MFN ? ~0ULL : mfn;
 +    else
-+        /* 32 bit guest.  Can safely truncate INVALID_MFN for 64 bit toolstacks. */
++        /* 32 bit guest.  Can truncate INVALID_MFN for 64 bit toolstacks. */
 +        ((uint32_t *)ctx->x86_pv.p2m)[pfn] = mfn;
 +}
 +
@@ -961,7 +1117,8 @@ index 0000000..58029c4
 + * needs to populate new frames if a PTE is found referring to a frame which
 + * hasn't yet been seen from PAGE_DATA records.
 + */
-+static int x86_pv_localise_page(struct xc_sr_context *ctx, uint32_t type, void *page)
++static int x86_pv_localise_page(struct xc_sr_context *ctx,
++                                uint32_t type, void *page)
 +{
 +    xc_interface *xch = ctx->xch;
 +    uint64_t *table = page;
@@ -1074,7 +1231,8 @@ index 0000000..58029c4
 +/*
 + * restore_ops function.
 + */
-+static int x86_pv_process_record(struct xc_sr_context *ctx, struct xc_sr_record *rec)
++static int x86_pv_process_record(struct xc_sr_context *ctx,
++                                 struct xc_sr_record *rec)
 +{
 +    switch ( rec->type )
 +    {
@@ -1092,9 +1250,6 @@ index 0000000..58029c4
 +
 +    case REC_TYPE_SHARED_INFO:
 +        return handle_shared_info(ctx, rec);
-+
-+    case REC_TYPE_TOOLSTACK:
-+        return handle_toolstack(ctx, rec);
 +
 +    case REC_TYPE_TSC_INFO:
 +        return handle_tsc_info(ctx, rec);

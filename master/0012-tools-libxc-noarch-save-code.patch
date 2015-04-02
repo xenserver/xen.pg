@@ -1,4 +1,4 @@
-From 1593d0a7fa5cad30788c612aec9a0a1acd0c0cf1 Mon Sep 17 00:00:00 2001
+From c5c0d584276635531e24004585eea7fe07e1e2d3 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sun, 8 Jun 2014 03:03:29 +0100
 Subject: [PATCH 12/13] tools/libxc: noarch save code
@@ -11,12 +11,14 @@ This writes the image and domain headers, and writes all the PAGE_DATA records
 using a "live" process.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+CC: Wei Liu <wei.liu2@citrix.com>
 diff --git a/tools/libxc/xc_sr_save.c b/tools/libxc/xc_sr_save.c
-index c9dff36..1634497 100644
+index 3c34a6b..1e9bb2a 100644
 --- a/tools/libxc/xc_sr_save.c
 +++ b/tools/libxc/xc_sr_save.c
-@@ -1,11 +1,746 @@
+@@ -1,11 +1,780 @@
 +#include <assert.h>
 +#include <arpa/inet.h>
 +
@@ -110,9 +112,9 @@ index c9dff36..1634497 100644
 +    mfns = malloc(nr_pfns * sizeof(*mfns));
 +    /* Types of the batch pfns. */
 +    types = malloc(nr_pfns * sizeof(*types));
-+    /* Errors from attempting to map the mfns. */
++    /* Errors from attempting to map the gfns. */
 +    errors = malloc(nr_pfns * sizeof(*errors));
-+    /* Pointers to page data to send.  Either mapped mfns or local allocations. */
++    /* Pointers to page data to send.  Mapped gfns or local allocations. */
 +    guest_data = calloc(nr_pfns, sizeof(*guest_data));
 +    /* Pointers to locally allocated pages.  Need freeing. */
 +    local_pages = calloc(nr_pfns, sizeof(*local_pages));
@@ -128,7 +130,8 @@ index c9dff36..1634497 100644
 +
 +    for ( i = 0; i < nr_pfns; ++i )
 +    {
-+        types[i] = mfns[i] = ctx->save.ops.pfn_to_gfn(ctx, ctx->save.batch_pfns[i]);
++        types[i] = mfns[i] = ctx->save.ops.pfn_to_gfn(ctx,
++                                                      ctx->save.batch_pfns[i]);
 +
 +        /* Likely a ballooned page. */
 +        if ( mfns[i] == INVALID_MFN )
@@ -266,7 +269,7 @@ index c9dff36..1634497 100644
 +    if ( guest_mapping )
 +        munmap(guest_mapping, nr_pages * PAGE_SIZE);
 +    for ( i = 0; local_pages && i < nr_pfns; ++i )
-+            free(local_pages[i]);
++        free(local_pages[i]);
 +    free(iov);
 +    free(local_pages);
 +    free(guest_data);
@@ -292,7 +295,8 @@ index c9dff36..1634497 100644
 +    if ( !rc )
 +    {
 +        VALGRIND_MAKE_MEM_UNDEFINED(ctx->save.batch_pfns,
-+                                    MAX_BATCH_SIZE * sizeof(*ctx->save.batch_pfns));
++                                    MAX_BATCH_SIZE *
++                                    sizeof(*ctx->save.batch_pfns));
 +    }
 +
 +    return rc;
@@ -426,20 +430,57 @@ index c9dff36..1634497 100644
 +    return 0;
 +}
 +
++static int enable_logdirty(struct xc_sr_context *ctx)
++{
++    xc_interface *xch = ctx->xch;
++    int on1 = 0, off = 0, on2 = 0;
++    int rc;
++
++    /* This juggling is required if logdirty is enabled for VRAM tracking. */
++    rc = xc_shadow_control(xch, ctx->domid,
++                           XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
++                           NULL, 0, NULL, 0, NULL);
++    if ( rc < 0 )
++    {
++        on1 = errno;
++        rc = xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
++                               NULL, 0, NULL, 0, NULL);
++        if ( rc < 0 )
++            off = errno;
++        else {
++            rc = xc_shadow_control(xch, ctx->domid,
++                                   XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
++                                   NULL, 0, NULL, 0, NULL);
++            if ( rc < 0 )
++                on2 = errno;
++        }
++        if ( rc < 0 )
++        {
++            PERROR("Failed to enable logdirty: %d,%d,%d", on1, off, on2);
++            return rc;
++        }
++    }
++
++    return 0;
++}
++
 +static int update_progress_string(struct xc_sr_context *ctx,
 +                                  char **str, unsigned iter)
 +{
 +    xc_interface *xch = ctx->xch;
++    char *new_str = NULL;
 +
-+    free(*str);
-+    if ( asprintf(str, "Memory iteration %u of %u",
++    if ( asprintf(&new_str, "Memory iteration %u of %u",
 +                  iter, ctx->save.max_iterations) == -1 )
 +    {
-+        ERROR("Unable to allocate progress string");
++        PERROR("Unable to allocate new progress string");
 +        return -1;
 +    }
 +
-+    xc_report_progress_set(xch, *str);
++    free(*str);
++    *str = new_str;
++
++    xc_set_progress_prefix(xch, *str);
 +    return 0;
 +}
 +
@@ -458,7 +499,8 @@ index c9dff36..1634497 100644
 +    to_send = xc_hypercall_buffer_alloc_pages(
 +        xch, to_send, NRPAGES(bitmap_size(ctx->save.p2m_size)));
 +
-+    ctx->save.batch_pfns = malloc(MAX_BATCH_SIZE * sizeof(*ctx->save.batch_pfns));
++    ctx->save.batch_pfns = malloc(MAX_BATCH_SIZE *
++                                  sizeof(*ctx->save.batch_pfns));
 +    ctx->save.deferred_pages = calloc(1, bitmap_size(ctx->save.p2m_size));
 +
 +    if ( !ctx->save.batch_pfns || !to_send || !ctx->save.deferred_pages )
@@ -467,23 +509,9 @@ index c9dff36..1634497 100644
 +        goto out;
 +    }
 +
-+    /* This juggling is required if logdirty is enabled for VRAM tracking. */
-+    if ( xc_shadow_control(xch, ctx->domid,
-+                           XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
-+                           NULL, 0, NULL, 0, NULL) < 0 )
-+    {
-+        int frc = xc_shadow_control(xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_OFF,
-+                                    NULL, 0, NULL, 0, NULL);
-+        if ( frc >= 0 )
-+            frc = xc_shadow_control(xch, ctx->domid,
-+                                    XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY,
-+                                    NULL, 0, NULL, 0, NULL);
-+        if ( frc < 0 )
-+        {
-+            PERROR("Failed to enable logdirty: rc %d", frc);
-+            goto out;
-+        }
-+    }
++    rc = enable_logdirty(ctx);
++    if ( rc )
++        goto out;
 +
 +    rc = update_progress_string(ctx, &progress_str, 0);
 +    if ( rc )
@@ -558,7 +586,7 @@ index c9dff36..1634497 100644
 +        if ( rc )
 +            goto out;
 +
-+        xc_report_progress_set(xch, "Memory verify");
++        xc_set_progress_prefix(xch, "Memory verify");
 +        rc = send_all_pages(ctx);
 +        if ( rc )
 +            goto out;
@@ -578,7 +606,7 @@ index c9dff36..1634497 100644
 +    }
 +
 +  out:
-+    xc_report_progress_set(xch, NULL);
++    xc_set_progress_prefix(xch, NULL);
 +    free(progress_str);
 +    xc_hypercall_buffer_free_pages(xch, to_send,
 +                                   NRPAGES(bitmap_size(ctx->save.p2m_size)));
@@ -611,7 +639,7 @@ index c9dff36..1634497 100644
 +    if ( rc )
 +        goto err;
 +
-+    xc_report_progress_set(xch, "Memory");
++    xc_set_progress_prefix(xch, "Memory");
 +
 +    rc = send_all_pages(ctx);
 +    if ( rc )
@@ -700,10 +728,11 @@ index c9dff36..1634497 100644
 +    return rc;
 +};
 +
- int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_iters,
-                     uint32_t max_factor, uint32_t flags,
+ int xc_domain_save2(xc_interface *xch, int io_fd, uint32_t dom,
+                     uint32_t max_iters, uint32_t max_factor, uint32_t flags,
                      struct save_callbacks* callbacks, int hvm)
  {
++    xen_pfn_t nr_pfns;
 +    struct xc_sr_context ctx =
 +        {
 +            .xch = xch,
@@ -743,7 +772,14 @@ index c9dff36..1634497 100644
 +
 +    ctx.domid = dom;
 +
-+    ctx.save.p2m_size = xc_domain_maximum_gpfn(xch, dom) + 1;
++    if ( xc_domain_nr_gpfns(xch, dom, &nr_pfns) < 0 )
++    {
++        PERROR("Unable to obtain the guest p2m size");
++        return -1;
++    }
++
++    ctx.save.p2m_size = nr_pfns;
++
 +    if ( ctx.save.p2m_size > ~XEN_DOMCTL_PFINFO_LTAB_MASK )
 +    {
 +        errno = E2BIG;

@@ -1,4 +1,4 @@
-From e93d1cf708078d5eefb714cd3534191bedd84bdf Mon Sep 17 00:00:00 2001
+From 742a507e0813d544c348d6c4e606f13b41635030 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:33 +0100
 Subject: [PATCH 10/13] tools/libxc: x86 HVM save code
@@ -10,6 +10,9 @@ needed.
 There is no need for any page normalisation.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Ian Campbell <Ian.Campbell@citrix.com>
+CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
+CC: Wei Liu <wei.liu2@citrix.com>
 diff --git a/tools/libxc/Makefile b/tools/libxc/Makefile
 index d42ecce..bf04991 100644
 --- a/tools/libxc/Makefile
@@ -23,7 +26,7 @@ index d42ecce..bf04991 100644
  GUEST_SRCS-y += xc_sr_save.c
  GUEST_SRCS-y += xc_offline_page.c xc_compression.c
 diff --git a/tools/libxc/xc_sr_common.h b/tools/libxc/xc_sr_common.h
-index 2f4cbd2..510aa47 100644
+index 0488734..cd27246 100644
 --- a/tools/libxc/xc_sr_common.h
 +++ b/tools/libxc/xc_sr_common.h
 @@ -283,6 +283,7 @@ struct xc_sr_context
@@ -36,10 +39,10 @@ index 2f4cbd2..510aa47 100644
  
 diff --git a/tools/libxc/xc_sr_save_x86_hvm.c b/tools/libxc/xc_sr_save_x86_hvm.c
 new file mode 100644
-index 0000000..cfe4118
+index 0000000..5b4d336
 --- /dev/null
 +++ b/tools/libxc/xc_sr_save_x86_hvm.c
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,220 @@
 +#include <assert.h>
 +
 +#include "xc_sr_common_x86.h"
@@ -141,15 +144,6 @@ index 0000000..cfe4118
 +        rc = xc_get_hvm_param(xch, ctx->domid, index, (unsigned long *)&value);
 +        if ( rc )
 +        {
-+            /* Gross XenServer hack. Consider HVM_PARAM_CONSOLE_PFN failure
-+             * nonfatal. This is related to the fact it is impossible to
-+             * distinguish "no console" from a console at pfn/evtchn 0.
-+             *
-+             * TODO - find a compatible way to fix this.
-+             */
-+            if ( index == HVM_PARAM_CONSOLE_PFN )
-+                continue;
-+
 +            PERROR("Failed to get HVMPARAM at index %u", index);
 +            return rc;
 +        }
@@ -169,41 +163,15 @@ index 0000000..cfe4118
 +    return rc;
 +}
 +
-+/* TODO - remove. */
-+static int write_toolstack(struct xc_sr_context *ctx)
-+{
-+    xc_interface *xch = ctx->xch;
-+    struct xc_sr_record rec = {
-+        .type = REC_TYPE_TOOLSTACK,
-+        .length = 0,
-+    };
-+    uint8_t *buf;
-+    uint32_t len;
-+    int rc;
-+
-+    if ( !ctx->save.callbacks || !ctx->save.callbacks->toolstack_save )
-+        return 0;
-+
-+    if ( ctx->save.callbacks->toolstack_save(ctx->domid, &buf, &len, ctx->save.callbacks->data) < 0 )
-+    {
-+        PERROR("Error calling toolstack_save");
-+        return -1;
-+    }
-+
-+    rc = write_split_record(ctx, &rec, buf, len);
-+    if ( rc < 0 )
-+        PERROR("Error writing TOOLSTACK record");
-+    free(buf);
-+    return rc;
-+}
-+
-+static xen_pfn_t x86_hvm_pfn_to_gfn(const struct xc_sr_context *ctx, xen_pfn_t pfn)
++static xen_pfn_t x86_hvm_pfn_to_gfn(const struct xc_sr_context *ctx,
++                                    xen_pfn_t pfn)
 +{
 +    /* identity map */
 +    return pfn;
 +}
 +
-+static int x86_hvm_normalise_page(struct xc_sr_context *ctx, xen_pfn_t type, void **page)
++static int x86_hvm_normalise_page(struct xc_sr_context *ctx,
++                                  xen_pfn_t type, void **page)
 +{
 +    /* no-op */
 +    return 0;
@@ -242,12 +210,8 @@ index 0000000..cfe4118
 +{
 +    int rc;
 +
++    /* Write the TSC record. */
 +    rc = write_tsc_info(ctx);
-+    if ( rc )
-+        return rc;
-+
-+    /* TODO - remove. */
-+    rc = write_toolstack(ctx);
 +    if ( rc )
 +        return rc;
 +

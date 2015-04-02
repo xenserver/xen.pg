@@ -1,0 +1,120 @@
+From 71cba2a07bb541f25390cdd3546c9ee296a7257b Mon Sep 17 00:00:00 2001
+From: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date: Mon, 30 Mar 2015 10:46:38 -0400
+Subject: [PATCH] libxc: Introduce xc_domain_nr_gpfns as a cousin of
+ xc_domain_maximum_gpfn.
+
+The commit a8f8a590e02d2d2b717257c0bd9a8b396103bdf4
+"libxc: Check xc_domain_maximum_gpfn for negative return values"
+introduced an regression in tools outside libxc (migrate v2)
+which wanted the unfiltered GPFN value. Said commit added
+a wrapper which added +1 if there were no errors.
+
+To make it work pre-commit a8f8a59 we add an xc_domain_nr_gpfns
+which will add +1 if there are no errors (and change all in-tree
+callers to use it). The xc_domain_maximum_gpfn will return the
+unfiltered GPFN value.
+
+Suggested-by: Ian Campbell <ian.campbell@citrix.com>
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 65279df..8dfaea1 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1317,6 +1317,8 @@ int xc_domain_disable_migrate(xc_interface *xch, uint32_t domid);
+ 
+ int xc_domain_maximum_gpfn(xc_interface *xch, domid_t domid, xen_pfn_t *gpfns);
+ 
++int xc_domain_nr_gpfns(xc_interface *xch, domid_t domid, xen_pfn_t *gpfns);
++
+ int xc_domain_increase_reservation(xc_interface *xch,
+                                    uint32_t domid,
+                                    unsigned long nr_extents,
+diff --git a/tools/libxc/xc_core_arm.c b/tools/libxc/xc_core_arm.c
+index c3f5868..57d4715 100644
+--- a/tools/libxc/xc_core_arm.c
++++ b/tools/libxc/xc_core_arm.c
+@@ -45,7 +45,7 @@ xc_core_arch_memory_map_get(xc_interface *xch, struct xc_core_arch_context *unus
+     xen_pfn_t p2m_size = 0;
+     xc_core_memory_map_t *map;
+ 
+-    if ( xc_domain_maximum_gpfn(xch, info->domid, &p2m_size) < 0 )
++    if ( xc_domain_nr_gpfns(xch, info->domid, &p2m_size) < 0 )
+         return -1;
+ 
+     map = malloc(sizeof(*map));
+diff --git a/tools/libxc/xc_core_x86.c b/tools/libxc/xc_core_x86.c
+index 4552e43..93ebcbb 100644
+--- a/tools/libxc/xc_core_x86.c
++++ b/tools/libxc/xc_core_x86.c
+@@ -50,7 +50,7 @@ xc_core_arch_memory_map_get(xc_interface *xch, struct xc_core_arch_context *unus
+     xen_pfn_t p2m_size = 0;
+     xc_core_memory_map_t *map;
+ 
+-    if ( xc_domain_maximum_gpfn(xch, info->domid, &p2m_size) < 0 )
++    if ( xc_domain_nr_gpfns(xch, info->domid, &p2m_size) < 0 )
+         return -1;
+ 
+     map = malloc(sizeof(*map));
+@@ -85,7 +85,7 @@ xc_core_arch_map_p2m_rw(xc_interface *xch, struct domain_info_context *dinfo, xc
+     int err;
+     int i;
+ 
+-    if ( xc_domain_maximum_gpfn(xch, info->domid, &dinfo->p2m_size) < 0 )
++    if ( xc_domain_nr_gpfns(xch, info->domid, &dinfo->p2m_size) < 0 )
+     {
+         ERROR("Could not get maximum GPFN!");
+         goto out;
+@@ -212,7 +212,7 @@ int
+ xc_core_arch_get_scratch_gpfn(xc_interface *xch, domid_t domid,
+                               xen_pfn_t *gpfn)
+ {
+-    return xc_domain_maximum_gpfn(xch, domid, gpfn);
++    return xc_domain_nr_gpfns(xch, domid, gpfn);
+ }
+ 
+ /*
+diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
+index 18f5c5e..fe26d85 100644
+--- a/tools/libxc/xc_domain.c
++++ b/tools/libxc/xc_domain.c
+@@ -799,12 +799,22 @@ int xc_domain_maximum_gpfn(xc_interface *xch, domid_t domid, xen_pfn_t *gpfns)
+ 
+     if ( rc >= 0 )
+     {
+-        *gpfns = rc + 1;
++        *gpfns = rc;
+         rc = 0;
+     }
+     return rc;
+ }
+ 
++int xc_domain_nr_gpfns(xc_interface *xch, domid_t domid, xen_pfn_t *gpfns)
++{
++    int rc = xc_domain_maximum_gpfn(xch, domid, gpfns);
++
++    if ( rc >= 0 )
++        *gpfns += 1;
++
++    return rc;
++}
++
+ int xc_domain_increase_reservation(xc_interface *xch,
+                                    uint32_t domid,
+                                    unsigned long nr_extents,
+diff --git a/tools/libxc/xc_domain_save.c b/tools/libxc/xc_domain_save.c
+index b611c07..cef6995 100644
+--- a/tools/libxc/xc_domain_save.c
++++ b/tools/libxc/xc_domain_save.c
+@@ -939,7 +939,7 @@ int xc_domain_save(xc_interface *xch, int io_fd, uint32_t dom, uint32_t max_iter
+     }
+ 
+     /* Get the size of the P2M table */
+-    if ( xc_domain_maximum_gpfn(xch, dom, &dinfo->p2m_size) < 0 )
++    if ( xc_domain_nr_gpfns(xch, dom, &dinfo->p2m_size) < 0 )
+     {
+         ERROR("Could not get maximum GPFN!");
+         goto out;
