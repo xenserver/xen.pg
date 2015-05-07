@@ -1,7 +1,7 @@
-From 801f7c50b9a8cb7c199c028d562cfec3168af3fb Mon Sep 17 00:00:00 2001
+From a8631b03d44bc82ee26c796b6356827e0d4f5972 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:02 +0100
-Subject: [PATCH 08/13] tools/libxc: x86 PV save code
+Subject: [PATCH] tools/libxc: x86 PV save code
 
 Save the x86 PV specific parts of a domain.  This is the X86_PV_INFO record,
 the P2M_FRAMES, the X86_PV_SHARED_INFO, the three different VCPU context
@@ -11,9 +11,7 @@ The normalise_page callback used by the common code when writing the PAGE_DATA
 records, converts MFNs in page tables to PFNs.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-CC: Ian Campbell <Ian.Campbell@citrix.com>
-CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
-CC: Wei Liu <wei.liu2@citrix.com>
+Acked-by: Ian Campbell <Ian.Campbell@citrix.com>
 diff --git a/tools/libxc/Makefile b/tools/libxc/Makefile
 index 890d17a..26cffa5 100644
 --- a/tools/libxc/Makefile
@@ -27,7 +25,7 @@ index 890d17a..26cffa5 100644
  GUEST_SRCS-y += xc_sr_save.c
  GUEST_SRCS-y += xc_offline_page.c xc_compression.c
 diff --git a/tools/libxc/xc_sr_common.h b/tools/libxc/xc_sr_common.h
-index e3b1990..819f50e 100644
+index b71b532..2f0f00b 100644
 --- a/tools/libxc/xc_sr_common.h
 +++ b/tools/libxc/xc_sr_common.h
 @@ -285,6 +285,7 @@ struct xc_sr_context
@@ -40,10 +38,10 @@ index e3b1990..819f50e 100644
  {
 diff --git a/tools/libxc/xc_sr_save_x86_pv.c b/tools/libxc/xc_sr_save_x86_pv.c
 new file mode 100644
-index 0000000..74ce379
+index 0000000..a668221
 --- /dev/null
 +++ b/tools/libxc/xc_sr_save_x86_pv.c
-@@ -0,0 +1,860 @@
+@@ -0,0 +1,885 @@
 +#include <assert.h>
 +#include <limits.h>
 +
@@ -70,10 +68,10 @@ index 0000000..74ce379
 +
 +/*
 + * Copy a list of mfns from a guest, accounting for differences between guest
-+ * and toolstack width.
++ * and toolstack width.  Can fail if truncation would occur.
 + */
-+static void copy_mfns_from_guest(const struct xc_sr_context *ctx,
-+                                 xen_pfn_t *dst, const void *src, size_t count)
++static int copy_mfns_from_guest(const struct xc_sr_context *ctx,
++                                xen_pfn_t *dst, const void *src, size_t count)
 +{
 +    size_t x;
 +
@@ -89,11 +87,28 @@ index 0000000..74ce379
 +
 +            dst[x] = s == ~0U ? INVALID_MFN : s;
 +#else
-+            /* 32bit toolstack, 64bit guest.  Truncate their pointers */
-+            dst[x] = ((uint64_t *)src)[x];
++            /*
++             * 32bit toolstack, 64bit guest.  Truncate INVALID_MFN, but bail
++             * if any other truncation would occur.
++             *
++             * This will only occur on hosts where a PV guest has ram above
++             * the 16TB boundary.  A 32bit dom0 is unlikely to have
++             * successfully booted on a system this large.
++             */
++            uint64_t s = ((uint64_t *)src)[x];
++
++            if ( (s != ~0ULL) && ((s >> 32) != 0) )
++            {
++                errno = E2BIG;
++                return -1;
++            }
++
++            dst[x] = s;
 +#endif
 +        }
 +    }
++
++    return 0;
 +}
 +
 +/*
@@ -153,7 +168,11 @@ index 0000000..74ce379
 +        goto err;
 +    }
 +
-+    copy_mfns_from_guest(ctx, local_fll, guest_fll, fll_entries);
++    if ( copy_mfns_from_guest(ctx, local_fll, guest_fll, fll_entries) )
++    {
++        ERROR("Truncation detected copying p2m frame list list");
++        goto err;
++    }
 +
 +    /* Check for bad mfns in frame list list. */
 +    for ( x = 0; x < fll_entries; ++x )
@@ -184,7 +203,11 @@ index 0000000..74ce379
 +        goto err;
 +    }
 +
-+    copy_mfns_from_guest(ctx, local_fl, guest_fl, fl_entries);
++    if ( copy_mfns_from_guest(ctx, local_fl, guest_fl, fl_entries) )
++    {
++        ERROR("Truncation detected copying p2m frame list");
++        goto err;
++    }
 +
 +    for ( x = 0; x < fl_entries; ++x )
 +    {
@@ -577,7 +600,7 @@ index 0000000..74ce379
 +
 +/*
 + * Writes an X86_PV_P2M_FRAMES record into the stream.  This contains the list
-+ * of pfns making upt the p2m table.
++ * of pfns making up the p2m table.
 + */
 +static int write_x86_pv_p2m_frames(struct xc_sr_context *ctx)
 +{
@@ -645,7 +668,7 @@ index 0000000..74ce379
 +{
 +    xc_interface *xch = ctx->xch;
 +    uint64_t pte;
-+    unsigned i, xen_first = -1, xen_last = -1; /* Indicies of Xen mappings. */
++    unsigned i, xen_first = -1, xen_last = -1; /* Indices of Xen mappings. */
 +
 +    type &= XEN_DOMCTL_PFINFO_LTABTYPE_MASK;
 +

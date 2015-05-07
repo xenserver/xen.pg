@@ -1,7 +1,7 @@
-From 601c3e41aeae3b216a66e5613d7cf94478ef9d9d Mon Sep 17 00:00:00 2001
+From eab806a097b38c07979a313f8bd2a7258cdcce3b Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sat, 7 Jun 2014 21:17:09 +0100
-Subject: [PATCH 09/13] tools/libxc: x86 PV restore code
+Subject: [PATCH] tools/libxc: x86 PV restore code
 
 Restore the x86 PV specific parts.  The X86_PV_INFO, the P2M_FRAMES,
 SHARED_INFO, and VCPU context records.
@@ -13,9 +13,7 @@ Page tables are pinned and the guest's P2M is updated when the stream is
 complete.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-CC: Ian Campbell <Ian.Campbell@citrix.com>
-CC: Ian Jackson <Ian.Jackson@eu.citrix.com>
-CC: Wei Liu <wei.liu2@citrix.com>
+Acked-by: Ian Campbell <Ian.Campbell@citrix.com>
 diff --git a/tools/libxc/Makefile b/tools/libxc/Makefile
 index 26cffa5..d42ecce 100644
 --- a/tools/libxc/Makefile
@@ -29,7 +27,7 @@ index 26cffa5..d42ecce 100644
  GUEST_SRCS-y += xc_sr_restore.c
  GUEST_SRCS-y += xc_sr_save.c
 diff --git a/tools/libxc/xc_sr_common.h b/tools/libxc/xc_sr_common.h
-index 819f50e..4f33839 100644
+index 2f0f00b..7d3d54f 100644
 --- a/tools/libxc/xc_sr_common.h
 +++ b/tools/libxc/xc_sr_common.h
 @@ -287,6 +287,8 @@ struct xc_sr_context
@@ -193,10 +191,10 @@ index cdebc69..045f486 100644
                         domid_t store_domid, unsigned int console_evtchn,
 diff --git a/tools/libxc/xc_sr_restore_x86_pv.c b/tools/libxc/xc_sr_restore_x86_pv.c
 new file mode 100644
-index 0000000..be45558
+index 0000000..ef26c64
 --- /dev/null
 +++ b/tools/libxc/xc_sr_restore_x86_pv.c
-@@ -0,0 +1,1153 @@
+@@ -0,0 +1,1165 @@
 +#include <assert.h>
 +
 +#include "xc_sr_common_x86_pv.h"
@@ -327,7 +325,7 @@ index 0000000..be45558
 +}
 +
 +/*
-+ * Update details in a guests start_info strucutre.
++ * Update details in a guests start_info structure.
 + */
 +static int process_start_info(struct xc_sr_context *ctx,
 +                              vcpu_guest_context_any_t *vcpu)
@@ -827,11 +825,11 @@ index 0000000..be45558
 +            return -1;
 +        }
 +
-+        /* Domain informations changed, better to refresh. */
++        /* Domain's information changed, better to refresh. */
 +        rc = x86_pv_domain_info(ctx);
 +        if ( rc != 0 )
 +        {
-+            ERROR("Unable to refresh guest informations");
++            ERROR("Unable to refresh guest information");
 +            return -1;
 +        }
 +    }
@@ -912,9 +910,9 @@ index 0000000..be45558
 +
 +/*
 + * Processes X86_PV_VCPU_{BASIC,EXTENDED,XSAVE,MSRS} records from the stream.
-+ * The blobs are all stashed to one side as they need to be defered until the
++ * The blobs are all stashed to one side as they need to be deferred until the
 + * very end of the stream, rather than being send to Xen at the point they
-+ * arive in the stream.  It performs all pre-hypercall size validation.
++ * arrive in the stream.  It performs all pre-hypercall size validation.
 + */
 +static int handle_x86_pv_vcpu_blob(struct xc_sr_context *ctx,
 +                                   struct xc_sr_record *rec)
@@ -929,14 +927,24 @@ index 0000000..be45558
 +
 +    switch ( rec->type )
 +    {
-+#define RECNAME(x, y) case (x): rec_name = (y) ; break
-+        RECNAME(REC_TYPE_X86_PV_VCPU_BASIC,    "X86_PV_VCPU_BASIC");
-+        RECNAME(REC_TYPE_X86_PV_VCPU_EXTENDED, "X86_PV_VCPU_EXTENDED");
-+        RECNAME(REC_TYPE_X86_PV_VCPU_XSAVE,    "X86_PV_VCPU_XSAVE");
-+        RECNAME(REC_TYPE_X86_PV_VCPU_MSRS,     "X86_PV_VCPU_MSRS");
-+#undef RECNAME
++    case REC_TYPE_X86_PV_VCPU_BASIC:
++        rec_name = "X86_PV_VCPU_BASIC";
++        break;
++
++    case REC_TYPE_X86_PV_VCPU_EXTENDED:
++        rec_name = "X86_PV_VCPU_EXTENDED";
++        break;
++
++    case REC_TYPE_X86_PV_VCPU_XSAVE:
++        rec_name = "X86_PV_VCPU_XSAVE";
++        break;
++
++    case REC_TYPE_X86_PV_VCPU_MSRS:
++        rec_name = "X86_PV_VCPU_MSRS";
++        break;
++
 +    default:
-+        ERROR("Unrecogised vcpu blob record %s (%u)",
++        ERROR("Unrecognised vcpu blob record %s (%u)",
 +              rec_type_to_str(rec->type), rec->type);
 +        goto out;
 +    }
@@ -1012,11 +1020,13 @@ index 0000000..be45558
 +    /* Stash sideways for later. */
 +    switch ( rec->type )
 +    {
-+#define RECSTORE(x, y) case (x): free(y); (y) = blob; (y ## sz) = blobsz; break
-+        RECSTORE(REC_TYPE_X86_PV_VCPU_BASIC,    vcpu->basic);
-+        RECSTORE(REC_TYPE_X86_PV_VCPU_EXTENDED, vcpu->extd);
-+        RECSTORE(REC_TYPE_X86_PV_VCPU_XSAVE,    vcpu->xsave);
-+        RECSTORE(REC_TYPE_X86_PV_VCPU_MSRS,     vcpu->msr);
++#define RECSTORE(x, y) case REC_TYPE_X86_PV_ ## x: \
++        free(y); (y) = blob; (y ## sz) = blobsz; break
++
++        RECSTORE(VCPU_BASIC,    vcpu->basic);
++        RECSTORE(VCPU_EXTENDED, vcpu->extd);
++        RECSTORE(VCPU_XSAVE,    vcpu->xsave);
++        RECSTORE(VCPU_MSRS,     vcpu->msr);
 +#undef RECSTORE
 +    }
 +
