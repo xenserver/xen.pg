@@ -1,0 +1,280 @@
+From ef1e0bbb338fe9070d7e66772bc61d0a33a9c6b7 Mon Sep 17 00:00:00 2001
+From: David Vrabel <david.vrabel@citrix.com>
+Date: Thu, 9 Apr 2015 16:47:17 +0100
+Subject: [PATCH] x86,arm: remove asm/spinlock.h from all architectures
+
+Now that all architecture use a common ticket lock implementation for
+spinlocks, remove the architecture specific byte lock implementations.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Tim Deegan <tim@xen.org>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+diff --git a/xen/arch/arm/README.LinuxPrimitives b/xen/arch/arm/README.LinuxPrimitives
+index 7f33fc7..3115f51 100644
+--- a/xen/arch/arm/README.LinuxPrimitives
++++ b/xen/arch/arm/README.LinuxPrimitives
+@@ -25,16 +25,6 @@ linux/arch/arm64/include/asm/atomic.h   xen/include/asm-arm/arm64/atomic.h
+ 
+ ---------------------------------------------------------------------
+ 
+-spinlocks: last sync @ v3.16-rc6 (last commit: 95c4189689f9)
+-
+-linux/arch/arm64/include/asm/spinlock.h xen/include/asm-arm/arm64/spinlock.h
+-
+-Skipped:
+-  5686b06 arm64: lockref: add support for lockless lockrefs using cmpxchg
+-  52ea2a5 arm64: locks: introduce ticket-based spinlock implementation
+-
+----------------------------------------------------------------------
+-
+ mem*: last sync @ v3.16-rc6 (last commit: d875c9b37240)
+ 
+ linux/arch/arm64/lib/memchr.S           xen/arch/arm/arm64/lib/memchr.S
+@@ -103,24 +93,6 @@ linux/arch/arm/include/asm/atomic.h     xen/include/asm-arm/arm32/atomic.h
+ 
+ ---------------------------------------------------------------------
+ 
+-spinlocks: last sync: 15e7e5c1ebf5
+-
+-linux/arch/arm/include/asm/spinlock.h   xen/include/asm-arm/arm32/spinlock.h
+-
+-*** Linux has switched to ticket locks but we still use bitlocks.
+-
+-resync to v3.14-rc7:
+-
+-  7c8746a ARM: 7955/1: spinlock: ensure we have a compiler barrier before sev
+-  0cbad9c ARM: 7854/1: lockref: add support for lockless lockrefs using cmpxchg64
+-  9bb17be ARM: locks: prefetch the destination word for write prior to strex
+-  27a8479 ARM: smp_on_up: move inline asm ALT_SMP patching macro out of spinlock.
+-  00efaa0 ARM: 7812/1: rwlocks: retry trylock operation if strex fails on free lo
+-  afa31d8 ARM: 7811/1: locks: use early clobber in arch_spin_trylock
+-  73a6fdc ARM: spinlock: use inner-shareable dsb variant prior to sev instruction
+-
+----------------------------------------------------------------------
+-
+ mem*: last sync @ v3.16-rc6 (last commit: d98b90ea22b0)
+ 
+ linux/arch/arm/lib/copy_template.S      xen/arch/arm/arm32/lib/copy_template.S
+diff --git a/xen/include/asm-arm/arm32/spinlock.h b/xen/include/asm-arm/arm32/spinlock.h
+deleted file mode 100644
+index bc0343c..0000000
+--- a/xen/include/asm-arm/arm32/spinlock.h
++++ /dev/null
+@@ -1,66 +0,0 @@
+-#ifndef __ASM_ARM32_SPINLOCK_H
+-#define __ASM_ARM32_SPINLOCK_H
+-
+-static inline void dsb_sev(void)
+-{
+-    __asm__ __volatile__ (
+-        "dsb\n"
+-        "sev\n"
+-        );
+-}
+-
+-typedef struct {
+-    volatile unsigned int lock;
+-} raw_spinlock_t;
+-
+-#define _RAW_SPIN_LOCK_UNLOCKED { 0 }
+-
+-#define _raw_spin_is_locked(x)          ((x)->lock != 0)
+-
+-static always_inline void _raw_spin_unlock(raw_spinlock_t *lock)
+-{
+-    ASSERT(_raw_spin_is_locked(lock));
+-
+-    smp_mb();
+-
+-    __asm__ __volatile__(
+-"   str     %1, [%0]\n"
+-    :
+-    : "r" (&lock->lock), "r" (0)
+-    : "cc");
+-
+-    dsb_sev();
+-}
+-
+-static always_inline int _raw_spin_trylock(raw_spinlock_t *lock)
+-{
+-    unsigned long contended, res;
+-
+-    do {
+-        __asm__ __volatile__(
+-    "   ldrex   %0, [%2]\n"
+-    "   teq     %0, #0\n"
+-    "   strexeq %1, %3, [%2]\n"
+-    "   movne   %1, #0\n"
+-        : "=&r" (contended), "=r" (res)
+-        : "r" (&lock->lock), "r" (1)
+-        : "cc");
+-    } while (res);
+-
+-    if (!contended) {
+-        smp_mb();
+-        return 1;
+-    } else {
+-        return 0;
+-    }
+-}
+-
+-#endif /* __ASM_SPINLOCK_H */
+-/*
+- * Local variables:
+- * mode: C
+- * c-file-style: "BSD"
+- * c-basic-offset: 4
+- * indent-tabs-mode: nil
+- * End:
+- */
+diff --git a/xen/include/asm-arm/arm64/spinlock.h b/xen/include/asm-arm/arm64/spinlock.h
+deleted file mode 100644
+index 5ae034d..0000000
+--- a/xen/include/asm-arm/arm64/spinlock.h
++++ /dev/null
+@@ -1,63 +0,0 @@
+-/*
+- * Derived from Linux arch64 spinlock.h which is:
+- * Copyright (C) 2012 ARM Ltd.
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License version 2 as
+- * published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+- */
+-
+-#ifndef __ASM_ARM64_SPINLOCK_H
+-#define __ASM_ARM64_SPINLOCK_H
+-
+-typedef struct {
+-    volatile unsigned int lock;
+-} raw_spinlock_t;
+-
+-#define _RAW_SPIN_LOCK_UNLOCKED { 0 }
+-
+-#define _raw_spin_is_locked(x)          ((x)->lock != 0)
+-
+-static always_inline void _raw_spin_unlock(raw_spinlock_t *lock)
+-{
+-    ASSERT(_raw_spin_is_locked(lock));
+-
+-    asm volatile(
+-        "       stlr    %w1, %0\n"
+-        : "=Q" (lock->lock) : "r" (0) : "memory");
+-}
+-
+-static always_inline int _raw_spin_trylock(raw_spinlock_t *lock)
+-{
+-    unsigned int tmp;
+-
+-    asm volatile(
+-        "2:     ldaxr   %w0, %1\n"
+-        "       cbnz    %w0, 1f\n"
+-        "       stxr    %w0, %w2, %1\n"
+-        "       cbnz    %w0, 2b\n"
+-        "1:\n"
+-        : "=&r" (tmp), "+Q" (lock->lock)
+-        : "r" (1)
+-        : "cc", "memory");
+-
+-    return !tmp;
+-}
+-
+-#endif /* __ASM_SPINLOCK_H */
+-/*
+- * Local variables:
+- * mode: C
+- * c-file-style: "BSD"
+- * c-basic-offset: 4
+- * indent-tabs-mode: nil
+- * End:
+- */
+diff --git a/xen/include/asm-arm/spinlock.h b/xen/include/asm-arm/spinlock.h
+deleted file mode 100644
+index a064f73..0000000
+--- a/xen/include/asm-arm/spinlock.h
++++ /dev/null
+@@ -1,23 +0,0 @@
+-#ifndef __ASM_SPINLOCK_H
+-#define __ASM_SPINLOCK_H
+-
+-#include <xen/config.h>
+-#include <xen/lib.h>
+-
+-#if defined(CONFIG_ARM_32)
+-# include <asm/arm32/spinlock.h>
+-#elif defined(CONFIG_ARM_64)
+-# include <asm/arm64/spinlock.h>
+-#else
+-# error "unknown ARM variant"
+-#endif
+-
+-#endif /* __ASM_SPINLOCK_H */
+-/*
+- * Local variables:
+- * mode: C
+- * c-file-style: "BSD"
+- * c-basic-offset: 4
+- * indent-tabs-mode: nil
+- * End:
+- */
+diff --git a/xen/include/asm-x86/spinlock.h b/xen/include/asm-x86/spinlock.h
+deleted file mode 100644
+index 06d9b04..0000000
+--- a/xen/include/asm-x86/spinlock.h
++++ /dev/null
+@@ -1,34 +0,0 @@
+-#ifndef __ASM_SPINLOCK_H
+-#define __ASM_SPINLOCK_H
+-
+-#include <xen/config.h>
+-#include <xen/lib.h>
+-#include <asm/atomic.h>
+-
+-typedef struct {
+-    volatile s16 lock;
+-} raw_spinlock_t;
+-
+-#define _RAW_SPIN_LOCK_UNLOCKED /*(raw_spinlock_t)*/ { 1 }
+-
+-#define _raw_spin_is_locked(x) ((x)->lock <= 0)
+-
+-static always_inline void _raw_spin_unlock(raw_spinlock_t *lock)
+-{
+-    ASSERT(_raw_spin_is_locked(lock));
+-    asm volatile (
+-        "movw $1,%0" 
+-        : "=m" (lock->lock) : : "memory" );
+-}
+-
+-static always_inline int _raw_spin_trylock(raw_spinlock_t *lock)
+-{
+-    s16 oldval;
+-    asm volatile (
+-        "xchgw %w0,%1"
+-        :"=r" (oldval), "=m" (lock->lock)
+-        :"0" ((s16)0) : "memory" );
+-    return (oldval > 0);
+-}
+-
+-#endif /* __ASM_SPINLOCK_H */
+diff --git a/xen/include/xen/spinlock.h b/xen/include/xen/spinlock.h
+index bafbc74..311685a 100644
+--- a/xen/include/xen/spinlock.h
++++ b/xen/include/xen/spinlock.h
+@@ -2,7 +2,6 @@
+ #define __SPINLOCK_H__
+ 
+ #include <asm/system.h>
+-#include <asm/spinlock.h>
+ 
+ #ifndef NDEBUG
+ struct lock_debug {
