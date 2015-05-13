@@ -21,17 +21,11 @@ operations via one VCPU will not see a lower map track limit.
 Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 Acked-by: Tim Deegan <tim@xen.org>
----
- xen/common/grant_table.c      |  139 ++++++++++++++++++++++++++---------------
- xen/include/xen/grant_table.h |    8 ++-
- xen/include/xen/sched.h       |    5 ++
- 3 files changed, 97 insertions(+), 55 deletions(-)
-
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index 76de00e..92d2740 100644
+index 8c19a22..bf80478 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
-@@ -118,9 +118,9 @@ struct gnttab_unmap_common {
+@@ -125,9 +125,9 @@ atomic_t grant_unmap_operations;
      ((t)->maptrack[(e)/MAPTRACK_PER_PAGE][(e)%MAPTRACK_PER_PAGE])
  
  static inline unsigned int
@@ -43,7 +37,7 @@ index 76de00e..92d2740 100644
  }
  
  #define MAPTRACK_TAIL (~0u)
-@@ -255,66 +255,101 @@ static int __get_paged_frame(unsigned long gfn, unsigned long *frame, struct pag
+@@ -262,66 +262,101 @@ static int __get_paged_frame(unsigned long gfn, unsigned long *frame, struct pag
  
  static inline int
  __get_maptrack_handle(
@@ -177,7 +171,7 @@ index 76de00e..92d2740 100644
  }
  
  /* 
-@@ -565,7 +600,8 @@ static void mapcount(
+@@ -572,7 +607,8 @@ static void mapcount(
      ASSERT(rw_is_locked(&rd->grant_table->lock));
      spin_lock(&lgt->maptrack_lock);
  
@@ -187,8 +181,8 @@ index 76de00e..92d2740 100644
      {
          map = &maptrack_entry(lgt, handle);
          if ( !(map->flags & (GNTMAP_device_map|GNTMAP_host_map)) ||
-@@ -913,7 +949,7 @@ __gnttab_unmap_common(
- 
+@@ -921,7 +957,7 @@ __gnttab_unmap_common(
+     op->page_accessed = 0;
      op->frame = (unsigned long)(op->dev_bus_addr >> PAGE_SHIFT);
  
 -    if ( unlikely(op->handle >= lgt->maptrack_limit) )
@@ -196,7 +190,7 @@ index 76de00e..92d2740 100644
      {
          gdprintk(XENLOG_INFO, "Bad handle (%d).\n", op->handle);
          op->status = GNTST_bad_handle;
-@@ -1386,6 +1422,7 @@ gnttab_setup_table(
+@@ -1409,6 +1445,7 @@ gnttab_setup_table(
      struct gnttab_setup_table op;
      struct domain *d;
      struct grant_table *gt;
@@ -204,7 +198,7 @@ index 76de00e..92d2740 100644
      int            i;
      xen_pfn_t  gmfn;
  
-@@ -1427,6 +1464,17 @@ gnttab_setup_table(
+@@ -1450,6 +1487,17 @@ gnttab_setup_table(
      gt = d->grant_table;
      write_lock(&gt->lock);
  
@@ -222,7 +216,7 @@ index 76de00e..92d2740 100644
      if ( gt->gt_version == 0 )
          gt->gt_version = 1;
  
-@@ -3017,18 +3065,6 @@ grant_table_create(
+@@ -3039,18 +3087,6 @@ grant_table_create(
              spin_lock_init(&t->active[i][j].lock);
      }
  
@@ -241,7 +235,7 @@ index 76de00e..92d2740 100644
      /* Shared grant table. */
      if ( (t->shared_raw = xzalloc_array(void *, max_grant_frames)) == NULL )
          goto no_mem_3;
-@@ -3059,8 +3095,6 @@ grant_table_create(
+@@ -3081,8 +3117,6 @@ grant_table_create(
          free_xenheap_page(t->shared_raw[i]);
      xfree(t->shared_raw);
   no_mem_3:
@@ -250,7 +244,7 @@ index 76de00e..92d2740 100644
   no_mem_2:
      for ( i = 0;
            i < num_act_frames_from_sha_frames(INITIAL_NR_GRANT_FRAMES); i++ )
-@@ -3088,7 +3122,8 @@ gnttab_release_mappings(
+@@ -3110,7 +3144,8 @@ gnttab_release_mappings(
  
      BUG_ON(!d->is_dying);
  
@@ -260,7 +254,7 @@ index 76de00e..92d2740 100644
      {
          map = &maptrack_entry(gt, handle);
          if ( !(map->flags & (GNTMAP_device_map|GNTMAP_host_map)) )
-@@ -3193,7 +3228,7 @@ grant_table_destroy(
+@@ -3215,7 +3250,7 @@ grant_table_destroy(
          free_xenheap_page(t->shared_raw[i]);
      xfree(t->shared_raw);
  
@@ -297,7 +291,7 @@ index 98cc94a..c10464c 100644
      spinlock_t            maptrack_lock;
      /* The defined versions are 1 and 2.  Set to 0 if we don't know
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 80c6f62..7f8422e 100644
+index 46fc6e3..be3cee6 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
 @@ -219,6 +219,11 @@ struct vcpu
@@ -312,6 +306,3 @@ index 80c6f62..7f8422e 100644
      /* IRQ-safe virq_lock protects against delivering VIRQ to stale evtchn. */
      evtchn_port_t    virq_to_evtchn[NR_VIRQS];
      spinlock_t       virq_lock;
--- 
-1.7.10.4
-
