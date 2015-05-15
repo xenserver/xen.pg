@@ -1,7 +1,7 @@
-From c15477edb052fd96dc0e62c2420160ab51ab409f Mon Sep 17 00:00:00 2001
+From 45fcc4568c5162b00fb3907fb158af82dd484a3d Mon Sep 17 00:00:00 2001
 From: David Vrabel <david.vrabel@citrix.com>
-Date: Thu, 9 Apr 2015 16:27:33 +0100
-Subject: [PATCH] xen: use ticket locks for spin locks
+Date: Fri, 15 May 2015 09:49:12 +0200
+Subject: [PATCH] use ticket locks for spin locks
 
 Replace the byte locks with ticket locks.  Ticket locks are: a) fair;
 and b) peform better when contented since they spin without an atomic
@@ -21,18 +21,13 @@ Architectures need only provide arch_fetch_and_add() and two barriers:
 arch_lock_acquire_barrier() and arch_lock_release_barrier().
 
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
----
- xen/common/spinlock.c        |  118 ++++++++++++++++++++++++------------------
- xen/include/asm-arm/system.h |    3 ++
- xen/include/asm-x86/system.h |    3 ++
- xen/include/xen/spinlock.h   |   16 ++++--
- 4 files changed, 86 insertions(+), 54 deletions(-)
-
+Reviewed-by: Tim Deegan <tim@xen.org>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
 diff --git a/xen/common/spinlock.c b/xen/common/spinlock.c
-index f9f19a8..a5c11b3 100644
+index f9f19a8..c170710 100644
 --- a/xen/common/spinlock.c
 +++ b/xen/common/spinlock.c
-@@ -115,94 +115,100 @@ void spin_debug_disable(void)
+@@ -115,125 +115,134 @@ void spin_debug_disable(void)
  
  #endif
  
@@ -155,22 +150,23 @@ index f9f19a8..a5c11b3 100644
 -    if ( !_raw_spin_trylock(&lock->raw) )
 +    old = observe_lock(&lock->tickets);
 +    if ( old.head != old.tail )
-         return 0;
++        return 0;
 +    new = old;
 +    new.tail++;
 +    if ( cmpxchg(&lock->tickets.head_tail,
 +                 old.head_tail, new.head_tail) != old.head_tail )
-+    {
-+        /*
-+         * cmpxchg() is a full barrier so no need for an
-+         * arch_lock_acquire_barrier().
-+         */
-+        return 0;
-+    }
+         return 0;
  #ifdef LOCK_PROFILE
      if (lock->profile)
          lock->profile->time_locked = NOW();
-@@ -213,27 +219,32 @@ int _spin_trylock(spinlock_t *lock)
+ #endif
+     preempt_disable();
++    /*
++     * cmpxchg() is a full barrier so no need for an
++     * arch_lock_acquire_barrier().
++     */
+     return 1;
+ }
  
  void _spin_barrier(spinlock_t *lock)
  {
@@ -193,7 +189,7 @@ index f9f19a8..a5c11b3 100644
 -#else
 -    check_barrier(&lock->debug);
 -    do { smp_mb(); } while ( _raw_spin_is_locked(&lock->raw) );
-+        while ( observe_head(&lock->tickets) != sample.tail )
++        while ( observe_head(&lock->tickets) == sample.head )
 +            cpu_relax();
 +#ifdef LOCK_PROFILE
 +        if ( lock->profile )
@@ -213,7 +209,7 @@ index f9f19a8..a5c11b3 100644
  
      /* Don't allow overflow of recurse_cpu field. */
      BUILD_BUG_ON(NR_CPUS > 0xfffu);
-@@ -256,8 +267,17 @@ int _spin_trylock_recursive(spinlock_t *lock)
+@@ -256,8 +265,17 @@ int _spin_trylock_recursive(spinlock_t *lock)
  
  void _spin_lock_recursive(spinlock_t *lock)
  {
@@ -248,13 +244,21 @@ index 2eb96e8..f0e222f 100644
  
  #endif
 diff --git a/xen/include/asm-x86/system.h b/xen/include/asm-x86/system.h
-index 47d4a70..3cadd2d 100644
+index efe721c..3b2fb94 100644
 --- a/xen/include/asm-x86/system.h
 +++ b/xen/include/asm-x86/system.h
-@@ -187,6 +187,9 @@ static always_inline unsigned long __xadd(
+@@ -185,6 +185,17 @@ static always_inline unsigned long __xadd(
  #define set_mb(var, value) do { xchg(&var, value); } while (0)
  #define set_wmb(var, value) do { var = value; wmb(); } while (0)
  
++/*
++ * On x86 the only reordering is of reads with older writes.  In the
++ * lock case, the read in observe_head() can only be reordered with
++ * writes that precede it, and moving a write _into_ a locked section
++ * is OK.  In the release case, the write in add_sized() can only be
++ * reordered with reads that follow it, and hoisting a read _into_ a
++ * locked region is OK.
++ */
 +#define arch_lock_acquire_barrier() barrier()
 +#define arch_lock_release_barrier() barrier()
 +
