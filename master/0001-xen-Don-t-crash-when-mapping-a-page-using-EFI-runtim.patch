@@ -1,0 +1,78 @@
+From 6a25bb5a4ccaa89a68f38d96ccf5f0455c293266 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Fri, 15 May 2015 12:45:11 +0100
+Subject: [PATCH] xen: Don't crash when mapping a page using EFI runtime page
+ tables
+
+When an interrupt is received during an EFI runtime service call, Xen
+may call map_domain_page() while using the EFI runtime page tables.
+This fails because, although the EFI runtime page tables are a
+copy of the idle domain's page tables, current points at a different
+domain's vCPU.
+
+To fix this, return NULL from mapcache_current_vcpu() when using the EFI
+runtime page tables which is treated equivalently to running in an idle
+vCPU.
+
+This issue can be reproduced by repeatedly calling GetVariable() from
+dom0 while using VT-d, since VT-d frequently maps a page from interrupt
+context.
+
+Example call trace:
+[<ffff82d0801615dc>] __find_next_zero_bit+0x28/0x60
+[<ffff82d08016a10e>] map_domain_page+0x4c6/0x4eb
+[<ffff82d080156ae6>] map_vtd_domain_page+0xd/0xf
+[<ffff82d08015533a>] msi_msg_read_remap_rte+0xe3/0x1d8
+[<ffff82d08014e516>] iommu_read_msi_from_ire+0x31/0x34
+[<ffff82d08016ff6c>] set_msi_affinity+0x134/0x17a
+[<ffff82d0801737b5>] move_masked_irq+0x5c/0x98
+[<ffff82d080173816>] move_native_irq+0x25/0x36
+[<ffff82d08016ffcb>] ack_nonmaskable_msi_irq+0x19/0x20
+[<ffff82d08016ffdb>] ack_maskable_msi_irq+0x9/0x37
+[<ffff82d080173e8b>] do_IRQ+0x251/0x635
+[<ffff82d080234502>] common_interrupt+0x62/0x70
+[<00000000df7ed2be>] 00000000df7ed2be
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+---
+ xen/arch/x86/domain_page.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/xen/arch/x86/domain_page.c b/xen/arch/x86/domain_page.c
+index 5d4564c..b44de01 100644
+--- a/xen/arch/x86/domain_page.c
++++ b/xen/arch/x86/domain_page.c
+@@ -32,20 +32,26 @@ static inline struct vcpu *mapcache_current_vcpu(void)
+         return NULL;
+ 
+     /*
++     * When using efi runtime page tables, we have the equivalent of the idle
++     * domain's page tables but current may point at another domain's VCPU.
++     * Return NULL as though current is not properly set up yet.
++     */
++    if ( efi_platform && read_cr3() == efi_rs_page_table() )
++        return NULL;
++
++    /*
+      * If guest_table is NULL, and we are running a paravirtualised guest,
+      * then it means we are running on the idle domain's page table and must
+      * therefore use its mapcache.
+      */
+     if ( unlikely(pagetable_is_null(v->arch.guest_table)) && is_pv_vcpu(v) )
+     {
+-        unsigned long cr3;
+-
+         /* If we really are idling, perform lazy context switch now. */
+         if ( (v = idle_vcpu[smp_processor_id()]) == current )
+             sync_local_execstate();
++
+         /* We must now be running on the idle page table. */
+-        ASSERT((cr3 = read_cr3()) == __pa(idle_pg_table) ||
+-               (efi_platform && cr3 == efi_rs_page_table()));
++        ASSERT(read_cr3() == __pa(idle_pg_table));
+     }
+ 
+     return v;
+-- 
+2.1.0
+
