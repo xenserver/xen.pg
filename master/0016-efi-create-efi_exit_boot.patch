@@ -7,32 +7,30 @@ Subject: [PATCH 16/18] efi: create efi_exit_boot()
 to support multiboot2 protocol on EFI platforms.
 
 Signed-off-by: Daniel Kiper <daniel.kiper@oracle.com>
----
- xen/common/efi/boot.c |   79 +++++++++++++++++++++++++++----------------------
- 1 file changed, 44 insertions(+), 35 deletions(-)
-
 diff --git a/xen/common/efi/boot.c b/xen/common/efi/boot.c
-index 63c930d..f8be3dd 100644
+index f8058ff..d96bb5c 100644
 --- a/xen/common/efi/boot.c
 +++ b/xen/common/efi/boot.c
-@@ -864,6 +864,47 @@ static void __init efi_set_gop_mode(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINTN gop
+@@ -864,6 +864,49 @@ static void __init efi_set_gop_mode(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINTN gop
          efi_arch_video_init(gop, info_size, mode_info);
  }
  
 +static void __init efi_exit_boot(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 +{
 +    EFI_STATUS status;
-+    UINTN map_key;
++    UINTN map_alloc_size, map_key;
 +    bool_t retry;
 +
-+    efi_bs->GetMemoryMap(&efi_memmap_size, NULL, &map_key,
++    efi_bs->GetMemoryMap(&map_alloc_size, NULL, &map_key,
 +                         &efi_mdesc_size, &mdesc_ver);
-+    efi_memmap = efi_arch_allocate_mmap_buffer(&efi_memmap_size);
++    map_alloc_size += 8 * efi_mdesc_size;
++    efi_memmap = efi_arch_allocate_mmap_buffer(map_alloc_size);
 +    if ( !efi_memmap )
 +        blexit(L"Unable to allocate memory for EFI memory map");
 +
 +    for ( retry = 0; ; retry = 1 )
 +    {
++        efi_memmap_size = map_alloc_size;
 +        status = efi_bs->GetMemoryMap(&efi_memmap_size, efi_memmap, &map_key,
 +                                      &efi_mdesc_size, &mdesc_ver);
 +        if ( EFI_ERROR(status) )
@@ -63,11 +61,11 @@ index 63c930d..f8be3dd 100644
  static int __init __maybe_unused set_color(u32 mask, int bpp, u8 *pos, u8 *sz)
  {
     if ( bpp < 0 )
-@@ -888,11 +929,11 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+@@ -888,11 +931,11 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
      EFI_STATUS status;
      unsigned int i, argc;
      CHAR16 **argv, *file_name, *cfg_file_name = NULL, *options = NULL;
--    UINTN map_key, gop_mode = ~0;
+-    UINTN map_alloc_size, map_key, gop_mode = ~0;
 +    UINTN gop_mode = ~0;
      EFI_SHIM_LOCK_PROTOCOL *shim_lock;
      EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
@@ -77,18 +75,20 @@ index 63c930d..f8be3dd 100644
      char *option_str;
      bool_t use_cfg_file;
  
-@@ -1108,39 +1149,7 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+@@ -1108,41 +1151,7 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
  
      efi_set_gop_mode(gop, gop_mode);
  
--    efi_bs->GetMemoryMap(&efi_memmap_size, NULL, &map_key,
+-    efi_bs->GetMemoryMap(&map_alloc_size, NULL, &map_key,
 -                         &efi_mdesc_size, &mdesc_ver);
--    efi_memmap = efi_arch_allocate_mmap_buffer(&efi_memmap_size);
+-    map_alloc_size += 8 * efi_mdesc_size;
+-    efi_memmap = efi_arch_allocate_mmap_buffer(map_alloc_size);
 -    if ( !efi_memmap )
 -        blexit(L"Unable to allocate memory for EFI memory map");
 -
 -    for ( retry = 0; ; retry = 1 )
 -    {
+-        efi_memmap_size = map_alloc_size;
 -        status = efi_bs->GetMemoryMap(&efi_memmap_size, efi_memmap, &map_key,
 -                                      &efi_mdesc_size, &mdesc_ver);
 -        if ( EFI_ERROR(status) )
@@ -118,6 +118,3 @@ index 63c930d..f8be3dd 100644
  
      efi_arch_post_exit_boot();
      for( ; ; ); /* not reached */
--- 
-1.7.10.4
-
