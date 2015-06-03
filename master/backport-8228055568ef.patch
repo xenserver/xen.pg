@@ -1,0 +1,49 @@
+From 8228055568ef195df5e0c205972a4a4c278e186b Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 3 Jun 2015 09:26:13 +0200
+Subject: [PATCH] x86/crash: don't use set_fixmap() in the crash path
+
+Experimentally, this can result in memory allocation, and in particular a
+failed assertion that interrupts are enabled when performing a TLB flush.
+
+  (XEN) Assertion 'local_irq_is_enabled()' failed at smp.c:223
+  <snip>
+  (XEN) [<ffff82d08018a0d3>] flush_area_mask+0x7/0x134
+  (XEN) [<ffff82d08011f7c6>] alloc_domheap_pages+0xa9/0x12a
+  (XEN) [<ffff82d08011f8ab>] alloc_xenheap_pages+0x64/0xdb
+  (XEN) [<ffff82d080178e08>] alloc_xen_pagetable+0x1c/0xa0
+  (XEN) [<ffff82d08017926b>] virt_to_xen_l1e+0x38/0x1be
+  (XEN) [<ffff82d080179bff>] map_pages_to_xen+0x80e/0xfd9
+  (XEN) [<ffff82d080185a23>] __set_fixmap+0x2c/0x2e
+  (XEN) [<ffff82d0801a6fd4>] machine_crash_shutdown+0x186/0x2b2
+  (XEN) [<ffff82d0801172bb>] kexec_crash+0x3f/0x5b
+  (XEN) [<ffff82d0801479b7>] panic+0x100/0x118
+  (XEN) [<ffff82d08019002b>] set_guest_machinecheck_trapbounce+0/0x6d
+  (XEN) [<ffff82d080195c15>] do_page_fault+0x40b/0x541
+  (XEN) [<ffff82d0802345e0>] handle_exception_saved+0x2e/0x6c
+
+Instead, use the directmap mapping which are writable and involve far less
+complexity than set_fixmap()
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/crash.c b/xen/arch/x86/crash.c
+index eb7be9c..888a214 100644
+--- a/xen/arch/x86/crash.c
++++ b/xen/arch/x86/crash.c
+@@ -140,13 +140,10 @@ static void nmi_shootdown_cpus(void)
+      * Ideally would be:
+      *   exception_table[TRAP_nmi] = &do_nmi_crash;
+      *
+-     * but the exception_table is read only.  Borrow an unused fixmap entry
+-     * to construct a writable mapping.
++     * but the exception_table is read only.  Access it via its directmap
++     * mappings.
+      */
+-    set_fixmap(FIX_TBOOT_MAP_ADDRESS, __pa(&exception_table[TRAP_nmi]));
+-    write_atomic((unsigned long *)
+-                 (fix_to_virt(FIX_TBOOT_MAP_ADDRESS) +
+-                  ((unsigned long)&exception_table[TRAP_nmi] & ~PAGE_MASK)),
++    write_atomic((unsigned long *)__va(__pa(&exception_table[TRAP_nmi])),
+                  (unsigned long)&do_nmi_crash);
+ 
+     /* Ensure the new callback function is set before sending out the NMI. */
