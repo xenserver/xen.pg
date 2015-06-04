@@ -1,0 +1,103 @@
+
+
+We need to use reserved device memory maps with multiple times, so
+provide just one common function should be friend.
+
+Signed-off-by: Tiejun Chen <tiejun.chen@intel.com>
+---
+ tools/firmware/hvmloader/util.c | 59 +++++++++++++++++++++++++++++++++++++++++
+ tools/firmware/hvmloader/util.h |  2 ++
+ 2 files changed, 61 insertions(+)
+
+diff -r e99ce3c7eaaa tools/firmware/hvmloader/util.c
+--- a/tools/firmware/hvmloader/util.c
++++ b/tools/firmware/hvmloader/util.c
+@@ -22,11 +22,14 @@
+ #include "config.h"
+ #include "hypercall.h"
+ #include "ctype.h"
++#include "errno.h"
+ #include <stdint.h>
+ #include <xen/xen.h>
+ #include <xen/memory.h>
+ #include <xen/sched.h>
+ 
++struct xen_reserved_device_memory *rdm_map;
++
+ void wrmsr(uint32_t idx, uint64_t v)
+ {
+     asm volatile (
+@@ -828,6 +831,61 @@ int hpet_exists(unsigned long hpet_base)
+     return ((hpet_id >> 16) == 0x8086);
+ }
+ 
++static int
++get_reserved_device_memory_map(struct xen_reserved_device_memory entries[],
++                               uint32_t *max_entries)
++{
++    int rc;
++    struct xen_reserved_device_memory_map xrdmmap = {
++        .nr_entries = *max_entries
++    };
++
++    set_xen_guest_handle(xrdmmap.buffer, entries);
++
++    rc = hypercall_memory_op(XENMEM_reserved_device_memory_map, &xrdmmap);
++    *max_entries = xrdmmap.nr_entries;
++
++    return rc;
++}
++
++/*
++ * Getting all reserved device memory map info in case of hvmloader.
++ * We just return zero for any failed cases, and this means we
++ * can't further handle any reserved device memory.
++ */
++unsigned int hvm_get_reserved_device_memory_map(void)
++{
++    static unsigned int nr_entries = 0;
++    int rc = get_reserved_device_memory_map(rdm_map, &nr_entries);
++
++    if ( rc == -ENOBUFS )
++    {
++        rdm_map = mem_alloc(nr_entries*sizeof(struct xen_reserved_device_memory),
++                            0);
++        if ( rdm_map )
++        {
++            rc = get_reserved_device_memory_map(rdm_map, &nr_entries);
++            if ( rc )
++            {
++                printf("Could not get reserved dev memory info on domain");
++                return 0;
++            }
++        }
++        else
++        {
++            printf("No space to get reserved dev memory maps!\n");
++            return 0;
++        }
++    }
++    else if ( rc )
++    {
++        printf("Could not get reserved dev memory info on domain");
++        return 0;
++    }
++
++    return nr_entries;
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff -r e99ce3c7eaaa tools/firmware/hvmloader/util.h
+--- a/tools/firmware/hvmloader/util.h
++++ b/tools/firmware/hvmloader/util.h
+@@ -241,6 +241,8 @@ int build_e820_table(struct e820entry *e
+                      unsigned int bios_image_base);
+ void dump_e820_table(struct e820entry *e820, unsigned int nr);
+ 
++unsigned int hvm_get_reserved_device_memory_map(void);
++
+ #ifndef NDEBUG
+ void perform_tests(void);
+ #else

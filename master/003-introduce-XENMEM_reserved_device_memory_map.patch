@@ -1,0 +1,294 @@
+From: Jan Beulich <jbeulich@suse.com>
+
+This is a prerequisite for punching holes into HVM and PVH guests' P2M
+to allow passing through devices that are associated with (on VT-d)
+RMRRs.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
+diff --git a/xen/common/compat/memory.c b/xen/common/compat/memory.c
+index 9aeae69..43d73d9 100644
+--- a/xen/common/compat/memory.c
++++ b/xen/common/compat/memory.c
+@@ -17,6 +17,37 @@ CHECK_TYPE(domid);
+ CHECK_mem_access_op;
+ CHECK_vmemrange;
+ 
++#ifdef HAS_PASSTHROUGH
++struct get_reserved_device_memory {
++    struct compat_reserved_device_memory_map map;
++    unsigned int used_entries;
++};
++
++static int get_reserved_device_memory(xen_pfn_t start,
++                                      xen_ulong_t nr, void *ctxt)
++{
++    struct get_reserved_device_memory *grdm = ctxt;
++
++    if ( grdm->used_entries < grdm->map.nr_entries )
++    {
++        struct compat_reserved_device_memory rdm = {
++            .start_pfn = start, .nr_pages = nr
++        };
++
++        if ( rdm.start_pfn != start || rdm.nr_pages != nr )
++            return -ERANGE;
++
++        if ( __copy_to_compat_offset(grdm->map.buffer, grdm->used_entries,
++                                     &rdm, 1) )
++            return -EFAULT;
++    }
++
++    ++grdm->used_entries;
++
++    return 0;
++}
++#endif
++
+ int compat_memory_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) compat)
+ {
+     int split, op = cmd & MEMOP_CMD_MASK;
+@@ -391,6 +422,29 @@ int compat_memory_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) compat)
+             break;
+         }
+ 
++#ifdef HAS_PASSTHROUGH
++        case XENMEM_reserved_device_memory_map:
++        {
++            struct get_reserved_device_memory grdm;
++
++            if ( copy_from_guest(&grdm.map, compat, 1) ||
++                 !compat_handle_okay(grdm.map.buffer, grdm.map.nr_entries) )
++                return -EFAULT;
++
++            grdm.used_entries = 0;
++            rc = iommu_get_reserved_device_memory(get_reserved_device_memory,
++                                                  &grdm);
++
++            if ( !rc && grdm.map.nr_entries < grdm.used_entries )
++                rc = -ENOBUFS;
++            grdm.map.nr_entries = grdm.used_entries;
++            if ( __copy_to_guest(compat, &grdm.map, 1) )
++                rc = -EFAULT;
++
++            return rc;
++        }
++#endif
++
+         default:
+             return compat_arch_memory_op(cmd, compat);
+         }
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index 3561535..362326e 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -935,6 +935,34 @@ static long release_mfn_list(
+     return 0;
+ }
+ 
++#ifdef HAS_PASSTHROUGH
++struct get_reserved_device_memory {
++    struct xen_reserved_device_memory_map map;
++    unsigned int used_entries;
++};
++
++static int get_reserved_device_memory(xen_pfn_t start,
++                                      xen_ulong_t nr, void *ctxt)
++{
++    struct get_reserved_device_memory *grdm = ctxt;
++
++    if ( grdm->used_entries < grdm->map.nr_entries )
++    {
++        struct xen_reserved_device_memory rdm = {
++            .start_pfn = start, .nr_pages = nr
++        };
++
++        if ( __copy_to_guest_offset(grdm->map.buffer, grdm->used_entries,
++                                    &rdm, 1) )
++            return -EFAULT;
++    }
++
++    ++grdm->used_entries;
++
++    return 0;
++}
++#endif
++
+ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+ {
+     struct domain *d;
+@@ -1395,6 +1423,29 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+                     op | (start_extent << MEMOP_EXTENT_SHIFT), arg);
+         break;
+ 
++#ifdef HAS_PASSTHROUGH
++    case XENMEM_reserved_device_memory_map:
++    {
++        struct get_reserved_device_memory grdm;
++
++        if ( copy_from_guest(&grdm.map, arg, 1) ||
++             !guest_handle_okay(grdm.map.buffer, grdm.map.nr_entries) )
++            return -EFAULT;
++
++        grdm.used_entries = 0;
++        rc = iommu_get_reserved_device_memory(get_reserved_device_memory,
++                                              &grdm);
++
++        if ( !rc && grdm.map.nr_entries < grdm.used_entries )
++            rc = -ENOBUFS;
++        grdm.map.nr_entries = grdm.used_entries;
++        if ( __copy_to_guest(arg, &grdm.map, 1) )
++            rc = -EFAULT;
++
++        break;
++    }
++#endif
++
+     default:
+         rc = arch_memory_op(cmd, arg);
+         break;
+diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
+index 75a35d4..94503ba 100644
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -305,6 +305,16 @@ void iommu_resume()
+         ops->resume();
+ }
+ 
++int iommu_get_reserved_device_memory(iommu_grdm_t *func, void *ctxt)
++{
++    const struct iommu_ops *ops = iommu_get_ops();
++
++    if ( !iommu_enabled || !ops->get_reserved_device_memory )
++        return 0;
++
++    return ops->get_reserved_device_memory(func, ctxt);
++}
++
+ int iommu_do_domctl(
+     struct xen_domctl *domctl, struct domain *d,
+     XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+diff --git a/xen/drivers/passthrough/vtd/dmar.c b/xen/drivers/passthrough/vtd/dmar.c
+index 1152c3a..141e735 100644
+--- a/xen/drivers/passthrough/vtd/dmar.c
++++ b/xen/drivers/passthrough/vtd/dmar.c
+@@ -893,3 +893,20 @@ int platform_supports_x2apic(void)
+     unsigned int mask = ACPI_DMAR_INTR_REMAP | ACPI_DMAR_X2APIC_OPT_OUT;
+     return cpu_has_x2apic && ((dmar_flags & mask) == ACPI_DMAR_INTR_REMAP);
+ }
++
++int intel_iommu_get_reserved_device_memory(iommu_grdm_t *func, void *ctxt)
++{
++    struct acpi_rmrr_unit *rmrr;
++    int rc = 0;
++
++    list_for_each_entry(rmrr, &acpi_rmrr_units, list)
++    {
++        rc = func(PFN_DOWN(rmrr->base_address),
++                  PFN_UP(rmrr->end_address) - PFN_DOWN(rmrr->base_address),
++                  ctxt);
++        if ( rc )
++            break;
++    }
++
++    return rc;
++}
+diff --git a/xen/drivers/passthrough/vtd/extern.h b/xen/drivers/passthrough/vtd/extern.h
+index 5524dba..f9ee9b0 100644
+--- a/xen/drivers/passthrough/vtd/extern.h
++++ b/xen/drivers/passthrough/vtd/extern.h
+@@ -75,6 +75,7 @@ int domain_context_mapping_one(struct domain *domain, struct iommu *iommu,
+                                u8 bus, u8 devfn, const struct pci_dev *);
+ int domain_context_unmap_one(struct domain *domain, struct iommu *iommu,
+                              u8 bus, u8 devfn);
++int intel_iommu_get_reserved_device_memory(iommu_grdm_t *func, void *ctxt);
+ 
+ unsigned int io_apic_read_remap_rte(unsigned int apic, unsigned int reg);
+ void io_apic_write_remap_rte(unsigned int apic,
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index 5a946d4..7b7a63a 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -2495,6 +2495,7 @@ const struct iommu_ops intel_iommu_ops = {
+     .crash_shutdown = vtd_crash_shutdown,
+     .iotlb_flush = intel_iommu_iotlb_flush,
+     .iotlb_flush_all = intel_iommu_iotlb_flush_all,
++    .get_reserved_device_memory = intel_iommu_get_reserved_device_memory,
+     .dump_p2m_table = vtd_dump_p2m_table,
+ };
+ 
+diff --git a/xen/include/public/memory.h b/xen/include/public/memory.h
+index a8dc83f..5b1311d 100644
+--- a/xen/include/public/memory.h
++++ b/xen/include/public/memory.h
+@@ -628,6 +628,30 @@ struct xen_release_mfn_list {
+ typedef struct xen_release_mfn_list xen_release_mfn_list_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_release_mfn_list_t);
+ 
++/*
++ * For legacy reasons, some devices must be configured with special memory
++ * regions to function correctly.  The guest must avoid using any of these
++ * regions.
++ */
++#define XENMEM_reserved_device_memory_map   27
++struct xen_reserved_device_memory {
++    xen_pfn_t start_pfn;
++    xen_ulong_t nr_pages;
++};
++typedef struct xen_reserved_device_memory xen_reserved_device_memory_t;
++DEFINE_XEN_GUEST_HANDLE(xen_reserved_device_memory_t);
++
++struct xen_reserved_device_memory_map {
++    /* IN/OUT */
++    unsigned int nr_entries;
++    /* OUT */
++    XEN_GUEST_HANDLE(xen_reserved_device_memory_t) buffer;
++};
++typedef struct xen_reserved_device_memory_map xen_reserved_device_memory_map_t;
++DEFINE_XEN_GUEST_HANDLE(xen_reserved_device_memory_map_t);
++
++/* Next available subop number is 28 */
++
+ #endif /* __XEN_PUBLIC_MEMORY_H__ */
+ 
+ /*
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index 8eb764a..409f6f8 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -120,6 +120,8 @@ void iommu_dt_domain_destroy(struct domain *d);
+ 
+ struct page_info;
+ 
++typedef int iommu_grdm_t(xen_pfn_t start, xen_ulong_t nr, void *ctxt);
++
+ struct iommu_ops {
+     int (*init)(struct domain *d);
+     void (*hwdom_init)(struct domain *d);
+@@ -156,12 +158,14 @@ struct iommu_ops {
+     void (*crash_shutdown)(void);
+     void (*iotlb_flush)(struct domain *d, unsigned long gfn, unsigned int page_count);
+     void (*iotlb_flush_all)(struct domain *d);
++    int (*get_reserved_device_memory)(iommu_grdm_t *, void *);
+     void (*dump_p2m_table)(struct domain *d);
+ };
+ 
+ void iommu_suspend(void);
+ void iommu_resume(void);
+ void iommu_crash_shutdown(void);
++int iommu_get_reserved_device_memory(iommu_grdm_t *, void *);
+ 
+ void iommu_share_p2m_table(struct domain *d);
+ 
+diff --git a/xen/include/xlat.lst b/xen/include/xlat.lst
+index 48c7d54..346c0d9 100644
+--- a/xen/include/xlat.lst
++++ b/xen/include/xlat.lst
+@@ -64,6 +64,7 @@
+ ?	mem_access_op		memory.h
+ !	pod_target			memory.h
+ !	remove_from_physmap		memory.h
++!	reserved_device_memory_map	memory.h
+ ?	vmemrange			memory.h
+ !	vnuma_topology_info		memory.h
+ !	translate_gpfn_list             memory.h

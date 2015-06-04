@@ -1,0 +1,218 @@
+Only present RMRR regions for device's passed through at the current time for
+the domain making the hypercall.
+
+This patch is based on mailing list patch:
+[v8][PATCH 04/17] update the existing hypercall to support XEN_DOMCTL_set_rdm
+
+---
+
+diff -r d90179f495d4 xen/common/compat/memory.c
+--- a/xen/common/compat/memory.c
++++ b/xen/common/compat/memory.c
+@@ -19,27 +19,48 @@ struct get_reserved_device_memory {
+     unsigned int used_entries;
+ };
+ 
+-static int get_reserved_device_memory(xen_pfn_t start,
+-                                      xen_ulong_t nr, void *ctxt)
++static int get_reserved_device_memory(xen_pfn_t start, xen_ulong_t nr,
++                                      u32 id, void *ctxt)
+ {
+     struct get_reserved_device_memory *grdm = ctxt;
++    struct domain *d;
++    u32 sbdf;
++    struct pci_dev *pdev;
++    struct compat_reserved_device_memory rdm = {
++        .start_pfn = start, .nr_pages = nr
++    };
+ 
+-    if ( grdm->used_entries < grdm->map.nr_entries )
++    if ( rdm.start_pfn != start || rdm.nr_pages != nr )
++        return -ERANGE;
++
++    d = rcu_lock_current_domain();
++    if ( d == NULL )
++        return -ESRCH;
++
++    for_each_pdev(d, pdev)
+     {
+-        struct compat_reserved_device_memory rdm = {
+-            .start_pfn = start, .nr_pages = nr
+-        };
+-
+-        if ( rdm.start_pfn != start || rdm.nr_pages != nr )
+-            return -ERANGE;
+-
+-        if ( __copy_to_compat_offset(grdm->map.buffer, grdm->used_entries,
+-                                     &rdm, 1) )
+-            return -EFAULT;
++	sbdf = PCI_SBDF2(pdev->seg,
++			 pdev->bus,
++			 pdev->devfn);
++	if ( sbdf == id )
++	{
++	    if ( grdm->used_entries < grdm->map.nr_entries )
++	    {
++		if ( __copy_to_compat_offset(grdm->map.buffer,
++					     grdm->used_entries,
++					     &rdm, 1) )
++		{
++		    rcu_unlock_domain(d);
++		    return -EFAULT;
++		}
++	    }
++	    ++grdm->used_entries;
++            rcu_unlock_domain(d);
++	    return 1;
++	}
+     }
+ 
+-    ++grdm->used_entries;
+-
++    rcu_unlock_domain(d);
+     return 0;
+ }
+ #endif
+@@ -404,6 +425,7 @@ int compat_memory_op(unsigned int cmd, X
+ 
+             if ( !rc && grdm.map.nr_entries < grdm.used_entries )
+                 rc = -ENOBUFS;
++
+             grdm.map.nr_entries = grdm.used_entries;
+             if ( __copy_to_guest(compat, &grdm.map, 1) )
+                 rc = -EFAULT;
+diff -r d90179f495d4 xen/common/memory.c
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -935,24 +935,45 @@ struct get_reserved_device_memory {
+     unsigned int used_entries;
+ };
+ 
+-static int get_reserved_device_memory(xen_pfn_t start,
+-                                      xen_ulong_t nr, void *ctxt)
++static int get_reserved_device_memory(xen_pfn_t start, xen_ulong_t nr,
++                                      u32 id, void *ctxt)
+ {
+     struct get_reserved_device_memory *grdm = ctxt;
++    struct domain *d;
++    u32 sbdf;
++    struct pci_dev *pdev;
++    struct xen_reserved_device_memory rdm = {
++        .start_pfn = start, .nr_pages = nr
++    };
+ 
+-    if ( grdm->used_entries < grdm->map.nr_entries )
++    d = rcu_lock_current_domain();
++    if ( d == NULL )
++        return -ESRCH;
++
++    for_each_pdev(d, pdev)
+     {
+-        struct xen_reserved_device_memory rdm = {
+-            .start_pfn = start, .nr_pages = nr
+-        };
+-
+-        if ( __copy_to_guest_offset(grdm->map.buffer, grdm->used_entries,
+-                                    &rdm, 1) )
+-            return -EFAULT;
++	sbdf = PCI_SBDF2(pdev->seg,
++			 pdev->bus,
++			 pdev->devfn);
++	if ( sbdf == id )
++	{
++	    if ( grdm->used_entries < grdm->map.nr_entries )
++	    {
++		if ( __copy_to_guest_offset(grdm->map.buffer,
++					    grdm->used_entries,
++					    &rdm, 1) )
++		{
++		    rcu_unlock_domain(d);
++		    return -EFAULT;
++		}
++	    }
++	    ++grdm->used_entries;
++            rcu_unlock_domain(d);
++	    return 1;
++	}
+     }
+ 
+-    ++grdm->used_entries;
+-
++    rcu_unlock_domain(d);
+     return 0;
+ }
+ #endif
+@@ -1275,6 +1296,7 @@ long do_memory_op(unsigned long cmd, XEN
+ 
+         if ( !rc && grdm.map.nr_entries < grdm.used_entries )
+             rc = -ENOBUFS;
++
+         grdm.map.nr_entries = grdm.used_entries;
+         if ( __copy_to_guest(arg, &grdm.map, 1) )
+             rc = -EFAULT;
+diff -r d90179f495d4 xen/drivers/passthrough/vtd/dmar.c
+--- a/xen/drivers/passthrough/vtd/dmar.c
++++ b/xen/drivers/passthrough/vtd/dmar.c
+@@ -896,17 +896,30 @@ int platform_supports_x2apic(void)
+ 
+ int intel_iommu_get_reserved_device_memory(iommu_grdm_t *func, void *ctxt)
+ {
+-    struct acpi_rmrr_unit *rmrr;
++    struct acpi_rmrr_unit *rmrr, *rmrr_cur = NULL;
+     int rc = 0;
++    unsigned int i;
++    u16 bdf;
+ 
+-    list_for_each_entry(rmrr, &acpi_rmrr_units, list)
++    for_each_rmrr_device ( rmrr, bdf, i )
+     {
+-        rc = func(PFN_DOWN(rmrr->base_address),
+-                  PFN_UP(rmrr->end_address) - PFN_DOWN(rmrr->base_address),
+-                  ctxt);
+-        if ( rc )
+-            break;
++        if ( rmrr != rmrr_cur )
++        {
++            rc = func(PFN_DOWN(rmrr->base_address),
++                      PFN_UP(rmrr->end_address) -
++                        PFN_DOWN(rmrr->base_address),
++                      PCI_SBDF(rmrr->segment, bdf),
++                      ctxt);
++
++            if ( unlikely(rc < 0) )
++                return rc;
++
++            /* We've matched this RMRR so skip the other devices in it */
++            if ( rc )
++                rmrr_cur = rmrr;
++
++        }
+     }
+ 
+-    return rc;
++    return 0;
+ }
+diff -r d90179f495d4 xen/include/xen/iommu.h
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -90,7 +90,7 @@ struct msi_desc;
+ struct msi_msg;
+ struct page_info;
+ 
+-typedef int iommu_grdm_t(xen_pfn_t start, xen_ulong_t nr, void *ctxt);
++typedef int iommu_grdm_t(xen_pfn_t start, xen_ulong_t nr, u32 id, void *ctxt);
+ 
+ struct iommu_ops {
+     int (*init)(struct domain *d);
+diff -r d90179f495d4 xen/include/xen/pci.h
+--- a/xen/include/xen/pci.h
++++ b/xen/include/xen/pci.h
+@@ -31,6 +31,8 @@
+ #define PCI_DEVFN2(bdf) ((bdf) & 0xff)
+ #define PCI_BDF(b,d,f)  ((((b) & 0xff) << 8) | PCI_DEVFN(d,f))
+ #define PCI_BDF2(b,df)  ((((b) & 0xff) << 8) | ((df) & 0xff))
++#define PCI_SBDF(s,bdf) (((s & 0xffff) << 16) | (bdf & 0xffff))
++#define PCI_SBDF2(s,b,df) (((s & 0xffff) << 16) | PCI_BDF2(b,df))
+ 
+ struct pci_dev_info {
+     bool_t is_extfn;
