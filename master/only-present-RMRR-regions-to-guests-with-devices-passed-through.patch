@@ -4,12 +4,11 @@ the domain making the hypercall.
 This patch is based on mailing list patch:
 [v8][PATCH 04/17] update the existing hypercall to support XEN_DOMCTL_set_rdm
 
----
-
-diff -r d90179f495d4 xen/common/compat/memory.c
+diff --git a/xen/common/compat/memory.c b/xen/common/compat/memory.c
+index 43d73d9..ad6f188 100644
 --- a/xen/common/compat/memory.c
 +++ b/xen/common/compat/memory.c
-@@ -19,27 +19,48 @@ struct get_reserved_device_memory {
+@@ -23,27 +23,48 @@ struct get_reserved_device_memory {
      unsigned int used_entries;
  };
  
@@ -27,25 +26,24 @@ diff -r d90179f495d4 xen/common/compat/memory.c
 +    };
  
 -    if ( grdm->used_entries < grdm->map.nr_entries )
-+    if ( rdm.start_pfn != start || rdm.nr_pages != nr )
-+        return -ERANGE;
-+
-+    d = rcu_lock_current_domain();
-+    if ( d == NULL )
-+        return -ESRCH;
-+
-+    for_each_pdev(d, pdev)
-     {
+-    {
 -        struct compat_reserved_device_memory rdm = {
 -            .start_pfn = start, .nr_pages = nr
 -        };
--
++    if ( rdm.start_pfn != start || rdm.nr_pages != nr )
++        return -ERANGE;
+ 
 -        if ( rdm.start_pfn != start || rdm.nr_pages != nr )
 -            return -ERANGE;
--
++    d = rcu_lock_current_domain();
++    if ( d == NULL )
++        return -ESRCH;
+ 
 -        if ( __copy_to_compat_offset(grdm->map.buffer, grdm->used_entries,
 -                                     &rdm, 1) )
 -            return -EFAULT;
++    for_each_pdev(d, pdev)
++    {
 +	sbdf = PCI_SBDF2(pdev->seg,
 +			 pdev->bus,
 +			 pdev->devfn);
@@ -73,7 +71,7 @@ diff -r d90179f495d4 xen/common/compat/memory.c
      return 0;
  }
  #endif
-@@ -404,6 +425,7 @@ int compat_memory_op(unsigned int cmd, X
+@@ -437,6 +458,7 @@ int compat_memory_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) compat)
  
              if ( !rc && grdm.map.nr_entries < grdm.used_entries )
                  rc = -ENOBUFS;
@@ -81,10 +79,11 @@ diff -r d90179f495d4 xen/common/compat/memory.c
              grdm.map.nr_entries = grdm.used_entries;
              if ( __copy_to_guest(compat, &grdm.map, 1) )
                  rc = -EFAULT;
-diff -r d90179f495d4 xen/common/memory.c
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index 362326e..26417a6 100644
 --- a/xen/common/memory.c
 +++ b/xen/common/memory.c
-@@ -935,24 +935,45 @@ struct get_reserved_device_memory {
+@@ -941,24 +941,45 @@ struct get_reserved_device_memory {
      unsigned int used_entries;
  };
  
@@ -102,19 +101,19 @@ diff -r d90179f495d4 xen/common/memory.c
 +    };
  
 -    if ( grdm->used_entries < grdm->map.nr_entries )
-+    d = rcu_lock_current_domain();
-+    if ( d == NULL )
-+        return -ESRCH;
-+
-+    for_each_pdev(d, pdev)
-     {
+-    {
 -        struct xen_reserved_device_memory rdm = {
 -            .start_pfn = start, .nr_pages = nr
 -        };
--
++    d = rcu_lock_current_domain();
++    if ( d == NULL )
++        return -ESRCH;
+ 
 -        if ( __copy_to_guest_offset(grdm->map.buffer, grdm->used_entries,
 -                                    &rdm, 1) )
 -            return -EFAULT;
++    for_each_pdev(d, pdev)
++    {
 +	sbdf = PCI_SBDF2(pdev->seg,
 +			 pdev->bus,
 +			 pdev->devfn);
@@ -142,7 +141,7 @@ diff -r d90179f495d4 xen/common/memory.c
      return 0;
  }
  #endif
-@@ -1275,6 +1296,7 @@ long do_memory_op(unsigned long cmd, XEN
+@@ -1438,6 +1459,7 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
  
          if ( !rc && grdm.map.nr_entries < grdm.used_entries )
              rc = -ENOBUFS;
@@ -150,7 +149,8 @@ diff -r d90179f495d4 xen/common/memory.c
          grdm.map.nr_entries = grdm.used_entries;
          if ( __copy_to_guest(arg, &grdm.map, 1) )
              rc = -EFAULT;
-diff -r d90179f495d4 xen/drivers/passthrough/vtd/dmar.c
+diff --git a/xen/drivers/passthrough/vtd/dmar.c b/xen/drivers/passthrough/vtd/dmar.c
+index 141e735..fbacdd8 100644
 --- a/xen/drivers/passthrough/vtd/dmar.c
 +++ b/xen/drivers/passthrough/vtd/dmar.c
 @@ -896,17 +896,30 @@ int platform_supports_x2apic(void)
@@ -192,11 +192,12 @@ diff -r d90179f495d4 xen/drivers/passthrough/vtd/dmar.c
 -    return rc;
 +    return 0;
  }
-diff -r d90179f495d4 xen/include/xen/iommu.h
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index 409f6f8..8fc6d6d 100644
 --- a/xen/include/xen/iommu.h
 +++ b/xen/include/xen/iommu.h
-@@ -90,7 +90,7 @@ struct msi_desc;
- struct msi_msg;
+@@ -120,7 +120,7 @@ void iommu_dt_domain_destroy(struct domain *d);
+ 
  struct page_info;
  
 -typedef int iommu_grdm_t(xen_pfn_t start, xen_ulong_t nr, void *ctxt);
@@ -204,7 +205,8 @@ diff -r d90179f495d4 xen/include/xen/iommu.h
  
  struct iommu_ops {
      int (*init)(struct domain *d);
-diff -r d90179f495d4 xen/include/xen/pci.h
+diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
+index 91520bc..ba881ef 100644
 --- a/xen/include/xen/pci.h
 +++ b/xen/include/xen/pci.h
 @@ -31,6 +31,8 @@
