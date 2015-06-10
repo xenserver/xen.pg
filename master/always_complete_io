@@ -1,0 +1,60 @@
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 3c9d606..a2d5f4e 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -138,7 +138,7 @@ static int hvmemul_do_io(
+     case STATE_IORESP_READY:
+         vio->io_req.state = STATE_IOREQ_NONE;
+         p = vio->io_req;
+-        BUG_ON(data_is_addr || dir == IOREQ_WRITE);
++        BUG_ON(data_is_addr);
+         goto finish_access;
+     default:
+         BUG();
+@@ -177,7 +177,7 @@ static int hvmemul_do_io(
+             rc = hvm_send_assist_req(s, &p);
+             if ( rc != X86EMUL_RETRY )
+                 vio->io_req.state = STATE_IOREQ_NONE;
+-            else if ( data_is_addr || dir == IOREQ_WRITE )
++            else if ( data_is_addr )
+                 rc = X86EMUL_OKAY;
+         }
+         break;
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 84f0327..5f21f46 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -488,11 +488,14 @@ void hvm_do_resume(struct vcpu *v)
+         (void)handle_mmio();
+         break;
+     case HVMIO_pio_completion:
+-        if ( vio->io_req.size == 4 ) /* Needs zero extension. */
+-            guest_cpu_user_regs()->rax = (uint32_t)vio->io_req.data;
+-        else
+-            memcpy(&guest_cpu_user_regs()->rax, &vio->io_req.data,
+-                   vio->io_req.size);
++        if ( vio->io_req.dir == IOREQ_READ )
++        {
++            if ( vio->io_req.size == 4 ) /* Needs zero extension. */
++                guest_cpu_user_regs()->rax = (uint32_t)vio->io_req.data;
++            else
++                memcpy(&guest_cpu_user_regs()->rax, &vio->io_req.data,
++                       vio->io_req.size);
++        }
+         vio->io_req.state = STATE_IOREQ_NONE;
+         break;
+     case HVMIO_realmode_completion:
+diff --git a/xen/include/asm-x86/hvm/vcpu.h b/xen/include/asm-x86/hvm/vcpu.h
+index 7338638..008c8fa 100644
+--- a/xen/include/asm-x86/hvm/vcpu.h
++++ b/xen/include/asm-x86/hvm/vcpu.h
+@@ -49,8 +49,7 @@ struct hvm_vcpu_io {
+ 
+ #define HVMIO_NEED_COMPLETION(_vio) \
+     ( ((_vio)->io_req.state == STATE_IOREQ_READY) &&    \
+-      !(_vio)->io_req.data_is_ptr && \
+-      ((_vio)->io_req.dir == IOREQ_READ) )
++      !(_vio)->io_req.data_is_ptr )
+ 
+     /*
+      * HVM emulation:

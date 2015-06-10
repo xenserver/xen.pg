@@ -1,0 +1,308 @@
+From be67b40f55fb338dbfee090231d3cef8e0b41f0c Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Fri, 15 May 2015 13:38:11 +0100
+Subject: [PATCH 03/18] x86/hvm: re-name struct hvm_mmio_handler to
+ hvm_mmio_ops
+
+The struct just contains three methods and no data, so the name
+hvm_mmio_ops more accurately reflects its content. A subsequent patch
+introduces a new structure which more accurately warrants the name
+hvm_mmio_handler so doing the rename in this purely cosmetic patch avoids
+conflating functional and cosmetic changes in a single patch.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Cc: Keir Fraser <keir@xen.org>
+Cc: Jan Beulich <jbeulich@suse.com>
+Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+---
+ tools/tests/vhpet/emul.h                  |    8 +++---
+ tools/tests/vhpet/main.c                  |    6 ++---
+ xen/arch/x86/hvm/hpet.c                   |    8 +++---
+ xen/arch/x86/hvm/intercept.c              |   42 ++++++++++++++---------------
+ xen/arch/x86/hvm/vioapic.c                |    8 +++---
+ xen/arch/x86/hvm/vlapic.c                 |    8 +++---
+ xen/arch/x86/hvm/vmsi.c                   |    8 +++---
+ xen/drivers/passthrough/amd/iommu_guest.c |    8 +++---
+ xen/include/asm-x86/hvm/io.h              |   18 ++++++-------
+ 9 files changed, 57 insertions(+), 57 deletions(-)
+
+diff --git a/tools/tests/vhpet/emul.h b/tools/tests/vhpet/emul.h
+index 09e4611..383acff 100644
+--- a/tools/tests/vhpet/emul.h
++++ b/tools/tests/vhpet/emul.h
+@@ -237,11 +237,11 @@ typedef int (*hvm_mmio_write_t)(struct vcpu *v,
+ typedef int (*hvm_mmio_check_t)(struct vcpu *v, unsigned long addr);
+ 
+ 
+-struct hvm_mmio_handler
++struct hvm_mmio_ops
+ {
+-    hvm_mmio_check_t check_handler;
+-    hvm_mmio_read_t read_handler;
+-    hvm_mmio_write_t write_handler;
++    hvm_mmio_check_t check;
++    hvm_mmio_read_t  read;
++    hvm_mmio_write_t write;
+ };
+ 
+ /* Marshalling and unmarshalling uses a buffer with size and cursor. */
+diff --git a/tools/tests/vhpet/main.c b/tools/tests/vhpet/main.c
+index fbd7510..6fe65ea 100644
+--- a/tools/tests/vhpet/main.c
++++ b/tools/tests/vhpet/main.c
+@@ -70,7 +70,7 @@ static int skip_error_on_load;
+ 
+ static char *global_thousep;
+ 
+-extern const struct hvm_mmio_handler hpet_mmio_handler;
++extern const struct hvm_mmio_ops hpet_mmio_ops;
+ 
+ struct domain dom1;
+ struct vcpu vcpu0;
+@@ -297,13 +297,13 @@ void udelay(int w)
+ unsigned int hpet_readl(unsigned long a)
+ {
+     unsigned long ret = 0;
+-    hpet_mmio_handler.read_handler(current, a, 4, &ret);
++    hpet_mmio_ops.read(current, a, 4, &ret);
+     return ret;
+ }
+ 
+ void hpet_writel(unsigned long d, unsigned long a)
+ {
+-    hpet_mmio_handler.write_handler(current, a, 4, d);
++    hpet_mmio_ops.write(current, a, 4, d);
+     return;
+ }
+ 
+diff --git a/xen/arch/x86/hvm/hpet.c b/xen/arch/x86/hvm/hpet.c
+index bdfc6fc..a96a85a 100644
+--- a/xen/arch/x86/hvm/hpet.c
++++ b/xen/arch/x86/hvm/hpet.c
+@@ -496,10 +496,10 @@ static int hpet_range(struct vcpu *v, unsigned long addr)
+             (addr < (HPET_BASE_ADDRESS + HPET_MMAP_SIZE)));
+ }
+ 
+-const struct hvm_mmio_handler hpet_mmio_handler = {
+-    .check_handler = hpet_range,
+-    .read_handler  = hpet_read,
+-    .write_handler = hpet_write
++const struct hvm_mmio_ops hpet_mmio_ops = {
++    .check = hpet_range,
++    .read  = hpet_read,
++    .write = hpet_write
+ };
+ 
+ 
+diff --git a/xen/arch/x86/hvm/intercept.c b/xen/arch/x86/hvm/intercept.c
+index d52a48c..dc39b1b 100644
+--- a/xen/arch/x86/hvm/intercept.c
++++ b/xen/arch/x86/hvm/intercept.c
+@@ -32,20 +32,20 @@
+ #include <xen/event.h>
+ #include <xen/iommu.h>
+ 
+-static const struct hvm_mmio_handler *const
++static const struct hvm_mmio_ops *const
+ hvm_mmio_handlers[HVM_MMIO_HANDLER_NR] =
+ {
+-    &hpet_mmio_handler,
+-    &vlapic_mmio_handler,
+-    &vioapic_mmio_handler,
+-    &msixtbl_mmio_handler,
+-    &iommu_mmio_handler
++    &hpet_mmio_ops,
++    &vlapic_mmio_ops,
++    &vioapic_mmio_ops,
++    &msixtbl_mmio_ops,
++    &iommu_mmio_ops
+ };
+ 
+ static int hvm_mmio_access(struct vcpu *v,
+                            ioreq_t *p,
+-                           hvm_mmio_read_t read_handler,
+-                           hvm_mmio_write_t write_handler)
++                           hvm_mmio_read_t read,
++                           hvm_mmio_write_t write)
+ {
+     struct hvm_vcpu_io *vio = &v->arch.hvm_vcpu.hvm_io;
+     unsigned long data;
+@@ -64,11 +64,11 @@ static int hvm_mmio_access(struct vcpu *v,
+                 vio->mmio_retrying = 0;
+             }
+             else
+-                rc = read_handler(v, p->addr, p->size, &data);
++                rc = read(v, p->addr, p->size, &data);
+             p->data = data;
+         }
+         else /* p->dir == IOREQ_WRITE */
+-            rc = write_handler(v, p->addr, p->size, p->data);
++            rc = write(v, p->addr, p->size, p->data);
+         return rc;
+     }
+ 
+@@ -86,7 +86,7 @@ static int hvm_mmio_access(struct vcpu *v,
+             }
+             else
+             {
+-                rc = read_handler(v, p->addr + step * i, p->size, &data);
++                rc = read(v, p->addr + step * i, p->size, &data);
+                 if ( rc != X86EMUL_OKAY )
+                     break;
+             }
+@@ -145,7 +145,7 @@ static int hvm_mmio_access(struct vcpu *v,
+             }
+             if ( rc != X86EMUL_OKAY )
+                 break;
+-            rc = write_handler(v, p->addr + step * i, p->size, data);
++            rc = write(v, p->addr + step * i, p->size, data);
+             if ( rc != X86EMUL_OKAY )
+                 break;
+         }
+@@ -169,7 +169,7 @@ bool_t hvm_mmio_internal(paddr_t gpa)
+     unsigned int i;
+ 
+     for ( i = 0; i < HVM_MMIO_HANDLER_NR; ++i )
+-        if ( hvm_mmio_handlers[i]->check_handler(curr, gpa) )
++        if ( hvm_mmio_handlers[i]->check(curr, gpa) )
+             return 1;
+ 
+     return 0;
+@@ -182,21 +182,21 @@ int hvm_mmio_intercept(ioreq_t *p)
+ 
+     for ( i = 0; i < HVM_MMIO_HANDLER_NR; i++ )
+     {
+-        hvm_mmio_check_t check_handler =
+-            hvm_mmio_handlers[i]->check_handler;
++        hvm_mmio_check_t check =
++            hvm_mmio_handlers[i]->check;
+ 
+-        if ( check_handler(v, p->addr) )
++        if ( check(v, p->addr) )
+         {
+             if ( unlikely(p->count > 1) &&
+-                 !check_handler(v, unlikely(p->df)
+-                                   ? p->addr - (p->count - 1L) * p->size
+-                                   : p->addr + (p->count - 1L) * p->size) )
++                 !check(v, unlikely(p->df)
++                        ? p->addr - (p->count - 1L) * p->size
++                        : p->addr + (p->count - 1L) * p->size) )
+                 p->count = 1;
+ 
+             return hvm_mmio_access(
+                 v, p,
+-                hvm_mmio_handlers[i]->read_handler,
+-                hvm_mmio_handlers[i]->write_handler);
++                hvm_mmio_handlers[i]->read,
++                hvm_mmio_handlers[i]->write);
+         }
+     }
+ 
+diff --git a/xen/arch/x86/hvm/vioapic.c b/xen/arch/x86/hvm/vioapic.c
+index d3c681b..ec9f909 100644
+--- a/xen/arch/x86/hvm/vioapic.c
++++ b/xen/arch/x86/hvm/vioapic.c
+@@ -244,10 +244,10 @@ static int vioapic_range(struct vcpu *v, unsigned long addr)
+              (addr < vioapic->base_address + VIOAPIC_MEM_LENGTH)));
+ }
+ 
+-const struct hvm_mmio_handler vioapic_mmio_handler = {
+-    .check_handler = vioapic_range,
+-    .read_handler = vioapic_read,
+-    .write_handler = vioapic_write
++const struct hvm_mmio_ops vioapic_mmio_ops = {
++    .check = vioapic_range,
++    .read = vioapic_read,
++    .write = vioapic_write
+ };
+ 
+ static void ioapic_inj_irq(
+diff --git a/xen/arch/x86/hvm/vlapic.c b/xen/arch/x86/hvm/vlapic.c
+index 72b6509..a465a68 100644
+--- a/xen/arch/x86/hvm/vlapic.c
++++ b/xen/arch/x86/hvm/vlapic.c
+@@ -1005,10 +1005,10 @@ static int vlapic_range(struct vcpu *v, unsigned long addr)
+            (offset < PAGE_SIZE);
+ }
+ 
+-const struct hvm_mmio_handler vlapic_mmio_handler = {
+-    .check_handler = vlapic_range,
+-    .read_handler = vlapic_read,
+-    .write_handler = vlapic_write
++const struct hvm_mmio_ops vlapic_mmio_ops = {
++    .check = vlapic_range,
++    .read = vlapic_read,
++    .write = vlapic_write
+ };
+ 
+ static void set_x2apic_id(struct vlapic *vlapic)
+diff --git a/xen/arch/x86/hvm/vmsi.c b/xen/arch/x86/hvm/vmsi.c
+index ab4ac50..ffc4eb7 100644
+--- a/xen/arch/x86/hvm/vmsi.c
++++ b/xen/arch/x86/hvm/vmsi.c
+@@ -369,10 +369,10 @@ static int msixtbl_range(struct vcpu *v, unsigned long addr)
+     return !!virt;
+ }
+ 
+-const struct hvm_mmio_handler msixtbl_mmio_handler = {
+-    .check_handler = msixtbl_range,
+-    .read_handler = msixtbl_read,
+-    .write_handler = msixtbl_write
++const struct hvm_mmio_ops msixtbl_mmio_ops = {
++    .check = msixtbl_range,
++    .read = msixtbl_read,
++    .write = msixtbl_write
+ };
+ 
+ static void add_msixtbl_entry(struct domain *d,
+diff --git a/xen/drivers/passthrough/amd/iommu_guest.c b/xen/drivers/passthrough/amd/iommu_guest.c
+index 98e7b38..7b0c102 100644
+--- a/xen/drivers/passthrough/amd/iommu_guest.c
++++ b/xen/drivers/passthrough/amd/iommu_guest.c
+@@ -919,8 +919,8 @@ static int guest_iommu_mmio_range(struct vcpu *v, unsigned long addr)
+            addr < iommu->mmio_base + IOMMU_MMIO_SIZE;
+ }
+ 
+-const struct hvm_mmio_handler iommu_mmio_handler = {
+-    .check_handler = guest_iommu_mmio_range,
+-    .read_handler = guest_iommu_mmio_read,
+-    .write_handler = guest_iommu_mmio_write
++const struct hvm_mmio_ops iommu_mmio_ops = {
++    .check = guest_iommu_mmio_range,
++    .read = guest_iommu_mmio_read,
++    .write = guest_iommu_mmio_write
+ };
+diff --git a/xen/include/asm-x86/hvm/io.h b/xen/include/asm-x86/hvm/io.h
+index 886a9d6..f2aaec5 100644
+--- a/xen/include/asm-x86/hvm/io.h
++++ b/xen/include/asm-x86/hvm/io.h
+@@ -59,17 +59,17 @@ struct hvm_io_handler {
+     struct  io_handler hdl_list[MAX_IO_HANDLER];
+ };
+ 
+-struct hvm_mmio_handler {
+-    hvm_mmio_check_t check_handler;
+-    hvm_mmio_read_t read_handler;
+-    hvm_mmio_write_t write_handler;
++struct hvm_mmio_ops {
++    hvm_mmio_check_t check;
++    hvm_mmio_read_t  read;
++    hvm_mmio_write_t write;
+ };
+ 
+-extern const struct hvm_mmio_handler hpet_mmio_handler;
+-extern const struct hvm_mmio_handler vlapic_mmio_handler;
+-extern const struct hvm_mmio_handler vioapic_mmio_handler;
+-extern const struct hvm_mmio_handler msixtbl_mmio_handler;
+-extern const struct hvm_mmio_handler iommu_mmio_handler;
++extern const struct hvm_mmio_ops hpet_mmio_ops;
++extern const struct hvm_mmio_ops vlapic_mmio_ops;
++extern const struct hvm_mmio_ops vioapic_mmio_ops;
++extern const struct hvm_mmio_ops msixtbl_mmio_ops;
++extern const struct hvm_mmio_ops iommu_mmio_ops;
+ 
+ #define HVM_MMIO_HANDLER_NR 5
+ 
+-- 
+1.7.10.4
+

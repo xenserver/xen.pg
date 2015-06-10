@@ -1,0 +1,301 @@
+From 63d0144a065a55a8eee266cdc30556a9d193daaa Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Mon, 18 May 2015 14:16:00 +0100
+Subject: [PATCH 07/18] x86/hvm: revert 82ed8716b "fix direct PCI port I/O
+ emulation retry...
+
+...and error handling"
+
+NOTE: A straight reversion was not possible because of subsequent changes
+      in the code so this at least partially a manual reversion.
+
+By limiting hvmemul_do_io_addr() to reps falling within the pages on which
+a reference has already been taken, we can guarantee that calls to
+hvm_copy_to/from_guest_phys() will not hit the HVMCOPY_gfn_paged_out
+or HVMCOPY_gfn_shared cases. Thus we can remove the retry logic from
+the intercept code and simplify it significantly.
+
+Normally hvmemul_do_io_addr() will only reference single page at a time.
+It will, however, take an extra page reference for I/O spanning a page
+boundary.
+
+It is still important to know, upon returning from x86_emulate(), whether
+the number of reps was reduced so the mmio_retry flag is retained for that
+purpose.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Cc: Keir Fraser <keir@xen.org>
+Cc: Jan Beulich <jbeulich@suse.com>
+Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index a448911..521f141 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -60,6 +60,7 @@ static int hvmemul_do_io(
+         .type = is_mmio ? IOREQ_TYPE_COPY : IOREQ_TYPE_PIO,
+         .addr = addr,
+         .size = size,
++        .count = *reps,
+         .dir = dir,
+         .df = df,
+         .data = data,
+@@ -131,15 +132,6 @@ static int hvmemul_do_io(
+         HVMIO_dispatched : HVMIO_awaiting_completion;
+     vio->io_size = size;
+ 
+-    /*
+-     * When retrying a repeated string instruction, force exit to guest after
+-     * completion of the retried iteration to allow handling of interrupts.
+-     */
+-    if ( vio->mmio_retrying )
+-        *reps = 1;
+-
+-    p.count = *reps;
+-
+     if ( dir == IOREQ_WRITE )
+     {
+         if ( !data_is_addr )
+@@ -153,17 +145,9 @@ static int hvmemul_do_io(
+     switch ( rc )
+     {
+     case X86EMUL_OKAY:
+-    case X86EMUL_RETRY:
+-        *reps = p.count;
+         p.state = STATE_IORESP_READY;
+-        if ( !vio->mmio_retry )
+-        {
+-            hvm_io_assist(&p);
+-            vio->io_state = HVMIO_none;
+-        }
+-        else
+-            /* Defer hvm_io_assist() invocation to hvm_do_resume(). */
+-            vio->io_state = HVMIO_handle_mmio_awaiting_completion;
++        hvm_io_assist(&p);
++        vio->io_state = HVMIO_none;
+         break;
+     case X86EMUL_UNHANDLEABLE:
+     {
+@@ -294,17 +278,69 @@ int hvmemul_do_io_addr(
+     bool_t is_mmio, paddr_t addr, unsigned long *reps, 
+     unsigned int size, uint8_t dir, bool_t df, paddr_t ram_gpa)
+ {
+-    struct page_info *ram_page;
++    struct vcpu *v = current;
++    unsigned long ram_gmfn = paddr_to_pfn(ram_gpa);
++    struct page_info *ram_page[2];
++    int nr_pages = 0;
++    unsigned long count;
+     int rc;
+ 
+-    rc = hvmemul_acquire_page(paddr_to_pfn(ram_gpa), &ram_page);
++
++    rc = hvmemul_acquire_page(ram_gmfn, &ram_page[nr_pages]);
+     if ( rc != X86EMUL_OKAY )
+-        return rc;
++        goto out;
++
++    nr_pages++;
++
++    /* Detemine how many reps will fit within this page */
++    for ( count = 0; count < *reps; count++ )
++    {
++        paddr_t start, end;
++
++        if ( df )
++        {
++            start = ram_gpa - count * size;
++            end = ram_gpa + size - 1;
++        }
++        else
++        {
++            start = ram_gpa;
++            end = ram_gpa + (count + 1) * size - 1;
++        }
++
++        if ( paddr_to_pfn(start) != ram_gmfn ||
++             paddr_to_pfn(end) != ram_gmfn )
++            break;
++    }
++
++    if ( count == 0 )
++    {
++        /*
++         * This access must span two pages, so grab a reference to
++         * the next page and do a single rep.
++         */
++        rc = hvmemul_acquire_page(df ? ram_gmfn - 1 : ram_gmfn + 1,
++                                  &ram_page[nr_pages]);
++        if ( rc != X86EMUL_OKAY )
++            goto out;
++
++        nr_pages++;
++        count = 1;
++    }
+ 
+-    rc = hvmemul_do_io(is_mmio, addr, reps, size, dir, df, 1,
++    rc = hvmemul_do_io(is_mmio, addr, &count, size, dir, df, 1,
+                        (uint64_t)ram_gpa);
++    if ( rc == X86EMUL_OKAY )
++    {
++        v->arch.hvm_vcpu.hvm_io.mmio_retry = (count < *reps);
++        *reps = count;
++    }
++
++ out:
++    v->arch.hvm_vcpu.hvm_io.mmio_retry |= (rc == X86EMUL_RETRY);
+ 
+-    hvmemul_release_page(ram_page);
++    while ( --nr_pages >= 0 )
++        hvmemul_release_page(ram_page[nr_pages]);
+ 
+     return rc;
+ }
+@@ -1434,7 +1470,6 @@ static int _hvm_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt,
+     }
+ 
+     hvmemul_ctxt->exn_pending = 0;
+-    vio->mmio_retrying = vio->mmio_retry;
+     vio->mmio_retry = 0;
+ 
+     if ( cpu_has_vmx )
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 3071b6d..cfd07c1 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -427,6 +427,7 @@ static bool_t hvm_wait_for_io(struct hvm_ioreq_vcpu *sv, ioreq_t *p)
+ 
+ void hvm_do_resume(struct vcpu *v)
+ {
++    struct hvm_vcpu_io *vio = &v->arch.hvm_vcpu.hvm_io;
+     struct domain *d = v->domain;
+     struct hvm_ioreq_server *s;
+ 
+@@ -455,6 +456,9 @@ void hvm_do_resume(struct vcpu *v)
+         }
+     }
+ 
++    if ( vio->mmio_retry )
++        (void)handle_mmio();
++
+     /* Inject pending hw/sw trap */
+     if ( v->arch.hvm_vcpu.inject_trap.vector != -1 ) 
+     {
+diff --git a/xen/arch/x86/hvm/intercept.c b/xen/arch/x86/hvm/intercept.c
+index b8bcd0b..c0c9254 100644
+--- a/xen/arch/x86/hvm/intercept.c
++++ b/xen/arch/x86/hvm/intercept.c
+@@ -155,7 +155,6 @@ static const struct hvm_io_ops portio_ops = {
+ static int process_io_intercept(struct vcpu *v, ioreq_t *p,
+                                 struct hvm_io_handler *handler)
+ {
+-    struct hvm_vcpu_io *vio = &v->arch.hvm_vcpu.hvm_io;
+     const struct hvm_io_ops *ops = handler->ops;
+     int rc = X86EMUL_OKAY, i, step = p->df ? -p->size : p->size;
+     uint64_t data;
+@@ -165,23 +164,12 @@ static int process_io_intercept(struct vcpu *v, ioreq_t *p,
+     {
+         for ( i = 0; i < p->count; i++ )
+         {
+-            if ( vio->mmio_retrying )
+-            {
+-                if ( vio->mmio_large_read_bytes != p->size )
+-                    return X86EMUL_UNHANDLEABLE;
+-                memcpy(&data, vio->mmio_large_read, p->size);
+-                vio->mmio_large_read_bytes = 0;
+-                vio->mmio_retrying = 0;
+-            }
+-            else
+-            {
+-                addr = (p->type == IOREQ_TYPE_COPY) ?
+-                    p->addr + step * i :
+-                    p->addr;
+-                rc = ops->read(handler, v, addr, p->size, &data);
+-                if ( rc != X86EMUL_OKAY )
+-                    break;
+-            }
++            addr = (p->type == IOREQ_TYPE_COPY) ?
++                p->addr + step * i :
++                p->addr;
++            rc = ops->read(handler, v, addr, p->size, &data);
++            if ( rc != X86EMUL_OKAY )
++                break;
+ 
+             if ( p->data_is_ptr )
+             {
+@@ -190,14 +178,12 @@ static int process_io_intercept(struct vcpu *v, ioreq_t *p,
+                 {
+                 case HVMCOPY_okay:
+                     break;
+-                case HVMCOPY_gfn_paged_out:
+-                case HVMCOPY_gfn_shared:
+-                    rc = X86EMUL_RETRY;
+-                    break;
+                 case HVMCOPY_bad_gfn_to_mfn:
+                     /* Drop the write as real hardware would. */
+                     continue;
+                 case HVMCOPY_bad_gva_to_gfn:
++                case HVMCOPY_gfn_paged_out:
++                case HVMCOPY_gfn_shared:
+                     ASSERT(0);
+                     /* fall through */
+                 default:
+@@ -210,13 +196,6 @@ static int process_io_intercept(struct vcpu *v, ioreq_t *p,
+             else
+                 p->data = data;
+         }
+-
+-        if ( rc == X86EMUL_RETRY )
+-        {
+-            vio->mmio_retry = 1;
+-            vio->mmio_large_read_bytes = p->size;
+-            memcpy(vio->mmio_large_read, &data, p->size);
+-        }
+     }
+     else /* p->dir == IOREQ_WRITE */
+     {
+@@ -229,14 +208,12 @@ static int process_io_intercept(struct vcpu *v, ioreq_t *p,
+                 {
+                 case HVMCOPY_okay:
+                     break;
+-                case HVMCOPY_gfn_paged_out:
+-                case HVMCOPY_gfn_shared:
+-                    rc = X86EMUL_RETRY;
+-                    break;
+                 case HVMCOPY_bad_gfn_to_mfn:
+                     data = ~0;
+                     break;
+                 case HVMCOPY_bad_gva_to_gfn:
++                case HVMCOPY_gfn_paged_out:
++                case HVMCOPY_gfn_shared:
+                     ASSERT(0);
+                     /* fall through */
+                 default:
+@@ -256,15 +233,6 @@ static int process_io_intercept(struct vcpu *v, ioreq_t *p,
+             if ( rc != X86EMUL_OKAY )
+                 break;
+         }
+-
+-        if ( rc == X86EMUL_RETRY )
+-            vio->mmio_retry = 1;
+-    }
+-
+-    if ( i != 0 )
+-    {
+-        p->count = i;
+-        rc = X86EMUL_OKAY;
+     }
+ 
+     return rc;
+diff --git a/xen/include/asm-x86/hvm/vcpu.h b/xen/include/asm-x86/hvm/vcpu.h
+index dd08416..97d78bd 100644
+--- a/xen/include/asm-x86/hvm/vcpu.h
++++ b/xen/include/asm-x86/hvm/vcpu.h
+@@ -74,7 +74,7 @@ struct hvm_vcpu_io {
+      * For string instruction emulation we need to be able to signal a
+      * necessary retry through other than function return codes.
+      */
+-    bool_t mmio_retry, mmio_retrying;
++    bool_t mmio_retry;
+ 
+     unsigned long msix_unmask_address;
+ 

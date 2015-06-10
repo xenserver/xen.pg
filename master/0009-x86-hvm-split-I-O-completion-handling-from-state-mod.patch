@@ -1,0 +1,245 @@
+From 6ea2fe9b3e1756cce0dd277ae733ed62a458b40d Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Tue, 19 May 2015 16:34:19 +0100
+Subject: [PATCH 09/18] x86/hvm: split I/O completion handling from state
+ model
+
+The state of in-flight I/O and how its completion will be handled are
+logically separate and conflating the two makes the code unnecessarily
+confusing.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Cc: Keir Fraser <keir@xen.org>
+Cc: Jan Beulich <jbeulich@suse.com>
+Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 354208d..7de0404 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -59,6 +59,7 @@
+ #include <asm/hvm/cacheattr.h>
+ #include <asm/hvm/trace.h>
+ #include <asm/hvm/nestedhvm.h>
++#include <asm/hvm/vmx/vmx.h>
+ #include <asm/mtrr.h>
+ #include <asm/apic.h>
+ #include <public/sched.h>
+@@ -415,26 +416,12 @@ static void hvm_io_assist(ioreq_t *p)
+         vio->io_state = HVMIO_completed;
+         vio->io_data = p->data;
+         break;
+-    case HVMIO_handle_mmio_awaiting_completion:
+-        vio->io_state = HVMIO_completed;
+-        vio->io_data = p->data;
+-        (void)handle_mmio();
+-        break;
+-    case HVMIO_handle_pio_awaiting_completion:
+-        if ( vio->io_size == 4 ) /* Needs zero extension. */
+-            guest_cpu_user_regs()->rax = (uint32_t)p->data;
+-        else
+-            memcpy(&guest_cpu_user_regs()->rax, &p->data, vio->io_size);
+-        break;
+     default:
+         break;
+     }
+ 
+-    if ( p->state == STATE_IOREQ_NONE )
+-    {
+-        msix_write_completion(curr);
+-        vcpu_end_shutdown_deferral(curr);
+-    }
++    msix_write_completion(curr);
++    vcpu_end_shutdown_deferral(curr);
+ }
+ 
+ static bool_t hvm_wait_for_io(struct hvm_ioreq_vcpu *sv, ioreq_t *p)
+@@ -469,6 +456,7 @@ void hvm_do_resume(struct vcpu *v)
+     struct hvm_vcpu_io *vio = &v->arch.hvm_vcpu.hvm_io;
+     struct domain *d = v->domain;
+     struct hvm_ioreq_server *s;
++    enum hvm_io_completion io_completion;
+ 
+     check_wakeup_from_wait();
+ 
+@@ -495,8 +483,36 @@ void hvm_do_resume(struct vcpu *v)
+         }
+     }
+ 
+-    if ( vio->mmio_retry )
++    io_completion = vio->io_completion;
++    vio->io_completion = HVMIO_no_completion;
++
++    switch ( io_completion )
++    {
++    case HVMIO_no_completion:
++        break;
++    case HVMIO_mmio_completion:
+         (void)handle_mmio();
++        break;
++    case HVMIO_pio_completion:
++        if ( vio->io_size == 4 ) /* Needs zero extension. */
++            guest_cpu_user_regs()->rax = (uint32_t)vio->io_data;
++        else
++            memcpy(&guest_cpu_user_regs()->rax, &vio->io_data, vio->io_size);
++        vio->io_state = HVMIO_none;
++        break;
++    case HVMIO_realmode_completion:
++    {
++        struct hvm_emulate_ctxt ctxt;
++
++        hvm_emulate_prepare(&ctxt, guest_cpu_user_regs());
++        vmx_realmode_emulate_one(&ctxt);
++        hvm_emulate_writeback(&ctxt);
++
++        break;
++    }
++    default:
++        BUG();
++    }
+ 
+     /* Inject pending hw/sw trap */
+     if ( v->arch.hvm_vcpu.inject_trap.vector != -1 ) 
+diff --git a/xen/arch/x86/hvm/io.c b/xen/arch/x86/hvm/io.c
+index ee0ed82..bfb8a81 100644
+--- a/xen/arch/x86/hvm/io.c
++++ b/xen/arch/x86/hvm/io.c
+@@ -92,8 +92,8 @@ int handle_mmio(void)
+ 
+     if ( rc != X86EMUL_RETRY )
+         vio->io_state = HVMIO_none;
+-    if ( vio->io_state == HVMIO_awaiting_completion )
+-        vio->io_state = HVMIO_handle_mmio_awaiting_completion;
++    if ( vio->io_state == HVMIO_awaiting_completion || vio->mmio_retry )
++        vio->io_completion = HVMIO_mmio_completion;
+     else
+         vio->mmio_access = (struct npfec){};
+ 
+@@ -158,7 +158,7 @@ int handle_pio(uint16_t port, unsigned int size, int dir)
+             return 0;
+         /* Completion in hvm_io_assist() with no re-emulation required. */
+         ASSERT(dir == IOREQ_READ);
+-        vio->io_state = HVMIO_handle_pio_awaiting_completion;
++        vio->io_completion = HVMIO_pio_completion;
+         break;
+     default:
+         gdprintk(XENLOG_ERR, "Weird HVM ioemulation status %d.\n", rc);
+diff --git a/xen/arch/x86/hvm/vmx/realmode.c b/xen/arch/x86/hvm/vmx/realmode.c
+index fe8b4a0..76ff9a5 100644
+--- a/xen/arch/x86/hvm/vmx/realmode.c
++++ b/xen/arch/x86/hvm/vmx/realmode.c
+@@ -101,15 +101,19 @@ static void realmode_deliver_exception(
+     }
+ }
+ 
+-static void realmode_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt)
++void vmx_realmode_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt)
+ {
+     struct vcpu *curr = current;
++    struct hvm_vcpu_io *vio = &curr->arch.hvm_vcpu.hvm_io;
+     int rc;
+ 
+     perfc_incr(realmode_emulations);
+ 
+     rc = hvm_emulate_one(hvmemul_ctxt);
+ 
++    if ( vio->io_state == HVMIO_awaiting_completion || vio->mmio_retry )
++        vio->io_completion = HVMIO_realmode_completion;
++
+     if ( rc == X86EMUL_UNHANDLEABLE )
+     {
+         gdprintk(XENLOG_ERR, "Failed to emulate insn.\n");
+@@ -177,9 +181,6 @@ void vmx_realmode(struct cpu_user_regs *regs)
+ 
+     hvm_emulate_prepare(&hvmemul_ctxt, regs);
+ 
+-    if ( vio->io_state == HVMIO_completed )
+-        realmode_emulate_one(&hvmemul_ctxt);
+-
+     /* Only deliver interrupts into emulated real mode. */
+     if ( !(curr->arch.hvm_vcpu.guest_cr[0] & X86_CR0_PE) &&
+          (intr_info & INTR_INFO_VALID_MASK) )
+@@ -190,8 +191,7 @@ void vmx_realmode(struct cpu_user_regs *regs)
+ 
+     curr->arch.hvm_vmx.vmx_emulate = 1;
+     while ( curr->arch.hvm_vmx.vmx_emulate &&
+-            !softirq_pending(smp_processor_id()) &&
+-            (vio->io_state == HVMIO_none) )
++            !softirq_pending(smp_processor_id()) )
+     {
+         /*
+          * Check for pending interrupts only every 16 instructions, because
+@@ -203,7 +203,10 @@ void vmx_realmode(struct cpu_user_regs *regs)
+              hvm_local_events_need_delivery(curr) )
+             break;
+ 
+-        realmode_emulate_one(&hvmemul_ctxt);
++        vmx_realmode_emulate_one(&hvmemul_ctxt);
++
++        if ( vio->io_state != HVMIO_none || vio->mmio_retry )
++            break;
+ 
+         /* Stop emulating unless our segment state is not safe */
+         if ( curr->arch.hvm_vmx.vmx_realmode )
+@@ -245,3 +248,13 @@ void vmx_realmode(struct cpu_user_regs *regs)
+     if ( intr_info & INTR_INFO_VALID_MASK )
+         __vmwrite(VM_ENTRY_INTR_INFO, intr_info);
+ }
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/xen/include/asm-x86/hvm/vcpu.h b/xen/include/asm-x86/hvm/vcpu.h
+index 97d78bd..c4d96a8 100644
+--- a/xen/include/asm-x86/hvm/vcpu.h
++++ b/xen/include/asm-x86/hvm/vcpu.h
+@@ -34,11 +34,16 @@ enum hvm_io_state {
+     HVMIO_none = 0,
+     HVMIO_dispatched,
+     HVMIO_awaiting_completion,
+-    HVMIO_handle_mmio_awaiting_completion,
+-    HVMIO_handle_pio_awaiting_completion,
+     HVMIO_completed
+ };
+ 
++enum hvm_io_completion {
++    HVMIO_no_completion = 0,
++    HVMIO_mmio_completion,
++    HVMIO_pio_completion,
++    HVMIO_realmode_completion
++};
++
+ struct hvm_vcpu_asid {
+     uint64_t generation;
+     uint32_t asid;
+@@ -46,9 +51,10 @@ struct hvm_vcpu_asid {
+ 
+ struct hvm_vcpu_io {
+     /* I/O request in flight to device model. */
+-    enum hvm_io_state   io_state;
+-    unsigned long       io_data;
+-    int                 io_size;
++    enum hvm_io_state      io_state;
++    unsigned long          io_data;
++    int                    io_size;
++    enum hvm_io_completion io_completion;
+ 
+     /*
+      * HVM emulation:
+diff --git a/xen/include/asm-x86/hvm/vmx/vmx.h b/xen/include/asm-x86/hvm/vmx/vmx.h
+index c8bb548..9404457 100644
+--- a/xen/include/asm-x86/hvm/vmx/vmx.h
++++ b/xen/include/asm-x86/hvm/vmx/vmx.h
+@@ -93,6 +93,7 @@ void vmx_asm_do_vmentry(void);
+ void vmx_intr_assist(void);
+ void noreturn vmx_do_resume(struct vcpu *);
+ void vmx_vlapic_msr_changed(struct vcpu *v);
++void vmx_realmode_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt);
+ void vmx_realmode(struct cpu_user_regs *regs);
+ void vmx_update_debug_state(struct vcpu *v);
+ void vmx_update_exception_bitmap(struct vcpu *v);

@@ -1,0 +1,254 @@
+From ae70374e95310e8968f77ad9dec8e85b68468f9c Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Tue, 19 May 2015 14:07:32 +0100
+Subject: [PATCH 08/18] x86/hvm: only call hvm_io_assist() from
+ hvm_wait_for_io()
+
+By removing the calls in hvmemul_do_io() (which is replaced by a single
+assignment) and hvm_complete_assist_request() (which is replaced by a
+call to process_portio_intercept() with a suitable set of ops) then
+hvm_io_assist() can be moved into hvm.c and made static (and hence be a
+candidate for inlining).
+
+This patch also fixes the I/O state test at the end of hvm_io_assist()
+to check the correct value. Since the ioreq server patch series was
+integrated the current ioreq state is no longer an indicator of in-flight
+I/O state, since an I/O sheduled by re-emulation may be targetted at a
+different ioreq server.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Cc: Keir Fraser <keir@xen.org>
+Cc: Jan Beulich <jbeulich@suse.com>
+Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 521f141..4c962fa 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -50,6 +50,34 @@ static void hvmtrace_io_assist(int is_mmio, ioreq_t *p)
+     trace_var(event, 0/*!cycles*/, size, buffer);
+ }
+ 
++static int null_read(struct hvm_io_handler *io_handler,
++                     struct vcpu *v,
++                     uint64_t addr,
++                     uint32_t size,
++                     uint64_t *data)
++{
++    *data = ~0ul;
++    return X86EMUL_OKAY;
++}
++
++static int null_write(struct hvm_io_handler *io_handler,
++                      struct vcpu *v,
++                      uint64_t addr,
++                      uint32_t size,
++                      uint64_t data)
++{
++    return X86EMUL_OKAY;
++}
++
++static const struct hvm_io_ops null_ops = {
++    .read = null_read,
++    .write = null_write
++};
++
++static struct hvm_io_handler null_handler = {
++    .ops = &null_ops
++};
++
+ static int hvmemul_do_io(
+     int is_mmio, paddr_t addr, unsigned long *reps, unsigned int size,
+     uint8_t dir, bool_t df, bool_t data_is_addr, uint64_t data)
+@@ -145,8 +173,7 @@ static int hvmemul_do_io(
+     switch ( rc )
+     {
+     case X86EMUL_OKAY:
+-        p.state = STATE_IORESP_READY;
+-        hvm_io_assist(&p);
++        vio->io_data = p.data;
+         vio->io_state = HVMIO_none;
+         break;
+     case X86EMUL_UNHANDLEABLE:
+@@ -157,8 +184,9 @@ static int hvmemul_do_io(
+         /* If there is no suitable backing DM, just ignore accesses */
+         if ( !s )
+         {
+-            hvm_complete_assist_req(&p);
+-            rc = X86EMUL_OKAY;
++            rc = process_io_intercept(curr, &p, &null_handler);
++            if ( rc == X86EMUL_OKAY )
++                vio->io_data = p.data;
+             vio->io_state = HVMIO_none;
+         }
+         else
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index cfd07c1..354208d 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -398,6 +398,45 @@ bool_t hvm_io_pending(struct vcpu *v)
+     return 0;
+ }
+ 
++static void hvm_io_assist(ioreq_t *p)
++{
++    struct vcpu *curr = current;
++    struct hvm_vcpu_io *vio = &curr->arch.hvm_vcpu.hvm_io;
++    enum hvm_io_state io_state;
++
++    p->state = STATE_IOREQ_NONE;
++
++    io_state = vio->io_state;
++    vio->io_state = HVMIO_none;
++
++    switch ( io_state )
++    {
++    case HVMIO_awaiting_completion:
++        vio->io_state = HVMIO_completed;
++        vio->io_data = p->data;
++        break;
++    case HVMIO_handle_mmio_awaiting_completion:
++        vio->io_state = HVMIO_completed;
++        vio->io_data = p->data;
++        (void)handle_mmio();
++        break;
++    case HVMIO_handle_pio_awaiting_completion:
++        if ( vio->io_size == 4 ) /* Needs zero extension. */
++            guest_cpu_user_regs()->rax = (uint32_t)p->data;
++        else
++            memcpy(&guest_cpu_user_regs()->rax, &p->data, vio->io_size);
++        break;
++    default:
++        break;
++    }
++
++    if ( p->state == STATE_IOREQ_NONE )
++    {
++        msix_write_completion(curr);
++        vcpu_end_shutdown_deferral(curr);
++    }
++}
++
+ static bool_t hvm_wait_for_io(struct hvm_ioreq_vcpu *sv, ioreq_t *p)
+ {
+     /* NB. Optimised for common case (p->state == STATE_IOREQ_NONE). */
+@@ -2623,34 +2662,6 @@ bool_t hvm_send_assist_req(struct hvm_ioreq_server *s, ioreq_t *proto_p)
+     return 0;
+ }
+ 
+-void hvm_complete_assist_req(ioreq_t *p)
+-{
+-    switch ( p->type )
+-    {
+-    case IOREQ_TYPE_COPY:
+-    case IOREQ_TYPE_PIO:
+-        if ( p->dir == IOREQ_READ )
+-        {
+-            if ( !p->data_is_ptr )
+-                p->data = ~0ul;
+-            else
+-            {
+-                int i, step = p->df ? -p->size : p->size;
+-                uint32_t data = ~0;
+-
+-                for ( i = 0; i < p->count; i++ )
+-                    hvm_copy_to_guest_phys(p->data + step * i, &data,
+-                                           p->size);
+-            }
+-        }
+-        /* FALLTHRU */
+-    default:
+-        p->state = STATE_IORESP_READY;
+-        hvm_io_assist(p);
+-        break;
+-    }
+-}
+-
+ void hvm_broadcast_assist_req(ioreq_t *p)
+ {
+     struct domain *d = current->domain;
+diff --git a/xen/arch/x86/hvm/intercept.c b/xen/arch/x86/hvm/intercept.c
+index c0c9254..0537d39 100644
+--- a/xen/arch/x86/hvm/intercept.c
++++ b/xen/arch/x86/hvm/intercept.c
+@@ -152,8 +152,8 @@ static const struct hvm_io_ops portio_ops = {
+     .write = hvm_portio_write
+ };
+ 
+-static int process_io_intercept(struct vcpu *v, ioreq_t *p,
+-                                struct hvm_io_handler *handler)
++int process_io_intercept(struct vcpu *v, ioreq_t *p,
++                         struct hvm_io_handler *handler)
+ {
+     const struct hvm_io_ops *ops = handler->ops;
+     int rc = X86EMUL_OKAY, i, step = p->df ? -p->size : p->size;
+diff --git a/xen/arch/x86/hvm/io.c b/xen/arch/x86/hvm/io.c
+index 87625ed..ee0ed82 100644
+--- a/xen/arch/x86/hvm/io.c
++++ b/xen/arch/x86/hvm/io.c
+@@ -169,45 +169,6 @@ int handle_pio(uint16_t port, unsigned int size, int dir)
+     return 1;
+ }
+ 
+-void hvm_io_assist(ioreq_t *p)
+-{
+-    struct vcpu *curr = current;
+-    struct hvm_vcpu_io *vio = &curr->arch.hvm_vcpu.hvm_io;
+-    enum hvm_io_state io_state;
+-
+-    p->state = STATE_IOREQ_NONE;
+-
+-    io_state = vio->io_state;
+-    vio->io_state = HVMIO_none;
+-
+-    switch ( io_state )
+-    {
+-    case HVMIO_awaiting_completion:
+-        vio->io_state = HVMIO_completed;
+-        vio->io_data = p->data;
+-        break;
+-    case HVMIO_handle_mmio_awaiting_completion:
+-        vio->io_state = HVMIO_completed;
+-        vio->io_data = p->data;
+-        (void)handle_mmio();
+-        break;
+-    case HVMIO_handle_pio_awaiting_completion:
+-        if ( vio->io_size == 4 ) /* Needs zero extension. */
+-            guest_cpu_user_regs()->rax = (uint32_t)p->data;
+-        else
+-            memcpy(&guest_cpu_user_regs()->rax, &p->data, vio->io_size);
+-        break;
+-    default:
+-        break;
+-    }
+-
+-    if ( p->state == STATE_IOREQ_NONE )
+-    {
+-        msix_write_completion(curr);
+-        vcpu_end_shutdown_deferral(curr);
+-    }
+-}
+-
+ static bool_t dpci_portio_accept(struct hvm_io_handler *io_handler,
+                                  struct vcpu *v,
+                                  uint64_t addr,
+diff --git a/xen/include/asm-x86/hvm/io.h b/xen/include/asm-x86/hvm/io.h
+index 50965f1..7aa1f80 100644
+--- a/xen/include/asm-x86/hvm/io.h
++++ b/xen/include/asm-x86/hvm/io.h
+@@ -94,6 +94,8 @@ void hvm_register_io_handler(struct domain *d,
+ struct hvm_io_handler *hvm_find_io_handler(struct vcpu *v,
+                                            ioreq_t *p);
+ 
++int process_io_intercept(struct vcpu *v, ioreq_t *p,
++                         struct hvm_io_handler *handler);
+ int hvm_io_intercept(ioreq_t *p);
+ 
+ void register_mmio_handler(struct domain *d,
+@@ -113,7 +115,6 @@ int handle_mmio_with_translation(unsigned long gva, unsigned long gpfn,
+                                  struct npfec);
+ int handle_pio(uint16_t port, unsigned int size, int dir);
+ void hvm_interrupt_post(struct vcpu *v, int vector, int type);
+-void hvm_io_assist(ioreq_t *p);
+ void hvm_dpci_eoi(struct domain *d, unsigned int guest_irq,
+                   const union vioapic_redir_entry *ent);
+ void msix_write_completion(struct vcpu *);

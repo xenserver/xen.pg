@@ -1,0 +1,191 @@
+From 6d0fe25c6c17e89a72d9e20229370a19467b20c4 Mon Sep 17 00:00:00 2001
+From: Don Slutz <dslutz@verizon.com>
+Date: Wed, 11 Feb 2015 17:21:14 +0100
+Subject: [PATCH 01/18] x86/HVM: do not retry in hvmemul_do_io() if no ioreq
+ server exists for this I/O
+
+This saves a VMENTRY and a VMEXIT since we no longer retry the
+ioport read on backing DM not handling a given ioreq.
+
+There are 2 case about "no ioreq server exists for this I/O":
+
+1) No ioreq servers (PVH case)
+2) No ioreq servers for this I/O (non PVH case)
+
+The routine hvm_has_dm() used to check for the empty list, the PVH
+case (#1).
+
+By changing from hvm_has_dm() to hvm_select_ioreq_server() both
+cases are considered.  Doing it this way allows
+hvm_send_assist_req() to only have 2 possible return values.
+
+The key part of skipping the retry is to do "rc = X86EMUL_OKAY"
+which is what the error path on the call to hvm_has_dm() does in
+hvmemul_do_io() (the only call on hvm_has_dm()).
+
+Since this case is no longer handled in hvm_send_assist_req(), move
+the call to hvm_complete_assist_req() into hvmemul_do_io().
+
+As part of this change, do the work of hvm_complete_assist_req() in
+the PVH case.  Acting more like real hardware looks to be better.
+
+Adding "rc = X86EMUL_OKAY" in the failing case of
+hvm_send_assist_req() would break what was done in commit
+bac0999325056a3b3a92f7622df7ffbc5388b1c3 and commit
+f20f3c8ece5c10fa7626f253d28f570a43b23208.  We are currently doing
+the succeeding case of hvm_send_assist_req() and retying the I/O.
+
+Since hvm_select_ioreq_server() has already been called, switch to
+using hvm_send_assist_req_to_ioreq_server().
+
+Since there is no longer any calls to hvm_send_assist_req(), drop
+that routine and rename hvm_send_assist_req_to_ioreq_server() to
+hvm_send_assist_req.
+
+Since hvm_send_assist_req() is an extern, add an ASSERT() on s.
+
+Signed-off-by: Don Slutz <dslutz@verizon.com>
+Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+---
+ xen/arch/x86/hvm/emulate.c    |   12 +++++++++---
+ xen/arch/x86/hvm/hvm.c        |   29 ++++++-----------------------
+ xen/include/asm-x86/hvm/hvm.h |    6 ++++--
+ 3 files changed, 19 insertions(+), 28 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 14c1847..8472a9d 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -218,21 +218,27 @@ static int hvmemul_do_io(
+             vio->io_state = HVMIO_handle_mmio_awaiting_completion;
+         break;
+     case X86EMUL_UNHANDLEABLE:
+-        /* If there is no backing DM, just ignore accesses */
+-        if ( !hvm_has_dm(curr->domain) )
++    {
++        struct hvm_ioreq_server *s =
++            hvm_select_ioreq_server(curr->domain, &p);
++
++        /* If there is no suitable backing DM, just ignore accesses */
++        if ( !s )
+         {
++            hvm_complete_assist_req(&p);
+             rc = X86EMUL_OKAY;
+             vio->io_state = HVMIO_none;
+         }
+         else
+         {
+             rc = X86EMUL_RETRY;
+-            if ( !hvm_send_assist_req(&p) )
++            if ( !hvm_send_assist_req(s, &p) )
+                 vio->io_state = HVMIO_none;
+             else if ( p_data == NULL )
+                 rc = X86EMUL_OKAY;
+         }
+         break;
++    }
+     default:
+         BUG();
+     }
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 7d53c6c..4a9687d 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -2354,8 +2354,8 @@ void hvm_vcpu_down(struct vcpu *v)
+     }
+ }
+ 
+-static struct hvm_ioreq_server *hvm_select_ioreq_server(struct domain *d,
+-                                                        ioreq_t *p)
++struct hvm_ioreq_server *hvm_select_ioreq_server(struct domain *d,
++                                                 ioreq_t *p)
+ {
+ #define CF8_BDF(cf8)     (((cf8) & 0x00ffff00) >> 8)
+ #define CF8_ADDR_LO(cf8) ((cf8) & 0x000000fc)
+@@ -2537,18 +2537,13 @@ int hvm_buffered_io_send(ioreq_t *p)
+     return 1;
+ }
+ 
+-bool_t hvm_has_dm(struct domain *d)
+-{
+-    return !list_empty(&d->arch.hvm_domain.ioreq_server.list);
+-}
+-
+-bool_t hvm_send_assist_req_to_ioreq_server(struct hvm_ioreq_server *s,
+-                                           ioreq_t *proto_p)
++bool_t hvm_send_assist_req(struct hvm_ioreq_server *s, ioreq_t *proto_p)
+ {
+     struct vcpu *curr = current;
+     struct domain *d = curr->domain;
+     struct hvm_ioreq_vcpu *sv;
+ 
++    ASSERT(s);
+     if ( unlikely(!vcpu_start_shutdown_deferral(curr)) )
+         return 0; /* implicitly bins the i/o operation */
+ 
+@@ -2601,7 +2596,7 @@ bool_t hvm_send_assist_req_to_ioreq_server(struct hvm_ioreq_server *s,
+     return 0;
+ }
+ 
+-static bool_t hvm_complete_assist_req(ioreq_t *p)
++void hvm_complete_assist_req(ioreq_t *p)
+ {
+     switch ( p->type )
+     {
+@@ -2627,18 +2622,6 @@ static bool_t hvm_complete_assist_req(ioreq_t *p)
+         hvm_io_assist(p);
+         break;
+     }
+-
+-    return 1;
+-}
+-
+-bool_t hvm_send_assist_req(ioreq_t *p)
+-{
+-    struct hvm_ioreq_server *s = hvm_select_ioreq_server(current->domain, p);
+-
+-    if ( !s )
+-        return hvm_complete_assist_req(p);
+-
+-    return hvm_send_assist_req_to_ioreq_server(s, p);
+ }
+ 
+ void hvm_broadcast_assist_req(ioreq_t *p)
+@@ -2651,7 +2634,7 @@ void hvm_broadcast_assist_req(ioreq_t *p)
+     list_for_each_entry ( s,
+                           &d->arch.hvm_domain.ioreq_server.list,
+                           list_entry )
+-        (void) hvm_send_assist_req_to_ioreq_server(s, p);
++        (void) hvm_send_assist_req(s, p);
+ }
+ 
+ void hvm_hlt(unsigned long rflags)
+diff --git a/xen/include/asm-x86/hvm/hvm.h b/xen/include/asm-x86/hvm/hvm.h
+index e3d2d9a..0dc909b 100644
+--- a/xen/include/asm-x86/hvm/hvm.h
++++ b/xen/include/asm-x86/hvm/hvm.h
+@@ -228,8 +228,11 @@ int hvm_vcpu_cacheattr_init(struct vcpu *v);
+ void hvm_vcpu_cacheattr_destroy(struct vcpu *v);
+ void hvm_vcpu_reset_state(struct vcpu *v, uint16_t cs, uint16_t ip);
+ 
+-bool_t hvm_send_assist_req(ioreq_t *p);
++struct hvm_ioreq_server *hvm_select_ioreq_server(struct domain *d,
++                                                 ioreq_t *p);
++bool_t hvm_send_assist_req(struct hvm_ioreq_server *s, ioreq_t *p);
+ void hvm_broadcast_assist_req(ioreq_t *p);
++void hvm_complete_assist_req(ioreq_t *p);
+ 
+ void hvm_get_guest_pat(struct vcpu *v, u64 *guest_pat);
+ int hvm_set_guest_pat(struct vcpu *v, u64 guest_pat);
+@@ -359,7 +362,6 @@ void hvm_hypervisor_cpuid_leaf(uint32_t sub_idx,
+ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+                                    unsigned int *ecx, unsigned int *edx);
+ void hvm_migrate_timers(struct vcpu *v);
+-bool_t hvm_has_dm(struct domain *d);
+ bool_t hvm_io_pending(struct vcpu *v);
+ void hvm_do_resume(struct vcpu *v);
+ void hvm_migrate_pirqs(struct vcpu *v);
+-- 
+1.7.10.4
+

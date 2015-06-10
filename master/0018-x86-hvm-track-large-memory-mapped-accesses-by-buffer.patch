@@ -1,0 +1,165 @@
+From 1fbedaed6274f4778207c044a3c0acb0018e805a Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Fri, 5 Jun 2015 14:33:13 +0100
+Subject: [PATCH 18/18] x86/hvm: track large memory mapped accesses by buffer
+ offset
+
+The code in hvmemul_do_io() that tracks large reads or writes, to avoid
+re-issue of component I/O, is defeated by accesses across a page boundary
+because it uses physical address. The code is also only relevant to memory
+mapped I/O to or from a buffer.
+
+This patch re-factors the code and moves it into hvmemul_phys_mmio_access()
+where it is relevant and tracks using buffer offset rather then address.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Cc: Keir Fraser <keir@xen.org>
+Cc: Jan Beulich <jbeulich@suse.com>
+Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index ea51a0c..2569731 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -369,58 +369,7 @@ static int hvmemul_do_mmio_buffer(paddr_t mmio_gpa,
+                                   bool_t df,
+                                   uint8_t *buffer)
+ {
+-    struct vcpu *curr = current;
+-    struct hvm_vcpu_io *vio = &curr->arch.hvm_vcpu.hvm_io;
+-    int rc;
+-
+-    if ( dir == IOREQ_WRITE )
+-    {
+-        paddr_t pa = vio->mmio_large_write_pa;
+-        unsigned int bytes = vio->mmio_large_write_bytes;
+-        if ( (mmio_gpa >= pa) && ((mmio_gpa + size) <= (pa + bytes)) )
+-            return X86EMUL_OKAY;
+-    }
+-    else
+-    {
+-        paddr_t pa = vio->mmio_large_read_pa;
+-        unsigned int bytes = vio->mmio_large_read_bytes;
+-        if ( (mmio_gpa >= pa) && ((mmio_gpa + size) <= (pa + bytes)) )
+-        {
+-            memcpy(buffer, &vio->mmio_large_read[mmio_gpa - pa],
+-                   size);
+-            return X86EMUL_OKAY;
+-        }
+-    }
+-
+-    rc = hvmemul_do_io_buffer(1, mmio_gpa, reps, size, dir, df, buffer);
+-
+-    if ( rc != X86EMUL_OKAY )
+-        return rc;
+-
+-    if ( dir == IOREQ_WRITE )
+-    {
+-        paddr_t pa = vio->mmio_large_write_pa;
+-        unsigned int bytes = vio->mmio_large_write_bytes;
+-        if ( bytes == 0 )
+-            pa = vio->mmio_large_write_pa = mmio_gpa;
+-        if ( mmio_gpa == (pa + bytes) )
+-            vio->mmio_large_write_bytes += size;
+-    }
+-    else
+-    {
+-        paddr_t pa = vio->mmio_large_read_pa;
+-        unsigned int bytes = vio->mmio_large_read_bytes;
+-        if ( bytes == 0 )
+-            pa = vio->mmio_large_read_pa = mmio_gpa;
+-        if ( (mmio_gpa == (pa + bytes)) &&
+-             ((bytes + size) <= sizeof(vio->mmio_large_read)) )
+-        {
+-            memcpy(&vio->mmio_large_read[bytes], buffer, size);
+-            vio->mmio_large_read_bytes += size;
+-        }
+-    }
+-
+-    return X86EMUL_OKAY;
++    return hvmemul_do_io_buffer(1, mmio_gpa, reps, size, dir, df, buffer);
+ }
+ 
+ /*
+@@ -606,6 +555,7 @@ static int hvmemul_phys_mmio_access(paddr_t gpa,
+                                     uint8_t *buffer,
+                                     unsigned int *off)
+ {
++    struct hvm_vcpu_io *vio = &current->arch.hvm_vcpu.hvm_io;
+     unsigned long one_rep = 1;
+     unsigned int chunk;
+     int rc = 0;
+@@ -625,10 +575,34 @@ static int hvmemul_phys_mmio_access(paddr_t gpa,
+ 
+     while ( size != 0 )
+     {
+-        rc = hvmemul_do_mmio_buffer(gpa, &one_rep, chunk, dir, 0,
+-                                    &buffer[*off]);
+-        if ( rc != X86EMUL_OKAY )
+-            break;
++        /* Have we already done this chunk? */
++        if ( (*off + chunk) <= vio->mmio_cache[dir].size )
++        {
++            ASSERT(*off + chunk <= vio->mmio_cache[dir].size);
++
++            if ( dir == IOREQ_READ )
++                memcpy(&buffer[*off],
++                       &vio->mmio_cache[IOREQ_READ].buffer[*off],
++                       chunk);
++            else
++                ASSERT(memcmp(&buffer[*off],
++                              &vio->mmio_cache[IOREQ_WRITE].buffer[*off],
++                              chunk) == 0);
++        }
++        else
++        {
++            ASSERT(*off == vio->mmio_cache[dir].size);
++
++            rc = hvmemul_do_mmio_buffer(gpa, &one_rep, chunk, dir, 0,
++                                        &buffer[*off]);
++            if ( rc != X86EMUL_OKAY )
++                break;
++
++            /* Note that we have now done this chunk */
++            memcpy(&vio->mmio_cache[dir].buffer[*off],
++                   &buffer[*off], chunk);
++            vio->mmio_cache[dir].size += chunk;
++        }
+ 
+         /* Advance to the next chunk */
+         gpa += chunk;
+@@ -1536,7 +1510,7 @@ static int _hvm_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt,
+         rc = X86EMUL_RETRY;
+     if ( rc != X86EMUL_RETRY )
+     {
+-        vio->mmio_large_read_bytes = vio->mmio_large_write_bytes = 0;
++        memset(&vio->mmio_cache, 0, sizeof(vio->mmio_cache));
+         vio->mmio_insn_bytes = 0;
+     }
+     else
+diff --git a/xen/include/asm-x86/hvm/vcpu.h b/xen/include/asm-x86/hvm/vcpu.h
+index 008c8fa..4f41c83 100644
+--- a/xen/include/asm-x86/hvm/vcpu.h
++++ b/xen/include/asm-x86/hvm/vcpu.h
+@@ -61,13 +61,15 @@ struct hvm_vcpu_io {
+     unsigned long       mmio_gva;
+     unsigned long       mmio_gpfn;
+ 
+-    /* We may read up to m256 as a number of device-model transactions. */
+-    paddr_t mmio_large_read_pa;
+-    uint8_t mmio_large_read[32];
+-    unsigned int mmio_large_read_bytes;
+-    /* We may write up to m256 as a number of device-model transactions. */
+-    unsigned int mmio_large_write_bytes;
+-    paddr_t mmio_large_write_pa;
++    /*
++     * We may read or write up to m256 as a number of device-model
++     * transactions.
++     */
++    struct {
++        unsigned long size;
++        uint8_t buffer[32];
++    } mmio_cache[2]; /* Indexed by ioreq type */
++
+     /* For retries we shouldn't re-fetch the instruction. */
+     unsigned int mmio_insn_bytes;
+     unsigned char mmio_insn[16];

@@ -1,0 +1,193 @@
+From 2978087be327115f7fcd3ad63431b9019d435700 Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Wed, 20 May 2015 13:07:18 +0100
+Subject: [PATCH 13/18] x86/hvm: use ioreq_t to track in-flight state
+
+Use an ioreq_t rather than open coded state, size, dir and data fields
+in struct hvm_vcpu_io. This also allows PIO completion to be handled
+similarly to MMIO completion by re-issuing the handle_pio() call.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Cc: Keir Fraser <keir@xen.org>
+Cc: Jan Beulich <jbeulich@suse.com>
+Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 1732a7d..3c9d606 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -93,6 +93,7 @@ static int hvmemul_do_io(
+         .df = df,
+         .data = data,
+         .data_is_ptr = data_is_addr, /* ioreq_t field name is misleading */
++        .state = STATE_IOREQ_READY,
+     };
+     void *p_data = (void *)data;
+     int rc;
+@@ -130,23 +131,19 @@ static int hvmemul_do_io(
+         }
+     }
+ 
+-    switch ( vio->io_state )
++    switch ( vio->io_req.state )
+     {
+     case STATE_IOREQ_NONE:
+         break;
+     case STATE_IORESP_READY:
+-        vio->io_state = STATE_IOREQ_NONE;
++        vio->io_req.state = STATE_IOREQ_NONE;
++        p = vio->io_req;
+         BUG_ON(data_is_addr || dir == IOREQ_WRITE);
+         goto finish_access;
+     default:
+         BUG();
+     }
+ 
+-    vio->io_state = STATE_IOREQ_READY;
+-    vio->io_size = size;
+-    vio->io_dir = dir;
+-    vio->io_data_is_addr = data_is_addr;
+-
+     if ( dir == IOREQ_WRITE )
+     {
+         if ( !data_is_addr )
+@@ -155,13 +152,14 @@ static int hvmemul_do_io(
+         hvmtrace_io_assist(is_mmio, &p);
+     }
+ 
++    vio->io_req = p;
++
+     rc = hvm_io_intercept(&p);
+ 
+     switch ( rc )
+     {
+     case X86EMUL_OKAY:
+-        vio->io_data = p.data;
+-        vio->io_state = STATE_IOREQ_NONE;
++        vio->io_req.state = STATE_IOREQ_NONE;
+         break;
+     case X86EMUL_UNHANDLEABLE:
+     {
+@@ -172,15 +170,13 @@ static int hvmemul_do_io(
+         if ( !s )
+         {
+             rc = process_io_intercept(curr, &p, &null_handler);
+-            if ( rc == X86EMUL_OKAY )
+-                vio->io_data = p.data;
+-            vio->io_state = STATE_IOREQ_NONE;
++            vio->io_req.state = STATE_IOREQ_NONE;
+         }
+         else
+         {
+             rc = hvm_send_assist_req(s, &p);
+             if ( rc != X86EMUL_RETRY )
+-                vio->io_state = STATE_IOREQ_NONE;
++                vio->io_req.state = STATE_IOREQ_NONE;
+             else if ( data_is_addr || dir == IOREQ_WRITE )
+                 rc = X86EMUL_OKAY;
+         }
+@@ -199,7 +195,7 @@ static int hvmemul_do_io(
+         hvmtrace_io_assist(is_mmio, &p);
+ 
+         if ( !data_is_addr )
+-            memcpy(p_data, &vio->io_data, size);
++            memcpy(p_data, &p.data, size);
+     }
+ 
+     if ( is_mmio && !data_is_addr )
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 1352bf6..84f0327 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -408,11 +408,11 @@ static void hvm_io_assist(ioreq_t *p)
+ 
+     if ( HVMIO_NEED_COMPLETION(vio) )
+     {
+-        vio->io_state = STATE_IORESP_READY;
+-        vio->io_data = p->data;
++        vio->io_req.state = STATE_IORESP_READY;
++        vio->io_req.data = p->data;
+     }
+     else
+-        vio->io_state = STATE_IOREQ_NONE;
++        vio->io_req.state = STATE_IOREQ_NONE;
+ 
+     msix_write_completion(curr);
+     vcpu_end_shutdown_deferral(curr);
+@@ -488,11 +488,12 @@ void hvm_do_resume(struct vcpu *v)
+         (void)handle_mmio();
+         break;
+     case HVMIO_pio_completion:
+-        if ( vio->io_size == 4 ) /* Needs zero extension. */
+-            guest_cpu_user_regs()->rax = (uint32_t)vio->io_data;
++        if ( vio->io_req.size == 4 ) /* Needs zero extension. */
++            guest_cpu_user_regs()->rax = (uint32_t)vio->io_req.data;
+         else
+-            memcpy(&guest_cpu_user_regs()->rax, &vio->io_data, vio->io_size);
+-        vio->io_state = STATE_IOREQ_NONE;
++            memcpy(&guest_cpu_user_regs()->rax, &vio->io_req.data,
++                   vio->io_req.size);
++        vio->io_req.state = STATE_IOREQ_NONE;
+         break;
+     case HVMIO_realmode_completion:
+     {
+diff --git a/xen/arch/x86/hvm/svm/nestedsvm.c b/xen/arch/x86/hvm/svm/nestedsvm.c
+index 8b165c6..78667a2 100644
+--- a/xen/arch/x86/hvm/svm/nestedsvm.c
++++ b/xen/arch/x86/hvm/svm/nestedsvm.c
+@@ -1231,7 +1231,7 @@ enum hvm_intblk nsvm_intr_blocked(struct vcpu *v)
+          * Delay the injection because this would result in delivering
+          * an interrupt *within* the execution of an instruction.
+          */
+-        if ( v->arch.hvm_vcpu.hvm_io.io_state != STATE_IOREQ_NONE )
++        if ( v->arch.hvm_vcpu.hvm_io.io_req.state != STATE_IOREQ_NONE )
+             return hvm_intblk_shadow;
+ 
+         if ( !nv->nv_vmexit_pending && n2vmcb->exitintinfo.bytes != 0 ) {
+diff --git a/xen/arch/x86/hvm/vmx/realmode.c b/xen/arch/x86/hvm/vmx/realmode.c
+index 4135ad4..0f3124d 100644
+--- a/xen/arch/x86/hvm/vmx/realmode.c
++++ b/xen/arch/x86/hvm/vmx/realmode.c
+@@ -205,7 +205,7 @@ void vmx_realmode(struct cpu_user_regs *regs)
+ 
+         vmx_realmode_emulate_one(&hvmemul_ctxt);
+ 
+-        if ( vio->io_state != STATE_IOREQ_NONE || vio->mmio_retry )
++        if ( vio->io_req.state != STATE_IOREQ_NONE || vio->mmio_retry )
+             break;
+ 
+         /* Stop emulating unless our segment state is not safe */
+@@ -219,7 +219,7 @@ void vmx_realmode(struct cpu_user_regs *regs)
+     }
+ 
+     /* Need to emulate next time if we've started an IO operation */
+-    if ( vio->io_state != STATE_IOREQ_NONE )
++    if ( vio->io_req.state != STATE_IOREQ_NONE )
+         curr->arch.hvm_vmx.vmx_emulate = 1;
+ 
+     if ( !curr->arch.hvm_vmx.vmx_emulate && !curr->arch.hvm_vmx.vmx_realmode )
+diff --git a/xen/include/asm-x86/hvm/vcpu.h b/xen/include/asm-x86/hvm/vcpu.h
+index f797518..7338638 100644
+--- a/xen/include/asm-x86/hvm/vcpu.h
++++ b/xen/include/asm-x86/hvm/vcpu.h
+@@ -44,17 +44,13 @@ struct hvm_vcpu_asid {
+ 
+ struct hvm_vcpu_io {
+     /* I/O request in flight to device model. */
+-    uint8_t                io_state;
+-    unsigned long          io_data;
+-    int                    io_size;
++    ioreq_t                io_req;
+     enum hvm_io_completion io_completion;
+-    uint8_t                io_dir;
+-    uint8_t                io_data_is_addr;
+ 
+ #define HVMIO_NEED_COMPLETION(_vio) \
+-    ( ((_vio)->io_state == STATE_IOREQ_READY) &&    \
+-      !(_vio)->io_data_is_addr && \
+-      ((_vio)->io_dir == IOREQ_READ) )
++    ( ((_vio)->io_req.state == STATE_IOREQ_READY) &&    \
++      !(_vio)->io_req.data_is_ptr && \
++      ((_vio)->io_req.dir == IOREQ_READ) )
+ 
+     /*
+      * HVM emulation:
