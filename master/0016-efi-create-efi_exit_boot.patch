@@ -8,31 +8,34 @@ to support multiboot2 protocol on EFI platforms.
 
 Signed-off-by: Daniel Kiper <daniel.kiper@oracle.com>
 diff --git a/xen/common/efi/boot.c b/xen/common/efi/boot.c
-index f8058ff..d96bb5c 100644
+index 7c50386..cda22dc 100644
 --- a/xen/common/efi/boot.c
 +++ b/xen/common/efi/boot.c
-@@ -864,6 +864,49 @@ static void __init efi_set_gop_mode(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINTN gop
+@@ -872,6 +872,54 @@ static void __init efi_set_gop_mode(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINTN gop
          efi_arch_video_init(gop, info_size, mode_info);
  }
  
 +static void __init efi_exit_boot(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 +{
 +    EFI_STATUS status;
-+    UINTN map_alloc_size, map_key;
++    UINTN map_key, info_size;
 +    bool_t retry;
 +
-+    efi_bs->GetMemoryMap(&map_alloc_size, NULL, &map_key,
++    info_size = 0;
++    efi_bs->GetMemoryMap(&info_size, NULL, &map_key,
 +                         &efi_mdesc_size, &mdesc_ver);
-+    map_alloc_size += 8 * efi_mdesc_size;
-+    efi_memmap = efi_arch_allocate_mmap_buffer(map_alloc_size);
++    info_size += 8 * efi_mdesc_size;
++    efi_memmap = efi_arch_allocate_mmap_buffer(info_size);
 +    if ( !efi_memmap )
 +        blexit(L"Unable to allocate memory for EFI memory map");
 +
 +    for ( retry = 0; ; retry = 1 )
 +    {
-+        efi_memmap_size = map_alloc_size;
-+        status = efi_bs->GetMemoryMap(&efi_memmap_size, efi_memmap, &map_key,
-+                                      &efi_mdesc_size, &mdesc_ver);
++        efi_memmap_size = info_size;
++        status = SystemTable->BootServices->GetMemoryMap(&efi_memmap_size,
++                                                         efi_memmap, &map_key,
++                                                         &efi_mdesc_size,
++                                                         &mdesc_ver);
 +        if ( EFI_ERROR(status) )
 +            PrintErrMesg(L"Cannot obtain memory map", status);
 +
@@ -41,7 +44,9 @@ index f8058ff..d96bb5c 100644
 +
 +        efi_arch_pre_exit_boot();
 +
-+        status = efi_bs->ExitBootServices(ImageHandle, map_key);
++        status = SystemTable->BootServices->ExitBootServices(ImageHandle,
++                                                             map_key);
++        efi_bs = NULL;
 +        if ( status != EFI_INVALID_PARAMETER || retry )
 +            break;
 +    }
@@ -61,11 +66,11 @@ index f8058ff..d96bb5c 100644
  static int __init __maybe_unused set_color(u32 mask, int bpp, u8 *pos, u8 *sz)
  {
     if ( bpp < 0 )
-@@ -888,11 +931,11 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+@@ -896,11 +944,11 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
      EFI_STATUS status;
      unsigned int i, argc;
      CHAR16 **argv, *file_name, *cfg_file_name = NULL, *options = NULL;
--    UINTN map_alloc_size, map_key, gop_mode = ~0;
+-    UINTN map_key, info_size, gop_mode = ~0;
 +    UINTN gop_mode = ~0;
      EFI_SHIM_LOCK_PROTOCOL *shim_lock;
      EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
@@ -75,22 +80,25 @@ index f8058ff..d96bb5c 100644
      char *option_str;
      bool_t use_cfg_file;
  
-@@ -1108,41 +1151,7 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+@@ -1119,46 +1167,7 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
  
      efi_set_gop_mode(gop, gop_mode);
  
--    efi_bs->GetMemoryMap(&map_alloc_size, NULL, &map_key,
+-    info_size = 0;
+-    efi_bs->GetMemoryMap(&info_size, NULL, &map_key,
 -                         &efi_mdesc_size, &mdesc_ver);
--    map_alloc_size += 8 * efi_mdesc_size;
--    efi_memmap = efi_arch_allocate_mmap_buffer(map_alloc_size);
+-    info_size += 8 * efi_mdesc_size;
+-    efi_memmap = efi_arch_allocate_mmap_buffer(info_size);
 -    if ( !efi_memmap )
 -        blexit(L"Unable to allocate memory for EFI memory map");
 -
 -    for ( retry = 0; ; retry = 1 )
 -    {
--        efi_memmap_size = map_alloc_size;
--        status = efi_bs->GetMemoryMap(&efi_memmap_size, efi_memmap, &map_key,
--                                      &efi_mdesc_size, &mdesc_ver);
+-        efi_memmap_size = info_size;
+-        status = SystemTable->BootServices->GetMemoryMap(&efi_memmap_size,
+-                                                         efi_memmap, &map_key,
+-                                                         &efi_mdesc_size,
+-                                                         &mdesc_ver);
 -        if ( EFI_ERROR(status) )
 -            PrintErrMesg(L"Cannot obtain memory map", status);
 -
@@ -99,7 +107,9 @@ index f8058ff..d96bb5c 100644
 -
 -        efi_arch_pre_exit_boot();
 -
--        status = efi_bs->ExitBootServices(ImageHandle, map_key);
+-        status = SystemTable->BootServices->ExitBootServices(ImageHandle,
+-                                                             map_key);
+-        efi_bs = NULL;
 -        if ( status != EFI_INVALID_PARAMETER || retry )
 -            break;
 -    }
