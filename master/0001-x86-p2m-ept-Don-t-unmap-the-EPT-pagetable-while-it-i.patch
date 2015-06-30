@@ -1,0 +1,69 @@
+From c23ce93ce4142fe33a001efbbb8f0d10f28fd89e Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 30 Jun 2015 18:06:14 +0100
+Subject: [PATCH] x86/p2m-ept: Don't unmap the EPT pagetable while it is still
+ in use
+
+The call to iommu_pte_flush() between the two hunks uses &ept_entry->epte
+which is a pointer into the mapped page.
+
+It is eventually passed to `clflush` instruction which will suffer a pagefault
+if the virtual mapping has fallen out of the TLB.
+
+    (XEN) ----[ Xen-4.5.0-xs102594-d  x86_64  debug=y  Not tainted ]----
+    (XEN) CPU:    7
+    (XEN) RIP:    e008:[<ffff82d0801572f0>] cacheline_flush+0x4/0x9
+    <snip>
+    (XEN) Xen call trace:
+    (XEN)    [<ffff82d0801572f0>] cacheline_flush+0x4/0x9
+    (XEN)    [<ffff82d08014ffff>] __iommu_flush_cache+0x4a/0x6a
+    (XEN)    [<ffff82d0801532e2>] iommu_pte_flush+0x2b/0xd5
+    (XEN)    [<ffff82d0801f909a>] ept_set_entry+0x4bc/0x61f
+    (XEN)    [<ffff82d0801f0c25>] p2m_set_entry+0xd1/0x112
+    (XEN)    [<ffff82d0801f25b1>] clear_mmio_p2m_entry+0x1a0/0x200
+    (XEN)    [<ffff82d0801f4aac>] unmap_mmio_regions+0x49/0x73
+    (XEN)    [<ffff82d080106292>] do_domctl+0x15bd/0x1edb
+    (XEN)    [<ffff82d080234fcb>] syscall_enter+0xeb/0x145
+    (XEN)
+    (XEN) Pagetable walk from ffff820040004ae0:
+    (XEN)  L4[0x104] = 00000008668a5063 ffffffffffffffff
+    (XEN)  L3[0x001] = 00000008668a3063 ffffffffffffffff
+    (XEN)  L2[0x000] = 000000086689c063 ffffffffffffffff
+    (XEN)  L1[0x004] = 000000056f078063 000000000007f678
+    (XEN)
+    (XEN) ****************************************
+    (XEN) Panic on CPU 7:
+    (XEN) FATAL PAGE FAULT
+    (XEN) [error_code=0000]
+    (XEN) Faulting linear address: ffff820040004ae0
+    (XEN) ****************************************
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Jan Beulich <JBeulich@suse.com>
+CC: George Dunlap <george.dunlap@eu.citrix.com>
+CC: Jun Nakajima <jun.nakajima@intel.com>
+CC: Eddie Dong <eddie.dong@intel.com>
+CC: Kevin Tian <kevin.tian@intel.com>
+
+diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
+index 15c6e83..3a3398d 100644
+--- a/xen/arch/x86/mm/p2m-ept.c
++++ b/xen/arch/x86/mm/p2m-ept.c
+@@ -763,8 +763,6 @@ ept_set_entry(struct p2m_domain *p2m, unsigned long gfn, mfn_t mfn,
+         p2m->max_mapped_pfn = gfn + (1UL << order) - 1;
+ 
+ out:
+-    unmap_domain_page(table);
+-
+     if ( needs_sync != sync_off )
+         ept_sync_domain(p2m);
+ 
+@@ -787,6 +785,8 @@ out:
+         }
+     }
+ 
++    unmap_domain_page(table);
++
+     /* Release the old intermediate tables, if any.  This has to be the
+        last thing we do, after the ept_sync_domain() and removal
+        from the iommu tables, so as to avoid a potential
