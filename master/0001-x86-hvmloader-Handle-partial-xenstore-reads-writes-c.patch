@@ -1,0 +1,69 @@
+From 73d675a84f06f0e4d0912ebabf1779109e5f0927 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 3 Jul 2015 13:10:05 +0100
+Subject: [PATCH 1/3] x86/hvmloader: Handle partial xenstore reads/writes
+ correctly
+
+The functions ring_read and ring_write() have logic to try and deal with
+partial reads/writes.
+
+However, in all cases where the "while ()" loop executed twice, data
+corruption would occur as the second memcpy() starts from the beginning of
+"data" again, rather than from where it got to.
+
+This bug manifested itself as protocol corruption when a reply header crossed
+the first wrap of the response ring.  However, similar corruption would also
+occur if hvmloader observed xenstored performing partial writes of the block
+in question, or if hvmloader had to wait for xenstored to make space in either
+ring.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+CC: Jan Beulich <JBeulich@suse.com>
+diff --git a/tools/firmware/hvmloader/xenbus.c b/tools/firmware/hvmloader/xenbus.c
+index f900a1e..00513f7 100644
+--- a/tools/firmware/hvmloader/xenbus.c
++++ b/tools/firmware/hvmloader/xenbus.c
+@@ -105,7 +105,7 @@ void xenbus_shutdown(void)
+ /* Helper functions: copy data in and out of the ring */
+ static void ring_write(const char *data, uint32_t len)
+ {
+-    uint32_t part;
++    uint32_t part, done = 0;
+ 
+     ASSERT(len <= XENSTORE_PAYLOAD_MAX);
+ 
+@@ -122,16 +122,18 @@ static void ring_write(const char *data, uint32_t len)
+         if ( part > len ) 
+             part = len;
+ 
+-        memcpy(rings->req + MASK_XENSTORE_IDX(rings->req_prod), data, part);
++        memcpy(rings->req + MASK_XENSTORE_IDX(rings->req_prod),
++               data + done, part);
+         barrier(); /* = wmb before prod write, rmb before next cons read */
+         rings->req_prod += part;
+         len -= part;
++        done += part;
+     }
+ }
+ 
+ static void ring_read(char *data, uint32_t len)
+ {
+-    uint32_t part;
++    uint32_t part, done = 0;
+ 
+     ASSERT(len <= XENSTORE_PAYLOAD_MAX);
+ 
+@@ -148,10 +150,12 @@ static void ring_read(char *data, uint32_t len)
+         if ( part > len )
+             part = len;
+ 
+-        memcpy(data, rings->rsp + MASK_XENSTORE_IDX(rings->rsp_cons), part);
++        memcpy(data + done,
++               rings->rsp + MASK_XENSTORE_IDX(rings->rsp_cons), part);
+         barrier(); /* = wmb before cons write, rmb before next prod read */
+         rings->rsp_cons += part;
+         len -= part;
++        done += part;
+     }
+ }
+ 
