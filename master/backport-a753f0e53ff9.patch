@@ -1,0 +1,110 @@
+From a753f0e53ff973a8a066e86c1cb3d6dd5c68d59f Mon Sep 17 00:00:00 2001
+From: David Vrabel <david.vrabel@citrix.com>
+Date: Mon, 22 Jun 2015 11:38:01 +0200
+Subject: [PATCH] evtchn: defer freeing struct evtchn's until
+ evtchn_destroy_final()
+
+notify_via_xen_event_channel() and free_xen_event_channel() had to
+check if the domain was dying because they may be called while the
+domain is being destroyed and the struct evtchn's are being freed.
+
+By deferring the freeing of the struct evtchn's until all references
+to the domain are dropped, these functions can rely on the channel
+state being present and valid.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index 99b0041..80ddea9 100644
+--- a/xen/common/event_channel.c
++++ b/xen/common/event_channel.c
+@@ -1174,21 +1174,7 @@ int alloc_unbound_xen_event_channel(
+ 
+ void free_xen_event_channel(struct domain *d, int port)
+ {
+-    struct evtchn *chn;
+-
+-    spin_lock(&d->event_lock);
+-
+-    if ( unlikely(d->is_dying) )
+-    {
+-        spin_unlock(&d->event_lock);
+-        return;
+-    }
+-
+     BUG_ON(!port_is_valid(d, port));
+-    chn = evtchn_from_port(d, port);
+-    BUG_ON(!consumer_is_xen(chn));
+-
+-    spin_unlock(&d->event_lock);
+ 
+     evtchn_close(d, port, 0);
+ }
+@@ -1202,18 +1188,12 @@ void notify_via_xen_event_channel(struct domain *ld, int lport)
+ 
+     spin_lock(&ld->event_lock);
+ 
+-    if ( unlikely(ld->is_dying) )
+-    {
+-        spin_unlock(&ld->event_lock);
+-        return;
+-    }
+-
+     ASSERT(port_is_valid(ld, lport));
+     lchn = evtchn_from_port(ld, lport);
+-    ASSERT(consumer_is_xen(lchn));
+ 
+     if ( likely(lchn->state == ECS_INTERDOMAIN) )
+     {
++        ASSERT(consumer_is_xen(lchn));
+         rd    = lchn->u.interdomain.remote_dom;
+         rport = lchn->u.interdomain.remote_port;
+         rchn  = evtchn_from_port(rd, rport);
+@@ -1281,7 +1261,7 @@ int evtchn_init(struct domain *d)
+ 
+ void evtchn_destroy(struct domain *d)
+ {
+-    unsigned int i, j;
++    unsigned int i;
+ 
+     /* After this barrier no new event-channel allocations can occur. */
+     BUG_ON(!d->is_dying);
+@@ -1291,8 +1271,17 @@ void evtchn_destroy(struct domain *d)
+     for ( i = 0; port_is_valid(d, i); i++ )
+         evtchn_close(d, i, 0);
+ 
++    clear_global_virq_handlers(d);
++
++    evtchn_fifo_destroy(d);
++}
++
++
++void evtchn_destroy_final(struct domain *d)
++{
++    unsigned int i, j;
++
+     /* Free all event-channel buckets. */
+-    spin_lock(&d->event_lock);
+     for ( i = 0; i < NR_EVTCHN_GROUPS; i++ )
+     {
+         if ( !d->evtchn_group[i] )
+@@ -1300,20 +1289,9 @@ void evtchn_destroy(struct domain *d)
+         for ( j = 0; j < BUCKETS_PER_GROUP; j++ )
+             free_evtchn_bucket(d, d->evtchn_group[i][j]);
+         xfree(d->evtchn_group[i]);
+-        d->evtchn_group[i] = NULL;
+     }
+     free_evtchn_bucket(d, d->evtchn);
+-    d->evtchn = NULL;
+-    spin_unlock(&d->event_lock);
+-
+-    clear_global_virq_handlers(d);
+ 
+-    evtchn_fifo_destroy(d);
+-}
+-
+-
+-void evtchn_destroy_final(struct domain *d)
+-{
+ #if MAX_VIRT_CPUS > BITS_PER_LONG
+     xfree(d->poll_mask);
+     d->poll_mask = NULL;

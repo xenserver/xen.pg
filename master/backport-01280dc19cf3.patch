@@ -1,0 +1,67 @@
+From 01280dc19cf3da089f98faf4f524b54b5a191df0 Mon Sep 17 00:00:00 2001
+From: David Vrabel <david.vrabel@citrix.com>
+Date: Thu, 18 Jun 2015 14:53:23 +0200
+Subject: [PATCH] evtchn: simplify port_is_valid()
+
+By keeping a count of the number of currently valid event channels,
+port_is_valid() can be simplified.
+
+d->valid_evtchns is only increased (while holding d->event_lock), so
+port_is_valid() may be safely called without taking the lock (this
+will be useful later).
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index 0d4c081..ed532e9 100644
+--- a/xen/common/event_channel.c
++++ b/xen/common/event_channel.c
+@@ -191,6 +191,8 @@ static int get_free_port(struct domain *d)
+         return -ENOMEM;
+     bucket_from_port(d, port) = chn;
+ 
++    write_atomic(&d->valid_evtchns, d->valid_evtchns + EVTCHNS_PER_BUCKET);
++
+     return port;
+ }
+ 
+@@ -1263,6 +1265,7 @@ int evtchn_init(struct domain *d)
+     d->evtchn = alloc_evtchn_bucket(d, 0);
+     if ( !d->evtchn )
+         return -ENOMEM;
++    d->valid_evtchns = EVTCHNS_PER_BUCKET;
+ 
+     spin_lock_init_prof(d, event_lock);
+     if ( get_free_port(d) != 0 )
+diff --git a/xen/include/xen/event.h b/xen/include/xen/event.h
+index 7f73ee7..fbd535b 100644
+--- a/xen/include/xen/event.h
++++ b/xen/include/xen/event.h
+@@ -89,11 +89,7 @@ static inline bool_t port_is_valid(struct domain *d, unsigned int p)
+ {
+     if ( p >= d->max_evtchns )
+         return 0;
+-    if ( !d->evtchn )
+-        return 0;
+-    if ( p < EVTCHNS_PER_BUCKET )
+-        return 1;
+-    return group_from_port(d, p) != NULL && bucket_from_port(d, p) != NULL;
++    return p < read_atomic(&d->valid_evtchns);
+ }
+ 
+ static inline struct evtchn *evtchn_from_port(struct domain *d, unsigned int p)
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 46fc6e3..47c3fde 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -335,8 +335,9 @@ struct domain
+     /* Event channel information. */
+     struct evtchn   *evtchn;                         /* first bucket only */
+     struct evtchn  **evtchn_group[NR_EVTCHN_GROUPS]; /* all other buckets */
+-    unsigned int     max_evtchns;
+-    unsigned int     max_evtchn_port;
++    unsigned int     max_evtchns;     /* number supported by ABI */
++    unsigned int     max_evtchn_port; /* max permitted port number */
++    unsigned int     valid_evtchns;   /* number of allocated event channels */
+     spinlock_t       event_lock;
+     const struct evtchn_port_ops *evtchn_port_ops;
+     struct evtchn_fifo_domain *evtchn_fifo;
