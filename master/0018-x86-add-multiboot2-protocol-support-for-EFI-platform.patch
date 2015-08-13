@@ -5,7 +5,7 @@ Subject: [PATCH 18/18] x86: add multiboot2 protocol support for EFI platforms
 
 Signed-off-by: Daniel Kiper <daniel.kiper@oracle.com>
 diff --git a/xen/arch/x86/boot/head.S b/xen/arch/x86/boot/head.S
-index 7861057..89f5aa7 100644
+index 7144d37..adb9a80 100644
 --- a/xen/arch/x86/boot/head.S
 +++ b/xen/arch/x86/boot/head.S
 @@ -8,6 +8,7 @@
@@ -16,7 +16,7 @@ index 7861057..89f5aa7 100644
  
          .text
          .code32
-@@ -57,6 +58,9 @@ ENTRY(start)
+@@ -58,6 +59,9 @@ multiboot1_header_end:
          .long   .Lmultiboot2_info_req_end - .Lmultiboot2_info_req
          .long   MULTIBOOT2_TAG_TYPE_BASIC_MEMINFO
          .long   MULTIBOOT2_TAG_TYPE_MMAP
@@ -26,7 +26,7 @@ index 7861057..89f5aa7 100644
  .Lmultiboot2_info_req_end:
  
          .align  MULTIBOOT2_TAG_ALIGN
-@@ -80,6 +84,19 @@ ENTRY(start)
+@@ -81,6 +85,19 @@ multiboot1_header_end:
          .long   0 /* Number of the lines - no preference. */
          .long   0 /* Number of bits per pixel - no preference. */
  
@@ -46,7 +46,7 @@ index 7861057..89f5aa7 100644
          /* Multiboot2 header end tag. */
          .align  MULTIBOOT2_TAG_ALIGN
          .short  MULTIBOOT2_HEADER_TAG_END
-@@ -94,6 +111,17 @@ ENTRY(start)
+@@ -95,6 +112,17 @@ multiboot1_header_end:
  gdt_boot_descr:
          .word   6*8-1
          .long   sym_phys(trampoline_gdt)
@@ -64,7 +64,7 @@ index 7861057..89f5aa7 100644
  
  .Lbad_cpu_msg: .asciz "ERR: Not a 64-bit CPU!"
  .Lbad_ldr_msg: .asciz "ERR: Not a Multiboot bootloader!"
-@@ -124,6 +152,133 @@ print_err:
+@@ -125,6 +153,133 @@ print_err:
  .Lhalt: hlt
          jmp     .Lhalt
  
@@ -198,7 +198,7 @@ index 7861057..89f5aa7 100644
  __start:
          cld
          cli
-@@ -151,10 +306,10 @@ __start:
+@@ -152,10 +307,10 @@ __start:
  multiboot1_proto:
          /* Get mem_lower from Multiboot information */
          testb   $MBI_MEMLIMITS,(%ebx)
@@ -211,7 +211,7 @@ index 7861057..89f5aa7 100644
  
  multiboot2_proto:
          /* Skip Multiboot2 information fixed part */
-@@ -166,12 +321,12 @@ multiboot2_proto:
+@@ -167,12 +322,12 @@ multiboot2_proto:
          jne     1f
  
          mov     MB2_mem_lower(%ecx),%edx
@@ -226,7 +226,7 @@ index 7861057..89f5aa7 100644
  
          /* Go to next Multiboot2 information tag */
          add     MB2_tag_size(%ecx),%ecx
-@@ -179,7 +334,7 @@ multiboot2_proto:
+@@ -180,7 +335,7 @@ multiboot2_proto:
          and     $~(MULTIBOOT2_TAG_ALIGN-1),%ecx
          jmp     0b
  
@@ -235,7 +235,7 @@ index 7861057..89f5aa7 100644
          /* Set up trampoline segment 64k below EBDA */
          movzwl  0x40e,%ecx          /* EBDA segment */
          cmp     $0xa000,%ecx        /* sanity check (high) */
-@@ -195,12 +350,13 @@ trampoline_setup:
+@@ -196,12 +351,13 @@ trampoline_setup:
           * multiboot structure (if available) and use the smallest.
           */
          cmp     $0x100,%edx         /* is the multiboot value too small? */
@@ -251,7 +251,7 @@ index 7861057..89f5aa7 100644
          sub     $0x1000,%ecx
  
          /* From arch/x86/smpboot.c: start_eip had better be page-aligned! */
-@@ -215,6 +371,9 @@ trampoline_setup:
+@@ -216,6 +372,9 @@ trampoline_setup:
          call    reloc               /* %ecx contains trampoline address */
          mov     %eax,sym_phys(multiboot_ptr)
  
@@ -260,8 +260,8 @@ index 7861057..89f5aa7 100644
 +
          /* Initialize BSS (no nasty surprises!) */
          mov     $sym_phys(__bss_start),%edi
-         mov     $sym_phys(_end),%ecx
-@@ -222,6 +381,7 @@ trampoline_setup:
+         mov     $sym_phys(__bss_end),%ecx
+@@ -223,6 +382,7 @@ trampoline_setup:
          xor     %eax,%eax
          rep     stosb
  
@@ -317,12 +317,12 @@ index 0f09d73..20ffb69 100644
   * Local variables:
   * mode: C
 diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
-index 2324646..1619604 100644
+index 03a8d58..45119d2 100644
 --- a/xen/arch/x86/setup.c
 +++ b/xen/arch/x86/setup.c
-@@ -663,20 +663,23 @@ void __init noreturn __start_xen(unsigned long mbi_p)
-     if ( ((unsigned long)cpu0_stack & (STACK_SIZE-1)) != 0 )
-         panic("Misaligned CPU0 stack.");
+@@ -695,20 +695,23 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+     if ( !(mbi->flags & MBI_MODULES) || (mbi->mods_count == 0) )
+         panic("dom0 kernel not specified. Check bootloader configuration.");
  
 -    if ( efi_loader )
 +    if ( efi_platform )
@@ -366,10 +366,10 @@ index ca3712f..d27596b 100644
 +    OFFSET(MB2_efi64_ih, multiboot2_tag_efi64_ih_t, pointer);
  }
 diff --git a/xen/common/efi/boot.c b/xen/common/efi/boot.c
-index 909f8a0..ce0a803 100644
+index 2b90cef..639dc9a 100644
 --- a/xen/common/efi/boot.c
 +++ b/xen/common/efi/boot.c
-@@ -77,6 +77,17 @@ static size_t wstrlen(const CHAR16 * s);
+@@ -79,6 +79,17 @@ static size_t wstrlen(const CHAR16 * s);
  static int set_color(u32 mask, int bpp, u8 *pos, u8 *sz);
  static bool_t match_guid(const EFI_GUID *guid1, const EFI_GUID *guid2);
  

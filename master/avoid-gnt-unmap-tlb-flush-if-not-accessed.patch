@@ -6,10 +6,10 @@ not accessed whilst it was mapped.
 Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
 
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 6cd7f45..a54a456 100644
+index 9e08c9b..02aafae 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -3885,7 +3885,8 @@ static int create_grant_va_mapping(
+@@ -3927,7 +3927,8 @@ static int create_grant_va_mapping(
  }
  
  static int replace_grant_va_mapping(
@@ -19,7 +19,7 @@ index 6cd7f45..a54a456 100644
  {
      l1_pgentry_t *pl1e, ol1e;
      unsigned long gl1mfn;
-@@ -3931,12 +3932,13 @@ static int replace_grant_va_mapping(
+@@ -3973,12 +3974,13 @@ static int replace_grant_va_mapping(
      }
  
      /* Delete pagetable entry. */
@@ -34,7 +34,7 @@ index 6cd7f45..a54a456 100644
  
   unlock_and_out:
      page_unlock(l1pg);
-@@ -3947,9 +3949,9 @@ static int replace_grant_va_mapping(
+@@ -3989,9 +3991,9 @@ static int replace_grant_va_mapping(
  }
  
  static int destroy_grant_va_mapping(
@@ -46,7 +46,7 @@ index 6cd7f45..a54a456 100644
  }
  
  static int create_grant_p2m_mapping(uint64_t addr, unsigned long frame,
-@@ -3984,7 +3986,7 @@ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
+@@ -4026,7 +4028,7 @@ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
          return create_grant_p2m_mapping(addr, frame, flags, cache_flags);
  
      grant_pte_flags =
@@ -55,7 +55,7 @@ index 6cd7f45..a54a456 100644
      if ( cpu_has_nx )
          grant_pte_flags |= _PAGE_NX_BIT;
  
-@@ -4032,7 +4034,8 @@ static int replace_grant_p2m_mapping(
+@@ -4073,7 +4075,8 @@ static int replace_grant_p2m_mapping(
  }
  
  int replace_grant_host_mapping(
@@ -65,7 +65,7 @@ index 6cd7f45..a54a456 100644
  {
      struct vcpu *curr = current;
      l1_pgentry_t *pl1e, ol1e;
-@@ -4053,7 +4056,7 @@ int replace_grant_host_mapping(
+@@ -4094,7 +4097,7 @@ int replace_grant_host_mapping(
      }
  
      if ( !new_addr )
@@ -74,7 +74,7 @@ index 6cd7f45..a54a456 100644
  
      pl1e = guest_map_l1e(curr, new_addr, &gl1mfn);
      if ( !pl1e )
-@@ -4101,7 +4104,7 @@ int replace_grant_host_mapping(
+@@ -4142,7 +4145,7 @@ int replace_grant_host_mapping(
      put_page(l1pg);
      guest_unmap_l1e(curr, pl1e);
  
@@ -84,10 +84,10 @@ index 6cd7f45..a54a456 100644
          put_page_from_l1e(ol1e, curr->domain);
  
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index 23266c3..722a7ba 100644
+index a011276..8a9bac7 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
-@@ -73,6 +73,7 @@ struct gnttab_unmap_common {
+@@ -94,6 +94,7 @@ struct gnttab_unmap_common {
  
      /* Return */
      int16_t status;
@@ -95,7 +95,7 @@ index 23266c3..722a7ba 100644
  
      /* Shared state beteen *_unmap and *_unmap_complete */
      u16 flags;
-@@ -81,6 +82,12 @@ struct gnttab_unmap_common {
+@@ -102,6 +103,12 @@ struct gnttab_unmap_common {
      struct domain *rd;
  };
  
@@ -108,7 +108,7 @@ index 23266c3..722a7ba 100644
  /* Number of unmap operations that are done between each tlb flush */
  #define GNTTAB_UNMAP_BATCH_SIZE 32
  
-@@ -854,6 +861,7 @@ __gnttab_unmap_common(
+@@ -956,6 +963,7 @@ __gnttab_unmap_common(
      ld = current->domain;
      lgt = ld->grant_table;
  
@@ -116,16 +116,16 @@ index 23266c3..722a7ba 100644
      op->frame = (unsigned long)(op->dev_bus_addr >> PAGE_SHIFT);
  
      if ( unlikely(op->handle >= lgt->maptrack_limit) )
-@@ -934,7 +942,7 @@ __gnttab_unmap_common(
+@@ -1038,7 +1046,7 @@ __gnttab_unmap_common(
      {
          if ( (rc = replace_grant_host_mapping(op->host_addr,
                                                op->frame, op->new_addr, 
 -                                              op->flags)) < 0 )
 +                                              op->flags, &op->page_accessed)) < 0 )
-             goto unmap_out;
+             goto act_release_out;
  
          ASSERT(act->pin & (GNTPIN_hstw_mask | GNTPIN_hstr_mask));
-@@ -1102,20 +1110,25 @@ static long
+@@ -1205,20 +1213,25 @@ static long
  gnttab_unmap_grant_ref(
      XEN_GUEST_HANDLE_PARAM(gnttab_unmap_grant_ref_t) uop, unsigned int count)
  {
@@ -152,7 +152,7 @@ index 23266c3..722a7ba 100644
              ++partial_done;
              if ( unlikely(__copy_field_to_guest(uop, &op, status)) )
                  goto fault;
-@@ -1123,7 +1136,17 @@ gnttab_unmap_grant_ref(
+@@ -1226,7 +1239,17 @@ gnttab_unmap_grant_ref(
          }
  
          gnttab_flush_tlb(current->domain);
@@ -171,7 +171,7 @@ index 23266c3..722a7ba 100644
          for ( i = 0; i < partial_done; i++ )
              __gnttab_unmap_common_complete(&(common[i]));
  
-@@ -2919,7 +2942,12 @@ static void gnttab_usage_print_all(unsigned char key)
+@@ -3304,7 +3327,12 @@ static void gnttab_usage_print_all(unsigned char key)
      printk("%s [ key '%c' pressed\n", __FUNCTION__, key);
      for_each_domain ( d )
          gnttab_usage_print(d);

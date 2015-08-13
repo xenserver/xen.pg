@@ -1,4 +1,4 @@
-From b7f81971f3a402cf34d2322150cfbf6610eae4df Mon Sep 17 00:00:00 2001
+From 951ba641d515062e10c3b1f27ccab6f29059d44d Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Fri, 19 Jun 2015 16:29:13 +0100
 Subject: [PATCH 7/8] xen/x86: Rework CR4 handling for PV guests
@@ -21,19 +21,19 @@ to modify.
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 CC: Jan Beulich <JBeulich@suse.com>
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 8663232..6fc03c6 100644
+index 957e8c6..6b14101 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -486,7 +486,7 @@ int vcpu_initialise(struct vcpu *v)
+@@ -482,7 +482,7 @@ int vcpu_initialise(struct vcpu *v)
          v->arch.cr3           = __pa(idle_pg_table);
      }
  
 -    v->arch.pv_vcpu.ctrlreg[4] = real_cr4_to_pv_guest_cr4(mmu_cr4_features);
 +    pv_cr4_write(v, 0);
  
-     rc = is_pv_32on64_vcpu(v) ? setup_compat_l4(v) : 0;
-  done:
-@@ -685,6 +685,26 @@ void arch_domain_unpause(struct domain *d)
+     if ( is_pv_32bit_domain(d) )
+     {
+@@ -703,6 +703,26 @@ void arch_domain_unpause(struct domain *d)
  }
  
  /*
@@ -60,7 +60,7 @@ index 8663232..6fc03c6 100644
   * These are the masks of CR4 bits (subject to hardware availability) which a
   * PV guest may not legitimiately attempt to modify.
   */
-@@ -701,6 +721,8 @@ static int __init init_pv_cr4_masks(void)
+@@ -719,6 +739,8 @@ static int __init init_pv_cr4_masks(void)
          common_mask &= ~X86_CR4_DE;
      if ( cpu_has_xsave )
          common_mask &= ~X86_CR4_OSXSAVE;
@@ -69,10 +69,11 @@ index 8663232..6fc03c6 100644
  
      pv_cr4_mask = compat_pv_cr4_mask = common_mask;
  
-@@ -710,21 +732,61 @@ static int __init init_pv_cr4_masks(void)
+@@ -728,21 +750,62 @@ static int __init init_pv_cr4_masks(void)
      if ( cpu_has_fsgsbase )
          pv_cr4_mask &= ~X86_CR4_FSGSBASE;
  
++    /* The readable and shadow masks should never overlap. */
 +    BUILD_BUG_ON(PV_CR4_SHADOW & PV_CR4_READ);
 +
      return 0;
@@ -137,7 +138,7 @@ index 8663232..6fc03c6 100644
  }
  
  #define xen_vcpu_guest_context vcpu_guest_context
-@@ -937,8 +999,7 @@ int arch_set_info_guest(
+@@ -955,8 +1018,7 @@ int arch_set_info_guest(
      v->arch.pv_vcpu.ctrlreg[0] |= read_cr0() & ~X86_CR0_TS;
  
      cr4 = v->arch.pv_vcpu.ctrlreg[4];
@@ -148,7 +149,7 @@ index 8663232..6fc03c6 100644
      memset(v->arch.debugreg, 0, sizeof(v->arch.debugreg));
      for ( i = 0; i < 8; i++ )
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 90116a7..d91926a 100644
+index eceff8e..9ba94bc 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
 @@ -2402,7 +2402,7 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
@@ -170,10 +171,10 @@ index 90116a7..d91926a 100644
              break;
  
 diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
-index fd483c9..ba28e87 100644
+index b9ae5ce..619c8d9 100644
 --- a/xen/include/asm-x86/domain.h
 +++ b/xen/include/asm-x86/domain.h
-@@ -502,22 +502,9 @@ bool_t update_secondary_system_time(struct vcpu *,
+@@ -528,22 +528,9 @@ bool_t update_secondary_system_time(struct vcpu *,
  void vcpu_show_execution_state(struct vcpu *);
  void vcpu_show_registers(const struct vcpu *);
  
