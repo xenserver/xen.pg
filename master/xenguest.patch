@@ -1,8 +1,8 @@
 diff --git a/.gitignore b/.gitignore
-index 8c8c06f..b263767 100644
+index dafa3c4..aaf5be0 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -195,6 +195,7 @@ tools/tests/mem-sharing/memshrtool
+@@ -194,6 +194,7 @@ tools/tests/mem-sharing/memshrtool
  tools/tests/mce-test/tools/xen-mceinj
  tools/xcutils/lsevtchn
  tools/xcutils/readnotes
@@ -11,10 +11,10 @@ index 8c8c06f..b263767 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index 247ea73..3e8a37e 100644
+index 26afe69..33150ca 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
-@@ -424,6 +424,7 @@ rm -rf $RPM_BUILD_ROOT
+@@ -440,6 +440,7 @@ rm -rf $RPM_BUILD_ROOT
  %{_libexecdir}/%{name}/bin/xenconsole
  %{_libexecdir}/%{name}/bin/xenctx
  %{_libexecdir}/%{name}/bin/xendomains
@@ -23,10 +23,10 @@ index 247ea73..3e8a37e 100644
  %{_libexecdir}/%{name}/bin/xenpvnetboot
  %{_libexecdir}/%{name}/boot/hvmloader
 diff --git a/tools/Makefile b/tools/Makefile
-index 32cfc62..e5d6d4b 100644
+index 6abba6f..4beea67 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
-@@ -21,6 +21,7 @@ SUBDIRS-$(CONFIG_BLKTAP2) += blktap2
+@@ -20,6 +20,7 @@ SUBDIRS-$(CONFIG_BLKTAP2) += blktap2
  SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
  SUBDIRS-y += libfsimage
  SUBDIRS-$(CONFIG_Linux) += libvchan
@@ -763,10 +763,10 @@ index 0000000..3427882
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..c14a20e
+index 0000000..7c47c6c
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,729 @@
+@@ -0,0 +1,777 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1224,6 +1224,56 @@ index 0000000..c14a20e
 +    return rc;
 +}
 +
++int stub_xc_hvm_build_with_mem(xc_interface *xch, int domid,
++                               uint64_t max_mem_mib, uint64_t max_start_mib,
++                               const char *image)
++{
++    uint64_t lowmem_end, highmem_end, mmio_start;
++    struct xc_hvm_build_args args = {
++        .mem_size   = max_mem_mib   << 20,
++        .mem_target = max_start_mib << 20,
++        .mmio_size  = HVM_BELOW_4G_MMIO_LENGTH,
++        .image_file_name = image,
++    };
++    unsigned int nr_e820 = 1;
++    struct e820entry e820[2];
++    int rc;
++
++    lowmem_end  = args.mem_size;
++    highmem_end = 0;
++    mmio_start  = (1ull << 32) - args.mmio_size;
++
++    if ( lowmem_end > mmio_start )
++    {
++        highmem_end = (1ull << 32) + (lowmem_end - mmio_start);
++        lowmem_end = mmio_start;
++        nr_e820 = 2;
++    }
++
++    args.lowmem_end = lowmem_end;
++    args.highmem_end = highmem_end;
++    args.mmio_start = mmio_start;
++
++    /* Leave low 1MB to HVMLoader... */
++    e820[0].addr = 0x100000u;
++    e820[0].size = args.lowmem_end - 0x100000u;
++    e820[0].type = E820_RAM;
++
++    if ( nr_e820 == 2 )
++    {
++        e820[1].addr = 1UL << 32;
++        e820[1].size = args.highmem_end - e820[1].addr;
++        e820[1].type = E820_RAM;
++    }
++
++    rc = xc_hvm_build(xch, domid, &args);
++
++    if (!rc)
++        rc = xc_domain_set_memory_map(xch, domid, e820, nr_e820);
++
++    return rc;
++}
++
 +int stub_xc_hvm_build(xc_interface *xch, xs_handle *xsh, int domid,
 +                      int mem_max_mib, int mem_start_mib, const char *image_name,
 +                      int store_evtchn, int store_domid,
@@ -1237,10 +1287,8 @@ index 0000000..c14a20e
 +    configure_vcpus(xch, domid, f);
 +    configure_tsc(xch, domid, f);
 +
-+    r = xc_hvm_build_target_mem(xch, domid,
-+                                mem_max_mib,
-+                                mem_start_mib,
-+                                image_name);
++    r = stub_xc_hvm_build_with_mem(xch, domid, mem_max_mib,
++                                   mem_start_mib, image_name);
 +    if (r == 0)
 +        r = xc_cpuid_apply_policy(xch, domid);
 +
