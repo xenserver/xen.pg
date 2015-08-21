@@ -1,0 +1,1383 @@
+diff --git a/mk/xen.spec.in b/mk/xen.spec.in
+index 8c0df30..ffdbded 100644
+--- a/mk/xen.spec.in
++++ b/mk/xen.spec.in
+@@ -319,6 +319,7 @@ rm -rf $RPM_BUILD_ROOT
+ %{_includedir}/%{name}/nmi.h
+ %{_includedir}/%{name}/physdev.h
+ %{_includedir}/%{name}/platform.h
++%{_includedir}/%{name}/pv-iommu.h
+ %{_includedir}/%{name}/pmu.h
+ %{_includedir}/%{name}/sched.h
+ %{_includedir}/%{name}/sys/evtchn.h
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 53cebb7..5148faa 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -62,6 +62,7 @@
+ #include <xen/iommu.h>
+ #include <compat/vcpu.h>
+ #include <asm/psr.h>
++#include <xen/m2b.h>
+ 
+ DEFINE_PER_CPU(struct vcpu *, curr_vcpu);
+ DEFINE_PER_CPU(unsigned long, cr4);
+@@ -2142,7 +2143,7 @@ int domain_relinquish_resources(struct domain *d)
+                 return ret;
+         }
+ 
+-        d->arch.relmem = RELMEM_xen;
++        d->arch.relmem = RELMEM_m2b;
+ 
+         spin_lock(&d->page_alloc_lock);
+         page_list_splice(&d->arch.relmem_list, &d->page_list);
+@@ -2150,6 +2151,15 @@ int domain_relinquish_resources(struct domain *d)
+         spin_unlock(&d->page_alloc_lock);
+ 
+         /* Fallthrough. Relinquish every page of memory. */
++
++    case RELMEM_m2b:
++
++        ret = m2b_domain_destroy(d, d->m2b_destroy_mfn);
++        if ( ret )
++            return ret;
++        d->arch.relmem = RELMEM_xen;
++        /* fallthrough */
++
+     case RELMEM_xen:
+         ret = relinquish_memory(d, &d->xenpage_list, ~0UL);
+         if ( ret )
+diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
+index 1521779..8e751f1 100644
+--- a/xen/arch/x86/x86_64/compat/entry.S
++++ b/xen/arch/x86/x86_64/compat/entry.S
+@@ -432,6 +432,7 @@ ENTRY(compat_hypercall_table)
+         .quad do_tmem_op
+         .quad do_ni_hypercall           /* reserved for XenClient */
+         .quad do_xenpmu_op              /* 40 */
++        .quad do_iommu_op
+         .rept __HYPERVISOR_arch_0-((.-compat_hypercall_table)/8)
+         .quad compat_ni_hypercall
+         .endr
+@@ -483,6 +484,7 @@ ENTRY(compat_hypercall_args_table)
+         .byte 1 /* do_tmem_op               */
+         .byte 0 /* reserved for XenClient   */
+         .byte 2 /* do_xenpmu_op             */  /* 40 */
++        .byte 2 /* do_iommu_op              */
+         .rept __HYPERVISOR_arch_0-(.-compat_hypercall_args_table)
+         .byte 0 /* compat_ni_hypercall      */
+         .endr
+diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
+index 74677a2..6ec2b0b 100644
+--- a/xen/arch/x86/x86_64/entry.S
++++ b/xen/arch/x86/x86_64/entry.S
+@@ -765,6 +765,7 @@ ENTRY(hypercall_table)
+         .quad do_tmem_op
+         .quad do_ni_hypercall       /* reserved for XenClient */
+         .quad do_xenpmu_op          /* 40 */
++        .quad do_iommu_op
+         .rept __HYPERVISOR_arch_0-((.-hypercall_table)/8)
+         .quad do_ni_hypercall
+         .endr
+@@ -816,6 +817,7 @@ ENTRY(hypercall_args_table)
+         .byte 1 /* do_tmem_op           */
+         .byte 0 /* reserved for XenClient */
+         .byte 2 /* do_xenpmu_op         */  /* 40 */
++        .byte 2 /* do_iommu_op          */
+         .rept __HYPERVISOR_arch_0-(.-hypercall_args_table)
+         .byte 0 /* do_ni_hypercall      */
+         .endr
+diff --git a/xen/common/Makefile b/xen/common/Makefile
+index 3fdf931..f2547a4 100644
+--- a/xen/common/Makefile
++++ b/xen/common/Makefile
+@@ -24,6 +24,7 @@ obj-y += notifier.o
+ obj-y += page_alloc.o
+ obj-$(HAS_PDX) += pdx.o
+ obj-y += preempt.o
++obj-y += pv_iommu.o
+ obj-y += random.o
+ obj-y += rangeset.o
+ obj-y += radix-tree.o
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index 97b0cdc..e7ec9ca 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -29,6 +29,7 @@
+ #include <asm/p2m.h>
+ #include <public/memory.h>
+ #include <xsm/xsm.h>
++#include <xen/m2b.h>
+ 
+ struct memop_args {
+     /* INPUT */
+@@ -235,6 +236,7 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
+         mfn = mfn_x(get_gfn_query_unlocked(d, gmfn, &p2mt));
+         ASSERT(!p2m_is_shared(p2mt));
+     }
++
+ #endif /* CONFIG_X86 */
+ 
+     page = mfn_to_page(mfn);
+@@ -251,6 +253,14 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
+     if ( test_and_clear_bit(_PGC_allocated, &page->count_info) )
+         put_page(page);
+ 
++    /* Check for M2B mapping */
++    if ( is_hvm_domain(d) &&
++            test_bit(_PGT_foreign_map, &page->u.inuse.type_info) )
++    {
++        /* Notifiy ioserver with M2B mappings */
++        notify_m2b_entries(page);
++    }
++
+     guest_physmap_remove_page(d, gmfn, mfn, 0);
+ 
+     /*
+diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
+new file mode 100644
+index 0000000..a62e611
+--- /dev/null
++++ b/xen/common/pv_iommu.c
+@@ -0,0 +1,851 @@
++#include <xen/config.h>
++#include <xen/init.h>
++#include <xen/lib.h>
++#include <xen/types.h>
++#include <xen/sched.h>
++#include <xen/irq.h>
++#include <xen/event.h>
++#include <xen/guest_access.h>
++#include <xen/iocap.h>
++#include <xen/serial.h>
++#include <asm/current.h>
++#include <asm/io_apic.h>
++#include <asm/msi.h>
++#include <asm/hvm/irq.h>
++#include <asm/hypercall.h>
++#include <public/xen.h>
++#include <xsm/xsm.h>
++#include <asm/p2m.h>
++#include <public/hvm/hvm_op.h>
++#include <public/xen.h>
++#include <public/pv-iommu.h>
++#include <asm/setup.h>
++#include <xen/list.h>
++
++
++#define ret_t long
++
++struct pv_iommu_info
++{
++    struct page_info *pg;
++    struct list_head head;
++    unsigned int count;
++    struct rcu_head rcu_head;
++};
++
++struct m2b_entry
++{
++    struct list_head list;
++    domid_t domain;
++    ioservid_t ioserver;
++    uint64_t bfn;
++    struct rcu_head rcu;
++};
++
++#define BFN_ANY         ~0UL
++#define IOSERVER_ANY    ~0
++
++static uint64_t **hwdom_premap_m2b;
++
++DEFINE_RCU_READ_LOCK(m2b_rcu);
++#define PREMAP_M2B_PAGE(x) ( x / (PAGE_SIZE/sizeof(uint64_t) ) )
++#define PREMAP_M2B_IDX(x) ( x % (PAGE_SIZE/sizeof(uint64_t) ) )
++
++#define PREMAP_M2B(x) hwdom_premap_m2b[PREMAP_M2B_PAGE(x)][PREMAP_M2B_IDX(x)]
++
++static int get_paged_frame(unsigned long gfn, unsigned long *frame,
++                           struct page_info **page, int readonly,
++                           struct domain *rd)
++{
++    int rc = 0;
++#if defined(P2M_PAGED_TYPES) || defined(P2M_SHARED_TYPES)
++    p2m_type_t p2mt;
++
++    *page = get_page_from_gfn(rd, gfn, &p2mt,
++                             (readonly) ? P2M_ALLOC : P2M_UNSHARE);
++    if ( !(*page) )
++    {
++        *frame = INVALID_MFN;
++        if ( p2m_is_shared(p2mt) )
++            return -EIO;
++        if ( p2m_is_paging(p2mt) )
++        {
++            p2m_mem_paging_populate(rd, gfn);
++            return -EIO;
++        }
++        return -EIO;
++    }
++    *frame = page_to_mfn(*page);
++#else
++    *frame = gmfn_to_mfn(rd, gfn);
++    *page = mfn_valid(*frame) ? mfn_to_page(*frame) : NULL;
++    if ( (!(page)) || (!get_page*page, rd) )
++    {
++        *frame = INVALID_MFN;
++        *page = NULL;
++        rc = -EIO;
++    }
++#endif
++
++    return rc;
++}
++
++struct m2b_entry *lookup_m2b_entry(struct page_info *page, struct domain *d,
++                                   ioservid_t ioserver, unsigned long bfn)
++{
++    struct m2b_entry *m2b_e = NULL;
++    struct list_head *entry;
++    domid_t domain = d->domain_id;
++
++    if ( !test_bit(_PGT_foreign_map, &page->u.inuse.type_info) )
++        return NULL;
++
++    rcu_read_lock(&m2b_rcu);
++    list_for_each_rcu(entry, &page->pv_iommu->head)
++    {
++        m2b_e = list_entry(entry, struct m2b_entry, list);
++        if ( m2b_e->domain == domain && m2b_e->ioserver == ioserver &&
++                m2b_e->bfn == bfn )
++                    goto done;
++        else if ( ioserver == IOSERVER_ANY && m2b_e->domain == domain &&
++                  m2b_e->bfn == bfn )
++                    goto done;
++        else if ( bfn == BFN_ANY && m2b_e->domain == domain &&
++                  m2b_e->ioserver == ioserver )
++                    goto done;
++        else if ( bfn == BFN_ANY && ioserver == IOSERVER_ANY &&
++                  m2b_e->domain == domain )
++                    goto done;
++    }
++done:
++    rcu_read_unlock(&m2b_rcu);
++
++    /* Nothing was found */
++    return m2b_e;
++}
++
++void notify_m2b_entries(struct page_info *page)
++{
++    return;
++    /*struct m2b_entry *m2b_e;
++    struct hvm_ioreq_server *s = NULL;
++    ioreq_t p = {
++        .type = IOREQ_TYPE_INVAL_BFN,
++        .size = 4,
++        .dir = IOREQ_WRITE,
++    };
++    struct list_head *entry;
++
++    if ( !test_bit(_PGT_foreign_map, &page->u.inuse.type_info) )
++        return;
++
++    rcu_read_lock(&m2b_rcu);
++    list_for_each_rcu(entry, &page->pv_iommu->head)
++    {
++        m2b_e = list_entry(entry, struct m2b_entry, list);
++        if ( m2b_e->ioserver != IOSERVER_ANY )
++        {
++            if ( !hvm_get_ioreq_server_info(current->domain, m2b_e->ioserver, s) )
++            {
++                    p.data = m2b_e->bfn;
++                    if ( !hvm_send_ioreq(s, &p, 1) )
++                        hvm_send_ioreq(s, &p, 0);
++            }
++        }
++    }
++    rcu_read_unlock(&m2b_rcu);*/
++}
++
++/* Called with page_lock held */
++int add_m2b_entry(struct page_info *page, struct domain *d,
++                  ioservid_t ioserver, uint64_t bfn)
++{
++    struct m2b_entry *m2b_e;
++    int head_allocated = 0;
++    domid_t domain = d->domain_id;
++
++    if ( !test_bit(_PGT_foreign_map, &page->u.inuse.type_info) )
++    {
++        page->pv_iommu = xmalloc(struct pv_iommu_info);
++        if ( !page->pv_iommu )
++            return -ENOMEM;
++        head_allocated = 1;
++        INIT_LIST_HEAD(&page->pv_iommu->head);
++        INIT_RCU_HEAD(&page->pv_iommu->rcu_head);
++        set_bit(_PGT_foreign_map, &page->u.inuse.type_info);
++        page->pv_iommu->count = 0;
++    }
++
++    m2b_e = xmalloc(struct m2b_entry);
++    if ( !m2b_e )
++    {
++        if ( head_allocated )
++            xfree(page->pv_iommu);
++
++        return -ENOMEM;
++    }
++
++    m2b_e->domain = domain;
++    m2b_e->ioserver = ioserver;
++    m2b_e->bfn = bfn;
++
++    INIT_LIST_HEAD(&m2b_e->list);
++    INIT_RCU_HEAD(&m2b_e->rcu);
++    list_add_rcu(&m2b_e->list, &page->pv_iommu->head);
++
++    atomic_inc(&d->m2b_count);
++    page->pv_iommu->count++;
++    return 0;
++}
++
++void free_m2b_entry(struct rcu_head *rcu)
++{
++    xfree(container_of(rcu, struct m2b_entry, rcu));
++}
++
++/* Called with page_lock held */
++int del_m2b_entry(struct page_info *page, struct domain *d, ioservid_t ioserver,
++                  unsigned long bfn)
++{
++    struct m2b_entry *m2b_e;
++
++    m2b_e = lookup_m2b_entry(page, d, ioserver, bfn);
++    if ( !m2b_e )
++        return -ENOENT;
++
++    list_del_rcu(&m2b_e->list);
++    call_rcu(&m2b_e->rcu, free_m2b_entry);
++    page->pv_iommu->count--;
++    atomic_dec(&d->m2b_count);
++
++    if ( page->pv_iommu->count == 0 )
++    {
++        clear_bit(_PGT_foreign_map, &page->u.inuse.type_info);
++        xfree(page->pv_iommu);
++    }
++    return 0;
++}
++
++
++/* Remove all M2B entries created by the domain being destroyed */
++int m2b_domain_destroy(struct domain *d, unsigned long mfn)
++{
++    struct m2b_entry *m2b_e, *m2b_e_hwdom;
++    struct page_info *page;
++    int locked;
++
++    if ( ! atomic_read(&d->m2b_count) )
++        return 0;
++
++
++    for ( ; mfn < max_page; mfn++ )
++    {
++        /* Check for preemption every 4 MB */
++        if ( mfn % 0x1000 == 0 && mfn != d->m2b_destroy_mfn)
++        {
++            if ( hypercall_preempt_check() )
++            {
++                d->m2b_destroy_mfn = mfn;
++                return -ERESTART;
++            }
++        }
++	if (!mfn_valid(mfn))
++            continue;
++
++        page = mfn_to_page(mfn);
++        if ( !page || (page_get_owner(page) != d) )
++            continue;
++
++        m2b_e = lookup_m2b_entry(page, d,
++                        IOSERVER_ANY, BFN_ANY);
++        m2b_e_hwdom = lookup_m2b_entry(page, hardware_domain,
++                        IOSERVER_ANY, BFN_ANY);
++        if ( !m2b_e && !m2b_e_hwdom )
++            continue;
++
++        locked = page_lock(page);
++
++	/* Remove all M2B entries for this domain */
++        while ( (m2b_e = lookup_m2b_entry(page, d,
++                                          IOSERVER_ANY, BFN_ANY)) )
++        {
++            del_m2b_entry(page, d,
++                          m2b_e->ioserver,
++                          m2b_e->bfn);
++        }
++        /* Remove all M2B entries for hwdom */
++        while ( (m2b_e = lookup_m2b_entry(page, hardware_domain,
++                                          IOSERVER_ANY, BFN_ANY)) )
++        {
++            del_m2b_entry(page, hardware_domain,
++                          m2b_e->ioserver,
++                          m2b_e->bfn);
++            atomic_dec(&d->m2b_count);
++        }
++
++	if ( locked )
++            page_unlock(page);
++        /* Remove this domains reference */
++        put_page(page);
++        if ( ! atomic_read(&d->m2b_count) )
++            break;
++    }
++
++    return 0;
++}
++
++
++int can_use_iommu_check(struct domain *d)
++{
++    if ( !iommu_enabled || (!is_hardware_domain(d) && !need_iommu(d)) )
++        return 0;
++
++    if ( is_hardware_domain(d) && iommu_passthrough )
++        return 0;
++
++    return 1;
++}
++
++void do_iommu_sub_op(struct pv_iommu_op *op)
++{
++    int ret;
++    struct domain *d = current->domain;
++    struct domain *rd = NULL;
++
++    /* Only order 0 pages supported */
++    if ( IOMMU_get_page_order(op->flags) != 0 )
++    {
++        op->status = -ENOSPC;
++        goto finish;
++    }
++
++    switch ( op->subop_id )
++    {
++        case IOMMUOP_query_caps:
++        {
++            op->flags = 0;
++            op->status = 0;
++            if ( can_use_iommu_check(d) )
++                op->flags |= IOMMU_QUERY_map_cap;
++
++            if ( is_hardware_domain(d) && !d->need_iommu )
++            {
++                op->flags |= IOMMU_QUERY_map_all_mfns;
++                hwdom_premap_m2b = xzalloc_array(unsigned long *,
++                                        (sizeof(unsigned long) * max_page)/
++                                        PAGE_SIZE);
++
++
++                //if (hwdom_premap_m2b)
++                //        op->flags |= IOMMU_QUERY_allow_wildcard_m2b;
++            }
++            break;
++        }
++        case IOMMUOP_map_page:
++        {
++            unsigned long mfn, tmp;
++            unsigned int flags = 0;
++            struct page_info *page = NULL;
++
++            /* Check if calling domain can create IOMMU mappings */
++            if ( !can_use_iommu_check(d) )
++            {
++                op->status = -EPERM;
++                goto finish;
++            }
++
++            /* Check we are the owner of the page */
++            if ( !is_hardware_domain(d) &&
++                 ( maddr_get_owner(op->u.map_page.gfn) != d ) )
++            {
++                op->status = -EPERM;
++                goto finish;
++            }
++
++            /* Lookup page struct backing gfn */
++            if ( (op->flags & IOMMU_MAP_OP_no_ref_cnt) )
++            {
++                mfn = op->u.map_page.gfn;
++                page = mfn_to_page(mfn);
++                if (!page)
++                {
++                        op->status = -EPERM; // Should this be something else?
++                        goto finish;
++                }
++            } else if ( get_paged_frame(op->u.map_page.gfn, &mfn, &page, 0, d) )
++            {
++                op->status = -EPERM; // Should this be something else?
++               goto finish;
++            }
++
++            /* Check for conflict with existing BFN mappings */
++            if ( !iommu_lookup_page(d, op->u.map_page.bfn, &tmp) )
++            {
++                if ( !(op->flags & IOMMU_MAP_OP_no_ref_cnt) )
++                    put_page(page);
++                op->status = -EPERM;
++                goto finish;
++            }
++
++            if ( op->flags & IOMMU_OP_readable )
++                flags |= IOMMUF_readable;
++
++            if ( op->flags & IOMMU_OP_writeable )
++                flags |= IOMMUF_writable;
++
++            if ( iommu_map_page(d, op->u.map_page.bfn, mfn, flags) )
++            {
++                if ( !(op->flags & IOMMU_MAP_OP_no_ref_cnt) )
++                    put_page(page);
++                op->status = -EIO;
++                goto finish;
++            }
++
++            /* The _get_page_frame call takes a page reference for us */
++            //if ( (op->flags & IOMMU_MAP_OP_no_ref_cnt) )
++            //    put_page(page);
++
++            /* Add to M2B with wildcard ioserver entry */
++            if ( is_hardware_domain(d) && (op->flags & IOMMU_MAP_OP_add_m2b ))
++            {
++                if ( !hwdom_premap_m2b )
++                {
++                    op->status = -EPERM;
++                    goto finish;
++                }
++                /* Check if tracking page is allocated */
++                if ( !hwdom_premap_m2b[PREMAP_M2B_PAGE(mfn)] )
++                {
++                    hwdom_premap_m2b[PREMAP_M2B_PAGE(mfn)] =
++                            alloc_xenheap_page();
++                    if ( !hwdom_premap_m2b[PREMAP_M2B_PAGE(mfn)] )
++                    {
++                        op->status = -ENOMEM;
++                        goto finish;
++                    }
++                    clear_page(hwdom_premap_m2b[PREMAP_M2B_PAGE(mfn)]);
++                } else if ( read_atomic(&PREMAP_M2B(mfn)) )
++                {
++                    op->status = -EPERM;
++                    goto finish;
++                }
++
++                write_atomic(&PREMAP_M2B(mfn), op->u.map_page.bfn);
++            }
++            op->status = 0;
++            break;
++        }
++
++        case IOMMUOP_unmap_page:
++	{
++            struct page_info *page;
++            unsigned long mfn;
++
++            /* Check if there is a valid BFN mapping for this domain */
++            if ( iommu_lookup_page(d, op->u.unmap_page.bfn, &mfn) )
++            {
++                op->status = -ENOENT;
++                goto finish;
++            }
++
++            if ( iommu_unmap_page(d, op->u.unmap_page.bfn) )
++            {
++                op->status = -EIO;
++                goto finish;
++            }
++
++            /* Use MFN from B2M mapping to lookup page */
++            page = mfn_to_page(mfn);
++
++            /* Remove wildcard M2B mapping */
++            if ( is_hardware_domain(d) &&
++                (op->flags & IOMMU_UNMAP_OP_remove_m2b) &&
++                hwdom_premap_m2b &&
++                hwdom_premap_m2b[PREMAP_M2B_PAGE(mfn)] &&
++                read_atomic(&PREMAP_M2B(mfn)) )
++            {
++                /* Remove M2B entry */
++                write_atomic(&PREMAP_M2B(mfn), 0);
++            }
++            if ( !(op->flags & IOMMU_MAP_OP_no_ref_cnt) )
++                put_page(page);
++
++            op->status = 0;
++            break;
++        }
++        case IOMMUOP_map_foreign_page:
++        {
++            unsigned long mfn, tmp;
++            unsigned int flags = 0;
++            struct page_info *page = NULL;
++            struct m2b_entry *m2b_e;
++            int locked;
++
++            /* Check if calling domain can create IOMMU mappings */
++            if ( !can_use_iommu_check(d) )
++            {
++                op->status = -EPERM;
++                goto finish;
++            }
++
++
++            rd = rcu_lock_domain_by_any_id(op->u.map_foreign_page.domid);
++            if ( !rd )
++            {
++                op->status = -ENXIO;
++                goto finish;
++            }
++
++            /* Only HVM domains can have their pages foreign mapped */
++            if ( is_pv_domain(rd) )
++            {
++                op->status = -EPERM;
++                goto finish;
++            }
++
++            if ( d->domain_id == op->u.map_foreign_page.domid ||
++                    op->u.map_foreign_page.domid == DOMID_SELF )
++            {
++                op->status = -EPERM;
++                goto finish;
++            }
++
++	    /* Check for privilege over remote domain*/
++            if ( xsm_iommu_control(XSM_DM_PRIV, rd, op->subop_id) )
++            {
++                op->status = -EPERM;
++                goto finish;
++            }
++
++            /* Lookup page struct backing gfn */
++            if ( get_paged_frame(op->u.map_foreign_page.gfn, &mfn, &page, 0,
++                        rd) )
++            {
++                op->status = -ENXIO;
++                goto finish;
++            }
++	    /* Check M2B for existing mapping */
++            m2b_e = lookup_m2b_entry(page, d,
++                        op->u.map_foreign_page.ioserver,
++                        op->u.map_foreign_page.bfn);
++
++            /* M2B already exists for domid, gfn, ioserver combination */
++            if ( m2b_e )
++            {
++                put_page(page);
++                op->status = 0;
++                goto finish;
++            }
++
++            if ( !mfn_valid(mfn) || xen_in_range(mfn) ||
++                 is_xen_heap_page(page) )
++            {
++                put_page(page);
++                op->status = -EPERM;
++                goto finish;
++            }
++
++            /* Check for conflict with existing BFN mapping */
++            if ( !iommu_lookup_page(d, op->u.map_foreign_page.bfn, &tmp) )
++            {
++                put_page(page);
++                op->status = -EPERM;
++                goto finish;
++            }
++
++            if ( op->flags & IOMMU_OP_readable )
++                flags |= IOMMUF_readable;
++
++            if ( op->flags & IOMMU_OP_writeable )
++                flags |= IOMMUF_writable;
++
++            if ( iommu_map_page(d, op->u.map_foreign_page.bfn, mfn, flags) )
++            {
++                put_page(page);
++                op->status = -EIO;
++                goto finish;
++            }
++	    /* Add M2B entry */
++            locked = page_lock(page);
++            ret = add_m2b_entry(page, d,
++                        op->u.map_foreign_page.ioserver,
++                        op->u.map_foreign_page.bfn);
++            atomic_inc(&rd->m2b_count);
++	    if ( locked )
++                page_unlock(page);
++            if ( ret )
++            {
++                if ( iommu_unmap_page(d, op->u.map_foreign_page.bfn) )
++                    domain_crash(d);
++
++                put_page(page);
++                op->status = -ENOMEM;
++                goto finish;
++            }
++
++            op->status = 0;
++	    break;
++        }
++        case IOMMUOP_lookup_foreign_page:
++        {
++            unsigned long mfn;
++            struct page_info *page = NULL;
++            struct m2b_entry *m2b_e;
++	    int rc;
++            int locked;
++
++            if ( d->domain_id == op->u.lookup_foreign_page.domid ||
++                 op->u.lookup_foreign_page.domid == DOMID_SELF )
++            {
++                op->status = -EPERM;
++                goto finish;
++            }
++
++            rd = rcu_lock_domain_by_any_id(op->u.lookup_foreign_page.domid);
++
++            if ( !rd )
++            {
++                op->status = -ENXIO;
++                goto finish;
++            }
++
++            /* Only HVM domains can have their pages foreign mapped */
++            if ( is_pv_domain(rd) )
++            {
++                op->status = -EPERM;
++                goto finish;
++            }
++
++	    /* Check for privilege */
++            if ( xsm_iommu_control(XSM_DM_PRIV, rd, op->subop_id) )
++            {
++                op->status = -EPERM;
++                goto finish;
++            }
++
++            /* Lookup page struct backing gfn */
++            if ( (rc = get_paged_frame(op->u.lookup_foreign_page.gfn, &mfn, &page, 0,
++                                 rd)) )
++            {
++                op->status = -ENXIO; // Should this be something else?
++                goto finish;
++            }
++	    /* Check M2B for existing mapping */
++            m2b_e = lookup_m2b_entry(page, d,
++                                     op->u.lookup_foreign_page.ioserver,
++                                     BFN_ANY);
++
++            /* M2B already exists for domid, gfn, ioserver combination */
++            if ( m2b_e )
++            {
++                put_page(page);
++                op->u.lookup_foreign_page.bfn = m2b_e->bfn;
++                op->status = 0;
++                goto finish;
++            }
++
++            /* Check if IOMMU is disabled/bypassed */
++            if ( !can_use_iommu_check(d) )
++            {
++                /* Add M2B entry using MFN */
++                locked = page_lock(page);
++                ret = add_m2b_entry(page, d,
++                                    op->u.lookup_foreign_page.ioserver, mfn);
++                atomic_inc(&rd->m2b_count);
++                if ( locked )
++                    page_unlock(page);
++                if ( ret )
++                {
++                   put_page(page);
++                   op->status = -ENOMEM;
++                   goto finish;
++                }
++                op->u.lookup_foreign_page.bfn = mfn;
++            }
++            else if ( is_hardware_domain(d) )
++            {
++                uint64_t bfn;
++                /* Check if a premap already exists */
++                if ( !hwdom_premap_m2b ||
++                     !hwdom_premap_m2b[PREMAP_M2B_PAGE(mfn)])
++                {
++                    put_page(page);
++                    op->status = -ENOENT;
++                    goto finish;
++                }
++
++                bfn = read_atomic(&PREMAP_M2B(mfn));
++
++                /* Check if BFN is non zero */
++                if ( !bfn )
++                {
++                    put_page(page);
++                    op->status = -ENOENT;
++                    goto finish;
++                }
++
++                locked = page_lock(page);
++                ret = add_m2b_entry(page, d,
++                                    op->u.lookup_foreign_page.ioserver,
++                                    bfn);
++                atomic_inc(&rd->m2b_count);
++                if ( locked )
++		    page_unlock(page);
++
++                if ( ret )
++                {
++                   put_page(page);
++                   op->status = -ENOMEM;
++                   goto finish;
++                }
++                op->u.lookup_foreign_page.bfn = bfn;
++            }
++            op->status = 0;
++	    break;
++        }
++        case IOMMUOP_unmap_foreign_page:
++        {
++            struct m2b_entry *m2b_e;
++            struct page_info *page;
++            unsigned long mfn;
++	    int locked;
++
++
++            if ( !can_use_iommu_check(d) )
++            {
++                page = mfn_to_page(op->u.unmap_foreign_page.bfn);
++            }
++            else
++            {
++                /* Check if there is a valid BFN mapping for this domain */
++                if ( iommu_lookup_page(d, op->u.unmap_foreign_page.bfn, &mfn) )
++                {
++                   op->status = -ENOENT;
++                   goto finish;
++                }
++                /* Use MFN from B2M mapping to lookup page */
++                page = mfn_to_page(mfn);
++            }
++
++            if ( !page )
++            {
++               op->status = -ENOENT;
++               goto finish;
++            }
++
++	    /* Try to remove the M2B mapping */
++            locked = page_lock(page);
++            ret = del_m2b_entry(page, d,
++                                op->u.unmap_foreign_page.ioserver,
++                                op->u.unmap_foreign_page.bfn);
++            atomic_dec(&page_get_owner(page)->m2b_count);
++            if ( locked )
++	        page_unlock(page);
++            if ( ret )
++            {
++               op->status = -ENOENT;
++               goto finish;
++            }
++
++            /* Check if hwdom IOMMU premap is present */
++            if ( is_hardware_domain(d) && can_use_iommu_check(d) &&
++                 hwdom_premap_m2b && hwdom_premap_m2b[PREMAP_M2B_PAGE(mfn)] &&
++                 (read_atomic(&PREMAP_M2B(mfn)) == op->u.unmap_foreign_page.bfn))
++                goto foreign_unmap_done;
++
++            if ( can_use_iommu_check(d) )
++            {
++                /* Check if there are any M2B mappings left for this domain */
++                m2b_e = lookup_m2b_entry(page, d,
++                                         IOSERVER_ANY,
++                                         op->u.unmap_foreign_page.bfn);
++
++                /* No M2B left for this bfn so IOMMU unmap it */
++                if ( !m2b_e )
++                {
++                    if ( iommu_unmap_page(d, op->u.map_foreign_page.bfn) )
++                        domain_crash(d);
++                }
++            }
++foreign_unmap_done:
++            /* Remove the reference to the page */
++            put_page(page);
++            op->status = 0;
++	    break;
++        }
++
++        default:
++            op->status = -ENODEV;
++            break;
++    }
++
++finish:
++    if ( rd )
++        rcu_unlock_domain(rd);
++
++    return;
++}
++
++ret_t do_iommu_op(XEN_GUEST_HANDLE_PARAM(void) arg, unsigned int count)
++{
++    ret_t ret = 0;
++    int i;
++    struct pv_iommu_op op;
++    struct domain *d = current->domain;
++
++    if ( (int)count < 0 )
++        return -EINVAL;
++
++    if ( count > 1 )
++        this_cpu(iommu_dont_flush_iotlb) = 1;
++
++    for ( i = 0; i < count; i++ )
++    {
++        if ( i && hypercall_preempt_check() )
++        {
++            ret =  i;
++            goto flush_pages;
++        }
++        if ( unlikely(__copy_from_guest_offset(&op, arg, i, 1)) )
++        {
++            ret = -EFAULT;
++            goto flush_pages;
++        }
++        do_iommu_sub_op(&op);
++        if ( unlikely(__copy_to_guest_offset(arg, i, &op, 1)) )
++        {
++            ret = -EFAULT;
++            goto flush_pages;
++        }
++    }
++
++flush_pages:
++    if ( ret > 0 )
++    {
++        XEN_GUEST_HANDLE_PARAM(pv_iommu_op_t) op =
++            guest_handle_cast(arg, pv_iommu_op_t);
++        ASSERT(ret < count);
++        guest_handle_add_offset(op, i);
++        arg = guest_handle_cast(op, void);
++        ret = hypercall_create_continuation(__HYPERVISOR_iommu_op,
++                                           "hi", arg, count - i);
++    }
++    if ( count > 1 )
++    {
++        this_cpu(iommu_dont_flush_iotlb) = 0;
++        if ( i )
++            iommu_iotlb_flush_all(d);
++    }
++    return ret;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
++
+diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
+index 9e0daf4..90a174f 100644
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -47,7 +47,7 @@ bool_t __hwdom_initdata iommu_dom0_strict;
+ bool_t __read_mostly iommu_verbose;
+ bool_t __read_mostly iommu_workaround_bios_bug;
+ bool_t __read_mostly iommu_igfx = 1;
+-bool_t __read_mostly iommu_passthrough = 1;
++bool_t __read_mostly iommu_passthrough = 0;
+ bool_t __read_mostly iommu_snoop = 1;
+ bool_t __read_mostly iommu_qinval = 1;
+ bool_t __read_mostly iommu_intremap = 1;
+@@ -249,6 +249,16 @@ int iommu_unmap_page(struct domain *d, unsigned long gfn)
+     return hd->platform_ops->unmap_page(d, gfn);
+ }
+ 
++int iommu_lookup_page(struct domain *d, unsigned long gfn, unsigned long *mfn)
++{
++    struct hvm_iommu *hd = domain_hvm_iommu(d);
++
++    if ( !iommu_enabled || !hd->platform_ops )
++        return -ENOMEM;
++
++    return hd->platform_ops->lookup_page(d, gfn, mfn);
++}
++
+ static void iommu_free_pagetables(unsigned long unused)
+ {
+     do {
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index 1dffc40..24302e3 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -606,7 +606,7 @@ static void intel_iommu_iotlb_flush(struct domain *d, unsigned long gfn, unsigne
+ 
+ static void intel_iommu_iotlb_flush_all(struct domain *d)
+ {
+-    __intel_iommu_iotlb_flush(d, 0, 0, 0);
++    __intel_iommu_iotlb_flush(d, 0, 1, -1);
+ }
+ 
+ /* clear one page's page table */
+@@ -1687,6 +1687,46 @@ static void iommu_domain_teardown(struct domain *d)
+     spin_unlock(&hd->arch.mapping_lock);
+ }
+ 
++static int intel_iommu_lookup_page(
++    struct domain *d, unsigned long gfn, unsigned long *mfn)
++{
++    struct hvm_iommu *hd = domain_hvm_iommu(d);
++    struct dma_pte *page = NULL, *pte = NULL, old;
++    u64 pg_maddr;
++
++    /* Do nothing if VT-d shares EPT page table */
++    if ( iommu_use_hap_pt(d) )
++        return 0;
++
++    /* Do nothing if hardware domain and iommu supports pass thru. */
++    if ( iommu_passthrough && is_hardware_domain(d) ) {
++        *mfn = gfn;
++        return 0;
++    }
++
++    spin_lock(&hd->arch.mapping_lock);
++
++    pg_maddr = addr_to_dma_page_maddr(d, (paddr_t)gfn << PAGE_SHIFT_4K, 1);
++    if ( pg_maddr == 0 )
++    {
++        spin_unlock(&hd->arch.mapping_lock);
++        return -ENOMEM;
++    }
++    page = (struct dma_pte *)map_vtd_domain_page(pg_maddr);
++    pte = page + (gfn & LEVEL_MASK);
++    old = *pte;
++    if (!dma_pte_present(old)) {
++        unmap_vtd_domain_page(page);
++        spin_unlock(&hd->arch.mapping_lock);
++        return -ENOMEM;
++    }
++    unmap_vtd_domain_page(page);
++    spin_unlock(&hd->arch.mapping_lock);
++
++    *mfn = dma_get_pte_addr(old) >> PAGE_SHIFT_4K;
++    return 0;
++}
++
+ static int intel_iommu_map_page(
+     struct domain *d, unsigned long gfn, unsigned long mfn,
+     unsigned int flags)
+@@ -2511,6 +2551,7 @@ const struct iommu_ops intel_iommu_ops = {
+     .assign_device  = intel_iommu_assign_device,
+     .teardown = iommu_domain_teardown,
+     .map_page = intel_iommu_map_page,
++    .lookup_page = intel_iommu_lookup_page,
+     .unmap_page = intel_iommu_unmap_page,
+     .free_page_table = iommu_free_page_table,
+     .reassign_device = reassign_device_ownership,
+diff --git a/xen/drivers/passthrough/vtd/iommu.h b/xen/drivers/passthrough/vtd/iommu.h
+index ac71ed1..83f525c 100644
+--- a/xen/drivers/passthrough/vtd/iommu.h
++++ b/xen/drivers/passthrough/vtd/iommu.h
+@@ -274,6 +274,7 @@ struct dma_pte {
+ #define dma_pte_addr(p) ((p).val & PADDR_MASK & PAGE_MASK_4K)
+ #define dma_set_pte_addr(p, addr) do {\
+             (p).val |= ((addr) & PAGE_MASK_4K); } while (0)
++#define dma_get_pte_addr(p) (((p).val & PAGE_MASK_4K))
+ #define dma_pte_present(p) (((p).val & DMA_PTE_PROT) != 0)
+ #define dma_pte_superpage(p) (((p).val & DMA_PTE_SP) != 0)
+ 
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index 69808a9..bd508ee 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -299,6 +299,7 @@ struct arch_domain
+     enum {
+         RELMEM_not_started,
+         RELMEM_shared,
++        RELMEM_m2b,
+         RELMEM_xen,
+         RELMEM_l4,
+         RELMEM_l3,
+diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
+index 7f62c1e..2463bd4 100644
+--- a/xen/include/asm-x86/mm.h
++++ b/xen/include/asm-x86/mm.h
+@@ -62,6 +62,12 @@ struct page_info
+          * This list is allocated and freed when a page is shared/unshared.
+          */
+         struct page_sharing_info *sharing;
++        /* For foreign mapped pages, we use a doubly-linked list
++         * of all the {pfn,domain, ioserver} tuples that map this page.
++         * This list is allocated and freed from a page is foreign
++	 * mapped/unmapped.
++         */
++        struct pv_iommu_info *pv_iommu;
+     };
+ 
+     /* Reference count and various PGC_xxx flags and fields. */
+@@ -200,9 +206,12 @@ struct page_info
+  /* Page is locked? */
+ #define _PGT_locked       PG_shift(9)
+ #define PGT_locked        PG_mask(1, 9)
++ /* Page has foreign mappings? */
++#define _PGT_foreign_map  PG_shift(10)
++#define PGT_foreign_map   PG_mask(1, _PGT_foreign_map)
+ 
+  /* Count of uses of this frame as its current type. */
+-#define PGT_count_width   PG_shift(9)
++#define PGT_count_width   PG_shift(10)
+ #define PGT_count_mask    ((1UL<<PGT_count_width)-1)
+ 
+  /* Cleared when the owning guest 'frees' this page. */
+diff --git a/xen/include/public/hvm/ioreq.h b/xen/include/public/hvm/ioreq.h
+index 2e5809b..c8ecc6e 100644
+--- a/xen/include/public/hvm/ioreq.h
++++ b/xen/include/public/hvm/ioreq.h
+@@ -37,6 +37,7 @@
+ #define IOREQ_TYPE_PCI_CONFIG   2
+ #define IOREQ_TYPE_TIMEOFFSET   7
+ #define IOREQ_TYPE_INVALIDATE   8 /* mapcache */
++#define IOREQ_TYPE_INVAL_BFN    9 /* bfn */
+ 
+ /*
+  * VMExit dispatcher should cooperate with instruction decoder to
+diff --git a/xen/include/public/pv-iommu.h b/xen/include/public/pv-iommu.h
+new file mode 100644
+index 0000000..4505f3e
+--- /dev/null
++++ b/xen/include/public/pv-iommu.h
+@@ -0,0 +1,93 @@
++/*
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#ifndef __XEN_PUBLIC_PV_IOMMU_H__
++#define __XEN_PUBLIC_PV_IOMMU_H__
++
++#include "xen.h"
++
++#define IOMMUOP_query_caps            1
++#define IOMMUOP_map_page              2
++#define IOMMUOP_unmap_page            3
++#define IOMMUOP_map_foreign_page      4
++#define IOMMUOP_lookup_foreign_page   5
++#define IOMMUOP_unmap_foreign_page    6
++
++struct pv_iommu_op {
++    uint16_t subop_id;
++
++#define IOMMU_page_order (0xf1 << 10)
++#define IOMMU_get_page_order(flags) ((flags & IOMMU_page_order) >> 10)
++#define IOMMU_QUERY_map_cap (1 << 0)
++#define IOMMU_QUERY_map_all_mfns (1 << 1)
++#define IOMMU_OP_readable (1 << 0)
++#define IOMMU_OP_writeable (1 << 1)
++#define IOMMU_MAP_OP_no_ref_cnt (1 << 2)
++#define IOMMU_MAP_OP_add_m2b (1 << 3)
++#define IOMMU_UNMAP_OP_remove_m2b (1 << 0)
++    uint16_t flags;
++    int32_t status;
++
++    union {
++        struct {
++            uint64_t bfn;
++            uint64_t gfn;
++        } map_page;
++
++        struct {
++            uint64_t bfn;
++        } unmap_page;
++
++        struct {
++            uint64_t bfn;
++            uint64_t gfn;
++            uint16_t domid;
++            uint16_t ioserver;
++        } map_foreign_page;
++
++        struct {
++            uint64_t bfn;
++            uint64_t gfn;
++            uint16_t domid;
++            uint16_t ioserver;
++        } lookup_foreign_page;
++
++        struct {
++            uint64_t bfn;
++            uint16_t ioserver;
++        } unmap_foreign_page;
++    } u;
++};
++
++
++typedef struct pv_iommu_op pv_iommu_op_t;
++DEFINE_XEN_GUEST_HANDLE(pv_iommu_op_t);
++
++#endif
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/xen/include/public/xen.h b/xen/include/public/xen.h
+index ff5547e..a221a3c 100644
+--- a/xen/include/public/xen.h
++++ b/xen/include/public/xen.h
+@@ -102,6 +102,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_ulong_t);
+ #define __HYPERVISOR_tmem_op              38
+ #define __HYPERVISOR_xc_reserved_op       39 /* reserved for XenClient */
+ #define __HYPERVISOR_xenpmu_op            40
++#define __HYPERVISOR_iommu_op             41
+ 
+ /* Architecture-specific hypercall definitions. */
+ #define __HYPERVISOR_arch_0               48
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index 8f3a20e..0199a36 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -77,6 +77,7 @@ void iommu_teardown(struct domain *d);
+ int iommu_map_page(struct domain *d, unsigned long gfn, unsigned long mfn,
+                    unsigned int flags);
+ int iommu_unmap_page(struct domain *d, unsigned long gfn);
++int iommu_lookup_page(struct domain *d, unsigned long gfn, unsigned long *mfn);
+ 
+ enum iommu_feature
+ {
+@@ -150,6 +151,7 @@ struct iommu_ops {
+     void (*teardown)(struct domain *d);
+     int (*map_page)(struct domain *d, unsigned long gfn, unsigned long mfn,
+                     unsigned int flags);
++    int (*lookup_page)(struct domain *d, unsigned long gfn, unsigned long *mfn);
+     int (*unmap_page)(struct domain *d, unsigned long gfn);
+     void (*free_page_table)(struct page_info *);
+ #ifdef CONFIG_X86
+diff --git a/xen/include/xen/m2b.h b/xen/include/xen/m2b.h
+new file mode 100644
+index 0000000..360688d
+--- /dev/null
++++ b/xen/include/xen/m2b.h
+@@ -0,0 +1,40 @@
++/*
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#ifndef __XEN_M2B_H__
++#define __XEN_M2B_H__
++
++#include "sched.h"
++
++int m2b_domain_destroy(struct domain *d, unsigned long mfn);
++
++void notify_m2b_entries(struct page_info *page);
++
++#endif
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index bde3573..e79de01 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -465,6 +465,10 @@ struct domain
+     rwlock_t vnuma_rwlock;
+     struct vnuma_info *vnuma;
+ 
++    /* Progress of cleaning m2b for domain destroy */
++    unsigned long m2b_destroy_mfn;
++    atomic_t m2b_count;
++
+     /* Domain runstates */
+     spinlock_t runstate_lock;
+     atomic_t runstate_missed_changes;
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index bbbfce7..f3b4bf0 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -566,6 +566,12 @@ static XSM_INLINE int xsm_vm_event_control(XSM_DEFAULT_ARG struct domain *d, int
+     return xsm_default_action(action, current->domain, d);
+ }
+ 
++static XSM_INLINE int xsm_iommu_control(XSM_DEFAULT_ARG struct domain *d, unsigned long op)
++{
++    XSM_ASSERT_ACTION(XSM_DM_PRIV);
++    return xsm_default_action(action, current->domain, d);
++}
++
+ #ifdef HAS_MEM_ACCESS
+ static XSM_INLINE int xsm_mem_access(XSM_DEFAULT_ARG struct domain *d)
+ {
+diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
+index 3678a93..1129f18 100644
+--- a/xen/include/xsm/xsm.h
++++ b/xen/include/xsm/xsm.h
+@@ -609,6 +609,11 @@ static inline int xsm_vm_event_control (xsm_default_t def, struct domain *d, int
+     return xsm_ops->vm_event_control(d, mode, op);
+ }
+ 
++static inline int xsm_iommu_control(xsm_default_t def, struct domain *d, unsigned long op)
++{
++    return xsm_ops->iommu_control(d, op);
++}
++
+ #ifdef HAS_MEM_ACCESS
+ static inline int xsm_mem_access (xsm_default_t def, struct domain *d)
+ {
