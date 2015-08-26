@@ -100,7 +100,7 @@ index 3fdf931..f2547a4 100644
  obj-y += rangeset.o
  obj-y += radix-tree.o
 diff --git a/xen/common/memory.c b/xen/common/memory.c
-index 97b0cdc..e7ec9ca 100644
+index 97b0cdc..6ea5ce8 100644
 --- a/xen/common/memory.c
 +++ b/xen/common/memory.c
 @@ -29,6 +29,7 @@
@@ -125,7 +125,7 @@ index 97b0cdc..e7ec9ca 100644
  
 +    /* Check for M2B mapping */
 +    if ( is_hvm_domain(d) &&
-+            test_bit(_PGT_foreign_map, &page->u.inuse.type_info) )
++            test_bit(_PGC_foreign_map, &page->count_info) )
 +    {
 +        /* Notifiy ioserver with M2B mappings */
 +        notify_m2b_entries(page);
@@ -136,10 +136,10 @@ index 97b0cdc..e7ec9ca 100644
      /*
 diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
 new file mode 100644
-index 0000000..a62e611
+index 0000000..6694574
 --- /dev/null
 +++ b/xen/common/pv_iommu.c
-@@ -0,0 +1,851 @@
+@@ -0,0 +1,862 @@
 +#include <xen/config.h>
 +#include <xen/init.h>
 +#include <xen/lib.h>
@@ -239,7 +239,7 @@ index 0000000..a62e611
 +    struct list_head *entry;
 +    domid_t domain = d->domain_id;
 +
-+    if ( !test_bit(_PGT_foreign_map, &page->u.inuse.type_info) )
++    if ( !test_bit(_PGC_foreign_map, &page->count_info) )
 +        return NULL;
 +
 +    rcu_read_lock(&m2b_rcu);
@@ -278,7 +278,7 @@ index 0000000..a62e611
 +    };
 +    struct list_head *entry;
 +
-+    if ( !test_bit(_PGT_foreign_map, &page->u.inuse.type_info) )
++    if ( !test_bit(_PGC_foreign_map, &page->count_info) )
 +        return;
 +
 +    rcu_read_lock(&m2b_rcu);
@@ -306,7 +306,7 @@ index 0000000..a62e611
 +    int head_allocated = 0;
 +    domid_t domain = d->domain_id;
 +
-+    if ( !test_bit(_PGT_foreign_map, &page->u.inuse.type_info) )
++    if ( !test_bit(_PGC_foreign_map, &page->count_info) )
 +    {
 +        page->pv_iommu = xmalloc(struct pv_iommu_info);
 +        if ( !page->pv_iommu )
@@ -314,7 +314,7 @@ index 0000000..a62e611
 +        head_allocated = 1;
 +        INIT_LIST_HEAD(&page->pv_iommu->head);
 +        INIT_RCU_HEAD(&page->pv_iommu->rcu_head);
-+        set_bit(_PGT_foreign_map, &page->u.inuse.type_info);
++        set_bit(_PGC_foreign_map, &page->count_info);
 +        page->pv_iommu->count = 0;
 +    }
 +
@@ -362,7 +362,7 @@ index 0000000..a62e611
 +
 +    if ( page->pv_iommu->count == 0 )
 +    {
-+        clear_bit(_PGT_foreign_map, &page->u.inuse.type_info);
++        clear_bit(_PGC_foreign_map, &page->count_info);
 +        xfree(page->pv_iommu);
 +    }
 +    return 0;
@@ -680,7 +680,9 @@ index 0000000..a62e611
 +            }
 +
 +            if ( !mfn_valid(mfn) || xen_in_range(mfn) ||
-+                 is_xen_heap_page(page) )
++                 is_xen_heap_page(page)  ||
++		 (page->count_info & PGC_allocated) ||
++	         ( (page->count_info & PGC_count_mask) < 2 ))
 +            {
 +                put_page(page);
 +                op->status = -EPERM;
@@ -785,6 +787,15 @@ index 0000000..a62e611
 +                op->status = 0;
 +                goto finish;
 +            }
++
++	    /* Only create BFN mappings for guest mapped memory */
++	    if ( !(page->count_info & PGC_allocated) || 
++	         ( (page->count_info & PGC_count_mask) < 2 ))
++	    {
++                put_page(page);
++                op->status = -EPERM;
++                goto finish;
++	    }
 +
 +            /* Check if IOMMU is disabled/bypassed */
 +            if ( !can_use_iommu_check(d) )
@@ -1114,36 +1125,36 @@ index 69808a9..bd508ee 100644
          RELMEM_l4,
          RELMEM_l3,
 diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
-index 7f62c1e..2463bd4 100644
+index 7f62c1e..d9cd0cb 100644
 --- a/xen/include/asm-x86/mm.h
 +++ b/xen/include/asm-x86/mm.h
-@@ -62,6 +62,12 @@ struct page_info
-          * This list is allocated and freed when a page is shared/unshared.
+@@ -63,6 +63,12 @@ struct page_info
           */
          struct page_sharing_info *sharing;
-+        /* For foreign mapped pages, we use a doubly-linked list
-+         * of all the {pfn,domain, ioserver} tuples that map this page.
-+         * This list is allocated and freed from a page is foreign
-+	 * mapped/unmapped.
-+         */
-+        struct pv_iommu_info *pv_iommu;
      };
++    /* For foreign mapped pages, we use a doubly-linked list
++     * of all the {pfn,domain, ioserver} tuples that map this page.
++     * This list is allocated and freed from a page is foreign
++     * mapped/unmapped.
++     */
++    struct pv_iommu_info *pv_iommu;
  
      /* Reference count and various PGC_xxx flags and fields. */
-@@ -200,9 +206,12 @@ struct page_info
-  /* Page is locked? */
- #define _PGT_locked       PG_shift(9)
- #define PGT_locked        PG_mask(1, 9)
-+ /* Page has foreign mappings? */
-+#define _PGT_foreign_map  PG_shift(10)
-+#define PGT_foreign_map   PG_mask(1, _PGT_foreign_map)
+     unsigned long count_info;
+@@ -232,8 +238,12 @@ struct page_info
+ #define _PGC_pinned_by_tools PG_shift(10)
+ #define PGC_pinned_by_tools PG_mask(1, 10)
  
-  /* Count of uses of this frame as its current type. */
--#define PGT_count_width   PG_shift(9)
-+#define PGT_count_width   PG_shift(10)
- #define PGT_count_mask    ((1UL<<PGT_count_width)-1)
++/* Page has foreign mappings? */
++#define _PGC_foreign_map  PG_shift(11)
++#define PGC_foreign_map   PG_mask(1, 11)
++
+  /* Count of references to this frame. */
+-#define PGC_count_width   PG_shift(10)
++#define PGC_count_width   PG_shift(11)
+ #define PGC_count_mask    ((1UL<<PGC_count_width)-1)
  
-  /* Cleared when the owning guest 'frees' this page. */
+ struct spage_info
 diff --git a/xen/include/public/hvm/ioreq.h b/xen/include/public/hvm/ioreq.h
 index 2e5809b..c8ecc6e 100644
 --- a/xen/include/public/hvm/ioreq.h
