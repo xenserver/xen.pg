@@ -11,7 +11,7 @@ index 8c0df30..ffdbded 100644
  %{_includedir}/%{name}/sched.h
  %{_includedir}/%{name}/sys/evtchn.h
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 53cebb7..5148faa 100644
+index e359cb0..04bcdc7 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
 @@ -62,6 +62,7 @@
@@ -22,7 +22,7 @@ index 53cebb7..5148faa 100644
  
  DEFINE_PER_CPU(struct vcpu *, curr_vcpu);
  DEFINE_PER_CPU(unsigned long, cr4);
-@@ -2142,7 +2143,7 @@ int domain_relinquish_resources(struct domain *d)
+@@ -2157,7 +2158,7 @@ int domain_relinquish_resources(struct domain *d)
                  return ret;
          }
  
@@ -31,7 +31,7 @@ index 53cebb7..5148faa 100644
  
          spin_lock(&d->page_alloc_lock);
          page_list_splice(&d->arch.relmem_list, &d->page_list);
-@@ -2150,6 +2151,15 @@ int domain_relinquish_resources(struct domain *d)
+@@ -2165,6 +2166,15 @@ int domain_relinquish_resources(struct domain *d)
          spin_unlock(&d->page_alloc_lock);
  
          /* Fallthrough. Relinquish every page of memory. */
@@ -100,7 +100,7 @@ index 3fdf931..f2547a4 100644
  obj-y += rangeset.o
  obj-y += radix-tree.o
 diff --git a/xen/common/memory.c b/xen/common/memory.c
-index 97b0cdc..6ea5ce8 100644
+index 71d5937..0bcd7c1 100644
 --- a/xen/common/memory.c
 +++ b/xen/common/memory.c
 @@ -29,6 +29,7 @@
@@ -111,7 +111,7 @@ index 97b0cdc..6ea5ce8 100644
  
  struct memop_args {
      /* INPUT */
-@@ -235,6 +236,7 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
+@@ -241,6 +242,7 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
          mfn = mfn_x(get_gfn_query_unlocked(d, gmfn, &p2mt));
          ASSERT(!p2m_is_shared(p2mt));
      }
@@ -119,7 +119,7 @@ index 97b0cdc..6ea5ce8 100644
  #endif /* CONFIG_X86 */
  
      page = mfn_to_page(mfn);
-@@ -251,6 +253,14 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
+@@ -257,6 +259,14 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
      if ( test_and_clear_bit(_PGC_allocated, &page->count_info) )
          put_page(page);
  
@@ -136,7 +136,7 @@ index 97b0cdc..6ea5ce8 100644
      /*
 diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
 new file mode 100644
-index 0000000..6694574
+index 0000000..c93fb0f
 --- /dev/null
 +++ b/xen/common/pv_iommu.c
 @@ -0,0 +1,862 @@
@@ -190,8 +190,8 @@ index 0000000..6694574
 +static uint64_t **hwdom_premap_m2b;
 +
 +DEFINE_RCU_READ_LOCK(m2b_rcu);
-+#define PREMAP_M2B_PAGE(x) ( x / (PAGE_SIZE/sizeof(uint64_t) ) )
-+#define PREMAP_M2B_IDX(x) ( x % (PAGE_SIZE/sizeof(uint64_t) ) )
++#define PREMAP_M2B_PAGE(x) ( pfn_to_pdx(x) / (PAGE_SIZE/sizeof(uint64_t) ) )
++#define PREMAP_M2B_IDX(x) ( pfn_to_pdx(x) % (PAGE_SIZE/sizeof(uint64_t) ) )
 +
 +#define PREMAP_M2B(x) hwdom_premap_m2b[PREMAP_M2B_PAGE(x)][PREMAP_M2B_IDX(x)]
 +
@@ -474,8 +474,8 @@ index 0000000..6694574
 +            {
 +                op->flags |= IOMMU_QUERY_map_all_mfns;
 +                hwdom_premap_m2b = xzalloc_array(unsigned long *,
-+                                        (sizeof(unsigned long) * max_page)/
-+                                        PAGE_SIZE);
++                                        ((sizeof(unsigned long) * max_pdx)/
++                                        PAGE_SIZE) + 1);
 +
 +
 +                //if (hwdom_premap_m2b)
@@ -1033,7 +1033,7 @@ index 9e0daf4..90a174f 100644
  {
      do {
 diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
-index 1dffc40..24302e3 100644
+index 836aed5..40719a6 100644
 --- a/xen/drivers/passthrough/vtd/iommu.c
 +++ b/xen/drivers/passthrough/vtd/iommu.c
 @@ -606,7 +606,7 @@ static void intel_iommu_iotlb_flush(struct domain *d, unsigned long gfn, unsigne
@@ -1113,10 +1113,10 @@ index ac71ed1..83f525c 100644
  #define dma_pte_superpage(p) (((p).val & DMA_PTE_SP) != 0)
  
 diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
-index 69808a9..bd508ee 100644
+index 3ba4ec6..cd304b2 100644
 --- a/xen/include/asm-x86/domain.h
 +++ b/xen/include/asm-x86/domain.h
-@@ -299,6 +299,7 @@ struct arch_domain
+@@ -305,6 +305,7 @@ struct arch_domain
      enum {
          RELMEM_not_started,
          RELMEM_shared,
@@ -1125,7 +1125,7 @@ index 69808a9..bd508ee 100644
          RELMEM_l4,
          RELMEM_l3,
 diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
-index 7f62c1e..d9cd0cb 100644
+index 093b37c..c718b76 100644
 --- a/xen/include/asm-x86/mm.h
 +++ b/xen/include/asm-x86/mm.h
 @@ -63,6 +63,12 @@ struct page_info
