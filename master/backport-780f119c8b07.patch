@@ -1,0 +1,383 @@
+From 780f119c8b073b36bcc098ef7b7f70fd1dc17c96 Mon Sep 17 00:00:00 2001
+From: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Date: Wed, 9 Sep 2015 16:27:24 +0200
+Subject: [PATCH] x86: clean up vm_event-related code in asm-x86/domain.h
+
+As suggested by Jan Beulich, moved struct monitor_write_data from
+struct arch_domain to struct arch_vcpu, as well as moving all
+vm_event-related data from asm-x86/domain.h to struct vm_event,
+and allocating it dynamically only when needed.
+
+Suggested-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Acked-by: Tamas K Lengyel <tamas@tklengyel.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 045f6ff..58e173e 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -424,9 +424,6 @@ int vcpu_initialise(struct vcpu *v)
+ 
+     v->arch.flags = TF_kernel_mode;
+ 
+-    /* By default, do not emulate */
+-    v->arch.vm_event.emulate_flags = 0;
+-
+     rc = mapcache_vcpu_init(v);
+     if ( rc )
+         return rc;
+@@ -511,8 +508,8 @@ int vcpu_initialise(struct vcpu *v)
+ 
+ void vcpu_destroy(struct vcpu *v)
+ {
+-    xfree(v->arch.vm_event.emul_read_data);
+-    v->arch.vm_event.emul_read_data = NULL;
++    xfree(v->arch.vm_event);
++    v->arch.vm_event = NULL;
+ 
+     if ( is_pv_32bit_vcpu(v) )
+     {
+@@ -668,9 +665,6 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags,
+ 
+ void arch_domain_destroy(struct domain *d)
+ {
+-    vfree(d->arch.event_write_data);
+-    d->arch.event_write_data = NULL;
+-
+     if ( has_hvm_container_domain(d) )
+         hvm_domain_destroy(d);
+ 
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 30acb78..5934c72 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -22,6 +22,7 @@
+ #include <asm/hvm/trace.h>
+ #include <asm/hvm/support.h>
+ #include <asm/hvm/svm/svm.h>
++#include <asm/vm_event.h>
+ 
+ static void hvmtrace_io_assist(const ioreq_t *p)
+ {
+@@ -71,12 +72,12 @@ static int set_context_data(void *buffer, unsigned int size)
+ {
+     struct vcpu *curr = current;
+ 
+-    if ( curr->arch.vm_event.emul_read_data )
++    if ( curr->arch.vm_event )
+     {
+         unsigned int safe_size =
+-            min(size, curr->arch.vm_event.emul_read_data->size);
++            min(size, curr->arch.vm_event->emul_read_data.size);
+ 
+-        memcpy(buffer, curr->arch.vm_event.emul_read_data->data, safe_size);
++        memcpy(buffer, curr->arch.vm_event->emul_read_data.data, safe_size);
+         memset(buffer + safe_size, 0, size - safe_size);
+         return X86EMUL_OKAY;
+     }
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 615fa89..fd21962 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -63,6 +63,7 @@
+ #include <asm/altp2m.h>
+ #include <asm/mtrr.h>
+ #include <asm/apic.h>
++#include <asm/vm_event.h>
+ #include <public/sched.h>
+ #include <public/hvm/ioreq.h>
+ #include <public/version.h>
+@@ -541,9 +542,9 @@ void hvm_do_resume(struct vcpu *v)
+         break;
+     }
+ 
+-    if ( unlikely(d->arch.event_write_data) )
++    if ( unlikely(v->arch.vm_event) )
+     {
+-        struct monitor_write_data *w = &d->arch.event_write_data[v->vcpu_id];
++        struct monitor_write_data *w = &v->arch.vm_event->write_data;
+ 
+         if ( w->do_write.msr )
+         {
+@@ -3337,7 +3338,6 @@ int hvm_set_cr0(unsigned long value, bool_t may_defer)
+     struct domain *d = v->domain;
+     unsigned long gfn, old_value = v->arch.hvm_vcpu.guest_cr[0];
+     struct page_info *page;
+-    struct arch_domain *currad = &v->domain->arch;
+ 
+     HVM_DBG_LOG(DBG_LEVEL_VMMU, "Update CR0 value = %lx", value);
+ 
+@@ -3367,16 +3367,16 @@ int hvm_set_cr0(unsigned long value, bool_t may_defer)
+         goto gpf;
+     }
+ 
+-    if ( may_defer && unlikely(currad->monitor.write_ctrlreg_enabled &
++    if ( may_defer && unlikely(v->domain->arch.monitor.write_ctrlreg_enabled &
+                                monitor_ctrlreg_bitmask(VM_EVENT_X86_CR0)) )
+     {
+-        ASSERT(currad->event_write_data != NULL);
++        ASSERT(v->arch.vm_event);
+ 
+         if ( hvm_event_crX(CR0, value, old_value) )
+         {
+             /* The actual write will occur in hvm_do_resume(), if permitted. */
+-            currad->event_write_data[v->vcpu_id].do_write.cr0 = 1;
+-            currad->event_write_data[v->vcpu_id].cr0 = value;
++            v->arch.vm_event->write_data.do_write.cr0 = 1;
++            v->arch.vm_event->write_data.cr0 = value;
+ 
+             return X86EMUL_OKAY;
+         }
+@@ -3468,18 +3468,17 @@ int hvm_set_cr3(unsigned long value, bool_t may_defer)
+     struct vcpu *v = current;
+     struct page_info *page;
+     unsigned long old = v->arch.hvm_vcpu.guest_cr[3];
+-    struct arch_domain *currad = &v->domain->arch;
+ 
+-    if ( may_defer && unlikely(currad->monitor.write_ctrlreg_enabled &
++    if ( may_defer && unlikely(v->domain->arch.monitor.write_ctrlreg_enabled &
+                                monitor_ctrlreg_bitmask(VM_EVENT_X86_CR3)) )
+     {
+-        ASSERT(currad->event_write_data != NULL);
++        ASSERT(v->arch.vm_event);
+ 
+         if ( hvm_event_crX(CR3, value, old) )
+         {
+             /* The actual write will occur in hvm_do_resume(), if permitted. */
+-            currad->event_write_data[v->vcpu_id].do_write.cr3 = 1;
+-            currad->event_write_data[v->vcpu_id].cr3 = value;
++            v->arch.vm_event->write_data.do_write.cr3 = 1;
++            v->arch.vm_event->write_data.cr3 = value;
+ 
+             return X86EMUL_OKAY;
+         }
+@@ -3515,7 +3514,6 @@ int hvm_set_cr4(unsigned long value, bool_t may_defer)
+ {
+     struct vcpu *v = current;
+     unsigned long old_cr;
+-    struct arch_domain *currad = &v->domain->arch;
+ 
+     if ( value & hvm_cr4_guest_reserved_bits(v, 0) )
+     {
+@@ -3543,16 +3541,16 @@ int hvm_set_cr4(unsigned long value, bool_t may_defer)
+         goto gpf;
+     }
+ 
+-    if ( may_defer && unlikely(currad->monitor.write_ctrlreg_enabled &
++    if ( may_defer && unlikely(v->domain->arch.monitor.write_ctrlreg_enabled &
+                                monitor_ctrlreg_bitmask(VM_EVENT_X86_CR4)) )
+     {
+-        ASSERT(currad->event_write_data != NULL);
++        ASSERT(v->arch.vm_event);
+ 
+         if ( hvm_event_crX(CR4, value, old_cr) )
+         {
+             /* The actual write will occur in hvm_do_resume(), if permitted. */
+-            currad->event_write_data[v->vcpu_id].do_write.cr4 = 1;
+-            currad->event_write_data[v->vcpu_id].cr4 = value;
++            v->arch.vm_event->write_data.do_write.cr4 = 1;
++            v->arch.vm_event->write_data.cr4 = value;
+ 
+             return X86EMUL_OKAY;
+         }
+@@ -4752,12 +4750,12 @@ int hvm_msr_write_intercept(unsigned int msr, uint64_t msr_content,
+ 
+     if ( may_defer && unlikely(currad->monitor.mov_to_msr_enabled) )
+     {
+-        ASSERT(currad->event_write_data != NULL);
++        ASSERT(v->arch.vm_event);
+ 
+         /* The actual write will occur in hvm_do_resume() (if permitted). */
+-        currad->event_write_data[v->vcpu_id].do_write.msr = 1;
+-        currad->event_write_data[v->vcpu_id].msr = msr;
+-        currad->event_write_data[v->vcpu_id].value = msr_content;
++        v->arch.vm_event->write_data.do_write.msr = 1;
++        v->arch.vm_event->write_data.msr = msr;
++        v->arch.vm_event->write_data.value = msr_content;
+ 
+         hvm_event_msr(msr, msr_content);
+         return X86EMUL_OKAY;
+diff --git a/xen/arch/x86/mm/p2m.c b/xen/arch/x86/mm/p2m.c
+index 6b4a35b..e1d930a 100644
+--- a/xen/arch/x86/mm/p2m.c
++++ b/xen/arch/x86/mm/p2m.c
+@@ -36,6 +36,7 @@
+ #include <asm/hvm/nestedhvm.h>
+ #include <asm/altp2m.h>
+ #include <asm/hvm/svm/amd-iommu-proto.h>
++#include <asm/vm_event.h>
+ #include <xsm/xsm.h>
+ 
+ #include "mm-locks.h"
+@@ -1591,11 +1592,10 @@ void p2m_mem_access_emulate_check(struct vcpu *v,
+             }
+         }
+ 
+-        v->arch.vm_event.emulate_flags = violation ? rsp->flags : 0;
++        v->arch.vm_event->emulate_flags = violation ? rsp->flags : 0;
+ 
+-        if ( (rsp->flags & VM_EVENT_FLAG_SET_EMUL_READ_DATA) &&
+-             v->arch.vm_event.emul_read_data )
+-            *v->arch.vm_event.emul_read_data = rsp->data.emul_read_data;
++        if ( (rsp->flags & VM_EVENT_FLAG_SET_EMUL_READ_DATA) )
++            v->arch.vm_event->emul_read_data = rsp->data.emul_read_data;
+     }
+ }
+ 
+@@ -1678,34 +1678,35 @@ bool_t p2m_mem_access_check(paddr_t gpa, unsigned long gla,
+     }
+ 
+     /* The previous vm_event reply does not match the current state. */
+-    if ( v->arch.vm_event.gpa != gpa || v->arch.vm_event.eip != eip )
++    if ( unlikely(v->arch.vm_event) &&
++         (v->arch.vm_event->gpa != gpa || v->arch.vm_event->eip != eip) )
+     {
+         /* Don't emulate the current instruction, send a new vm_event. */
+-        v->arch.vm_event.emulate_flags = 0;
++        v->arch.vm_event->emulate_flags = 0;
+ 
+         /*
+          * Make sure to mark the current state to match it again against
+          * the new vm_event about to be sent.
+          */
+-        v->arch.vm_event.gpa = gpa;
+-        v->arch.vm_event.eip = eip;
++        v->arch.vm_event->gpa = gpa;
++        v->arch.vm_event->eip = eip;
+     }
+ 
+-    if ( v->arch.vm_event.emulate_flags )
++    if ( unlikely(v->arch.vm_event) && v->arch.vm_event->emulate_flags )
+     {
+         enum emul_kind kind = EMUL_KIND_NORMAL;
+ 
+-        if ( v->arch.vm_event.emulate_flags &
++        if ( v->arch.vm_event->emulate_flags &
+              VM_EVENT_FLAG_SET_EMUL_READ_DATA )
+             kind = EMUL_KIND_SET_CONTEXT;
+-        else if ( v->arch.vm_event.emulate_flags &
++        else if ( v->arch.vm_event->emulate_flags &
+                   VM_EVENT_FLAG_EMULATE_NOWRITE )
+             kind = EMUL_KIND_NOWRITE;
+ 
+         hvm_mem_access_emulate_one(kind, TRAP_invalid_op,
+                                    HVM_DELIVER_NO_ERROR_CODE);
+ 
+-        v->arch.vm_event.emulate_flags = 0;
++        v->arch.vm_event->emulate_flags = 0;
+         return 1;
+     }
+ 
+diff --git a/xen/arch/x86/vm_event.c b/xen/arch/x86/vm_event.c
+index b32a839..e4e0aa4 100644
+--- a/xen/arch/x86/vm_event.c
++++ b/xen/arch/x86/vm_event.c
+@@ -27,22 +27,14 @@ int vm_event_init_domain(struct domain *d)
+ {
+     struct vcpu *v;
+ 
+-    if ( !d->arch.event_write_data )
+-        d->arch.event_write_data =
+-            vzalloc(sizeof(struct monitor_write_data) * d->max_vcpus);
+-
+-    if ( !d->arch.event_write_data )
+-        return -ENOMEM;
+-
+     for_each_vcpu ( d, v )
+     {
+-        if ( v->arch.vm_event.emul_read_data )
++        if ( v->arch.vm_event )
+             continue;
+ 
+-        v->arch.vm_event.emul_read_data =
+-            xzalloc(struct vm_event_emul_read_data);
++        v->arch.vm_event = xzalloc(struct arch_vm_event);
+ 
+-        if ( !v->arch.vm_event.emul_read_data )
++        if ( !v->arch.vm_event )
+             return -ENOMEM;
+     }
+ 
+@@ -57,13 +49,10 @@ void vm_event_cleanup_domain(struct domain *d)
+ {
+     struct vcpu *v;
+ 
+-    vfree(d->arch.event_write_data);
+-    d->arch.event_write_data = NULL;
+-
+     for_each_vcpu ( d, v )
+     {
+-        xfree(v->arch.vm_event.emul_read_data);
+-        v->arch.vm_event.emul_read_data = NULL;
++        xfree(v->arch.vm_event);
++        v->arch.vm_event = NULL;
+     }
+ }
+ 
+@@ -79,10 +68,9 @@ void vm_event_register_write_resume(struct vcpu *v, vm_event_response_t *rsp)
+ {
+     if ( rsp->flags & VM_EVENT_FLAG_DENY )
+     {
+-        struct monitor_write_data *w =
+-            &v->domain->arch.event_write_data[v->vcpu_id];
++        struct monitor_write_data *w = &v->arch.vm_event->write_data;
+ 
+-        ASSERT(v->domain->arch.event_write_data != NULL);
++        ASSERT(w);
+ 
+         switch ( rsp->reason )
+         {
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index 0fce09e..680e2d8 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -385,8 +385,6 @@ struct arch_domain
+ 
+     /* Mem_access emulation control */
+     bool_t mem_access_emulate_enabled;
+-
+-    struct monitor_write_data *event_write_data;
+ } __cacheline_aligned;
+ 
+ #define has_arch_pdevs(d)    (!list_empty(&(d)->arch.pdev_list))
+@@ -533,16 +531,7 @@ struct arch_vcpu
+     /* A secondary copy of the vcpu time info. */
+     XEN_GUEST_HANDLE(vcpu_time_info_t) time_info_guest;
+ 
+-    /*
+-     * Should we emulate the next matching instruction on VCPU resume
+-     * after a vm_event?
+-     */
+-    struct {
+-        uint32_t emulate_flags;
+-        unsigned long gpa;
+-        unsigned long eip;
+-        struct vm_event_emul_read_data *emul_read_data;
+-    } vm_event;
++    struct arch_vm_event *vm_event;
+ };
+ 
+ smap_check_policy_t smap_policy_change(struct vcpu *v,
+diff --git a/xen/include/asm-x86/vm_event.h b/xen/include/asm-x86/vm_event.h
+index 0ae5952..2ff2cab 100644
+--- a/xen/include/asm-x86/vm_event.h
++++ b/xen/include/asm-x86/vm_event.h
+@@ -22,6 +22,18 @@
+ #include <xen/sched.h>
+ #include <xen/vm_event.h>
+ 
++/*
++ * Should we emulate the next matching instruction on VCPU resume
++ * after a vm_event?
++ */
++struct arch_vm_event {
++    uint32_t emulate_flags;
++    unsigned long gpa;
++    unsigned long eip;
++    struct vm_event_emul_read_data emul_read_data;
++    struct monitor_write_data write_data;
++};
++
+ int vm_event_init_domain(struct domain *d);
+ 
+ void vm_event_cleanup_domain(struct domain *d);
