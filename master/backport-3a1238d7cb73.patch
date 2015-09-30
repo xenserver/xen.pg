@@ -1,0 +1,128 @@
+From 3a1238d7cb73bc50f9ca1abede2b7cc59ec97bcd Mon Sep 17 00:00:00 2001
+From: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Date: Mon, 28 Sep 2015 17:29:45 +0200
+Subject: [PATCH] fine grained control of REP emulation optimizations
+
+Previously, if vm_event emulation support was enabled, then REP
+optimizations were disabled when emulating REP-compatible
+instructions. This patch allows fine-tuning of this behaviour by
+providing a dedicated libxc helper function.
+
+Signed-off-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 37205c2..c0d2d6f 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -2425,6 +2425,18 @@ int xc_monitor_software_breakpoint(xc_interface *xch, domid_t domain_id,
+ int xc_monitor_guest_request(xc_interface *xch, domid_t domain_id,
+                              bool enable, bool sync);
+ 
++/**
++ * This function enables / disables emulation for each REP for a
++ * REP-compatible instruction.
++ *
++ * @parm xch a handle to an open hypervisor interface.
++ * @parm domain_id the domain id one wants to get the node affinity of.
++ * @parm enable if 0 optimize when possible, else emulate each REP.
++ * @return 0 on success, -1 on failure.
++ */
++int xc_monitor_emulate_each_rep(xc_interface *xch, domid_t domain_id,
++                                bool enable);
++
+ /***
+  * Memory sharing operations.
+  *
+diff --git a/tools/libxc/xc_monitor.c b/tools/libxc/xc_monitor.c
+index 065669c..b1705dd 100644
+--- a/tools/libxc/xc_monitor.c
++++ b/tools/libxc/xc_monitor.c
+@@ -143,3 +143,16 @@ int xc_monitor_guest_request(xc_interface *xch, domid_t domain_id, bool enable,
+ 
+     return do_domctl(xch, &domctl);
+ }
++
++int xc_monitor_emulate_each_rep(xc_interface *xch, domid_t domain_id,
++                                bool enable)
++{
++    DECLARE_DOMCTL;
++
++    domctl.cmd = XEN_DOMCTL_monitor_op;
++    domctl.domain = domain_id;
++    domctl.u.monitor_op.op = XEN_DOMCTL_MONITOR_OP_EMULATE_EACH_REP;
++    domctl.u.monitor_op.event = enable;
++
++    return do_domctl(xch, &domctl);
++}
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 5934c72..39774b7 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -514,7 +514,7 @@ static int hvmemul_virtual_to_linear(
+      * being triggered for repeated writes to a whole page.
+      */
+     *reps = min_t(unsigned long, *reps,
+-                  unlikely(current->domain->arch.mem_access_emulate_enabled)
++                  unlikely(current->domain->arch.mem_access_emulate_each_rep)
+                            ? 1 : 4096);
+ 
+     reg = hvmemul_get_seg_reg(seg, hvmemul_ctxt);
+diff --git a/xen/arch/x86/monitor.c b/xen/arch/x86/monitor.c
+index 3d52135..7611f7b 100644
+--- a/xen/arch/x86/monitor.c
++++ b/xen/arch/x86/monitor.c
+@@ -73,10 +73,15 @@ int monitor_domctl(struct domain *d, struct xen_domctl_monitor_op *mop)
+     if ( rc )
+         return rc;
+ 
+-    if ( mop->op == XEN_DOMCTL_MONITOR_OP_GET_CAPABILITIES )
++    switch ( mop->op )
+     {
++    case XEN_DOMCTL_MONITOR_OP_GET_CAPABILITIES:
+         mop->event = capabilities;
+         return 0;
++
++    case XEN_DOMCTL_MONITOR_OP_EMULATE_EACH_REP:
++        d->arch.mem_access_emulate_each_rep = !!mop->event;
++        return 0;
+     }
+ 
+     /*
+diff --git a/xen/arch/x86/vm_event.c b/xen/arch/x86/vm_event.c
+index e4e0aa4..c38d37b 100644
+--- a/xen/arch/x86/vm_event.c
++++ b/xen/arch/x86/vm_event.c
+@@ -54,6 +54,8 @@ void vm_event_cleanup_domain(struct domain *d)
+         xfree(v->arch.vm_event);
+         v->arch.vm_event = NULL;
+     }
++
++    d->arch.mem_access_emulate_each_rep = 0;
+ }
+ 
+ void vm_event_toggle_singlestep(struct domain *d, struct vcpu *v)
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index 680e2d8..d49b028 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -385,6 +385,7 @@ struct arch_domain
+ 
+     /* Mem_access emulation control */
+     bool_t mem_access_emulate_enabled;
++    bool_t mem_access_emulate_each_rep;
+ } __cacheline_aligned;
+ 
+ #define has_arch_pdevs(d)    (!list_empty(&(d)->arch.pdev_list))
+diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
+index 675f021..a62e096 100644
+--- a/xen/include/public/domctl.h
++++ b/xen/include/public/domctl.h
+@@ -1007,6 +1007,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_psr_cmt_op_t);
+ #define XEN_DOMCTL_MONITOR_OP_ENABLE            0
+ #define XEN_DOMCTL_MONITOR_OP_DISABLE           1
+ #define XEN_DOMCTL_MONITOR_OP_GET_CAPABILITIES  2
++#define XEN_DOMCTL_MONITOR_OP_EMULATE_EACH_REP  3
+ 
+ #define XEN_DOMCTL_MONITOR_EVENT_WRITE_CTRLREG         0
+ #define XEN_DOMCTL_MONITOR_EVENT_MOV_TO_MSR            1
