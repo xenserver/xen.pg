@@ -768,10 +768,10 @@ index 0000000..c43d473
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..67c2c85
+index 0000000..4dd762e
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,822 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1222,6 +1222,35 @@ index 0000000..67c2c85
 +    return rc;
 +}
 +
++static int get_rdm(uint16_t seg, uint8_t bus, uint8_t devfn,
++                   unsigned int *nr_entries,
++                   struct xen_reserved_device_memory **xrdm)
++{
++    int rc = 0, r;
++
++    *nr_entries = 0;
++    r = xc_reserved_device_memory_map(xch, 0, seg, bus, devfn,
++                                      NULL, nr_entries);
++    /* "0" means we have no any rdm entry. */
++    if (!r)
++        goto out;
++
++    if (errno != ENOBUFS) {
++        rc = -1;
++        goto out;
++    }
++    *xrdm = malloc(sizeof(**xrdm) * (*nr_entries));
++    if (!*xrdm)
++        rc = -1;
++
++    r = xc_reserved_device_memory_map(xch, 0, seg, bus, devfn,
++                                      *xrdm, nr_entries);
++    if (r)
++        rc = -1;
++out:
++    return rc;
++}
++
 +int stub_xc_hvm_build_with_mem(uint64_t max_mem_mib, uint64_t max_start_mib,
 +                               const char *image)
 +{
@@ -1232,13 +1261,31 @@ index 0000000..67c2c85
 +        .mmio_size  = HVM_BELOW_4G_MMIO_LENGTH,
 +        .image_file_name = image,
 +    };
-+    unsigned int nr_e820 = 1;
-+    struct e820entry e820[2];
++    unsigned int i, nr = 0;
++    struct e820entry *e820;
 +    int rc;
++    unsigned int nr_rdm_entries = 0;
++    struct xen_reserved_device_memory *xrdm = NULL;
++    unsigned long rmrr_overlapped_ram = 0;
++    char buf[64];
++    char *s;
 +
 +    if ( pci_passthrough_sbdf_list )
++    {
 +        xg_info("TODO - query Xen for RMRRs for '%s'\n",
 +                pci_passthrough_sbdf_list);
++    } else {
++        snprintf(buf, sizeof buf, "/local/domain/%u/platform/igd_passthrough", domid);
++        s = xs_read(xsh, XBT_NULL, buf, NULL);
++        if (s)
++        {
++            xg_info("Getting RMRR's for Intel GPU\n");
++            get_rdm(0,0,(2 << 3), &nr_rdm_entries, &xrdm);
++        }
++    }
++    e820 = malloc(sizeof(*e820) * E820MAX);
++    if (!e820)
++	    return -ENOMEM;
 +
 +    lowmem_end  = args.mem_size;
 +    highmem_end = 0;
@@ -1248,7 +1295,6 @@ index 0000000..67c2c85
 +    {
 +        highmem_end = (1ull << 32) + (lowmem_end - mmio_start);
 +        lowmem_end = mmio_start;
-+        nr_e820 = 2;
 +    }
 +
 +    args.lowmem_end = lowmem_end;
@@ -1256,21 +1302,43 @@ index 0000000..67c2c85
 +    args.mmio_start = mmio_start;
 +
 +    /* Leave low 1MB to HVMLoader... */
-+    e820[0].addr = 0x100000u;
-+    e820[0].size = args.lowmem_end - 0x100000u;
-+    e820[0].type = E820_RAM;
++    e820[nr].addr = 0x100000u;
++    e820[nr].size = args.lowmem_end - 0x100000u;
++    e820[nr].type = E820_RAM;
++    nr++;
 +
-+    if ( nr_e820 == 2 )
++    /* RDM mapping */
++    for (i = 0; i < nr_rdm_entries; i++) {
++        e820[nr].addr = xrdm[i].start_pfn << XC_PAGE_SHIFT;
++        e820[nr].size = xrdm[i].nr_pages << XC_PAGE_SHIFT;
++        e820[nr].type = E820_RESERVED;
++        xg_info("Adding RMRR 0x%lx size 0x%lx\n", e820[nr].addr, e820[nr].size);
++        if ( e820[nr].addr < args.lowmem_end ) {
++            rmrr_overlapped_ram += ( args.lowmem_end - e820[nr].addr );
++            args.lowmem_end = e820[nr].addr;
++        }
++        nr++;
++    }
++    e820[0].size -= rmrr_overlapped_ram;
++    args.highmem_end += rmrr_overlapped_ram;
++    args.mmio_size += rmrr_overlapped_ram;
++    mmio_start -= rmrr_overlapped_ram;
++
++    if (nr_rdm_entries)
++        free(xrdm);
++
++    if ( lowmem_end > mmio_start )
 +    {
-+        e820[1].addr = 1UL << 32;
-+        e820[1].size = args.highmem_end - e820[1].addr;
-+        e820[1].type = E820_RAM;
++        e820[nr].addr = 1UL << 32;
++        e820[nr].size = args.highmem_end - e820[nr].addr;
++        e820[nr].type = E820_RAM;
++	nr++;
 +    }
 +
 +    rc = xc_hvm_build(xch, domid, &args);
 +
 +    if (!rc)
-+        rc = xc_domain_set_memory_map(xch, domid, e820, nr_e820);
++        rc = xc_domain_set_memory_map(xch, domid, e820, nr);
 +
 +    return rc;
 +}
