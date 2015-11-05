@@ -1,0 +1,182 @@
+rwlock: add per-cpu reader-writer locks
+
+Per-cpu read-write locks allow for the fast path read case to have
+low overhead by only setting/clearing a per-cpu variable for using
+the read lock. The per-cpu read fast path also avoids locked
+compare swap operations which can be particularly slow on coherent
+multi-socket systems, particularly if there is heavy usage of the
+read lock itself.
+
+The per-cpu reader-writer lock uses a global variable to control
+the read lock fast path. This allows a writer to disable the fast 
+path and ensure the readers use the underlying read-write lock
+implementation.
+
+Once the writer has taken the write lock and disabled the fast path,
+it must poll the per-cpu variable for all CPU's which have entered
+the critical section for the specific read-write lock the writer is
+attempting to take. This design allows for a single per-cpu variable
+to be used for read/write locks belonging to seperate data structures
+as long as multiple per-cpu read locks are not simultaneously held
+by one particular cpu. This also means per-cpu reader-writer locks
+are not recursion safe.
+
+Slow path readers which are unblocked set the per-cpu variable and
+drop the read lock. This simplifies the implementation and allows
+for fairness in the underlying read-write lock to be taken
+advantage of.
+
+There may be slightly more overhead on the per-cpu write lock path
+due to checking each CPUs fast path read variable but this overhead
+is likely be hidden by the required delay of waiting for readers to
+exit the critical section. The loop is optimised to only iterate over
+the per-cpu data of active readers of the rwlock.
+
+Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
+
+diff --git a/xen/common/spinlock.c b/xen/common/spinlock.c
+index 7f89694..d4c36cf 100644
+--- a/xen/common/spinlock.c
++++ b/xen/common/spinlock.c
+@@ -492,6 +492,39 @@ int _rw_is_write_locked(rwlock_t *lock)
+     return (lock->lock == RW_WRITE_FLAG); /* writer in critical section? */
+ }
+ 
++void percpu_write_lock(rwlock_t **per_cpudata, bool_t *writer_activating,
++		rwlock_t *rwlock)
++{
++    int cpu;
++    cpumask_t active_readers;
++
++    cpumask_copy(&active_readers, &cpu_online_map);
++    /* First take the write lock to protect against other writers */
++    write_lock(rwlock);
++
++    /* Now set the global variable so that readers start using read_lock */
++    ASSERT(*writer_activating == false);
++    *writer_activating = true;
++    smp_mb();
++
++    /* Check if there are any percpu readers in progress on our rwlock*/
++    do
++    {
++        for_each_cpu(cpu, &active_readers)
++        {
++            /* Remove any percpu readers not contending
++             * from our check mask */
++            if ( per_cpu_ptr(per_cpudata, cpu) != rwlock )
++                cpumask_clear_cpu(cpu, &active_readers);
++        }
++        /* Check if we've cleared all percpu readers */
++        if ( cpumask_empty(&active_readers) )
++            break;
++        /* Give the coherency fabric a break */
++        cpu_relax();
++    } while ( 1 );
++}
++
+ #ifdef LOCK_PROFILE
+ 
+ struct lock_profile_anc {
+diff --git a/xen/include/asm-arm/percpu.h b/xen/include/asm-arm/percpu.h
+index 71e7649..c308a56 100644
+--- a/xen/include/asm-arm/percpu.h
++++ b/xen/include/asm-arm/percpu.h
+@@ -27,6 +27,11 @@ void percpu_init_areas(void);
+ #define __get_cpu_var(var) \
+     (*RELOC_HIDE(&per_cpu__##var, READ_SYSREG(TPIDR_EL2)))
+ 
++#define per_cpu_ptr(var, cpu)  \
++    (*RELOC_HIDE(&var, __per_cpu_offset[cpu]))
++#define __get_cpu_ptr(var) \
++    (*RELOC_HIDE(&var, READ_SYSREG(TPIDR_EL2)))
++
+ #define DECLARE_PER_CPU(type, name) extern __typeof__(type) per_cpu__##name
+ 
+ DECLARE_PER_CPU(unsigned int, cpu_id);
+diff --git a/xen/include/asm-x86/percpu.h b/xen/include/asm-x86/percpu.h
+index 604ff0d..51562b9 100644
+--- a/xen/include/asm-x86/percpu.h
++++ b/xen/include/asm-x86/percpu.h
+@@ -20,4 +20,10 @@ void percpu_init_areas(void);
+ 
+ #define DECLARE_PER_CPU(type, name) extern __typeof__(type) per_cpu__##name
+ 
++#define __get_cpu_ptr(var) \
++    (*RELOC_HIDE(var, get_cpu_info()->per_cpu_offset))
++
++#define per_cpu_ptr(var, cpu)  \
++    (*RELOC_HIDE(var, __per_cpu_offset[cpu]))
++
+ #endif /* __X86_PERCPU_H__ */
+diff --git a/xen/include/xen/percpu.h b/xen/include/xen/percpu.h
+index abe0b11..c896863 100644
+--- a/xen/include/xen/percpu.h
++++ b/xen/include/xen/percpu.h
+@@ -16,6 +16,10 @@
+ /* Preferred on Xen. Also see arch-defined per_cpu(). */
+ #define this_cpu(var)    __get_cpu_var(var)
+ 
++#define this_cpu_ptr(ptr)    __get_cpu_ptr(ptr)
++
++#define get_per_cpu_var(var)  (per_cpu__##var)
++
+ /* Linux compatibility. */
+ #define get_cpu_var(var) this_cpu(var)
+ #define put_cpu_var(var)
+diff --git a/xen/include/xen/spinlock.h b/xen/include/xen/spinlock.h
+index fb0438e..30adf00 100644
+--- a/xen/include/xen/spinlock.h
++++ b/xen/include/xen/spinlock.h
+@@ -3,6 +3,7 @@
+ 
+ #include <asm/system.h>
+ #include <asm/spinlock.h>
++#include <xen/stdbool.h>
+ 
+ #ifndef NDEBUG
+ struct lock_debug {
+@@ -261,4 +262,43 @@ int _rw_is_write_locked(rwlock_t *lock);
+ #define rw_is_locked(l)               _rw_is_locked(l)
+ #define rw_is_write_locked(l)         _rw_is_write_locked(l)
+ 
++static inline void percpu_read_lock(rwlock_t **per_cpudata, bool_t *writer_activating,
++		rwlock_t *rwlock)
++{
++    ASSERT(this_cpu_ptr(per_cpudata) == NULL);
++    /* Indicate this cpu is reading */
++    this_cpu_ptr(per_cpudata) = rwlock;
++    smp_mb();
++    /* Check if a writer is waiting */
++    if ( unlikely(*writer_activating) )
++    {
++        /* Let the waiting writer know we aren't holding the lock */
++        this_cpu_ptr(per_cpudata) = NULL;
++        /* Wait using the read lock to keep the lock fair */
++        read_lock(rwlock);
++        /* Set the per CPU data again and continue*/
++        this_cpu_ptr(per_cpudata) = rwlock;
++        /* Drop the read lock because we don't need it anymore */
++        read_unlock(rwlock);
++    }
++}
++
++static inline void percpu_read_unlock(rwlock_t **per_cpudata)
++{
++    ASSERT(this_cpu_ptr(per_cpudata) != NULL);
++    this_cpu_ptr(per_cpudata) = NULL;
++    smp_wmb();
++}
++
++/* Don't inline percpu write lock as it's a complex function */
++void percpu_write_lock(rwlock_t **per_cpudata, bool_t *writer_activating,
++		rwlock_t *rwlock);
++
++static inline void percpu_write_unlock(bool_t *writer_activating, rwlock_t *rwlock)
++{
++    ASSERT(*writer_activating == true);
++    *writer_activating = false;
++    write_unlock(rwlock);
++}
++
+ #endif /* __SPINLOCK_H__ */
