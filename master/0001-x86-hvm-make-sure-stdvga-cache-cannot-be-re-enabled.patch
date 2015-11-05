@@ -1,0 +1,144 @@
+From c152527b836399b6caeed4edf5f1943c515ae6a8 Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Thu, 5 Nov 2015 12:35:51 +0000
+Subject: [PATCH] x86/hvm: make sure stdvga cache cannot be re-enabled
+
+As soon as the cache is disabled, it will become out-of-sync with the
+VGA device model and since no mechanism exists to acquire current VRAM
+state from the device model, re-enabling it leads to stale data
+being seen by the guest.
+
+The problem was introduced by commit 3bbaaec0 ("x86/hvm: unify stdvga
+mmio intercept with standard mmio intercept") and can be seen by
+deliberately crashing a Windows guest; the BSOD output is corrupted.
+
+This patch changes the existing 'cache' boolean in hvm_hw_stdvga into a
+tri-state enum and only allows the state to move from 'uninitialized' to
+'enabled'. Once the cache state becomes 'disabled' it will remain so for
+the lifetime of the VM.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/hvm/save.c b/xen/arch/x86/hvm/save.c
+index 4660beb..f7d4999 100644
+--- a/xen/arch/x86/hvm/save.c
++++ b/xen/arch/x86/hvm/save.c
+@@ -73,7 +73,7 @@ int arch_hvm_load(struct domain *d, struct hvm_save_header *hdr)
+     d->arch.hvm_domain.sync_tsc = rdtsc();
+ 
+     /* VGA state is not saved/restored, so we nobble the cache. */
+-    d->arch.hvm_domain.stdvga.cache = 0;
++    d->arch.hvm_domain.stdvga.cache = STDVGA_CACHE_DISABLED;
+ 
+     return 0;
+ }
+diff --git a/xen/arch/x86/hvm/stdvga.c b/xen/arch/x86/hvm/stdvga.c
+index f50bff7..60d93a8 100644
+--- a/xen/arch/x86/hvm/stdvga.c
++++ b/xen/arch/x86/hvm/stdvga.c
+@@ -101,6 +101,37 @@ static void vram_put(struct hvm_hw_stdvga *s, void *p)
+     unmap_domain_page(p);
+ }
+ 
++static void stdvga_try_cache_enable(struct hvm_hw_stdvga *s)
++{
++    /*
++     * Caching mode can only be enabled if the the cache has
++     * never been used before. As soon as it is disabled, it will
++     * become out-of-sync with the VGA device model and since no
++     * mechanism exists to acquire current VRAM state from the
++     * device model, re-enabling it would lead to stale data being
++     * seen by the guest.
++     */
++    if ( s->cache != STDVGA_CACHE_UNINITIALIZED )
++        return;
++
++    gdprintk(XENLOG_INFO, "entering caching mode\n");
++    s->cache = STDVGA_CACHE_ENABLED;
++}
++
++static void stdvga_cache_disable(struct hvm_hw_stdvga *s)
++{
++    if ( s->cache != STDVGA_CACHE_ENABLED )
++        return;
++
++    gdprintk(XENLOG_INFO, "leaving caching mode\n");
++    s->cache = STDVGA_CACHE_DISABLED;
++}
++
++static bool_t stdvga_cache_is_enabled(const struct hvm_hw_stdvga *s)
++{
++    return s->cache == STDVGA_CACHE_ENABLED;
++}
++
+ static int stdvga_outb(uint64_t addr, uint8_t val)
+ {
+     struct hvm_hw_stdvga *s = &current->domain->arch.hvm_domain.stdvga;
+@@ -139,12 +170,8 @@ static int stdvga_outb(uint64_t addr, uint8_t val)
+ 
+     if ( !prev_stdvga && s->stdvga )
+     {
+-        /*
+-         * (Re)start caching of video buffer.
+-         * XXX TODO: In case of a restart the cache could be unsynced.
+-         */
+-        s->cache = 1;
+-        gdprintk(XENLOG_INFO, "entering stdvga and caching modes\n");
++        gdprintk(XENLOG_INFO, "entering stdvga mode\n");
++        stdvga_try_cache_enable(s);
+     }
+     else if ( prev_stdvga && !s->stdvga )
+     {
+@@ -441,7 +468,7 @@ static int stdvga_mem_write(const struct hvm_io_handler *handler,
+     };
+     struct hvm_ioreq_server *srv;
+ 
+-    if ( !s->cache || !s->stdvga )
++    if ( !stdvga_cache_is_enabled(s) || !s->stdvga )
+         goto done;
+ 
+     /* Intercept mmio write */
+@@ -515,15 +542,12 @@ static bool_t stdvga_mem_accept(const struct hvm_io_handler *handler,
+          * not active since we can assert, when in stdvga mode, that writes
+          * to VRAM have no side effect and thus we can try to buffer them.
+          */
+-        if ( s->cache )
+-        {
+-            gdprintk(XENLOG_INFO, "leaving caching mode\n");
+-            s->cache = 0;
+-        }
++        stdvga_cache_disable(s);
+ 
+         goto reject;
+     }
+-    else if ( p->dir == IOREQ_READ && (!s->cache || !s->stdvga) )
++    else if ( p->dir == IOREQ_READ &&
++              (!stdvga_cache_is_enabled(s) || !s->stdvga) )
+         goto reject;
+ 
+     /* s->lock intentionally held */
+diff --git a/xen/include/asm-x86/hvm/io.h b/xen/include/asm-x86/hvm/io.h
+index 8585a1f..ceefa2e 100644
+--- a/xen/include/asm-x86/hvm/io.h
++++ b/xen/include/asm-x86/hvm/io.h
+@@ -128,13 +128,19 @@ void hvm_dpci_eoi(struct domain *d, unsigned int guest_irq,
+ void msix_write_completion(struct vcpu *);
+ void msixtbl_init(struct domain *d);
+ 
++enum stdvga_cache_state {
++    STDVGA_CACHE_UNINITIALIZED,
++    STDVGA_CACHE_ENABLED,
++    STDVGA_CACHE_DISABLED
++};
++
+ struct hvm_hw_stdvga {
+     uint8_t sr_index;
+     uint8_t sr[8];
+     uint8_t gr_index;
+     uint8_t gr[9];
+     bool_t stdvga;
+-    bool_t cache;
++    enum stdvga_cache_state cache;
+     uint32_t latch;
+     struct page_info *vram_page[64];  /* shadow of 0xa0000-0xaffff */
+     spinlock_t lock;
