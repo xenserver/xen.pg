@@ -768,10 +768,10 @@ index 0000000..c43d473
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..f6937fb
+index 0000000..6bcc7a3
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,822 @@
+@@ -0,0 +1,876 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1251,6 +1251,45 @@ index 0000000..f6937fb
 +    return rc;
 +}
 +
++/* Copied from xen hypervisor itself */
++const char * parse_pci_sbdf(char *s, unsigned int *seg_p,
++                             unsigned int *bus_p, unsigned int *dev_p,
++                             unsigned int *func_p)
++{
++    unsigned long seg = strtoul(s, &s, 16), bus, dev, func;
++
++    if ( *s != ':' )
++        return NULL;
++    bus = strtoul(s + 1, &s, 16);
++    if ( *s == ':' )
++        dev = strtoul(s + 1, &s, 16);
++    else
++    {
++        dev = bus;
++        bus = seg;
++        seg = 0;
++    }
++    if ( func_p )
++    {
++        if ( *s != '.' )
++            return NULL;
++        func = strtoul(s + 1, &s, 0);
++    }
++    else
++        func = 0;
++
++    if ( seg_p )
++        *seg_p = seg;
++    *bus_p = bus;
++    *dev_p = dev;
++    if ( func_p )
++        *func_p = func;
++
++    return s;
++}
++
++#define MAX_RMRR_DEVICES 16
++
 +int stub_xc_hvm_build_with_mem(uint64_t max_mem_mib, uint64_t max_start_mib,
 +                               const char *image)
 +{
@@ -1261,26 +1300,35 @@ index 0000000..f6937fb
 +        .mmio_size  = HVM_BELOW_4G_MMIO_LENGTH,
 +        .image_file_name = image,
 +    };
-+    unsigned int i, nr = 0;
++    unsigned int i, j, nr = 0;
 +    struct e820entry *e820;
 +    int rc;
-+    unsigned int nr_rdm_entries = 0;
-+    struct xen_reserved_device_memory *xrdm = NULL;
++    unsigned int nr_rdm_entries[MAX_RMRR_DEVICES] = {0};
++    unsigned int nr_rmrr_devs = 0;
++    struct xen_reserved_device_memory *xrdm[MAX_RMRR_DEVICES] = {0};
 +    unsigned long rmrr_overlapped_ram = 0;
-+    char buf[64];
 +    char *s;
 +
 +    if ( pci_passthrough_sbdf_list )
 +    {
-+        xg_info("TODO - query Xen for RMRRs for '%s'\n",
-+                pci_passthrough_sbdf_list);
-+    } else {
-+        snprintf(buf, sizeof buf, "/local/domain/%u/platform/igd_passthrough", domid);
-+        s = xs_read(xsh, XBT_NULL, buf, NULL);
-+        if (s)
++        s = strtok(pci_passthrough_sbdf_list,",");
++        while ( s != NULL )
 +        {
-+            xg_info("Getting RMRR's for Intel GPU\n");
-+            get_rdm(0,0,(2 << 3), &nr_rdm_entries, &xrdm);
++            unsigned int seg, bus, device, func;
++            xg_info("Getting RMRRs for device '%s'\n",s);
++            if ( parse_pci_sbdf(s, &seg, &bus, &device, &func) )
++            {
++                if ( !get_rdm(seg, bus, (device << 3) + func,
++                        &nr_rdm_entries[nr_rmrr_devs], &xrdm[nr_rmrr_devs]) )
++                    nr_rmrr_devs++;
++            }
++            if ( nr_rmrr_devs == MAX_RMRR_DEVICES )
++            {
++                xg_err("Error: hit limit of %d RMRR devices for domain\n",
++                            MAX_RMRR_DEVICES);
++                exit(1);
++            }
++            s = strtok (NULL, ",");
 +        }
 +    }
 +    e820 = malloc(sizeof(*e820) * E820MAX);
@@ -1308,24 +1356,30 @@ index 0000000..f6937fb
 +    nr++;
 +
 +    /* RDM mapping */
-+    for (i = 0; i < nr_rdm_entries; i++) {
-+        e820[nr].addr = xrdm[i].start_pfn << XC_PAGE_SHIFT;
-+        e820[nr].size = xrdm[i].nr_pages << XC_PAGE_SHIFT;
-+        e820[nr].type = E820_RESERVED;
-+        xg_info("Adding RMRR 0x%lx size 0x%lx\n", e820[nr].addr, e820[nr].size);
-+        if ( e820[nr].addr < args.lowmem_end ) {
-+            rmrr_overlapped_ram += ( args.lowmem_end - e820[nr].addr );
-+            args.lowmem_end = e820[nr].addr;
++    for (i = 0; i < nr_rmrr_devs; i++)
++    {
++        for (j = 0; j < nr_rdm_entries[i]; j++)
++        {
++            e820[nr].addr = xrdm[i][j].start_pfn << XC_PAGE_SHIFT;
++            e820[nr].size = xrdm[i][j].nr_pages << XC_PAGE_SHIFT;
++            e820[nr].type = E820_RESERVED;
++            xg_info("Adding RMRR 0x%lx size 0x%lx\n", e820[nr].addr, e820[nr].size);
++            if ( e820[nr].addr < args.lowmem_end ) {
++                rmrr_overlapped_ram += ( args.lowmem_end - e820[nr].addr );
++                args.lowmem_end = e820[nr].addr;
++            }
++            nr++;
 +        }
-+        nr++;
 +    }
 +    e820[0].size -= rmrr_overlapped_ram;
 +    args.highmem_end += rmrr_overlapped_ram;
 +    args.mmio_size += rmrr_overlapped_ram;
 +    args.mmio_start -= rmrr_overlapped_ram;
 +
-+    if (nr_rdm_entries)
-+        free(xrdm);
++    for (i = 0; i < nr_rmrr_devs; i++)
++    {
++        free(xrdm[i]);
++    }
 +
 +    if ( args.highmem_end > highmem_start )
 +    {
