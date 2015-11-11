@@ -1,0 +1,34 @@
+oxenstored: Quota.merge: don't assume domain already exists
+
+In Quota.merge, we merge two quota hashtables, orig_quota and mod_quota, putting
+the results into dest_quota. These hashtables map domids to the number of
+entries currently owned by that domain.
+
+When mod_quota contains an entry for a domid that was not present in orig_quota
+(or dest_quota), the call to get_entry caused Quota.merge to raise a Not_found
+exception. This propagates back to the client as an ENOENT error, which is not
+an appropriate return value from some operations, such as transaction_end.
+
+This situation can arise when a transaction that introduces a domain (hence
+calling Quota.add_entry) needs to be coalesced due to concurrent xenstore
+activity.
+
+This patch handles the merge in the case where mod_quota contains an entry not
+present in orig_quota (or in dest_quota) by treating that hashtable as having
+existing value 0.
+
+Signed-off-by: Jonathan Davies <jonathan.davies@citrix.com>
+
+diff --git a/tools/ocaml/xenstored/quota.ml b/tools/ocaml/xenstored/quota.ml
+index e6953c6..abcac91 100644
+--- a/tools/ocaml/xenstored/quota.ml
++++ b/tools/ocaml/xenstored/quota.ml
+@@ -83,6 +83,6 @@ let add quota diff =
+ 	Hashtbl.iter (fun id nb -> set_entry quota id (get_entry quota id + nb)) diff.cur
+ 
+ let merge orig_quota mod_quota dest_quota =
+-	  Hashtbl.iter (fun id nb -> let diff = nb - (get_entry orig_quota id) in
++	  Hashtbl.iter (fun id nb -> let diff = nb - (try get_entry orig_quota id with Not_found -> 0) in
+ 				if diff <> 0 then
+-					set_entry dest_quota id ((get_entry dest_quota id) + diff)) mod_quota.cur
++					set_entry dest_quota id ((try get_entry dest_quota id with Not_found -> 0) + diff)) mod_quota.cur
