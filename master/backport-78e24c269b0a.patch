@@ -1,12 +1,11 @@
-From 21387f046c7edc151651e964fddab4135ad25ed8 Mon Sep 17 00:00:00 2001
+From 78e24c269b0a4a8b864ece725e6d4209ed95dfa7 Mon Sep 17 00:00:00 2001
 From: David Vrabel <david.vrabel@citrix.com>
-Date: Mon, 30 Nov 2015 15:25:04 +0000
+Date: Wed, 2 Dec 2015 15:21:46 +0100
 Subject: [PATCH] evtchn: don't reuse ports that are still "busy"
 
 When using the FIFO ABI a guest may close an event channel that is
 still LINKED.  If this port is reused, subsequent events may be lost
-because it may be linked on an old queue (e.g., on a VCPU that is now
-down).
+because they may become pending on the wrong queue.
 
 This could be fixed by requiring guests to only close event channels
 that are not linked.  This is difficult since: a) irq cleanup in the
@@ -18,41 +17,14 @@ problematic behaviour.
 Instead, simply check a port is not "busy" (i.e., it's not linked)
 before reusing it.
 
-Signed-off-by: David Vrabel <david.vrabel@citrix.com>
----
- xen/common/event_2l.c      |  7 +++++++
- xen/common/event_channel.c |  3 ++-
- xen/common/event_fifo.c    | 13 +++++++++++++
- xen/include/xen/event.h    | 11 +++++++++++
- 4 files changed, 33 insertions(+), 1 deletion(-)
+Guests should still drain any queues for VCPUs that are being
+offlined, or the port will become unusable until the VCPU is onlined
+and starts processing events again.
 
-diff --git a/xen/common/event_2l.c b/xen/common/event_2l.c
-index 5837ae8..0ccc59f 100644
---- a/xen/common/event_2l.c
-+++ b/xen/common/event_2l.c
-@@ -74,6 +74,12 @@ static bool_t evtchn_2l_is_masked(struct domain *d,
-     return test_bit(evtchn->port, &shared_info(d, evtchn_mask));
- }
- 
-+static bool_t evtchn_2l_is_busy(struct domain *d,
-+                                const struct evtchn *evtchn)
-+{
-+    return 0;
-+}
-+
- static void evtchn_2l_print_state(struct domain *d,
-                                   const struct evtchn *evtchn)
- {
-@@ -90,6 +96,7 @@ static const struct evtchn_port_ops evtchn_port_ops_2l =
-     .unmask        = evtchn_2l_unmask,
-     .is_pending    = evtchn_2l_is_pending,
-     .is_masked     = evtchn_2l_is_masked,
-+    .is_busy       = evtchn_2l_is_busy,
-     .print_state   = evtchn_2l_print_state,
- };
- 
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
 diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
-index 5a529a6..b1d4e47 100644
+index 46737cf..584a5ff 100644
 --- a/xen/common/event_channel.c
 +++ b/xen/common/event_channel.c
 @@ -170,7 +170,8 @@ static int get_free_port(struct domain *d)
@@ -60,25 +32,24 @@ index 5a529a6..b1d4e47 100644
          if ( port > d->max_evtchn_port )
              return -ENOSPC;
 -        if ( evtchn_from_port(d, port)->state == ECS_FREE )
-+        chn = evtchn_from_port(d, port);
-+        if ( chn->state == ECS_FREE && !evtchn_port_is_busy(d, chn) )
++        if ( evtchn_from_port(d, port)->state == ECS_FREE
++             && !evtchn_port_is_busy(d, port) )
              return port;
      }
  
 diff --git a/xen/common/event_fifo.c b/xen/common/event_fifo.c
-index c9b7884..4157318 100644
+index c9b7884..79c36ff 100644
 --- a/xen/common/event_fifo.c
 +++ b/xen/common/event_fifo.c
-@@ -312,6 +312,18 @@ static bool_t evtchn_fifo_is_masked(struct domain *d,
+@@ -312,6 +312,17 @@ static bool_t evtchn_fifo_is_masked(struct domain *d,
      return test_bit(EVTCHN_FIFO_MASKED, word);
  }
  
-+static bool_t evtchn_fifo_is_busy(struct domain *d,
-+                                  const struct evtchn *evtchn)
++static bool_t evtchn_fifo_is_busy(struct domain *d, evtchn_port_t port)
 +{
 +    event_word_t *word;
 +
-+    word = evtchn_fifo_word_from_port(d, evtchn->port);
++    word = evtchn_fifo_word_from_port(d, port);
 +    if ( unlikely(!word) )
 +        return 0;
 +
@@ -88,7 +59,7 @@ index c9b7884..4157318 100644
  static int evtchn_fifo_set_priority(struct domain *d, struct evtchn *evtchn,
                                      unsigned int priority)
  {
-@@ -351,6 +363,7 @@ static const struct evtchn_port_ops evtchn_port_ops_fifo =
+@@ -351,6 +362,7 @@ static const struct evtchn_port_ops evtchn_port_ops_fifo =
      .unmask        = evtchn_fifo_unmask,
      .is_pending    = evtchn_fifo_is_pending,
      .is_masked     = evtchn_fifo_is_masked,
@@ -97,34 +68,32 @@ index c9b7884..4157318 100644
      .print_state   = evtchn_fifo_print_state,
  };
 diff --git a/xen/include/xen/event.h b/xen/include/xen/event.h
-index b87924a..b754f08 100644
+index af923d1..ef22f44 100644
 --- a/xen/include/xen/event.h
 +++ b/xen/include/xen/event.h
-@@ -139,6 +139,11 @@ struct evtchn_port_ops {
+@@ -136,6 +136,11 @@ struct evtchn_port_ops {
      void (*unmask)(struct domain *d, struct evtchn *evtchn);
      bool_t (*is_pending)(struct domain *d, const struct evtchn *evtchn);
      bool_t (*is_masked)(struct domain *d, const struct evtchn *evtchn);
 +    /*
-+     * Is the port unavailable because its still being cleaned up
++     * Is the port unavailable because it's still being cleaned up
 +     * after being closed?
 +     */
-+    bool_t (*is_busy)(struct domain *d, const struct evtchn *evtchn);
++    bool_t (*is_busy)(struct domain *d, evtchn_port_t port);
      int (*set_priority)(struct domain *d, struct evtchn *evtchn,
                          unsigned int priority);
      void (*print_state)(struct domain *d, const struct evtchn *evtchn);
-@@ -181,6 +186,12 @@ static inline bool_t evtchn_port_is_masked(struct domain *d,
+@@ -178,6 +183,13 @@ static inline bool_t evtchn_port_is_masked(struct domain *d,
      return d->evtchn_port_ops->is_masked(d, evtchn);
  }
  
-+static inline bool_t evtchn_port_is_busy(struct domain *d,
-+                                         const struct evtchn *evtchn)
++static inline bool_t evtchn_port_is_busy(struct domain *d, evtchn_port_t port)
 +{
-+    return d->evtchn_port_ops->is_busy(d, evtchn);
++    if ( d->evtchn_port_ops->is_busy )
++        return d->evtchn_port_ops->is_busy(d, port);
++    return 0;
 +}
 +
  static inline int evtchn_port_set_priority(struct domain *d,
                                             struct evtchn *evtchn,
                                             unsigned int priority)
--- 
-2.1.4
-
