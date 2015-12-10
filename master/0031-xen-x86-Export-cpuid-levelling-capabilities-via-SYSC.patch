@@ -1,0 +1,119 @@
+From c55b93653632810833f8870e04663062d0ad8ac2 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 31 Jul 2015 15:24:03 +0100
+Subject: [PATCH 31/39] xen/x86: Export cpuid levelling capabilities via SYSCTL
+
+This allows the toolstack to query what exactly Xen can control in a PV guest
+issuing a native `cpuid` instruction.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 7b89ebd..2ad85e0 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -32,6 +32,9 @@ integer_param("cpuid_mask_ext_ecx", opt_cpuid_mask_ext_ecx);
+ unsigned int __devinitdata opt_cpuid_mask_ext_edx = ~0u;
+ integer_param("cpuid_mask_ext_edx", opt_cpuid_mask_ext_edx);
+ 
++unsigned int __initdata expected_levelling_cap;
++unsigned int __read_mostly levelling_caps;
++
+ const struct cpu_dev *__read_mostly cpu_devs[X86_VENDOR_NUM] = {};
+ 
+ unsigned int paddr_bits __read_mostly = 36;
+diff --git a/xen/arch/x86/sysctl.c b/xen/arch/x86/sysctl.c
+index 50b2fd4..b01c968 100644
+--- a/xen/arch/x86/sysctl.c
++++ b/xen/arch/x86/sysctl.c
+@@ -253,6 +253,12 @@ long arch_do_sysctl(
+         break;
+     }
+ 
++    case XEN_SYSCTL_get_levelling_caps:
++        sysctl->u.levelling.caps = levelling_caps;
++        if ( __copy_to_guest(u_sysctl, sysctl, 1) )
++            ret = -EFAULT;
++        break;
++
+     default:
+         ret = -ENOSYS;
+         break;
+diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
+index f507f5e..b2c3653 100644
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -572,6 +572,19 @@ void microcode_set_module(unsigned int);
+ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void), unsigned long len);
+ int microcode_resume_cpu(unsigned int cpu);
+ 
++#define LCAP_faulting XEN_SYSCTL_LEVELCAP_faulting
++#define LCAP_1cd      (XEN_SYSCTL_LEVELCAP_1c  | XEN_SYSCTL_LEVELCAP_1d)
++#define LCAP_e1cd     (XEN_SYSCTL_LEVELCAP_e1c | XEN_SYSCTL_LEVELCAP_e1d)
++#define LCAP_Da1      XEN_SYSCTL_LEVELCAP_Da1
++#define LCAP_6c       XEN_SYSCTL_LEVELCAP_6c
++#define LCAP_7ab0     (XEN_SYSCTL_LEVELCAP_7a0 | XEN_SYSCTL_LEVELCAP_7b0)
++
++/*
++ * Expected levelling capabilities (given cpuid vendor/family information),
++ * and levelling capabilities actually available (given MSR probing).
++ */
++extern unsigned int expected_levelling_cap, levelling_caps;
++
+ enum get_cpu_vendor {
+    gcv_host_early,
+    gcv_host_late,
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index 3119b7b..7b134c6 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -785,6 +785,34 @@ struct xen_sysctl_featureset {
+ typedef struct xen_sysctl_featureset xen_sysctl_featureset_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_sysctl_featureset_t);
+ 
++/*
++ * XEN_SYSCTL_get_levelling_caps (x86 specific)
++ *
++ * Return hardware capabilities concerning masking or faulting of the cpuid
++ * instruction for PV guests.
++ */
++struct xen_sysctl_levelling_caps {
++/*
++ * Featureset array index encoding:
++ * - (possibly) 'e' Extended
++ * - leaf, uppercase hex
++ * - register, lowercase
++ * - (possibly) subleaf
++ */
++#define XEN_SYSCTL_LEVELCAP_faulting (1ul <<  0) /* CPUID faulting    */
++#define XEN_SYSCTL_LEVELCAP_1c       (1ul <<  1) /* 0x00000001.ecx    */
++#define XEN_SYSCTL_LEVELCAP_1d       (1ul <<  2) /* 0x00000001.edx    */
++#define XEN_SYSCTL_LEVELCAP_e1c      (1ul <<  3) /* 0x80000001.ecx    */
++#define XEN_SYSCTL_LEVELCAP_e1d      (1ul <<  4) /* 0x80000001.edx    */
++#define XEN_SYSCTL_LEVELCAP_Da1      (1ul <<  5) /* 0x0000000D:1.eax  */
++#define XEN_SYSCTL_LEVELCAP_6c       (1ul <<  6) /* 0x00000006.ecx    */
++#define XEN_SYSCTL_LEVELCAP_7a0      (1ul <<  7) /* 0x00000007:0.eax  */
++#define XEN_SYSCTL_LEVELCAP_7b0      (1ul <<  8) /* 0x00000007:0.ebx  */
++    uint64_t caps;
++};
++typedef struct xen_sysctl_levelling_caps xen_sysctl_levelling_caps_t;
++DEFINE_XEN_GUEST_HANDLE(xen_sysctl_levelling_caps_t);
++
+ struct xen_sysctl {
+     uint32_t cmd;
+ #define XEN_SYSCTL_readconsole                    1
+@@ -811,6 +839,7 @@ struct xen_sysctl {
+ #define XEN_SYSCTL_psr_cat_op                    23
+ #define XEN_SYSCTL_tmem_op                       24
+ #define XEN_SYSCTL_get_featureset                25
++#define XEN_SYSCTL_get_levelling_caps            26
+     uint32_t interface_version; /* XEN_SYSCTL_INTERFACE_VERSION */
+     union {
+         struct xen_sysctl_readconsole       readconsole;
+@@ -837,6 +866,7 @@ struct xen_sysctl {
+         struct xen_sysctl_psr_cat_op        psr_cat_op;
+         struct xen_sysctl_tmem_op           tmem_op;
+         struct xen_sysctl_featureset        featureset;
++        struct xen_sysctl_levelling_caps    levelling;
+         uint8_t                             pad[128];
+     } u;
+ };

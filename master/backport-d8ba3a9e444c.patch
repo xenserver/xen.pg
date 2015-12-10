@@ -1,0 +1,137 @@
+From b674fd5a8187a716bde080e4181774f5617bb9ed Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 26 Oct 2015 14:02:30 +0100
+Subject: [PATCH] x86: remove assumptions about the layout of x86_capabilities
+
+Future work will rearange it, invalidating these assumptions.
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index ad5fd09..cde655f 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -450,7 +450,7 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
+ 
+ 	/* Bit 31 in normal CPUID used for nonstandard 3DNow ID;
+ 	   3DNow is IDd by bit 31 in extended CPUID (1*32+31) anyway */
+-	clear_bit(0*32+31, c->x86_capability);
++	clear_bit(X86_FEATURE_3DNOW_ALT, c->x86_capability);
+ 	
+ 	if (c->x86 == 0xf && c->x86_model < 0x14
+ 	    && cpu_has(c, X86_FEATURE_LAHF_LM)) {
+diff --git a/xen/arch/x86/cpu/centaur.c b/xen/arch/x86/cpu/centaur.c
+index aaa0386..a471922 100644
+--- a/xen/arch/x86/cpu/centaur.c
++++ b/xen/arch/x86/cpu/centaur.c
+@@ -39,10 +39,8 @@ static void __init init_c3(struct cpuinfo_x86 *c)
+ 			printk(KERN_INFO "CPU: Enabled h/w RNG\n");
+ 		}
+ 
+-		/* store Centaur Extended Feature Flags as
+-		 * word 5 of the CPU capability bit array
+-		 */
+-		c->x86_capability[5] = cpuid_edx(0xC0000001);
++		c->x86_capability[cpufeat_word(X86_FEATURE_XSTORE)]
++                    = cpuid_edx(0xC0000001);
+ 	}
+ 
+ 	if (c->x86 == 0x6 && c->x86_model >= 0xf) {
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 9778f18..bb0d80c 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -200,13 +200,13 @@ static void __init early_cpu_detect(void)
+ 	if (c->x86 >= 0x6)
+ 		c->x86_model += ((tfms >> 16) & 0xF) << 4;
+ 	c->x86_mask = tfms & 15;
+-	cap0 &= ~cleared_caps[0];
+-	cap4 &= ~cleared_caps[4];
++	cap0 &= ~cleared_caps[cpufeat_word(X86_FEATURE_FPU)];
++	cap4 &= ~cleared_caps[cpufeat_word(X86_FEATURE_XMM3)];
+ 	if (cap0 & cpufeat_mask(X86_FEATURE_CLFLSH))
+ 		c->x86_cache_alignment = ((misc >> 8) & 0xff) * 8;
+ 	/* Leaf 0x1 capabilities filled in early for Xen. */
+-	c->x86_capability[0] = cap0;
+-	c->x86_capability[4] = cap4;
++	c->x86_capability[cpufeat_word(X86_FEATURE_FPU)] = cap0;
++	c->x86_capability[cpufeat_word(X86_FEATURE_XMM3)] = cap4;
+ }
+ 
+ static void __cpuinit generic_identify(struct cpuinfo_x86 *c)
+@@ -225,8 +225,8 @@ static void __cpuinit generic_identify(struct cpuinfo_x86 *c)
+ 	
+ 	/* Intel-defined flags: level 0x00000001 */
+ 	cpuid(0x00000001, &tfms, &ebx, &excap, &capability);
+-	c->x86_capability[0] = capability;
+-	c->x86_capability[4] = excap;
++	c->x86_capability[cpufeat_word(X86_FEATURE_FPU)] = capability;
++	c->x86_capability[cpufeat_word(X86_FEATURE_XMM3)] = excap;
+ 	c->x86 = (tfms >> 8) & 15;
+ 	c->x86_model = (tfms >> 4) & 15;
+ 	if (c->x86 == 0xf)
+@@ -243,8 +243,10 @@ static void __cpuinit generic_identify(struct cpuinfo_x86 *c)
+ 	c->extended_cpuid_level = cpuid_eax(0x80000000);
+ 	if ( (c->extended_cpuid_level & 0xffff0000) == 0x80000000 ) {
+ 		if ( c->extended_cpuid_level >= 0x80000001 ) {
+-			c->x86_capability[1] = cpuid_edx(0x80000001);
+-			c->x86_capability[6] = cpuid_ecx(0x80000001);
++			c->x86_capability[cpufeat_word(X86_FEATURE_SYSCALL)]
++				= cpuid_edx(0x80000001);
++			c->x86_capability[cpufeat_word(X86_FEATURE_LAHF_LM)]
++				= cpuid_ecx(0x80000001);
+ 		}
+ 		if ( c->extended_cpuid_level >= 0x80000004 )
+ 			get_model_name(c); /* Default name */
+diff --git a/xen/arch/x86/efi/efi-boot.h b/xen/arch/x86/efi/efi-boot.h
+index d8ca862..6dbb14d 100644
+--- a/xen/arch/x86/efi/efi-boot.h
++++ b/xen/arch/x86/efi/efi-boot.h
+@@ -608,7 +608,8 @@ static void __init efi_arch_cpu(void)
+     if ( cpuid_eax(0x80000000) > 0x80000000 )
+     {
+         cpuid_ext_features = cpuid_edx(0x80000001);
+-        boot_cpu_data.x86_capability[1] = cpuid_ext_features;
++        boot_cpu_data.x86_capability[cpufeat_word(X86_FEATURE_SYSCALL)]
++            = cpuid_ext_features;
+     }
+ }
+ 
+diff --git a/xen/arch/x86/mpparse.c b/xen/arch/x86/mpparse.c
+index 8609f4a..dc74e37 100644
+--- a/xen/arch/x86/mpparse.c
++++ b/xen/arch/x86/mpparse.c
+@@ -495,7 +495,8 @@ static inline void __init construct_default_ISA_mptable(int mpc_default_type)
+ 	processor.mpc_cpufeature = (boot_cpu_data.x86 << 8) |
+ 				   (boot_cpu_data.x86_model << 4) |
+ 				   boot_cpu_data.x86_mask;
+-	processor.mpc_featureflag = boot_cpu_data.x86_capability[0];
++	processor.mpc_featureflag =
++            boot_cpu_data.x86_capability[cpufeat_word(X86_FEATURE_FPU)];
+ 	processor.mpc_reserved[0] = 0;
+ 	processor.mpc_reserved[1] = 0;
+ 	for (i = 0; i < 2; i++) {
+@@ -799,7 +800,8 @@ int __devinit mp_register_lapic (
+ 	processor.mpc_cpuflag |= (boot_cpu ? CPU_BOOTPROCESSOR : 0);
+ 	processor.mpc_cpufeature = (boot_cpu_data.x86 << 8) | 
+ 		(boot_cpu_data.x86_model << 4) | boot_cpu_data.x86_mask;
+-	processor.mpc_featureflag = boot_cpu_data.x86_capability[0];
++	processor.mpc_featureflag
++            = boot_cpu_data.x86_capability[cpufeat_word(X86_FEATURE_FPU)];
+ 	processor.mpc_reserved[0] = 0;
+ 	processor.mpc_reserved[1] = 0;
+ 
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index 8df560f..c5a3f16 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -45,6 +45,7 @@
+ #define X86_FEATURE_ACC		(0*32+29) /* Automatic clock control */
+ #define X86_FEATURE_IA64	(0*32+30) /* IA-64 processor */
+ #define X86_FEATURE_PBE		(0*32+31) /* Pending Break Enable */
++#define X86_FEATURE_3DNOW_ALT	(0*32+31) /* AMD nonstandard 3DNow (Aliases PBE) */
+ 
+ /* AMD-defined CPU features, CPUID level 0x80000001, word 1 */
+ /* Don't duplicate feature flags which are redundant with Intel! */

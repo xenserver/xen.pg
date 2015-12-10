@@ -1,0 +1,110 @@
+From fbe5a627aebda7a56695fa295db3673f98896d03 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 26 Nov 2015 18:36:52 +0000
+Subject: [PATCH 36/39] x86: Context switch all levelling state in
+ context_switch()
+
+set_cpuid_faulting() is made private and included in
+intel_ctxt_switch_levelling()
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index 6b95ab6..cc1344a 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -300,6 +300,9 @@ static void __init noinline amd_init_levelling(void)
+ 		cpumask_defaults._6c &= (~0ULL << 32);
+ 		cpumask_defaults._6c |= ecx;
+ 	}
++
++        if (levelling_caps)
++            ctxt_switch_levelling = amd_ctxt_switch_levelling;
+ }
+ 
+ /*
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 896a579..4802ce8 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -86,6 +86,13 @@ static const struct cpu_dev default_cpu = {
+ };
+ static const struct cpu_dev *this_cpu = &default_cpu;
+ 
++void default_ctxt_switch_levelling(const struct domain *nextd)
++{
++    /* Nop */
++}
++void (*ctxt_switch_levelling)(const struct domain *nextd) __read_mostly =
++    default_ctxt_switch_levelling;
++
+ bool_t opt_cpu_info;
+ boolean_param("cpuinfo", opt_cpu_info);
+ 
+diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
+index f1bb222..87c66d2 100644
+--- a/xen/arch/x86/cpu/intel.c
++++ b/xen/arch/x86/cpu/intel.c
+@@ -32,9 +32,9 @@ static bool_t __init probe_intel_cpuid_faulting(void)
+ 	return 1;
+ }
+ 
+-static DEFINE_PER_CPU(bool_t, cpuid_faulting_enabled);
+-void set_cpuid_faulting(bool_t enable)
++static void set_cpuid_faulting(bool_t enable)
+ {
++	static DEFINE_PER_CPU(bool_t, cpuid_faulting_enabled);
+ 	uint32_t hi, lo;
+ 
+ 	if (!cpu_has_cpuid_faulting ||
+@@ -145,6 +145,13 @@ void intel_ctxt_switch_levelling(const struct domain *nextd)
+ 	struct cpumasks *these_masks = &this_cpu(cpumasks);
+ 	const struct cpumasks *masks = &cpumask_defaults;
+ 
++	if (cpu_has_cpuid_faulting) {
++		set_cpuid_faulting(nextd && is_pv_domain(nextd) &&
++				   !is_control_domain(nextd) &&
++				   !is_hardware_domain(nextd));
++		return;
++	}
++
+ #define LAZY(msr, field)						\
+ 	({								\
+ 		if ( msr && (these_masks->field != masks->field) )	\
+@@ -208,6 +215,9 @@ static void __init noinline intel_init_levelling(void)
+ 	}
+ 	else if ( !~opt_cpuid_mask_xsave_eax )
+ 		printk("No CPUID xsave feature mask available\n");
++
++	if (levelling_caps)
++		ctxt_switch_levelling = intel_ctxt_switch_levelling;
+ }
+ 
+ static void early_init_intel(struct cpuinfo_x86 *c)
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 8c2b704..e7897ab 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -1633,9 +1633,7 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
+             load_segments(next);
+         }
+ 
+-        set_cpuid_faulting(is_pv_domain(nextd) &&
+-                           !is_control_domain(nextd) &&
+-                           !is_hardware_domain(nextd));
++        ctxt_switch_levelling(nextd);
+     }
+ 
+     context_saved(prev);
+diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
+index 6d2f09b..52e5eae 100644
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -204,7 +204,7 @@ extern struct cpuinfo_x86 boot_cpu_data;
+ extern struct cpuinfo_x86 cpu_data[];
+ #define current_cpu_data cpu_data[smp_processor_id()]
+ 
+-extern void set_cpuid_faulting(bool_t enable);
++extern void (*ctxt_switch_levelling)(const struct domain *nextd);
+ 
+ extern u64 host_pat;
+ extern bool_t opt_cpu_info;

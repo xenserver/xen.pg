@@ -1,0 +1,228 @@
+From a479da3cabf31dc2babc8448f47fb97cd5dc3b57 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Sun, 30 Aug 2015 20:08:51 +0100
+Subject: [PATCH 17/39] xen/x86: Calculate PV featureset
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
+index 099e145..672bec5 100644
+--- a/xen/arch/x86/cpuid.c
++++ b/xen/arch/x86/cpuid.c
+@@ -3,13 +3,25 @@
+ #include <asm/processor.h>
+ #include <asm/cpuid.h>
+ 
++#include "cpuid/cpuid-private.h"
++
+ uint32_t __read_mostly host_featureset[XEN_NR_FEATURESET_ENTRIES];
++uint32_t __read_mostly pv_featureset[XEN_NR_FEATURESET_ENTRIES];
+ 
+ void __init calculate_featuresets(void)
+ {
++    unsigned int i;
++
+     /* Host featureset. */
+     memcpy(host_featureset, boot_cpu_data.x86_capability,
+            sizeof(host_featureset));
++
++    /* PV featureset. */
++    for ( i = 0; i < ARRAY_SIZE(pv_featureset); ++i )
++        pv_featureset[i] = host_featureset[i] & pv_featuremask[i];
++
++    /* Unconditionally claim to be able to set the hypervisor bit. */
++    __set_bit(X86_FEATURE_HYPERVISOR, pv_featureset);
+ }
+ 
+ /*
+diff --git a/xen/arch/x86/cpuid/cpuid-private.h b/xen/arch/x86/cpuid/cpuid-private.h
+index a4d582c..4a004d8 100644
+--- a/xen/arch/x86/cpuid/cpuid-private.h
++++ b/xen/arch/x86/cpuid/cpuid-private.h
+@@ -43,6 +43,13 @@ extern const uint32_t known_features[XEN_NR_FEATURESET_ENTRIES];
+ extern const uint32_t inverted_features[XEN_NR_FEATURESET_ENTRIES];
+ 
+ /*
++ * Bitmap of known features which can be exposed to PV guests.  Excludes
++ * features unusable by PV guests, or ones which have no hypervisor side
++ * support.
++ */
++extern const uint32_t pv_featuremask[XEN_NR_FEATURESET_ENTRIES];
++
++/*
+  * Local variables:
+  * mode: C
+  * c-file-style: "BSD"
+diff --git a/xen/arch/x86/cpuid/cpuid.c b/xen/arch/x86/cpuid/cpuid.c
+index 56993d2..ac72e55 100644
+--- a/xen/arch/x86/cpuid/cpuid.c
++++ b/xen/arch/x86/cpuid/cpuid.c
+@@ -102,7 +102,11 @@ const uint32_t known_features[XEN_NR_FEATURESET_ENTRIES] =
+                                             cpufeat_mask(X86_FEATURE_CAT)        |
+                                             cpufeat_mask(X86_FEATURE_RDSEED)     |
+                                             cpufeat_mask(X86_FEATURE_ADX)        |
+-                                            cpufeat_mask(X86_FEATURE_SMAP)),
++                                            cpufeat_mask(X86_FEATURE_SMAP)       |
++                                            cpufeat_mask(X86_FEATURE_PCOMMIT)    |
++                                            cpufeat_mask(X86_FEATURE_CLFLUSHOPT) |
++                                            cpufeat_mask(X86_FEATURE_CLWB)       |
++                                            cpufeat_mask(X86_FEATURE_SHA)),
+ 
+     [cpufeat_word(X86_FEATURE_PREFETCHWT1)] = (cpufeat_mask(X86_FEATURE_PREFETCHWT1)),
+ 
+@@ -116,6 +120,102 @@ const uint32_t inverted_features[XEN_NR_FEATURESET_ENTRIES] =
+     [cpufeat_word(X86_FEATURE_FPU_SEL)] = cpufeat_mask(X86_FEATURE_FPU_SEL),
+ };
+ 
++#define PV_FEATUREMASK_1d                       \
++    (cpufeat_mask(X86_FEATURE_FPU)    |         \
++     cpufeat_mask(X86_FEATURE_DE)     |         \
++     cpufeat_mask(X86_FEATURE_TSC)    |         \
++     cpufeat_mask(X86_FEATURE_MSR)    |         \
++     cpufeat_mask(X86_FEATURE_PAE)    |         \
++     cpufeat_mask(X86_FEATURE_MCE)    |         \
++     cpufeat_mask(X86_FEATURE_CX8)    |         \
++     cpufeat_mask(X86_FEATURE_APIC)   |         \
++     cpufeat_mask(X86_FEATURE_SEP)    |         \
++     cpufeat_mask(X86_FEATURE_MCA)    |         \
++     cpufeat_mask(X86_FEATURE_CMOV)   |         \
++     cpufeat_mask(X86_FEATURE_PAT)    |         \
++     cpufeat_mask(X86_FEATURE_CLFLSH) |         \
++     cpufeat_mask(X86_FEATURE_ACPI)   |         \
++     cpufeat_mask(X86_FEATURE_MMX)    |         \
++     cpufeat_mask(X86_FEATURE_FXSR)   |         \
++     cpufeat_mask(X86_FEATURE_XMM)    |         \
++     cpufeat_mask(X86_FEATURE_XMM2))
++
++#define PV_FEATUREMASK_1c                       \
++    (cpufeat_mask(X86_FEATURE_XMM3)      |      \
++     cpufeat_mask(X86_FEATURE_PCLMULQDQ) |      \
++     cpufeat_mask(X86_FEATURE_SSSE3)     |      \
++     cpufeat_mask(X86_FEATURE_FMA)       |      \
++     cpufeat_mask(X86_FEATURE_CX16)      |      \
++     cpufeat_mask(X86_FEATURE_SSE4_1)    |      \
++     cpufeat_mask(X86_FEATURE_SSE4_2)    |      \
++     cpufeat_mask(X86_FEATURE_X2APIC)    |      \
++     cpufeat_mask(X86_FEATURE_MOVBE)     |      \
++     cpufeat_mask(X86_FEATURE_POPCNT)    |      \
++     cpufeat_mask(X86_FEATURE_AES)       |      \
++     cpufeat_mask(X86_FEATURE_XSAVE)     |      \
++     cpufeat_mask(X86_FEATURE_OSXSAVE)   |      \
++     cpufeat_mask(X86_FEATURE_AVX)       |      \
++     cpufeat_mask(X86_FEATURE_F16C)      |      \
++     cpufeat_mask(X86_FEATURE_RDRAND)    |      \
++     cpufeat_mask(X86_FEATURE_HYPERVISOR))
++
++#define PV_FEATUREMASK_e1d                      \
++    ((PV_FEATUREMASK_1d & SHARED_1d)    |       \
++     cpufeat_mask(X86_FEATURE_SYSCALL)  |       \
++     cpufeat_mask(X86_FEATURE_MP)       |       \
++     cpufeat_mask(X86_FEATURE_NX)       |       \
++     cpufeat_mask(X86_FEATURE_MMXEXT)   |       \
++     cpufeat_mask(X86_FEATURE_FFXSR)    |       \
++     cpufeat_mask(X86_FEATURE_LM)       |       \
++     cpufeat_mask(X86_FEATURE_3DNOWEXT) |       \
++     cpufeat_mask(X86_FEATURE_3DNOW))
++
++#define PV_FEATUREMASK_e1c                      \
++    (cpufeat_mask(X86_FEATURE_LAHF_LM)       |  \
++     cpufeat_mask(X86_FEATURE_ABM)           |  \
++     cpufeat_mask(X86_FEATURE_SSE4A)         |  \
++     cpufeat_mask(X86_FEATURE_MISALIGNSSE)   |  \
++     cpufeat_mask(X86_FEATURE_3DNOWPREFETCH) |  \
++     cpufeat_mask(X86_FEATURE_XOP)           |  \
++     cpufeat_mask(X86_FEATURE_LWP)           |  \
++     cpufeat_mask(X86_FEATURE_FMA4)          |  \
++     cpufeat_mask(X86_FEATURE_TBM)           |  \
++     cpufeat_mask(X86_FEATURE_DBEXT))
++
++#define PV_FEATUREMASK_Da1                      \
++    (cpufeat_mask(X86_FEATURE_XSAVEOPT) |       \
++     cpufeat_mask(X86_FEATURE_XSAVEC)   |       \
++     cpufeat_mask(X86_FEATURE_XGETBV1))
++
++#define PV_FEATUREMASK_7b0                      \
++    (cpufeat_mask(X86_FEATURE_FSGSBASE)   |     \
++     cpufeat_mask(X86_FEATURE_BMI1)       |     \
++     cpufeat_mask(X86_FEATURE_HLE)        |     \
++     cpufeat_mask(X86_FEATURE_AVX2)       |     \
++     cpufeat_mask(X86_FEATURE_BMI2)       |     \
++     cpufeat_mask(X86_FEATURE_ERMS)       |     \
++     cpufeat_mask(X86_FEATURE_RTM)        |     \
++     cpufeat_mask(X86_FEATURE_RDSEED)     |     \
++     cpufeat_mask(X86_FEATURE_ADX)        |     \
++     cpufeat_mask(X86_FEATURE_PCOMMIT)    |     \
++     cpufeat_mask(X86_FEATURE_CLFLUSHOPT) |     \
++     cpufeat_mask(X86_FEATURE_CLWB)       |     \
++     cpufeat_mask(X86_FEATURE_SHA))
++
++#define PV_FEATUREMASK_7c0                      \
++    (cpufeat_mask(X86_FEATURE_PREFETCHWT1))
++
++const uint32_t pv_featuremask[XEN_NR_FEATURESET_ENTRIES] =
++{
++    PV_FEATUREMASK_1d,
++    PV_FEATUREMASK_1c,
++    PV_FEATUREMASK_e1d,
++    PV_FEATUREMASK_e1c,
++    PV_FEATUREMASK_Da1,
++    PV_FEATUREMASK_7b0,
++    PV_FEATUREMASK_7c0,
++};
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/arch/x86/sysctl.c b/xen/arch/x86/sysctl.c
+index 1f483b8..34ffe43 100644
+--- a/xen/arch/x86/sysctl.c
++++ b/xen/arch/x86/sysctl.c
+@@ -215,6 +215,10 @@ long arch_do_sysctl(
+             featureset = host_featureset;
+             break;
+ 
++        case XEN_SYSCTL_featureset_pv:
++            featureset = pv_featureset;
++            break;
++
+         default:
+             featureset = NULL;
+             break;
+diff --git a/xen/include/asm-x86/cpuid.h b/xen/include/asm-x86/cpuid.h
+index c303c74..6a7357f 100644
+--- a/xen/include/asm-x86/cpuid.h
++++ b/xen/include/asm-x86/cpuid.h
+@@ -6,6 +6,7 @@
+ #include <public/sysctl.h>
+ 
+ extern uint32_t host_featureset[XEN_NR_FEATURESET_ENTRIES];
++extern uint32_t pv_featureset[XEN_NR_FEATURESET_ENTRIES];
+ 
+ void calculate_featuresets(void);
+ 
+diff --git a/xen/include/public/arch-x86/featureset.h b/xen/include/public/arch-x86/featureset.h
+index f48ad5b..0e010e9 100644
+--- a/xen/include/public/arch-x86/featureset.h
++++ b/xen/include/public/arch-x86/featureset.h
+@@ -187,6 +187,10 @@
+ #define X86_FEATURE_RDSEED        ( 5*32+18) /* RDSEED instruction */
+ #define X86_FEATURE_ADX           ( 5*32+19) /* ADCX, ADOX instructions */
+ #define X86_FEATURE_SMAP          ( 5*32+20) /* Supervisor Mode Access Prevention */
++#define X86_FEATURE_PCOMMIT       ( 5*32+22) /* PCOMMIT instruction */
++#define X86_FEATURE_CLFLUSHOPT    ( 5*32+23) /* CLFLUSHOPT instruction */
++#define X86_FEATURE_CLWB          ( 5*32+24) /* CLWB instruction */
++#define X86_FEATURE_SHA           ( 5*32+29) /* SHA1 & SHA256 instructions */
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000007:0.ecx, word 6 */
+ #define X86_FEATURE_PREFETCHWT1   ( 6*32+ 0) /* PREFETCHWT1 instruction */
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index dfde433..33ba66b 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -773,6 +773,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_sysctl_tmem_op_t);
+  */
+ struct xen_sysctl_featureset {
+ #define XEN_SYSCTL_featureset_host      0
++#define XEN_SYSCTL_featureset_pv        1
+     uint32_t index;       /* IN: Which featureset to query? */
+     uint32_t nr_features; /* IN/OUT: Number of entries in/written to
+                            * 'features', or the maximum number of features if

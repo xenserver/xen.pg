@@ -1,0 +1,268 @@
+From 4e29e45149baa3b8042fa36ea1e76829b8860a11 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 1 Dec 2015 14:35:17 +0000
+Subject: [PATCH 28/39] x86: Improvements to in-hypervisor cpuid sanity checks
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index c297d1b..da6eb8c 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -70,6 +70,7 @@
+ #include <public/memory.h>
+ #include <public/vm_event.h>
+ #include <public/arch-x86/cpuid.h>
++#include <asm/cpuid.h>
+ 
+ bool_t __read_mostly hvm_enabled;
+ 
+@@ -4496,43 +4497,39 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+         /* Fix up VLAPIC details. */
+         *ebx &= 0x00FFFFFFu;
+         *ebx |= (v->vcpu_id * 2) << 24;
++
++        *ecx &= hvm_featureset[XEN_FEATURESET_1c];
++        *edx &= hvm_featureset[XEN_FEATURESET_1d];
++
+         if ( vlapic_hw_disabled(vcpu_vlapic(v)) )
+-            __clear_bit(X86_FEATURE_APIC & 31, edx);
++            __clear_bit(cpufeat_bit(X86_FEATURE_APIC), edx);
+ 
+         /* Fix up OSXSAVE. */
+-        if ( cpu_has_xsave )
+-            *ecx |= (v->arch.hvm_vcpu.guest_cr[4] & X86_CR4_OSXSAVE) ?
+-                     cpufeat_mask(X86_FEATURE_OSXSAVE) : 0;
++        if ( v->arch.hvm_vcpu.guest_cr[4] & X86_CR4_OSXSAVE )
++            *ecx |= cpufeat_mask(X86_FEATURE_OSXSAVE);
+ 
+         /* Don't expose PCID to non-hap hvm. */
+         if ( !hap_enabled(d) )
+             *ecx &= ~cpufeat_mask(X86_FEATURE_PCID);
+-
+-        /* Only provide PSE36 when guest runs in 32bit PAE or in long mode */
+-        if ( !(hvm_pae_enabled(v) || hvm_long_mode_enabled(v)) )
+-            *edx &= ~cpufeat_mask(X86_FEATURE_PSE36);
+         break;
+-    case 0x7:
+-        if ( (count == 0) && !cpu_has_smep )
+-            *ebx &= ~cpufeat_mask(X86_FEATURE_SMEP);
+ 
+-        if ( (count == 0) && !cpu_has_smap )
+-            *ebx &= ~cpufeat_mask(X86_FEATURE_SMAP);
+-
+-        /* Don't expose MPX to hvm when VMX support is not available */
+-        if ( (count == 0) &&
+-             (!(vmx_vmexit_control & VM_EXIT_CLEAR_BNDCFGS) ||
+-              !(vmx_vmentry_control & VM_ENTRY_LOAD_BNDCFGS)) )
+-            *ebx &= ~cpufeat_mask(X86_FEATURE_MPX);
++    case 0x7:
++        if ( count == 0 )
++        {
++            *ebx &= hvm_featureset[XEN_FEATURESET_7b0];
++            *ecx &= hvm_featureset[XEN_FEATURESET_7c0];
+ 
+-        /* Don't expose INVPCID to non-hap hvm. */
+-        if ( (count == 0) && !hap_enabled(d) )
+-            *ebx &= ~cpufeat_mask(X86_FEATURE_INVPCID);
++            /* Don't expose INVPCID to non-hap hvm. */
++            if ( !hap_enabled(d) )
++                *ebx &= ~cpufeat_mask(X86_FEATURE_INVPCID);
++        }
+         break;
++
+     case 0xb:
+         /* Fix the x2APIC identifier. */
+         *edx = v->vcpu_id * 2;
+         break;
++
+     case 0xd:
+         /* EBX value of main leaf 0 depends on enabled xsave features */
+         if ( count == 0 && v->arch.xcr0 ) 
+@@ -4549,9 +4546,18 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+                     *ebx = _eax + _ebx;
+             }
+         }
++        else if ( count == 1 )
++        {
++            *eax &= hvm_featureset[XEN_FEATURESET_Da1];
++            if ( !(*eax & cpufeat_mask(X86_FEATURE_XSAVES)) )
++                 *ebx = *ecx = *edx = 0;
++        }
+         break;
+ 
+     case 0x80000001:
++        *ecx &= hvm_featureset[XEN_FEATURESET_e1c];
++        *edx &= hvm_featureset[XEN_FEATURESET_e1d];
++
+         /* We expose RDTSCP feature to guest only when
+            tsc_mode == TSC_MODE_DEFAULT and host_tsc_is_safe() returns 1 */
+         if ( d->arch.tsc_mode != TSC_MODE_DEFAULT ||
+@@ -4560,12 +4566,10 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+         /* Hide 1GB-superpage feature if we can't emulate it. */
+         if (!hvm_pse1gb_supported(d))
+             *edx &= ~cpufeat_mask(X86_FEATURE_PAGE1GB);
+-        /* Only provide PSE36 when guest runs in 32bit PAE or in long mode */
+-        if ( !(hvm_pae_enabled(v) || hvm_long_mode_enabled(v)) )
+-            *edx &= ~cpufeat_mask(X86_FEATURE_PSE36);
+-        /* Hide data breakpoint extensions if the hardware has no support. */
+-        if ( !boot_cpu_has(X86_FEATURE_DBEXT) )
+-            *ecx &= ~cpufeat_mask(X86_FEATURE_DBEXT);
++        break;
++
++    case 0x80000007:
++        *edx &= hvm_featureset[XEN_FEATURESET_e7d];
+         break;
+ 
+     case 0x80000008:
+@@ -4583,6 +4587,8 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+         hvm_cpuid(0x80000001, NULL, NULL, NULL, &_edx);
+         *eax = (*eax & ~0xffff00) | (_edx & cpufeat_mask(X86_FEATURE_LM)
+                                      ? 0x3000 : 0x2000);
++
++        *ebx &= hvm_featureset[XEN_FEATURESET_e8b];
+         break;
+     }
+ }
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index 99a0499..7e3a7bc 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -73,6 +73,7 @@
+ #include <asm/hpet.h>
+ #include <asm/vpmu.h>
+ #include <public/arch-x86/cpuid.h>
++#include <asm/cpuid.h>
+ #include <xsm/xsm.h>
+ 
+ /*
+@@ -864,69 +865,27 @@ void pv_cpuid(struct cpu_user_regs *regs)
+ 
+     cpuid_count(a, c, &a, &b, &c, &d);
+ 
+-    if ( (regs->eax & 0x7fffffff) == 0x00000001 )
+-    {
+-        /* Modify Feature Information. */
+-        if ( !cpu_has_apic )
+-            __clear_bit(X86_FEATURE_APIC, &d);
+-
+-        if ( !is_pvh_domain(currd) )
+-        {
+-            __clear_bit(X86_FEATURE_PSE, &d);
+-            __clear_bit(X86_FEATURE_PGE, &d);
+-            __clear_bit(X86_FEATURE_PSE36, &d);
+-            __clear_bit(X86_FEATURE_VME, &d);
+-        }
+-    }
+-
+     switch ( regs->_eax )
+     {
+     case 0x00000001:
+-        /* Modify Feature Information. */
+-        if ( !cpu_has_sep )
+-            __clear_bit(X86_FEATURE_SEP, &d);
+-        __clear_bit(X86_FEATURE_DS, &d);
+-        __clear_bit(X86_FEATURE_ACC, &d);
+-        __clear_bit(X86_FEATURE_PBE, &d);
+-        if ( is_pvh_domain(currd) )
+-            __clear_bit(X86_FEATURE_MTRR, &d);
+-
+-        __clear_bit(X86_FEATURE_DTES64 % 32, &c);
+-        __clear_bit(X86_FEATURE_MWAIT % 32, &c);
+-        __clear_bit(X86_FEATURE_DSCPL % 32, &c);
+-        __clear_bit(X86_FEATURE_VMXE % 32, &c);
+-        __clear_bit(X86_FEATURE_SMXE % 32, &c);
+-        __clear_bit(X86_FEATURE_TM2 % 32, &c);
+-        if ( is_pv_32bit_domain(currd) )
+-            __clear_bit(X86_FEATURE_CX16 % 32, &c);
+-        __clear_bit(X86_FEATURE_XTPR % 32, &c);
+-        __clear_bit(X86_FEATURE_PDCM % 32, &c);
+-        __clear_bit(X86_FEATURE_PCID % 32, &c);
+-        __clear_bit(X86_FEATURE_DCA % 32, &c);
+-        if ( !cpu_has_xsave )
+-        {
+-            __clear_bit(X86_FEATURE_XSAVE % 32, &c);
+-            __clear_bit(X86_FEATURE_AVX % 32, &c);
+-        }
+-        if ( !cpu_has_apic )
+-           __clear_bit(X86_FEATURE_X2APIC % 32, &c);
+-        __set_bit(X86_FEATURE_HYPERVISOR % 32, &c);
++        c &= pv_featureset[XEN_FEATURESET_1c];
++        d &= pv_featureset[XEN_FEATURESET_1d];
++
++        if ( curr->arch.pv_vcpu.ctrlreg[4] & X86_CR4_OSXSAVE )
++            __set_bit(cpufeat_bit(X86_FEATURE_OSXSAVE), &c);
++
++        __set_bit(cpufeat_bit(X86_FEATURE_HYPERVISOR), &c);
+         break;
+ 
+     case 0x00000007:
+         if ( regs->_ecx == 0 )
+-            b &= (cpufeat_mask(X86_FEATURE_BMI1) |
+-                  cpufeat_mask(X86_FEATURE_HLE)  |
+-                  cpufeat_mask(X86_FEATURE_AVX2) |
+-                  cpufeat_mask(X86_FEATURE_BMI2) |
+-                  cpufeat_mask(X86_FEATURE_ERMS) |
+-                  cpufeat_mask(X86_FEATURE_RTM)  |
+-                  cpufeat_mask(X86_FEATURE_RDSEED)  |
+-                  cpufeat_mask(X86_FEATURE_ADX)  |
+-                  cpufeat_mask(X86_FEATURE_FSGSBASE));
++        {
++            b &= pv_featureset[XEN_FEATURESET_7b0];
++            c &= pv_featureset[XEN_FEATURESET_7c0];
++        }
+         else
+-            b = 0;
+-        a = c = d = 0;
++            b = c = 0;
++        a = d = 0;
+         break;
+ 
+     case XSTATE_CPUID:
+@@ -935,36 +894,23 @@ void pv_cpuid(struct cpu_user_regs *regs)
+             goto unsupported;
+         if ( regs->_ecx == 1 )
+         {
+-            a &= boot_cpu_data.x86_capability[cpufeat_word(X86_FEATURE_XSAVEOPT)];
+-            if ( !cpu_has_xsaves )
++            a &= pv_featureset[XEN_FEATURESET_Da1];
++            if ( !(a & cpufeat_mask(X86_FEATURE_XSAVES)) )
+                 b = c = d = 0;
+         }
+         break;
+ 
+     case 0x80000001:
+-        /* Modify Feature Information. */
+-        if ( is_pv_32bit_domain(currd) )
+-        {
+-            __clear_bit(X86_FEATURE_LM % 32, &d);
+-            __clear_bit(X86_FEATURE_LAHF_LM % 32, &c);
+-        }
+-        if ( is_pv_32bit_domain(currd) &&
+-             boot_cpu_data.x86_vendor != X86_VENDOR_AMD )
+-            __clear_bit(X86_FEATURE_SYSCALL % 32, &d);
+-        __clear_bit(X86_FEATURE_PAGE1GB % 32, &d);
+-        __clear_bit(X86_FEATURE_RDTSCP % 32, &d);
+-
+-        __clear_bit(X86_FEATURE_SVM % 32, &c);
+-        if ( !cpu_has_apic )
+-           __clear_bit(X86_FEATURE_EXTAPIC % 32, &c);
+-        __clear_bit(X86_FEATURE_OSVW % 32, &c);
+-        __clear_bit(X86_FEATURE_IBS % 32, &c);
+-        __clear_bit(X86_FEATURE_SKINIT % 32, &c);
+-        __clear_bit(X86_FEATURE_WDT % 32, &c);
+-        __clear_bit(X86_FEATURE_LWP % 32, &c);
+-        __clear_bit(X86_FEATURE_NODEID_MSR % 32, &c);
+-        __clear_bit(X86_FEATURE_TOPOEXT % 32, &c);
+-        __clear_bit(X86_FEATURE_MWAITX % 32, &c);
++        c &= pv_featureset[XEN_FEATURESET_e1c];
++        d &= pv_featureset[XEN_FEATURESET_e1d];
++        break;
++
++    case 0x80000007:
++        d &= pv_featureset[XEN_FEATURESET_e7d];
++        break;
++
++    case 0x80000008:
++        b &= pv_featureset[XEN_FEATURESET_e8b];
+         break;
+ 
+     case 0x0000000a: /* Architectural Performance Monitor Features (Intel) */

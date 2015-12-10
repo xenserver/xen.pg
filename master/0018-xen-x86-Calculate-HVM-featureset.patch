@@ -1,0 +1,208 @@
+From 61b90aac0241db3ba40023f95b1a343355a03a64 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 31 Aug 2015 18:18:29 +0100
+Subject: [PATCH 18/39] xen/x86: Calculate HVM featureset
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
+index 672bec5..1a8b0ff 100644
+--- a/xen/arch/x86/cpuid.c
++++ b/xen/arch/x86/cpuid.c
+@@ -2,11 +2,13 @@
+ #include <xen/init.h>
+ #include <asm/processor.h>
+ #include <asm/cpuid.h>
++#include <asm/hvm/hvm.h>
+ 
+ #include "cpuid/cpuid-private.h"
+ 
+ uint32_t __read_mostly host_featureset[XEN_NR_FEATURESET_ENTRIES];
+ uint32_t __read_mostly pv_featureset[XEN_NR_FEATURESET_ENTRIES];
++uint32_t __read_mostly hvm_featureset[XEN_NR_FEATURESET_ENTRIES];
+ 
+ void __init calculate_featuresets(void)
+ {
+@@ -22,6 +24,27 @@ void __init calculate_featuresets(void)
+ 
+     /* Unconditionally claim to be able to set the hypervisor bit. */
+     __set_bit(X86_FEATURE_HYPERVISOR, pv_featureset);
++
++    /* HVM featureset. */
++    if ( hvm_enabled )
++    {
++        const uint32_t *hvm_featuremask = hvm_funcs.hap_supported
++            ? hvm_hap_featuremask : hvm_shadow_featuremask;
++
++        for ( i = 0; i < ARRAY_SIZE(hvm_featureset); ++i )
++            hvm_featureset[i] = host_featureset[i] & hvm_featuremask[i];
++
++        /* Unconditionally claim to be able to set the hypervisor bit. */
++        __set_bit(X86_FEATURE_HYPERVISOR, hvm_featureset);
++
++        /*
++         * On AMD, PV guests are entirely unable to use 'sysenter' as Xen runs
++         * in long mode, but HVM guests are able if running in protected mode.
++         */
++        if ( (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) &&
++             !test_bit(X86_FEATURE_SEP, boot_cpu_data.x86_capability) )
++            __set_bit(X86_FEATURE_SEP, hvm_featureset);
++    }
+ }
+ 
+ /*
+diff --git a/xen/arch/x86/cpuid/cpuid-private.h b/xen/arch/x86/cpuid/cpuid-private.h
+index 4a004d8..014ec43 100644
+--- a/xen/arch/x86/cpuid/cpuid-private.h
++++ b/xen/arch/x86/cpuid/cpuid-private.h
+@@ -50,6 +50,14 @@ extern const uint32_t inverted_features[XEN_NR_FEATURESET_ENTRIES];
+ extern const uint32_t pv_featuremask[XEN_NR_FEATURESET_ENTRIES];
+ 
+ /*
++ * Bitmap of known features which can be exposed to HVM guests.  Excludes
++ * features unusable by HVM guests, or ones which have no hypervisor side
++ * support.  The available featureset is less if shadow paging is used.
++ */
++extern const uint32_t hvm_shadow_featuremask[XEN_NR_FEATURESET_ENTRIES];
++extern const uint32_t hvm_hap_featuremask[XEN_NR_FEATURESET_ENTRIES];
++
++/*
+  * Local variables:
+  * mode: C
+  * c-file-style: "BSD"
+diff --git a/xen/arch/x86/cpuid/cpuid.c b/xen/arch/x86/cpuid/cpuid.c
+index ac72e55..259a497 100644
+--- a/xen/arch/x86/cpuid/cpuid.c
++++ b/xen/arch/x86/cpuid/cpuid.c
+@@ -216,6 +216,93 @@ const uint32_t pv_featuremask[XEN_NR_FEATURESET_ENTRIES] =
+     PV_FEATUREMASK_7c0,
+ };
+ 
++#define HVM_SHADOW_FEATUREMASK_1d               \
++    (PV_FEATUREMASK_1d               |          \
++     cpufeat_mask(X86_FEATURE_VME)   |          \
++     cpufeat_mask(X86_FEATURE_PSE)   |          \
++     cpufeat_mask(X86_FEATURE_MTRR)  |          \
++     cpufeat_mask(X86_FEATURE_PGE)   |          \
++     cpufeat_mask(X86_FEATURE_PSE36))
++
++#define HVM_SHADOW_FEATUREMASK_1c               \
++    (PV_FEATUREMASK_1c                      |   \
++     cpufeat_mask(X86_FEATURE_VMXE)         |   \
++     cpufeat_mask(X86_FEATURE_PCID)         |   \
++     cpufeat_mask(X86_FEATURE_TSC_DEADLINE))
++
++#define HVM_SHADOW_FEATUREMASK_e1d              \
++    (PV_FEATUREMASK_e1d                      |  \
++     (HVM_SHADOW_FEATUREMASK_1d & SHARED_1d) |  \
++     cpufeat_mask(X86_FEATURE_PAGE1GB)       |  \
++     cpufeat_mask(X86_FEATURE_RDTSCP))
++
++#define HVM_SHADOW_FEATUREMASK_e1c              \
++    (PV_FEATUREMASK_e1c                   |     \
++     cpufeat_mask(X86_FEATURE_SVM)        |     \
++     cpufeat_mask(X86_FEATURE_CR8_LEGACY) |     \
++     cpufeat_mask(X86_FEATURE_IBS))
++
++#define HVM_SHADOW_FEATUREMASK_Da1              \
++    (PV_FEATUREMASK_Da1               |         \
++     cpufeat_mask(X86_FEATURE_XSAVES))
++
++#define HVM_SHADOW_FEATUREMASK_7b0              \
++    (PV_FEATUREMASK_7b0                   |     \
++     cpufeat_mask(X86_FEATURE_TSC_ADJUST) |     \
++     cpufeat_mask(X86_FEATURE_SMEP)       |     \
++     cpufeat_mask(X86_FEATURE_INVPCID)    |     \
++     cpufeat_mask(X86_FEATURE_SMAP))
++
++#define HVM_SHADOW_FEATUREMASK_7c0              \
++    (PV_FEATUREMASK_7c0)
++
++const uint32_t hvm_shadow_featuremask[XEN_NR_FEATURESET_ENTRIES] =
++{
++    HVM_SHADOW_FEATUREMASK_1d,
++    HVM_SHADOW_FEATUREMASK_1c,
++    HVM_SHADOW_FEATUREMASK_e1d,
++    HVM_SHADOW_FEATUREMASK_e1c,
++    HVM_SHADOW_FEATUREMASK_Da1,
++    HVM_SHADOW_FEATUREMASK_7b0,
++    HVM_SHADOW_FEATUREMASK_7c0,
++};
++
++#define HVM_HAP_FEATUREMASK_1d                  \
++    (HVM_SHADOW_FEATUREMASK_1d)
++
++#define HVM_HAP_FEATUREMASK_1c                  \
++    (HVM_SHADOW_FEATUREMASK_1c     |            \
++     cpufeat_mask(X86_FEATURE_PCID))
++
++#define HVM_HAP_FEATUREMASK_e1d                 \
++    (HVM_SHADOW_FEATUREMASK_e1d           |     \
++     (HVM_HAP_FEATUREMASK_1d & SHARED_1d) |     \
++     cpufeat_mask(X86_FEATURE_PAGE1GB))
++
++#define HVM_HAP_FEATUREMASK_e1c                 \
++    (HVM_SHADOW_FEATUREMASK_e1c)
++
++#define HVM_HAP_FEATUREMASK_Da1                 \
++    (HVM_SHADOW_FEATUREMASK_Da1)
++
++#define HVM_HAP_FEATUREMASK_7b0                 \
++    (HVM_SHADOW_FEATUREMASK_7b0        |        \
++     cpufeat_mask(X86_FEATURE_INVPCID))
++
++#define HVM_HAP_FEATUREMASK_7c0                 \
++    (HVM_SHADOW_FEATUREMASK_7c0)
++
++const uint32_t hvm_hap_featuremask[XEN_NR_FEATURESET_ENTRIES] =
++{
++    HVM_HAP_FEATUREMASK_1d,
++    HVM_HAP_FEATUREMASK_1c,
++    HVM_HAP_FEATUREMASK_e1d,
++    HVM_HAP_FEATUREMASK_e1c,
++    HVM_HAP_FEATUREMASK_Da1,
++    HVM_HAP_FEATUREMASK_7b0,
++    HVM_HAP_FEATUREMASK_7c0,
++};
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/arch/x86/sysctl.c b/xen/arch/x86/sysctl.c
+index 34ffe43..0ba0f5e 100644
+--- a/xen/arch/x86/sysctl.c
++++ b/xen/arch/x86/sysctl.c
+@@ -219,6 +219,10 @@ long arch_do_sysctl(
+             featureset = pv_featureset;
+             break;
+ 
++        case XEN_SYSCTL_featureset_hvm:
++            featureset = hvm_featureset;
++            break;
++
+         default:
+             featureset = NULL;
+             break;
+diff --git a/xen/include/asm-x86/cpuid.h b/xen/include/asm-x86/cpuid.h
+index 6a7357f..b6498b9 100644
+--- a/xen/include/asm-x86/cpuid.h
++++ b/xen/include/asm-x86/cpuid.h
+@@ -7,6 +7,7 @@
+ 
+ extern uint32_t host_featureset[XEN_NR_FEATURESET_ENTRIES];
+ extern uint32_t pv_featureset[XEN_NR_FEATURESET_ENTRIES];
++extern uint32_t hvm_featureset[XEN_NR_FEATURESET_ENTRIES];
+ 
+ void calculate_featuresets(void);
+ 
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index 33ba66b..8728950 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -774,6 +774,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_sysctl_tmem_op_t);
+ struct xen_sysctl_featureset {
+ #define XEN_SYSCTL_featureset_host      0
+ #define XEN_SYSCTL_featureset_pv        1
++#define XEN_SYSCTL_featureset_hvm       2
+     uint32_t index;       /* IN: Which featureset to query? */
+     uint32_t nr_features; /* IN/OUT: Number of entries in/written to
+                            * 'features', or the maximum number of features if

@@ -1,8 +1,8 @@
 diff --git a/.gitignore b/.gitignore
-index 9ead7c4..01f860c 100644
+index f757164..52aaca3 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -195,6 +195,7 @@ tools/tests/mem-sharing/memshrtool
+@@ -196,6 +196,7 @@ tools/tests/mem-sharing/memshrtool
  tools/tests/mce-test/tools/xen-mceinj
  tools/xcutils/lsevtchn
  tools/xcutils/readnotes
@@ -11,10 +11,10 @@ index 9ead7c4..01f860c 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index 64ec038..501223c 100644
+index 5b98eab..a2791e7 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
-@@ -440,6 +440,7 @@ rm -rf $RPM_BUILD_ROOT
+@@ -442,6 +442,7 @@ rm -rf $RPM_BUILD_ROOT
  %{_libexecdir}/%{name}/bin/xenconsole
  %{_libexecdir}/%{name}/bin/xenctx
  %{_libexecdir}/%{name}/bin/xendomains
@@ -36,7 +36,7 @@ index 6abba6f..4beea67 100644
  ifneq "$(MAKECMDGOALS)" "distclean"
 diff --git a/tools/xenguest/Makefile b/tools/xenguest/Makefile
 new file mode 100644
-index 0000000..6855d62
+index 0000000..53532e8
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,31 @@
@@ -44,7 +44,7 @@ index 0000000..6855d62
 +include $(XEN_ROOT)/tools/Rules.mk
 +
 +CFLAGS += -Werror -Wshadow
-+CFLAGS += -I.
++CFLAGS += -I. -I$(XEN_ROOT)/tools/libxc
 +CFLAGS += $(CFLAGS_libxenctrl) $(CFLAGS_libguest) $(CFLAGS_libxenstore)
 +CFLAGS += -D_GNU_SOURCE -D_BSD_SOURCE
 +
@@ -768,10 +768,10 @@ index 0000000..c43d473
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..de9dcfe
+index 0000000..8b6fdd1
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,878 @@
+@@ -0,0 +1,988 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -804,8 +804,10 @@ index 0000000..de9dcfe
 +#include <xen/hvm/hvm_info_table.h>
 +#include <xen/hvm/params.h>
 +#include <xen/hvm/e820.h>
++#include <xen/arch-x86/featureset.h>
 +
 +#include "xg_internal.h"
++#include "xc_bitops.h"
 +
 +char *xs_domain_path = NULL;
 +char *pci_passthrough_sbdf_list = NULL;
@@ -911,6 +913,112 @@ index 0000000..de9dcfe
 +int xenstore_puts(const char *key, const char *val)
 +{
 +    return xenstore_putsv(key, "%s", val);
++}
++
++static uint32_t *featureset, nr_features;
++
++/*
++ * Choose the featureset to use for a VM.
++ *
++ * The toolstack is expected to provide a featureset in the
++ * platform/featureset xenstore key, fomatted as a bitmap of '-' delimited
++ * 32bit hex-encoded words.  e.g.
++ *
++ *   aaaaaaaa-bbbbbbbb-cccccccc
++ *
++ * If no featureset is found, default to the host maximum.  It is important in
++ * a heterogenous case to permit featuresets longer than this hosts maximum,
++ * if they have been zero-extended to make a common longest length.
++ */
++static int get_vm_featureset(bool hvm)
++{
++    char *platform = xenstore_gets("platform/featureset");
++    char *s = platform, *e;
++    unsigned int i = 0;
++    int rc = 0;
++
++    if ( !platform )
++    {
++        xg_info("No featureset provided - using host maximum\n");
++
++        return xc_get_featureset(xch,
++                                 hvm ? XEN_SYSCTL_featureset_hvm
++                                     : XEN_SYSCTL_featureset_pv,
++                                 &nr_features, featureset);
++    }
++    else
++        xg_info("Parsing '%s' as featureset\n", platform);
++
++    while ( *s != '\0' )
++    {
++        unsigned long val;
++
++        errno = 0;
++        val = strtoul(s, &e, 16);
++        if ( (errno != 0) ||            /* Error converting. */
++             (val > ~(uint32_t)0) ||    /* Value out of range. */
++             (e == s) ||                /* No digits found. */
++                                        /* Bad following characters. */
++             !(*e == '\0' || *e == '-' || *e == ':')
++            )
++        {
++            xg_err("Bad '%s' in featureset\n", s);
++            rc = -1;
++            break;
++        }
++
++        if ( i < nr_features )
++            featureset[i++] = val;
++        else if ( val != 0 )
++        {
++            xg_err("Requested featureset '%s' truncated on this host\n", platform);
++            rc = -1;
++            break;
++        }
++
++        s = e;
++        if ( *s == '-' || *s == ':' )
++            s++;
++    }
++
++    free(platform);
++    return rc;
++}
++
++int construct_cpuid_policy(const struct flags *f, bool hvm)
++{
++    int rc = -1;
++
++    if ( xc_get_featureset(xch,
++                           XEN_SYSCTL_featureset_host,
++                           &nr_features, NULL) ||
++         nr_features == 0 )
++    {
++        xg_err("Failed to obtain featureset size %d %s\n",
++               errno, strerror(errno));
++        goto out;
++    }
++
++    featureset = calloc(nr_features, sizeof(*featureset));
++    if ( !featureset )
++    {
++        xg_err("Failed to allocate memory for featureset\n");
++        goto out;
++    }
++
++    if ( get_vm_featureset(hvm) )
++        goto out;
++
++    if ( !f->nx )
++        clear_bit(X86_FEATURE_NX, featureset);
++
++    rc = xc_cpuid_apply_policy_with_featureset(xch, domid,
++                                               featureset, nr_features);
++
++ out:
++    free(featureset);
++    featureset = NULL;
++    return rc;
 +}
 +
 +static int hvmloader_flag(const char *key)
@@ -1135,23 +1243,23 @@ index 0000000..de9dcfe
 +                           image_name, ramdisk_name, flags,
 +                           store_evtchn, store_mfn,
 +                           console_evtchn, console_mfn);
++    if ( r )
++        failwith_oss_xc("xc_dom_linux_build");
 +
-+    if (r == 0)
-+        r = xc_cpuid_apply_policy(xch, domid);
++    r = construct_cpuid_policy(&f, false);
++    if ( r )
++        failwith_oss_xc("construct_cpuid_policy");
 +
-+    if (r == 0)
-+        r = xc_dom_gnttab_seed(xch, domid,
-+                               *console_mfn, *store_mfn,
-+                               console_domid, store_domid);
-+
++    r = xc_dom_gnttab_seed(xch, domid,
++                           *console_mfn, *store_mfn,
++                           console_domid, store_domid);
++    if ( r )
++        failwith_oss_xc("xc_dom_gnttab_seed");
 +
 +    strncpy(protocol, xc_domain_get_native_protocol(xch, domid), 64);
 +
 +    free_flags(&f);
 +    xc_dom_release(dom);
-+
-+    if (r != 0)
-+        failwith_oss_xc("xc_dom_linux_build");
 +
 +    return 0;
 +}
@@ -1211,7 +1319,6 @@ index 0000000..de9dcfe
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_NESTEDHVM, f.nested_hvm);
-+    xc_set_hvm_param(xch, domid, HVM_PARAM_NX_ENABLED, f.nx);
 +    xc_get_hvm_param(xch, domid, HVM_PARAM_CONSOLE_PFN, console_mfn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_CONSOLE_EVTCHN, console_evtchn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_TRIPLE_FAULT_REASON, SHUTDOWN_crash);
@@ -1412,20 +1519,22 @@ index 0000000..de9dcfe
 +    configure_tsc(f);
 +
 +    r = stub_xc_hvm_build_with_mem(mem_max_mib, mem_start_mib, image_name);
-+    if (r)
++    if ( r )
 +        failwith_oss_xc("hvm_build");
 +
 +    r = hvm_build_set_params(store_evtchn, store_mfn,
 +                             console_evtchn, console_mfn, f);
-+    if (r)
++    if ( r )
 +        failwith_oss_xc("hvm_build_params");
 +
-+    r = xc_cpuid_apply_policy(xch, domid);
-+    if (r)
-+        failwith_oss_xc("xc_cpuid_apply_policy");
++    r = construct_cpuid_policy(&f, true);
++    if ( r )
++        failwith_oss_xc("construct_cpuid_policy");
 +
-+    xc_dom_gnttab_hvm_seed(xch, domid, *console_mfn, *store_mfn,
-+                           console_domid, store_domid);
++    r = xc_dom_gnttab_hvm_seed(xch, domid, *console_mfn, *store_mfn,
++                               console_domid, store_domid);
++    if ( r )
++        failwith_oss_xc("xc_dom_gnttab_hvm_seed");
 +
 +    free_flags(&f);
 +
@@ -1607,6 +1716,8 @@ index 0000000..de9dcfe
 +                          store_evtchn, store_mfn, 0,
 +                          console_evtchn, console_mfn, 0,
 +                          hvm, f.pae, 0, 0, NULL);
++    if ( r )
++        failwith_oss_xc("xc_domain_restore");
 +    /*
 +     * The legacy -> migration v2 code in XenServer 6.5 didn't combine the
 +     * out-of-band HVM_PARAM_PAE_ENABLED into the converted stream, and
@@ -1624,12 +1735,11 @@ index 0000000..de9dcfe
 +    if ( hvm )
 +        xc_set_hvm_param(xch, domid, HVM_PARAM_PAE_ENABLED, f.pae);
 +
-+    if (r == 0)
-+        r = xc_cpuid_apply_policy(xch, domid);
++    r = construct_cpuid_policy(&f, hvm);
++    if ( r )
++        failwith_oss_xc("construct_cpuid_policy");
 +
 +    free_flags(&f);
-+    if (r)
-+        failwith_oss_xc("xc_domain_restore");
 +
 +    if ( hvm )
 +    {

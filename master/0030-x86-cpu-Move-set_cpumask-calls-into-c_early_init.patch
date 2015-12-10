@@ -1,0 +1,99 @@
+From e0ad58ab1f379d2888a4d322f7421b8d03a862c7 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 26 Nov 2015 16:02:10 +0000
+Subject: [PATCH 30/39] x86/cpu: Move set_cpumask() calls into c_early_init()
+
+Before c/s 44e24f8567 "x86: don't call generic_identify() redundantly", the
+commandline-provided masks would take effect in Xen's view of the features.
+
+As the masks got applied after the query for features, the redundant call to
+generic_identify() would clobber the wrong feature information with the new,
+correct information.
+
+Move the set_cpumask() calls into c_early_init() so their effects take place
+before the main query for features in generic_identify().
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index 5d22863..265fbc0 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -424,6 +424,11 @@ static void __devinit amd_get_topology(struct cpuinfo_x86 *c)
+                                                          c->cpu_core_id);
+ }
+ 
++static void __devinit early_init_amd(struct cpuinfo_x86 *c)
++{
++	set_cpuidmask(c);
++}
++
+ static void __devinit init_amd(struct cpuinfo_x86 *c)
+ {
+ 	u32 l, h;
+@@ -615,14 +620,13 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
+ 	if ((smp_processor_id() == 1) && c1_ramping_may_cause_clock_drift(c))
+ 		disable_c1_ramping();
+ 
+-	set_cpuidmask(c);
+-
+ 	check_syscfg_dram_mod_en();
+ }
+ 
+ static const struct cpu_dev amd_cpu_dev = {
+ 	.c_vendor	= "AMD",
+ 	.c_ident 	= { "AuthenticAMD" },
++	.c_early_init	= early_init_amd,
+ 	.c_init		= init_amd,
+ };
+ 
+diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
+index bd595a5..d251b53 100644
+--- a/xen/arch/x86/cpu/intel.c
++++ b/xen/arch/x86/cpu/intel.c
+@@ -182,6 +182,23 @@ static void early_init_intel(struct cpuinfo_x86 *c)
+ 	if (boot_cpu_data.x86 == 0xF && boot_cpu_data.x86_model == 3 &&
+ 	    (boot_cpu_data.x86_mask == 3 || boot_cpu_data.x86_mask == 4))
+ 		paddr_bits = 36;
++
++	if (c == &boot_cpu_data && c->x86 == 6) {
++		if (probe_intel_cpuid_faulting())
++			__set_bit(X86_FEATURE_CPUID_FAULTING,
++				  c->x86_capability);
++	} else if (boot_cpu_has(X86_FEATURE_CPUID_FAULTING)) {
++		BUG_ON(!probe_intel_cpuid_faulting());
++		__set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
++	}
++
++	if (!cpu_has_cpuid_faulting)
++		set_cpuidmask(c);
++	else if ((c == &boot_cpu_data) &&
++		 (~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx &
++		    opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx &
++		    opt_cpuid_mask_xsave_eax)))
++		printk("No CPUID feature masking support available\n");
+ }
+ 
+ /*
+@@ -251,22 +268,6 @@ static void __devinit init_intel(struct cpuinfo_x86 *c)
+ 		detect_ht(c);
+ 	}
+ 
+-	if (c == &boot_cpu_data && c->x86 == 6) {
+-		if (probe_intel_cpuid_faulting())
+-			set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
+-	} else if (boot_cpu_has(X86_FEATURE_CPUID_FAULTING)) {
+-		BUG_ON(!probe_intel_cpuid_faulting());
+-		set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
+-	}
+-
+-	if (!cpu_has_cpuid_faulting)
+-		set_cpuidmask(c);
+-	else if ((c == &boot_cpu_data) &&
+-		 (~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx &
+-		    opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx &
+-		    opt_cpuid_mask_xsave_eax)))
+-		printk("No CPUID feature masking support available\n");
+-
+ 	/* Work around errata */
+ 	Intel_errata_workarounds(c);
+ 

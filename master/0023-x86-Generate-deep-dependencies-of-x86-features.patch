@@ -1,0 +1,297 @@
+From 81d0b2557152a5ddccb42a54a55f1b302332173e Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 18 Nov 2015 12:48:42 +0000
+Subject: [PATCH 23/39] x86: Generate deep dependencies of x86 features
+
+diff --git a/.gitignore b/.gitignore
+index 63944b5..f757164 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -228,6 +228,7 @@ xen/arch/x86/xen.lds
+ xen/arch/x86/boot/reloc.S
+ xen/arch/x86/boot/reloc.bin
+ xen/arch/x86/boot/reloc.lnk
++xen/arch/x86/cpuid/autogen.c
+ xen/arch/x86/efi.lds
+ xen/arch/x86/efi/check.efi
+ xen/arch/x86/efi/disabled
+diff --git a/tools/libxc/Makefile b/tools/libxc/Makefile
+index 83547e1..7c8c2d8 100644
+--- a/tools/libxc/Makefile
++++ b/tools/libxc/Makefile
+@@ -82,7 +82,7 @@ $(patsubst %.c,%.opic,$(ELF_SRCS-y)): CFLAGS += -Wno-pointer-sign
+ ifeq ($(CONFIG_X86),y)
+ vpath %.c ../../xen/arch/x86/cpuid
+ CFLAGS += -I../../xen/arch/x86/cpuid
+-CTRL_SRCS-y += cpuid.c
++CTRL_SRCS-y += cpuid.c autogen.c
+ endif
+ 
+ # new domain builder
+diff --git a/tools/libxc/xc_bitops.h b/tools/libxc/xc_bitops.h
+index cd749f4..8e645a1 100644
+--- a/tools/libxc/xc_bitops.h
++++ b/tools/libxc/xc_bitops.h
+@@ -36,19 +36,19 @@ static inline void bitmap_clear(unsigned long *addr, int nr_bits)
+     memset(addr, 0, bitmap_size(nr_bits));
+ }
+ 
+-static inline int test_bit(int nr, unsigned long *addr)
++static inline int test_bit(int nr, const void *addr)
+ {
+-    return (BITMAP_ENTRY(nr, addr) >> BITMAP_SHIFT(nr)) & 1;
++    return (BITMAP_ENTRY(nr, (const unsigned long *)addr) >> BITMAP_SHIFT(nr)) & 1;
+ }
+ 
+-static inline void clear_bit(int nr, unsigned long *addr)
++static inline void clear_bit(int nr, void *addr)
+ {
+-    BITMAP_ENTRY(nr, addr) &= ~(1UL << BITMAP_SHIFT(nr));
++    BITMAP_ENTRY(nr, (unsigned long *)addr) &= ~(1UL << BITMAP_SHIFT(nr));
+ }
+ 
+-static inline void set_bit(int nr, unsigned long *addr)
++static inline void set_bit(int nr, void *addr)
+ {
+-    BITMAP_ENTRY(nr, addr) |= (1UL << BITMAP_SHIFT(nr));
++    BITMAP_ENTRY(nr, (unsigned long *)addr) |= (1UL << BITMAP_SHIFT(nr));
+ }
+ 
+ static inline int test_and_clear_bit(int nr, unsigned long *addr)
+diff --git a/xen/arch/x86/cpuid/Makefile b/xen/arch/x86/cpuid/Makefile
+index 3fb2e0b..0fb720a 100644
+--- a/xen/arch/x86/cpuid/Makefile
++++ b/xen/arch/x86/cpuid/Makefile
+@@ -1 +1,6 @@
+ obj-y += cpuid.o
++obj-y += autogen.o
++
++autogen.c: gen-feature-deps.py
++	$(PYTHON) gen-feature-deps.py
++	$(call move-if-changed,autogen.c.tmp,autogen.c)
+diff --git a/xen/arch/x86/cpuid/cpuid-private.h b/xen/arch/x86/cpuid/cpuid-private.h
+index 1c92ee4..438f5d2 100644
+--- a/xen/arch/x86/cpuid/cpuid-private.h
++++ b/xen/arch/x86/cpuid/cpuid-private.h
+@@ -64,6 +64,24 @@ extern const uint32_t pv_featuremask[XEN_NR_FEATURESET_ENTRIES];
+ extern const uint32_t hvm_shadow_featuremask[XEN_NR_FEATURESET_ENTRIES];
+ extern const uint32_t hvm_hap_featuremask[XEN_NR_FEATURESET_ENTRIES];
+ 
++/* A featureset with a tag. */
++struct tagged_featureset
++{
++    uint32_t tag;
++    uint32_t fs[XEN_NR_FEATURESET_ENTRIES];
++};
++
++/* Sparse feature matrix identifying all features which depend on a feature. */
++extern const struct tagged_featureset deep_deps[];
++
++/* Number of entries in deep_deps. */
++extern const unsigned int nr_deep_deps;
++
++/* Bitmap of each tag found in 'deep_deps'. */
++extern const uint32_t deep_dep_features[XEN_NR_FEATURESET_ENTRIES];
++
++const struct tagged_featureset *lookup_deep_deps(uint32_t feature);
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/arch/x86/cpuid/cpuid.c b/xen/arch/x86/cpuid/cpuid.c
+index 259a497..badf1a1 100644
+--- a/xen/arch/x86/cpuid/cpuid.c
++++ b/xen/arch/x86/cpuid/cpuid.c
+@@ -304,6 +304,34 @@ const uint32_t hvm_hap_featuremask[XEN_NR_FEATURESET_ENTRIES] =
+ };
+ 
+ /*
++ * Looks up a features deep dependency.  Returns a pointer, or NULL if not
++ * found.
++ */
++const struct tagged_featureset *lookup_deep_deps(uint32_t feat)
++{
++    unsigned int start = 0, end = nr_deep_deps;
++
++    /* Fast early exit. */
++    if ( !test_bit(feat, deep_dep_features) )
++        return NULL;
++
++    /* deep_deps[] is sorted.  Perform a binary search. */
++    while ( start < end )
++    {
++        unsigned int mid = start + ((end - start) / 2);
++
++        if ( deep_deps[mid].tag > feat )
++            end = mid;
++        else if ( deep_deps[mid].tag < feat )
++            start = mid + 1;
++        else
++            return &deep_deps[mid];
++    }
++
++    return NULL;
++}
++
++/*
+  * Local variables:
+  * mode: C
+  * c-file-style: "BSD"
+diff --git a/xen/arch/x86/cpuid/gen-feature-deps.py b/xen/arch/x86/cpuid/gen-feature-deps.py
+new file mode 100755
+index 0000000..4dacaed
+--- /dev/null
++++ b/xen/arch/x86/cpuid/gen-feature-deps.py
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python
++import sys, os, os.path as path, re
++
++names = {}
++
++with open(path.join(os.environ["XEN_ROOT"],
++                    "xen/include/public/arch-x86/featureset.h")) as f:
++
++    feat_regex = re.compile(
++        r"^#define X86_FEATURE_([A-Z0-9_]+)"
++        "\s+\(([\s\d]+\*[\s\d]+\+[\s\d]+)\)")
++
++    this = sys.modules[__name__]
++
++    for l in f.readlines():
++        # Short circuit the regex...
++        if not l.startswith("#define X86_FEATURE_"):
++            continue
++
++        res = feat_regex.match(l)
++
++        if res is None:
++            print >>sys.stderr, "Failed to interpret '%s'" % (l, )
++            sys.exit(1)
++
++        name = res.groups()[0]
++        val = eval(res.groups()[1]) # Regex confines this to a very simple expression
++
++        # Expected duplicate symbols.  Discard
++        if name in ('3DNOW_ALT', ):
++            continue
++
++        if hasattr(this, name) or val in names:
++            print >>sys.stderr, "Duplicate symbol or representation for '%s'" \
++                % (name, )
++            sys.exit(1)
++
++        # Mutate the current namespace to insert a feature literal with its
++        # bit index
++        setattr(this, name, val)
++
++        # Construct a reverse mapping of value to name
++        names[val] = name
++
++
++# Dependences specified as a dictionary of tuples: The feature in the key
++# is a direct dependency of each of the features in the tuple.
++deps = {
++    XSAVE:
++    (XSAVEOPT, XSAVEC, XGETBV1, XSAVES, AVX, MPX),
++
++    AVX:
++    (FMA, FMA4, F16C, AVX2, XOP),
++
++    PAE:
++    (LM, ),
++
++    LM:
++    (CX16, LAHF_LM, PAGE1GB),
++
++    XMM:
++    (XMM2, ),
++
++    XMM2:
++    (XMM3, ),
++
++    XMM3:
++    (LM, ),
++
++    APIC:
++    (X2APIC, ),
++
++    PSE:
++    (PSE36, ),
++}
++
++deep_features = tuple(sorted(deps.keys()))
++
++deep_deps = {}
++for feat in deep_features:
++
++    seen = [feat]
++    to_process = list(deps[feat])
++
++    while len(to_process):
++        f = to_process.pop(0)
++
++        if f in seen:
++            print >>sys.stderr, "ERROR: Cycle found with %s when processing %s" \
++                % (names[f], names[feat])
++            sys.exit(1)
++
++        seen.append(f)
++        to_process.extend(deps.get(f, []))
++
++    deep_deps[feat] = seen[1:]
++
++def format_featurset(fs):
++
++    words = {}
++    res = "\n"
++
++    # Identify which featureset words each feature resides in
++    for f in fs:
++        word = f >> 5
++
++        if word in words:
++            words[word].append(f)
++        else:
++            words[word] = [f]
++
++    for w in sorted(words.keys()):
++        wf = sorted(words[w])
++
++        res += "        [cpufeat_word(X86_FEATURE_%s)] = (\n" % (names[wf[0]], )
++
++        res += " |\n".join(
++            "            cpufeat_mask(X86_FEATURE_%s)" %
++            (names[f], ) for f in wf)
++
++        res += "),\n\n"
++
++    return res.rstrip()
++
++with open(path.join(os.environ["XEN_ROOT"],
++                    "xen/arch/x86/cpuid/autogen.c.tmp"), "w") as f:
++    f.write(
++"""/*
++ * Automatically generated by %s - Do not edit!
++ */
++#include "cpuid-private.h"
++
++const struct tagged_featureset deep_deps[] =
++{""" % (sys.argv[0],))
++
++    for d in sorted(deep_deps.keys()):
++        f.write("""
++    { X86_FEATURE_%s,
++      {%s
++      }
++    },
++""" % (names[d], format_featurset(deep_deps[d])))
++
++    f.write(
++"""};
++
++const unsigned int nr_deep_deps = ARRAY_SIZE(deep_deps);
++
++const uint32_t deep_dep_features[XEN_NR_FEATURESET_ENTRIES] =
++{%s
++};
++""" % (format_featurset(deep_features), ))

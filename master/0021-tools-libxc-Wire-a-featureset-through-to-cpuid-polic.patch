@@ -1,0 +1,207 @@
+From cefb5cb0da503faae76f2c9adcde6220d7710a4d Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 6 Oct 2015 16:01:37 +0100
+Subject: [PATCH 21/39] tools/libxc: Wire a featureset through to cpuid policy
+ logic
+
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index f1c5cc1..1ac0ba9 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -2211,6 +2211,9 @@ int xc_cpuid_set(xc_interface *xch,
+                  char **config_transformed);
+ int xc_cpuid_apply_policy(xc_interface *xch,
+                           domid_t domid);
++int xc_cpuid_apply_policy_with_featureset(xc_interface *xch, domid_t domid,
++                                          uint32_t *featureset,
++                                          unsigned int nr_features);
+ void xc_cpuid_to_str(const unsigned int *regs,
+                      char **strs); /* some strs[] may be NULL if ENOMEM */
+ int xc_mca_op(xc_interface *xch, struct xen_mc *mc);
+diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
+index 0a806cb..8bd3126 100644
+--- a/tools/libxc/xc_cpuid_x86.c
++++ b/tools/libxc/xc_cpuid_x86.c
+@@ -46,6 +46,9 @@ struct cpuid_domain_info
+     bool pvh;
+     uint64_t xfeature_mask;
+ 
++    uint32_t *featureset;
++    unsigned int nr_features;
++
+     /* PV-only information. */
+     bool pv64;
+ 
+@@ -77,11 +80,14 @@ static void cpuid(const unsigned int *input, unsigned int *regs)
+ }
+ 
+ static int get_cpuid_domain_info(xc_interface *xch, domid_t domid,
+-                                 struct cpuid_domain_info *info)
++                                 struct cpuid_domain_info *info,
++                                 uint32_t *featureset,
++                                 unsigned int nr_features)
+ {
+     struct xen_domctl domctl = {};
+     xc_dominfo_t di;
+     unsigned int in[2] = { 0, ~0U }, regs[4];
++    unsigned int i, host_nr_features = 0;
+     int rc;
+ 
+     cpuid(in, regs);
+@@ -103,6 +109,32 @@ static int get_cpuid_domain_info(xc_interface *xch, domid_t domid,
+     info->hvm = di.hvm;
+     info->pvh = di.pvh;
+ 
++    /* Get featureset information. */
++    rc = xc_get_featureset(xch, XEN_SYSCTL_featureset_host,
++                           &host_nr_features, NULL);
++    if ( rc )
++        return rc;
++
++    if ( host_nr_features < XEN_FEATURESET_7c0 )
++        return -EINVAL;
++
++    info->featureset = calloc(host_nr_features, sizeof(*info->featureset));
++    if ( !info->featureset )
++        return -ENOMEM;
++
++    info->nr_features = host_nr_features;
++
++    if ( featureset )
++    {
++        memcpy(info->featureset, featureset,
++               min(host_nr_features, nr_features) * sizeof(*info->featureset));
++
++        /* Check for trucated set bits. */
++        for ( i = nr_features; i < host_nr_features; ++i )
++            if ( featureset[i] != 0 )
++                return -EOPNOTSUPP;
++    }
++
+     /* Get xstate information. */
+     domctl.cmd = XEN_DOMCTL_getvcpuextstate;
+     domctl.domain = domid;
+@@ -127,6 +159,14 @@ static int get_cpuid_domain_info(xc_interface *xch, domid_t domid,
+             return rc;
+ 
+         info->nestedhvm = !!val;
++
++        if ( !featureset )
++        {
++            rc = xc_get_featureset(xch, XEN_SYSCTL_featureset_hvm,
++                                   &host_nr_features, info->featureset);
++            if ( rc )
++                return rc;
++        }
+     }
+     else
+     {
+@@ -137,11 +177,24 @@ static int get_cpuid_domain_info(xc_interface *xch, domid_t domid,
+             return rc;
+ 
+         info->pv64 = (width == 8);
++
++        if ( !featureset )
++        {
++            rc = xc_get_featureset(xch, XEN_SYSCTL_featureset_pv,
++                                   &host_nr_features, info->featureset);
++            if ( rc )
++                return rc;
++        }
+     }
+ 
+     return 0;
+ }
+ 
++static void free_cpuid_domain_info(struct cpuid_domain_info *info)
++{
++    free(info->featureset);
++}
++
+ static void amd_xc_cpuid_policy(xc_interface *xch,
+                                 const struct cpuid_domain_info *info,
+                                 const unsigned int *input, unsigned int *regs)
+@@ -653,16 +706,18 @@ void xc_cpuid_to_str(const unsigned int *regs, char **strs)
+     }
+ }
+ 
+-int xc_cpuid_apply_policy(xc_interface *xch, domid_t domid)
++static int __xc_cpuid_apply_policy(xc_interface *xch, domid_t domid,
++                                   uint32_t *featureset,
++                                   unsigned int nr_features)
+ {
+     struct cpuid_domain_info info = {};
+     unsigned int input[2] = { 0, 0 }, regs[4];
+     unsigned int base_max, ext_max;
+     int rc;
+ 
+-    rc = get_cpuid_domain_info(xch, domid, &info);
++    rc = get_cpuid_domain_info(xch, domid, &info, featureset, nr_features);
+     if ( rc )
+-        return rc;
++        goto out;
+ 
+     cpuid(input, regs);
+     base_max = (regs[0] <= DEF_MAX_BASE) ? regs[0] : DEF_MAX_BASE;
+@@ -685,7 +740,7 @@ int xc_cpuid_apply_policy(xc_interface *xch, domid_t domid)
+         {
+             rc = xc_cpuid_do_domctl(xch, domid, input, regs);
+             if ( rc )
+-                return rc;
++                goto out;
+         }
+ 
+         /* Intel cache descriptor leaves. */
+@@ -713,7 +768,21 @@ int xc_cpuid_apply_policy(xc_interface *xch, domid_t domid)
+             break;
+     }
+ 
+-    return 0;
++ out:
++    free_cpuid_domain_info(&info);
++    return rc;
++}
++
++int xc_cpuid_apply_policy(xc_interface *xch, domid_t domid)
++{
++    return __xc_cpuid_apply_policy(xch, domid, NULL, 0);
++}
++
++int xc_cpuid_apply_policy_with_featureset(xc_interface *xch, domid_t domid,
++                                          uint32_t *featureset,
++                                          unsigned int nr_features)
++{
++    return __xc_cpuid_apply_policy(xch, domid, featureset, nr_features);
+ }
+ 
+ /*
+@@ -802,9 +871,9 @@ int xc_cpuid_set(
+ 
+     memset(config_transformed, 0, 4 * sizeof(*config_transformed));
+ 
+-    rc = get_cpuid_domain_info(xch, domid, &info);
++    rc = get_cpuid_domain_info(xch, domid, &info, NULL, 0);
+     if ( rc )
+-        return rc;
++        goto out;
+ 
+     cpuid(input, regs);
+ 
+@@ -855,7 +924,7 @@ int xc_cpuid_set(
+ 
+     rc = xc_cpuid_do_domctl(xch, domid, input, regs);
+     if ( rc == 0 )
+-        return 0;
++        goto out;
+ 
+  fail:
+     for ( i = 0; i < 4; i++ )
+@@ -863,5 +932,8 @@ int xc_cpuid_set(
+         free(config_transformed[i]);
+         config_transformed[i] = NULL;
+     }
++
++ out:
++    free_cpuid_domain_info(&info);
+     return rc;
+ }

@@ -1,0 +1,127 @@
+From 76d2e1295832412640e3636060d198bd1a05bfc8 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 2 Nov 2015 15:13:28 +0000
+Subject: [PATCH 13/39] xen/x86: Collect more CPUID feature words
+
+New words are:
+ * 0x00000007:0.ecx - New for Intel Skylake processors
+ * 0x80000007.edx - Contains Invarient TSC
+ * 0x80000008.ebx - Newly used for AMD Zen processors
+
+In addition, replace a lot of open-coded Invarient TSC manipulation.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index cde655f..5d22863 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -481,7 +481,7 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
+ 
+ 	if (c->extended_cpuid_level >= 0x80000007) {
+ 		c->x86_power = cpuid_edx(0x80000007);
+-		if (c->x86_power & (1<<8)) {
++		if (c->x86_power & cpufeat_mask(X86_FEATURE_ITSC)) {
+ 			set_bit(X86_FEATURE_CONSTANT_TSC, c->x86_capability);
+ 			set_bit(X86_FEATURE_NONSTOP_TSC, c->x86_capability);
+ 			if (c->x86 != 0x11)
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 5bdb4b3..b48ce58 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -260,13 +260,20 @@ static void __cpuinit generic_identify(struct cpuinfo_x86 *c)
+ 
+ 		if ( c->extended_cpuid_level >= 0x80000004 )
+ 			get_model_name(c); /* Default name */
++		if ( c->extended_cpuid_level >= 0x80000007 )
++			c->x86_capability[cpufeat_word(X86_FEATURE_ITSC)]
++				= cpuid_edx(0x80000007);
++		if ( c->extended_cpuid_level >= 0x80000008 )
++			c->x86_capability[cpufeat_word(X86_FEATURE_CLZERO)]
++				= cpuid_ebx(0x80000008);
+ 	}
+ 
+ 	/* Intel-defined flags: level 0x00000007 */
+ 	if ( c->cpuid_level >= 0x00000007 )
+ 		cpuid_count(0x00000007, 0, &tmp,
+ 			    &c->x86_capability[cpufeat_word(X86_FEATURE_FSGSBASE)],
+-			    &tmp, &tmp);
++			    &c->x86_capability[cpufeat_word(X86_FEATURE_PREFETCHWT1)],
++			    &tmp);
+ }
+ 
+ /*
+diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
+index bf6f90d..bd595a5 100644
+--- a/xen/arch/x86/cpu/intel.c
++++ b/xen/arch/x86/cpu/intel.c
+@@ -273,7 +273,7 @@ static void __devinit init_intel(struct cpuinfo_x86 *c)
+ 	if ((c->x86 == 0xf && c->x86_model >= 0x03) ||
+ 		(c->x86 == 0x6 && c->x86_model >= 0x0e))
+ 		set_bit(X86_FEATURE_CONSTANT_TSC, c->x86_capability);
+-	if (cpuid_edx(0x80000007) & (1u<<8)) {
++	if (cpu_has(c, X86_FEATURE_ITSC)) {
+ 		set_bit(X86_FEATURE_CONSTANT_TSC, c->x86_capability);
+ 		set_bit(X86_FEATURE_NONSTOP_TSC, c->x86_capability);
+ 		set_bit(X86_FEATURE_TSC_RELIABLE, c->x86_capability);
+diff --git a/xen/arch/x86/cpuid/cpuid.c b/xen/arch/x86/cpuid/cpuid.c
+index 6ee9ce2..56993d2 100644
+--- a/xen/arch/x86/cpuid/cpuid.c
++++ b/xen/arch/x86/cpuid/cpuid.c
+@@ -103,6 +103,12 @@ const uint32_t known_features[XEN_NR_FEATURESET_ENTRIES] =
+                                             cpufeat_mask(X86_FEATURE_RDSEED)     |
+                                             cpufeat_mask(X86_FEATURE_ADX)        |
+                                             cpufeat_mask(X86_FEATURE_SMAP)),
++
++    [cpufeat_word(X86_FEATURE_PREFETCHWT1)] = (cpufeat_mask(X86_FEATURE_PREFETCHWT1)),
++
++    [cpufeat_word(X86_FEATURE_ITSC)] = (cpufeat_mask(X86_FEATURE_ITSC)),
++
++    [cpufeat_word(X86_FEATURE_CLZERO)] = (cpufeat_mask(X86_FEATURE_CLZERO)),
+ };
+ 
+ const uint32_t inverted_features[XEN_NR_FEATURESET_ENTRIES] =
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 5b420cd..8c2b704 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -2159,7 +2159,7 @@ void domain_cpuid(
+              */
+             if ( (input == 0x80000007) && /* Advanced Power Management */
+                  !d->disable_migrate && !d->arch.vtsc )
+-                *edx &= ~(1u<<8); /* TSC Invariant */
++                *edx &= ~cpufeat_mask(X86_FEATURE_ITSC);
+ 
+             return;
+         }
+diff --git a/xen/include/public/arch-x86/featureset.h b/xen/include/public/arch-x86/featureset.h
+index 19abb98..f48ad5b 100644
+--- a/xen/include/public/arch-x86/featureset.h
++++ b/xen/include/public/arch-x86/featureset.h
+@@ -57,7 +57,10 @@
+ #define XEN_FEATURESET_e1c    3 /* 0x80000001.ecx      */
+ #define XEN_FEATURESET_Da1    4 /* 0x0000000d:1.eax    */
+ #define XEN_FEATURESET_7b0    5 /* 0x00000007:0.ebx    */
+-#define XEN_NR_FEATURESET_ENTRIES (XEN_FEATURESET_7b0 + 1)
++#define XEN_FEATURESET_7c0    6 /* 0x00000007:0.ecx    */
++#define XEN_FEATURESET_e7d    7 /* 0x80000007.edx      */
++#define XEN_FEATURESET_e8b    8 /* 0x80000008.ebx      */
++#define XEN_NR_FEATURESET_ENTRIES (XEN_FEATURESET_e8b + 1)
+ 
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000001.edx, word 0 */
+@@ -185,6 +188,15 @@
+ #define X86_FEATURE_ADX           ( 5*32+19) /* ADCX, ADOX instructions */
+ #define X86_FEATURE_SMAP          ( 5*32+20) /* Supervisor Mode Access Prevention */
+ 
++/* Intel-defined CPU features, CPUID level 0x00000007:0.ecx, word 6 */
++#define X86_FEATURE_PREFETCHWT1   ( 6*32+ 0) /* PREFETCHWT1 instruction */
++
++/* AMD-defined CPU features, CPUID level 0x80000007.edx, word 7 */
++#define X86_FEATURE_ITSC          ( 7*32+ 8) /* Invariant TSC */
++
++/* AMD-defined CPU features, CPUID level 0x80000008.ebx, word 8 */
++#define X86_FEATURE_CLZERO        ( 8*32+ 0) /* CLZERO instruction */
++
+ #endif /* !__XEN_PUBLIC_ARCH_X86_FEATURESET_H__ */
+ 
+ /*
