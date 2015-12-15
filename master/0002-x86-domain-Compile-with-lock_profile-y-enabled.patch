@@ -1,0 +1,54 @@
+From cfbb6ff400e1797f7fc160e6f488bf10deb199dd Mon Sep 17 00:00:00 2001
+From: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date: Fri, 6 Nov 2015 14:39:34 -0500
+Subject: [PATCH 2/4] x86/domain: Compile with lock_profile=y enabled.
+
+Our 'struct domain' has when lock profiling is enabled is bigger than
+one page.
+
+We can't use vmap nor vzalloc as both of those stash the
+physical address in struct page which makes the assumptions
+in 'arch_init_memory' trip over ASSERTs.
+
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+---
+ xen/arch/x86/domain.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 2a8d5c1..a395fe6 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -230,6 +230,7 @@ static unsigned int __init noinline _domain_struct_bits(void)
+ struct domain *alloc_domain_struct(void)
+ {
+     struct domain *d;
++    unsigned int order = get_order_from_bytes(sizeof(*d));
+ #ifdef CONFIG_BIGMEM
+     const unsigned int bits = 0;
+ #else
+@@ -243,10 +244,18 @@ struct domain *alloc_domain_struct(void)
+          bits = _domain_struct_bits();
+ #endif
+ 
++
++#ifndef LOCK_PROFILE
+     BUILD_BUG_ON(sizeof(*d) > PAGE_SIZE);
+-    d = alloc_xenheap_pages(0, MEMF_bits(bits));
++#endif
++    d = alloc_xenheap_pages(order, MEMF_bits(bits));
+     if ( d != NULL )
+-        clear_page(d);
++    {
++        unsigned int sz;
++
++        for ( sz = 0; sz < (PAGE_SIZE << order); sz += PAGE_SIZE )
++            clear_page((void *)d + sz);
++    }
+     return d;
+ }
+ 
+-- 
+2.1.4
+
