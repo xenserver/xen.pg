@@ -1,21 +1,42 @@
-From b34c647cb5c7f09ce99afe6f421a7f769541d2ac Mon Sep 17 00:00:00 2001
+From 23a67a621c1f3f6d90f06e0291add816a1fd9809 Mon Sep 17 00:00:00 2001
 From: David Vrabel <david.vrabel@citrix.com>
-Date: Thu, 12 Nov 2015 16:31:55 +0000
-Subject: [PATCH 3/3] x86/ept: defer the invalidation until the p2m lock is
+Date: Thu, 17 Dec 2015 12:22:22 +0000
+Subject: [PATCH 2/2] x86/ept: defer the invalidation until the p2m lock is
  released
 
 Holding the p2m lock while calling ept_sync_domain() is very expensive
 since it does a on_selected_cpus() call.  IPIs on many socket machines
 can be very slows and on_selected_cpus() is serialized.
 
-Defer the invalidate until the p2m lock is released.  Since the processor
-may cache partial translations, we also need to make sure any page table
-pages to be freed are not freed until the invalidate is complete.  Such
-pages are temporarily stored in a list.
+It is safe to defer the invalidate until the p2m lock is released
+except for two cases:
+
+1. When freeing a page table page (since partial translations may be
+   cached).
+2. When reclaiming a zero page as part of PoD.
+
+For these cases, add p2m_tlb_flush_sync() calls which will immediately
+perform the invalidate before the page is freed or reclaimed.
 
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+---
+v5:
+- add p2m_tlb_flush_sync() and call it before freeing pgae table pages
+  and reclaiming zeroed pod pages.
+
+v2:
+- use per-p2m list for deferred pages.
+- update synced_mask while holding write lock.
+---
+ xen/arch/x86/mm/mm-locks.h | 23 +++++++++++++++--------
+ xen/arch/x86/mm/p2m-ept.c  | 44 ++++++++++++++++++++++++++++++++++++--------
+ xen/arch/x86/mm/p2m-pod.c  |  2 ++
+ xen/arch/x86/mm/p2m.c      | 14 ++++++++++++++
+ xen/include/asm-x86/p2m.h  | 10 ++++++++++
+ 5 files changed, 77 insertions(+), 16 deletions(-)
+
 diff --git a/xen/arch/x86/mm/mm-locks.h b/xen/arch/x86/mm/mm-locks.h
-index 76c7217..b5eb560 100644
+index 76c7217..b1a92e2 100644
 --- a/xen/arch/x86/mm/mm-locks.h
 +++ b/xen/arch/x86/mm/mm-locks.h
 @@ -263,14 +263,21 @@ declare_mm_lock(altp2mlist)
@@ -38,30 +59,32 @@ index 76c7217..b5eb560 100644
 +            mm_write_lock(p2m, &(p)->lock);     \
 +        (p)->defer_flush++;                     \
 +    } while (0)
-+#define p2m_unlock(p)                                                   \
-+    do {                                                                \
-+        if ( --(p)->defer_flush == 0 && (p)->need_flush )               \
-+            (p)->flush_and_unlock(p);                                   \
-+        else                                                            \
-+            mm_write_unlock(&(p)->lock);                                \
++#define p2m_unlock(p)                           \
++    do {                                        \
++        if ( --(p)->defer_flush == 0 )          \
++            p2m_tlb_flush_and_unlock(p);        \
++        else                                    \
++            mm_write_unlock(&(p)->lock);        \
 +    } while (0)
  #define gfn_lock(p,g,o)       p2m_lock(p)
  #define gfn_unlock(p,g,o)     p2m_unlock(p)
  #define p2m_read_lock(p)      mm_read_lock(p2m, &(p)->lock)
 diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
-index 289842e..c7e880d 100644
+index 6e0cf89..69fff61 100644
 --- a/xen/arch/x86/mm/p2m-ept.c
 +++ b/xen/arch/x86/mm/p2m-ept.c
-@@ -263,7 +263,7 @@ static void ept_free_entry(struct p2m_domain *p2m, ept_entry_t *ept_entry, int l
-         unmap_domain_page(epte);
-     }
-     
--    p2m_free_ptp(p2m, mfn_to_page(ept_entry->mfn));
-+    p2m_free_ptp_defer(p2m, mfn_to_page(ept_entry->mfn));
- }
+@@ -843,7 +843,10 @@ out:
+        from the iommu tables, so as to avoid a potential
+        use-after-free. */
+     if ( is_epte_present(&old_entry) )
++    {
++        p2m_tlb_flush_sync(p2m);
+         ept_free_entry(p2m, &old_entry, target);
++    }
  
- static int ept_split_super_page(struct p2m_domain *p2m, ept_entry_t *ept_entry,
-@@ -1088,24 +1088,53 @@ static void __ept_sync_domain(void *info)
+     if ( rc == 0 && p2m_is_hostp2m(p2m) )
+         p2m_altp2m_propagate_change(d, _gfn(gfn), mfn, order, p2mt, p2ma);
+@@ -1095,24 +1098,48 @@ static void __ept_sync_domain(void *info)
       */
  }
  
@@ -87,7 +110,9 @@ index 289842e..c7e880d 100644
 +{
 +    on_selected_cpus(mask, __ept_sync_domain, p2m, 1);
 +}
-+
+ 
+-    on_selected_cpus(d->domain_dirty_cpumask,
+-                     __ept_sync_domain, p2m, 1);
 +void ept_sync_domain(struct p2m_domain *p2m)
 +{
 +    struct domain *d = p2m->domain;
@@ -103,27 +128,20 @@ index 289842e..c7e880d 100644
 +        p2m->need_flush = 1;
 +        return;
 +    }
-+    p2m->need_flush = 0;
 +
 +    ept_sync_domain_mask(p2m, d->domain_dirty_cpumask);
 +}
 +
-+static void ept_flush_and_unlock(struct p2m_domain *p2m)
++static void ept_flush_and_unlock(struct p2m_domain *p2m, bool_t unlock)
 +{
-+    PAGE_LIST_HEAD(deferred_pages);
-+
-+    page_list_move(&deferred_pages, &p2m->deferred_pages);
-+
-+    mm_write_unlock(&p2m->lock);
- 
--    on_selected_cpus(d->domain_dirty_cpumask,
--                     __ept_sync_domain, p2m, 1);
++    p2m->need_flush = 0;
++    if ( unlock )
++        mm_write_unlock(&p2m->lock);
 +    ept_sync_domain_mask(p2m, p2m->domain->domain_dirty_cpumask);
-+    p2m_free_ptp_list(p2m, &deferred_pages);
  }
  
  static void ept_enable_pml(struct p2m_domain *p2m)
-@@ -1138,6 +1167,7 @@ int ept_p2m_init(struct p2m_domain *p2m)
+@@ -1163,6 +1190,7 @@ int ept_p2m_init(struct p2m_domain *p2m)
      p2m->change_entry_type_range = ept_change_entry_type_range;
      p2m->memory_type_changed = ept_memory_type_changed;
      p2m->audit_p2m = NULL;
@@ -131,64 +149,72 @@ index 289842e..c7e880d 100644
  
      /* Set the memory type used when accessing EPT paging structures. */
      ept->ept_mt = EPT_DEFAULT_MT;
+diff --git a/xen/arch/x86/mm/p2m-pod.c b/xen/arch/x86/mm/p2m-pod.c
+index ea16d3e..a5d672e 100644
+--- a/xen/arch/x86/mm/p2m-pod.c
++++ b/xen/arch/x86/mm/p2m-pod.c
+@@ -886,6 +886,8 @@ p2m_pod_zero_check(struct p2m_domain *p2m, unsigned long *gfns, int count)
+         }
+     }
+ 
++    p2m_tlb_flush_sync(p2m);
++
+     /* Now check each page for real */
+     for ( i=0; i < count; i++ )
+     {
 diff --git a/xen/arch/x86/mm/p2m.c b/xen/arch/x86/mm/p2m.c
-index 12ba1ce..dfe6e26 100644
+index ed0bbd7..efb15cd 100644
 --- a/xen/arch/x86/mm/p2m.c
 +++ b/xen/arch/x86/mm/p2m.c
-@@ -68,6 +68,7 @@ static int p2m_initialise(struct domain *d, struct p2m_domain *p2m)
-     mm_lock_init(&p2m->pod.lock);
-     INIT_LIST_HEAD(&p2m->np2m_list);
-     INIT_PAGE_LIST_HEAD(&p2m->pages);
-+    INIT_PAGE_LIST_HEAD(&p2m->deferred_pages);
-     INIT_PAGE_LIST_HEAD(&p2m->pod.super);
-     INIT_PAGE_LIST_HEAD(&p2m->pod.single);
- 
-@@ -505,6 +506,23 @@ void p2m_free_ptp(struct p2m_domain *p2m, struct page_info *pg)
-     return;
+@@ -324,6 +324,20 @@ void p2m_flush_hardware_cached_dirty(struct domain *d)
+     }
  }
  
-+void p2m_free_ptp_defer(struct p2m_domain *p2m, struct page_info *pg)
++void p2m_tlb_flush_sync(struct p2m_domain *p2m)
 +{
-+    page_list_del(pg, &p2m->pages);
-+    page_list_add(pg, &p2m->deferred_pages);
++    if ( p2m->need_flush )
++        p2m->flush_and_unlock(p2m, 0);
 +}
 +
-+void p2m_free_ptp_list(struct p2m_domain *p2m, struct page_list_head *list)
++void p2m_tlb_flush_and_unlock(struct p2m_domain *p2m)
 +{
-+    struct page_info *pg, *tmp;
-+
-+    page_list_for_each_safe(pg, tmp, list)
-+    {
-+        page_list_del(pg, list);
-+        p2m->domain->arch.paging.free_page(p2m->domain, pg);
-+    }
++    if ( p2m->need_flush )
++        p2m->flush_and_unlock(p2m, 1);
++    else
++        mm_write_unlock(&p2m->lock);
 +}
 +
- /*
-  * Allocate a new p2m table for a domain.
-  *
+ mfn_t __get_gfn_type_access(struct p2m_domain *p2m, unsigned long gfn,
+                     p2m_type_t *t, p2m_access_t *a, p2m_query_t q,
+                     unsigned int *page_order, bool_t locked)
 diff --git a/xen/include/asm-x86/p2m.h b/xen/include/asm-x86/p2m.h
-index 6ccc1ad..5ced486 100644
+index fa46dd9..9c394c2 100644
 --- a/xen/include/asm-x86/p2m.h
 +++ b/xen/include/asm-x86/p2m.h
-@@ -254,6 +254,11 @@ struct p2m_domain {
+@@ -261,6 +261,10 @@ struct p2m_domain {
                                            unsigned long gfn, l1_pgentry_t *p,
                                            l1_pgentry_t new, unsigned int level);
      long               (*audit_p2m)(struct p2m_domain *p2m);
-+    void               (*flush_and_unlock)(struct p2m_domain *p2m);
++    void               (*flush_and_unlock)(struct p2m_domain *p2m, bool_t unlock);
 +
-+    struct page_list_head deferred_pages;
 +    unsigned int defer_flush;
 +    bool_t need_flush;
  
      /* Default P2M access type for each page in the the domain: new pages,
       * swapped in pages, cleared pages, and pages that are ambiguously
-@@ -681,6 +686,8 @@ static inline bool_t p2m_mem_access_sanity_check(struct domain *d)
+@@ -353,6 +357,12 @@ static inline bool_t p2m_is_altp2m(const struct p2m_domain *p2m)
  
- struct page_info *p2m_alloc_ptp(struct p2m_domain *p2m, unsigned long type);
- void p2m_free_ptp(struct p2m_domain *p2m, struct page_info *pg);
-+void p2m_free_ptp_defer(struct p2m_domain *p2m, struct page_info *pg);
-+void p2m_free_ptp_list(struct p2m_domain *p2m, struct page_list_head *list);
+ #define p2m_get_pagetable(p2m)  ((p2m)->phys_table)
  
- /* Directly set a p2m entry: only for use by p2m code. Does not need
-  * a call to put_gfn afterwards/ */
++/*
++ * Ensure any deferred p2m TLB flush has been completed on all VCPUs.
++ */
++void p2m_tlb_flush_sync(struct p2m_domain *p2m);
++void p2m_tlb_flush_and_unlock(struct p2m_domain *p2m);
++
+ /**** p2m query accessors. They lock p2m_lock, and thus serialize
+  * lookups wrt modifications. They _do not_ release the lock on exit.
+  * After calling any of the variants below, caller needs to use
+-- 
+2.1.4
+
