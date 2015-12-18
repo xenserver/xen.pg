@@ -1,8 +1,11 @@
-grant_table: convert grant table rwlock to percpu rwlock
+From dd292b92d3534cd50d2b25da64fc01a8d7295557 Mon Sep 17 00:00:00 2001
+From: Malcolm Crossley <malcolm.crossley@citrix.com>
+Date: Thu, 17 Dec 2015 12:33:08 +0000
+Subject: [PATCHv3 2/3] grant_table: convert grant table rwlock to percpu rwlock
 
 The per domain grant table read lock suffers from significant contention when
 performance multi-queue block or network IO due to the parallel
-grant map/unmaps/copies occuring on the DomU's grant table.
+grant map/unmaps/copies occurring on the DomU's grant table.
 
 On multi-socket systems, the contention results in the locked compare swap
 operation failing frequently which results in a tight loop of retries of the
@@ -11,102 +14,113 @@ rate of compare swap operations for a particular data location then taking
 the read lock itself becomes a bottleneck for grant operations.
 
 Standard rwlock performance of a single VIF VM-VM transfer with 16 queues
-configured was limited to approxmiately 10 gbit/s on a 2 socket Haswell-EP 
+configured was limited to approximately 15 gbit/s on a 2 socket Haswell-EP
 host.
 
 Percpu rwlock performance with the same configuration is approximately
-50 gbit/s.
+48 gbit/s.
 
 Oprofile was used to determine the initial overhead of the read-write locks
 and to confirm the overhead was dramatically reduced by the percpu rwlocks.
 
 Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
+--
+Changes since v2:
+ - Switched to using wrappers for taking percpu rwlock
+ - Added percpu structure pointer to percpu rwlock initialisation
+ - Added comment on removal of ASSERTS for grant table rw_is_locked()
+Changes since v1:
+ - Used new macros provided in updated percpu rwlock v2 patch
+ - Converted grant table rwlock_t to percpu_rwlock_t
+ - Patched a missed grant table rwlock_t usage site
 diff --git a/xen/arch/arm/mm.c b/xen/arch/arm/mm.c
-index b5d8c85..0dcdeb6 100644
+index b5d8c85..ab2f646 100644
 --- a/xen/arch/arm/mm.c
 +++ b/xen/arch/arm/mm.c
-@@ -1048,7 +1048,8 @@ int xenmem_add_to_physmap_one(
+@@ -1048,7 +1048,7 @@ int xenmem_add_to_physmap_one(
      switch ( space )
      {
      case XENMAPSPACE_grant_table:
 -        write_lock(&d->grant_table->lock);
-+        percpu_write_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier,
-+                               &d->grant_table->lock);
++        grant_percpu_write_lock(&d->grant_table->lock);
  
          if ( d->grant_table->gt_version == 0 )
              d->grant_table->gt_version = 1;
-@@ -1078,7 +1079,7 @@ int xenmem_add_to_physmap_one(
+@@ -1078,7 +1078,7 @@ int xenmem_add_to_physmap_one(
  
          t = p2m_ram_rw;
  
 -        write_unlock(&d->grant_table->lock);
-+        percpu_write_unlock(&grant_rwlock_barrier, &d->grant_table->lock);
++        grant_percpu_write_unlock(&d->grant_table->lock);
          break;
      case XENMAPSPACE_shared_info:
          if ( idx != 0 )
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 0143999..5ccb60a 100644
+index 0143999..7be4923 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -4657,7 +4657,8 @@ int xenmem_add_to_physmap_one(
+@@ -4657,7 +4657,7 @@ int xenmem_add_to_physmap_one(
                  mfn = virt_to_mfn(d->shared_info);
              break;
          case XENMAPSPACE_grant_table:
 -            write_lock(&d->grant_table->lock);
-+            percpu_write_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier,
-+			        &d->grant_table->lock);
++            grant_percpu_write_lock(&d->grant_table->lock);
  
              if ( d->grant_table->gt_version == 0 )
                  d->grant_table->gt_version = 1;
-@@ -4679,7 +4680,7 @@ int xenmem_add_to_physmap_one(
+@@ -4679,7 +4679,7 @@ int xenmem_add_to_physmap_one(
                      mfn = virt_to_mfn(d->grant_table->shared_raw[idx]);
              }
  
 -            write_unlock(&d->grant_table->lock);
-+            percpu_write_unlock(&grant_rwlock_barrier, &d->grant_table->lock);
++            grant_percpu_write_unlock(&d->grant_table->lock);
              break;
          case XENMAPSPACE_gmfn_range:
          case XENMAPSPACE_gmfn:
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index 498c1c6..bd3f5c9 100644
+index 498c1c6..54eb165 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
-@@ -185,6 +185,10 @@ struct active_grant_entry {
+@@ -185,6 +185,8 @@ struct active_grant_entry {
  #define _active_entry(t, e) \
      ((t)->active[(e)/ACGNT_PER_PAGE][(e)%ACGNT_PER_PAGE])
  
-+bool_t grant_rwlock_barrier;
-+
-+DEFINE_PER_CPU(rwlock_t *, grant_rwlock);
++DEFINE_PERCPU_RWLOCK_GLOBAL(grant_rwlock);
 +
  static inline void gnttab_flush_tlb(const struct domain *d)
  {
      if ( !paging_mode_external(d) )
-@@ -215,8 +219,6 @@ active_entry_acquire(struct grant_table *t, grant_ref_t e)
+@@ -215,7 +217,13 @@ active_entry_acquire(struct grant_table *t, grant_ref_t e)
  {
      struct active_grant_entry *act;
  
 -    ASSERT(rw_is_locked(&t->lock));
--
++    /* 
++     * The grant table for the active entry should be locked but the 
++     * percpu rwlock cannot be checked for read lock without race conditions
++     * or high overhead so we cannot use an ASSERT 
++     *
++     *   ASSERT(rw_is_locked(&t->lock));
++     */
+ 
      act = &_active_entry(t, e);
      spin_lock(&act->lock);
- 
-@@ -277,23 +279,23 @@ double_gt_lock(struct grant_table *lgt, struct grant_table *rgt)
+@@ -277,23 +285,23 @@ double_gt_lock(struct grant_table *lgt, struct grant_table *rgt)
       */
      if ( lgt < rgt )
      {
 -        write_lock(&lgt->lock);
 -        write_lock(&rgt->lock);
-+        percpu_write_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &lgt->lock);
-+        percpu_write_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++        grant_percpu_write_lock(&lgt->lock);
++        grant_percpu_write_lock(&rgt->lock);
      }
      else
      {
          if ( lgt != rgt )
 -            write_lock(&rgt->lock);
 -        write_lock(&lgt->lock);
-+            percpu_write_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
-+        percpu_write_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &lgt->lock);
++            grant_percpu_write_lock(&rgt->lock);
++        grant_percpu_write_lock(&lgt->lock);
      }
  }
  
@@ -114,69 +128,92 @@ index 498c1c6..bd3f5c9 100644
  double_gt_unlock(struct grant_table *lgt, struct grant_table *rgt)
  {
 -    write_unlock(&lgt->lock);
-+    percpu_write_unlock(&grant_rwlock_barrier, &lgt->lock);
++    grant_percpu_write_unlock(&lgt->lock);
      if ( lgt != rgt )
 -        write_unlock(&rgt->lock);
-+        percpu_write_unlock(&grant_rwlock_barrier, &rgt->lock);
++        grant_percpu_write_unlock(&rgt->lock);
  }
  
  static inline int
-@@ -666,8 +668,6 @@ static int grant_map_exists(const struct domain *ld,
+@@ -666,8 +674,14 @@ static int grant_map_exists(const struct domain *ld,
                              unsigned int *ref_count)
  {
      unsigned int ref, max_iter;
 -    
 -    ASSERT(rw_is_locked(&rgt->lock));
++
++    /* 
++     * The remote grant table should be locked but the percpu rwlock
++     * cannot be checked for read lock without race conditions or high 
++     * overhead so we cannot use an ASSERT 
++     *
++     *   ASSERT(rw_is_locked(&rgt->lock));
++     */
  
      max_iter = min(*ref_count + (1 << GNTTABOP_CONTINUATION_ARG_SHIFT),
                     nr_grant_entries(rgt));
-@@ -803,7 +803,7 @@ __gnttab_map_grant_ref(
+@@ -710,12 +724,12 @@ static unsigned int mapkind(
+      * Must have the local domain's grant table write lock when
+      * iterating over its maptrack entries.
+      */
+-    ASSERT(rw_is_write_locked(&lgt->lock));
++    ASSERT(percpu_rw_is_write_locked(&lgt->lock));
+     /*
+      * Must have the remote domain's grant table write lock while
+      * counting its active entries.
+      */
+-    ASSERT(rw_is_write_locked(&rd->grant_table->lock));
++    ASSERT(percpu_rw_is_write_locked(&rd->grant_table->lock));
+ 
+     for ( handle = 0; !(kind & MAPKIND_WRITE) &&
+                       handle < lgt->maptrack_limit; handle++ )
+@@ -803,7 +817,7 @@ __gnttab_map_grant_ref(
      }
  
      rgt = rd->grant_table;
 -    read_lock(&rgt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++    grant_percpu_read_lock(&rgt->lock);
  
      /* Bounds check on the grant ref */
      if ( unlikely(op->ref >= nr_grant_entries(rgt)))
-@@ -867,7 +867,7 @@ __gnttab_map_grant_ref(
+@@ -867,7 +881,7 @@ __gnttab_map_grant_ref(
      cache_flags = (shah->flags & (GTF_PAT | GTF_PWT | GTF_PCD) );
  
      active_entry_release(act);
 -    read_unlock(&rgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&rgt->lock);
  
      /* pg may be set, with a refcount included, from __get_paged_frame */
      if ( !pg )
-@@ -1014,7 +1014,7 @@ __gnttab_map_grant_ref(
+@@ -1014,7 +1028,7 @@ __gnttab_map_grant_ref(
          put_page(pg);
      }
  
 -    read_lock(&rgt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++    grant_percpu_read_lock(&rgt->lock);
  
      act = active_entry_acquire(rgt, op->ref);
  
-@@ -1037,7 +1037,7 @@ __gnttab_map_grant_ref(
+@@ -1037,7 +1051,7 @@ __gnttab_map_grant_ref(
      active_entry_release(act);
  
   unlock_out:
 -    read_unlock(&rgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&rgt->lock);
      op->status = rc;
      put_maptrack_handle(lgt, handle);
      rcu_unlock_domain(rd);
-@@ -1089,18 +1089,18 @@ __gnttab_unmap_common(
+@@ -1089,18 +1103,18 @@ __gnttab_unmap_common(
  
      op->map = &maptrack_entry(lgt, op->handle);
  
 -    read_lock(&lgt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &lgt->lock);
++    grant_percpu_read_lock(&lgt->lock);
  
      if ( unlikely(!read_atomic(&op->map->flags)) )
      {
 -        read_unlock(&lgt->lock);
-+        percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++        grant_percpu_read_unlock(&lgt->lock);
          gdprintk(XENLOG_INFO, "Zero flags for handle (%d).\n", op->handle);
          op->status = GNTST_bad_handle;
          return;
@@ -184,161 +221,161 @@ index 498c1c6..bd3f5c9 100644
  
      dom = op->map->domid;
 -    read_unlock(&lgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&lgt->lock);
  
      if ( unlikely((rd = rcu_lock_domain_by_id(dom)) == NULL) )
      {
-@@ -1122,7 +1122,7 @@ __gnttab_unmap_common(
+@@ -1122,7 +1136,7 @@ __gnttab_unmap_common(
  
      rgt = rd->grant_table;
  
 -    read_lock(&rgt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++    grant_percpu_read_lock(&rgt->lock);
  
      op->flags = read_atomic(&op->map->flags);
      if ( unlikely(!op->flags) || unlikely(op->map->domid != dom) )
-@@ -1174,7 +1174,7 @@ __gnttab_unmap_common(
+@@ -1174,7 +1188,7 @@ __gnttab_unmap_common(
   act_release_out:
      active_entry_release(act);
   unmap_out:
 -    read_unlock(&rgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&rgt->lock);
  
      if ( rc == GNTST_okay && gnttab_need_iommu_mapping(ld) )
      {
-@@ -1229,7 +1229,7 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1229,7 +1243,7 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
      rcu_lock_domain(rd);
      rgt = rd->grant_table;
  
 -    read_lock(&rgt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++    grant_percpu_read_lock(&rgt->lock);
      if ( rgt->gt_version == 0 )
          goto unlock_out;
  
-@@ -1295,7 +1295,7 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1295,7 +1309,7 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
   act_release_out:
      active_entry_release(act);
   unlock_out:
 -    read_unlock(&rgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&rgt->lock);
  
      if ( put_handle )
      {
-@@ -1608,7 +1608,7 @@ gnttab_setup_table(
+@@ -1608,7 +1622,7 @@ gnttab_setup_table(
      }
  
      gt = d->grant_table;
 -    write_lock(&gt->lock);
-+    percpu_write_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &gt->lock);
++    grant_percpu_write_lock(&gt->lock);
  
      if ( gt->gt_version == 0 )
          gt->gt_version = 1;
-@@ -1636,7 +1636,7 @@ gnttab_setup_table(
+@@ -1636,7 +1650,7 @@ gnttab_setup_table(
      }
  
   out3:
 -    write_unlock(&gt->lock);
-+    percpu_write_unlock(&grant_rwlock_barrier, &gt->lock);
++    grant_percpu_write_unlock(&gt->lock);
   out2:
      rcu_unlock_domain(d);
   out1:
-@@ -1678,13 +1678,13 @@ gnttab_query_size(
+@@ -1678,13 +1692,13 @@ gnttab_query_size(
          goto query_out_unlock;
      }
  
 -    read_lock(&d->grant_table->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &d->grant_table->lock);
++    grant_percpu_read_lock(&d->grant_table->lock);
  
      op.nr_frames     = nr_grant_frames(d->grant_table);
      op.max_nr_frames = max_grant_frames;
      op.status        = GNTST_okay;
  
 -    read_unlock(&d->grant_table->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&d->grant_table->lock);
  
   
   query_out_unlock:
-@@ -1710,7 +1710,7 @@ gnttab_prepare_for_transfer(
+@@ -1710,7 +1724,7 @@ gnttab_prepare_for_transfer(
      union grant_combo   scombo, prev_scombo, new_scombo;
      int                 retries = 0;
  
 -    read_lock(&rgt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++    grant_percpu_read_lock(&rgt->lock);
  
      if ( unlikely(ref >= nr_grant_entries(rgt)) )
      {
-@@ -1753,11 +1753,11 @@ gnttab_prepare_for_transfer(
+@@ -1753,11 +1767,11 @@ gnttab_prepare_for_transfer(
          scombo = prev_scombo;
      }
  
 -    read_unlock(&rgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&rgt->lock);
      return 1;
  
   fail:
 -    read_unlock(&rgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&rgt->lock);
      return 0;
  }
  
-@@ -1948,7 +1948,7 @@ gnttab_transfer(
+@@ -1948,7 +1962,7 @@ gnttab_transfer(
          TRACE_1D(TRC_MEM_PAGE_GRANT_TRANSFER, e->domain_id);
  
          /* Tell the guest about its new page frame. */
 -        read_lock(&e->grant_table->lock);
-+        percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &e->grant_table->lock);
++        grant_percpu_read_lock(&e->grant_table->lock);
          act = active_entry_acquire(e->grant_table, gop.ref);
  
          if ( e->grant_table->gt_version == 1 )
-@@ -1972,7 +1972,7 @@ gnttab_transfer(
+@@ -1972,7 +1986,7 @@ gnttab_transfer(
              GTF_transfer_completed;
  
          active_entry_release(act);
 -        read_unlock(&e->grant_table->lock);
-+        percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++        grant_percpu_read_unlock(&e->grant_table->lock);
  
          rcu_unlock_domain(e);
  
-@@ -2010,7 +2010,7 @@ __release_grant_for_copy(
+@@ -2010,7 +2024,7 @@ __release_grant_for_copy(
      released_read = 0;
      released_write = 0;
  
 -    read_lock(&rgt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++    grant_percpu_read_lock(&rgt->lock);
  
      act = active_entry_acquire(rgt, gref);
      sha = shared_entry_header(rgt, gref);
-@@ -2052,7 +2052,7 @@ __release_grant_for_copy(
+@@ -2052,7 +2066,7 @@ __release_grant_for_copy(
      }
  
      active_entry_release(act);
 -    read_unlock(&rgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&rgt->lock);
  
      if ( td != rd )
      {
-@@ -2109,7 +2109,7 @@ __acquire_grant_for_copy(
+@@ -2109,7 +2123,7 @@ __acquire_grant_for_copy(
  
      *page = NULL;
  
 -    read_lock(&rgt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++    grant_percpu_read_lock(&rgt->lock);
  
      if ( unlikely(gref >= nr_grant_entries(rgt)) )
          PIN_FAIL(gt_unlock_out, GNTST_bad_gntref,
-@@ -2191,20 +2191,20 @@ __acquire_grant_for_copy(
+@@ -2191,20 +2205,20 @@ __acquire_grant_for_copy(
               * here and reacquire
               */
              active_entry_release(act);
 -            read_unlock(&rgt->lock);
-+            percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++            grant_percpu_read_unlock(&rgt->lock);
  
              rc = __acquire_grant_for_copy(td, trans_gref, rd->domain_id,
                                            readonly, &grant_frame, page,
                                            &trans_page_off, &trans_length, 0);
  
 -            read_lock(&rgt->lock);
-+            percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++            grant_percpu_read_lock(&rgt->lock);
              act = active_entry_acquire(rgt, gref);
  
              if ( rc != GNTST_okay ) {
@@ -346,163 +383,198 @@ index 498c1c6..bd3f5c9 100644
                  rcu_unlock_domain(td);
                  active_entry_release(act);
 -                read_unlock(&rgt->lock);
-+                percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++                grant_percpu_read_unlock(&rgt->lock);
                  return rc;
              }
  
-@@ -2217,7 +2217,7 @@ __acquire_grant_for_copy(
+@@ -2217,7 +2231,7 @@ __acquire_grant_for_copy(
                  __fixup_status_for_copy_pin(act, status);
                  rcu_unlock_domain(td);
                  active_entry_release(act);
 -                read_unlock(&rgt->lock);
-+                percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++                grant_percpu_read_unlock(&rgt->lock);
                  put_page(*page);
                  return __acquire_grant_for_copy(rd, gref, ldom, readonly,
                                                  frame, page, page_off, length,
-@@ -2281,7 +2281,7 @@ __acquire_grant_for_copy(
+@@ -2281,7 +2295,7 @@ __acquire_grant_for_copy(
      *frame = act->frame;
  
      active_entry_release(act);
 -    read_unlock(&rgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&rgt->lock);
      return rc;
   
   unlock_out_clear:
-@@ -2296,7 +2296,7 @@ __acquire_grant_for_copy(
+@@ -2296,7 +2310,7 @@ __acquire_grant_for_copy(
      active_entry_release(act);
  
   gt_unlock_out:
 -    read_unlock(&rgt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&rgt->lock);
  
      return rc;
  }
-@@ -2612,7 +2612,7 @@ gnttab_set_version(XEN_GUEST_HANDLE_PARAM(gnttab_set_version_t) uop)
+@@ -2612,7 +2626,7 @@ gnttab_set_version(XEN_GUEST_HANDLE_PARAM(gnttab_set_version_t) uop)
      if ( gt->gt_version == op.version )
          goto out;
  
 -    write_lock(&gt->lock);
-+    percpu_write_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &gt->lock);
++    grant_percpu_write_lock(&gt->lock);
      /*
       * Make sure that the grant table isn't currently in use when we
       * change the version number, except for the first 8 entries which
-@@ -2725,7 +2725,7 @@ gnttab_set_version(XEN_GUEST_HANDLE_PARAM(gnttab_set_version_t) uop)
+@@ -2725,7 +2739,7 @@ gnttab_set_version(XEN_GUEST_HANDLE_PARAM(gnttab_set_version_t) uop)
      gt->gt_version = op.version;
  
   out_unlock:
 -    write_unlock(&gt->lock);
-+    percpu_write_unlock(&grant_rwlock_barrier, &gt->lock);
++    grant_percpu_write_unlock(&gt->lock);
  
   out:
      op.version = gt->gt_version;
-@@ -2781,7 +2781,7 @@ gnttab_get_status_frames(XEN_GUEST_HANDLE_PARAM(gnttab_get_status_frames_t) uop,
+@@ -2781,7 +2795,7 @@ gnttab_get_status_frames(XEN_GUEST_HANDLE_PARAM(gnttab_get_status_frames_t) uop,
  
      op.status = GNTST_okay;
  
 -    read_lock(&gt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &gt->lock);
++    grant_percpu_read_lock(&gt->lock);
  
      for ( i = 0; i < op.nr_frames; i++ )
      {
-@@ -2790,7 +2790,7 @@ gnttab_get_status_frames(XEN_GUEST_HANDLE_PARAM(gnttab_get_status_frames_t) uop,
+@@ -2790,7 +2804,7 @@ gnttab_get_status_frames(XEN_GUEST_HANDLE_PARAM(gnttab_get_status_frames_t) uop,
              op.status = GNTST_bad_virt_addr;
      }
  
 -    read_unlock(&gt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&gt->lock);
  out2:
      rcu_unlock_domain(d);
  out1:
-@@ -2840,7 +2840,7 @@ __gnttab_swap_grant_ref(grant_ref_t ref_a, grant_ref_t ref_b)
+@@ -2840,7 +2854,7 @@ __gnttab_swap_grant_ref(grant_ref_t ref_a, grant_ref_t ref_b)
      struct active_grant_entry *act_b = NULL;
      s16 rc = GNTST_okay;
  
 -    write_lock(&gt->lock);
-+    percpu_write_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &gt->lock);
++    grant_percpu_write_lock(&gt->lock);
  
      /* Bounds check on the grant refs */
      if ( unlikely(ref_a >= nr_grant_entries(d->grant_table)))
-@@ -2888,7 +2888,7 @@ out:
+@@ -2888,7 +2902,7 @@ out:
          active_entry_release(act_b);
      if ( act_a != NULL )
          active_entry_release(act_a);
 -    write_unlock(&gt->lock);
-+    percpu_write_unlock(&grant_rwlock_barrier, &gt->lock);
++    grant_percpu_write_unlock(&gt->lock);
  
      rcu_unlock_domain(d);
  
-@@ -2959,12 +2959,12 @@ static int __gnttab_cache_flush(gnttab_cache_flush_t *cflush,
+@@ -2959,12 +2973,12 @@ static int __gnttab_cache_flush(gnttab_cache_flush_t *cflush,
  
      if ( d != owner )
      {
 -        read_lock(&owner->grant_table->lock);
-+        percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &owner->grant_table->lock);
++        grant_percpu_read_lock(&owner->grant_table->lock);
  
          ret = grant_map_exists(d, owner->grant_table, mfn, ref_count);
          if ( ret != 0 )
          {
 -            read_unlock(&owner->grant_table->lock);
-+            percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++            grant_percpu_read_unlock(&owner->grant_table->lock);
              rcu_unlock_domain(d);
              put_page(page);
              return ret;
-@@ -2984,7 +2984,7 @@ static int __gnttab_cache_flush(gnttab_cache_flush_t *cflush,
+@@ -2984,7 +2998,7 @@ static int __gnttab_cache_flush(gnttab_cache_flush_t *cflush,
          ret = 0;
  
      if ( d != owner )
 -        read_unlock(&owner->grant_table->lock);
-+        percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++        grant_percpu_read_unlock(&owner->grant_table->lock);
      unmap_domain_page(v);
      put_page(page);
  
-@@ -3313,7 +3313,7 @@ gnttab_release_mappings(
+@@ -3211,7 +3225,7 @@ grant_table_create(
+         goto no_mem_0;
+ 
+     /* Simple stuff. */
+-    rwlock_init(&t->lock);
++    percpu_rwlock_resource_init(&t->lock, grant_rwlock);
+     spin_lock_init(&t->maptrack_lock);
+     t->nr_grant_frames = INITIAL_NR_GRANT_FRAMES;
+ 
+@@ -3313,7 +3327,7 @@ gnttab_release_mappings(
          }
  
          rgt = rd->grant_table;
 -        read_lock(&rgt->lock);
-+        percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &rgt->lock);
++        grant_percpu_read_lock(&rgt->lock);
  
          act = active_entry_acquire(rgt, ref);
          sha = shared_entry_header(rgt, ref);
-@@ -3374,7 +3374,7 @@ gnttab_release_mappings(
+@@ -3374,7 +3388,7 @@ gnttab_release_mappings(
              gnttab_clear_flag(_GTF_reading, status);
  
          active_entry_release(act);
 -        read_unlock(&rgt->lock);
-+        percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++        grant_percpu_read_unlock(&rgt->lock);
  
          rcu_unlock_domain(rd);
  
-@@ -3428,7 +3428,7 @@ static void gnttab_usage_print(struct domain *rd)
+@@ -3428,7 +3442,7 @@ static void gnttab_usage_print(struct domain *rd)
      printk("      -------- active --------       -------- shared --------\n");
      printk("[ref] localdom mfn      pin          localdom gmfn     flags\n");
  
 -    read_lock(&gt->lock);
-+    percpu_read_lock(&get_per_cpu_var(grant_rwlock), &grant_rwlock_barrier, &gt->lock);
++    grant_percpu_read_lock(&gt->lock);
  
      for ( ref = 0; ref != nr_grant_entries(gt); ref++ )
      {
-@@ -3471,7 +3471,7 @@ static void gnttab_usage_print(struct domain *rd)
+@@ -3471,7 +3485,7 @@ static void gnttab_usage_print(struct domain *rd)
          active_entry_release(act);
      }
  
 -    read_unlock(&gt->lock);
-+    percpu_read_unlock(&get_per_cpu_var(grant_rwlock));
++    grant_percpu_read_unlock(&gt->lock);
  
      if ( first )
          printk("grant-table for remote domain:%5d ... "
 diff --git a/xen/include/xen/grant_table.h b/xen/include/xen/grant_table.h
-index 5263fd6..6b1839a 100644
+index 5263fd6..941a470 100644
 --- a/xen/include/xen/grant_table.h
 +++ b/xen/include/xen/grant_table.h
-@@ -51,6 +51,10 @@
+@@ -51,13 +51,35 @@
  /* The maximum size of a grant table. */
  extern unsigned int max_grant_frames;
  
-+extern bool_t grant_rwlock_barrier;
++DECLARE_PERCPU_RWLOCK_GLOBAL(grant_rwlock);
 +
-+DECLARE_PER_CPU(rwlock_t *, grant_rwlock);
++static inline void grant_percpu_read_lock(percpu_rwlock_t *lock)
++{
++    percpu_read_lock(grant_rwlock, lock);
++}
++
++static inline void grant_percpu_read_unlock(percpu_rwlock_t *lock)
++{
++    percpu_read_unlock(grant_rwlock, lock);
++}
++
++static inline void grant_percpu_write_lock(percpu_rwlock_t *lock)
++{
++    percpu_write_lock(grant_rwlock, lock);
++}
++
++static inline void grant_percpu_write_unlock(percpu_rwlock_t *lock)
++{
++    percpu_write_unlock(grant_rwlock, lock);
++}
 +
  /* Per-domain grant information. */
  struct grant_table {
      /*
+      * Lock protecting updates to grant table state (version, active
+      * entry list, etc.)
+      */
+-    rwlock_t              lock;
++    percpu_rwlock_t       lock;
+     /* Table size. Number of frames shared with guest */
+     unsigned int          nr_grant_frames;
+     /* Shared grant table (see include/public/grant_table.h). */
