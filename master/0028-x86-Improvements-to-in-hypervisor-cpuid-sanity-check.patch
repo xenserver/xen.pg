@@ -1,10 +1,20 @@
-From 4e29e45149baa3b8042fa36ea1e76829b8860a11 Mon Sep 17 00:00:00 2001
+From 8dbef372cd92e590253a4025712f834d3bbbdf27 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Tue, 1 Dec 2015 14:35:17 +0000
 Subject: [PATCH 28/39] x86: Improvements to in-hypervisor cpuid sanity checks
 
+* Use the boot-generated pv and hvm featureset to clamp the visible features,
+  rather than picking and choosing at individual features.  This subsumes most
+  of the feature availability checks.
+* More use of compiler-visible &'s and |'s, rather than clear,set bit.
+* Remove logic which hides PSE36 out of PAE mode.  This is not how real
+  hardware behaves.
+* Improve logic to set OSXSAVE.  The bit is cleared by virtue of not being
+  valid in a featureset, and is a strict fast-forward from %cr4.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index c297d1b..da6eb8c 100644
+index 0aa1f6a..7151e05 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
 @@ -70,6 +70,7 @@
@@ -25,7 +35,7 @@ index c297d1b..da6eb8c 100644
 +
          if ( vlapic_hw_disabled(vcpu_vlapic(v)) )
 -            __clear_bit(X86_FEATURE_APIC & 31, edx);
-+            __clear_bit(cpufeat_bit(X86_FEATURE_APIC), edx);
++            *edx &= ~cpufeat_bit(X86_FEATURE_APIC);
  
          /* Fix up OSXSAVE. */
 -        if ( cpu_has_xsave )
@@ -123,7 +133,7 @@ index c297d1b..da6eb8c 100644
      }
  }
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 99a0499..7e3a7bc 100644
+index 99a0499..76ecd34 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
 @@ -73,6 +73,7 @@
@@ -189,9 +199,9 @@ index 99a0499..7e3a7bc 100644
 +        d &= pv_featureset[XEN_FEATURESET_1d];
 +
 +        if ( curr->arch.pv_vcpu.ctrlreg[4] & X86_CR4_OSXSAVE )
-+            __set_bit(cpufeat_bit(X86_FEATURE_OSXSAVE), &c);
++            c |= cpufeat_mask(X86_FEATURE_OSXSAVE);
 +
-+        __set_bit(cpufeat_bit(X86_FEATURE_HYPERVISOR), &c);
++        c |= cpufeat_mask(X86_FEATURE_HYPERVISOR);
          break;
  
      case 0x00000007:
