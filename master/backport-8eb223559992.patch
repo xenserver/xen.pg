@@ -1,7 +1,7 @@
-From 726066a8a2cc5d58af25a38ab86b027a990e3b25 Mon Sep 17 00:00:00 2001
+From 8eb2235599925b508bcbeb3402aba21fa2c266fd Mon Sep 17 00:00:00 2001
 From: David Vrabel <david.vrabel@citrix.com>
-Date: Thu, 3 Dec 2015 15:03:17 +0000
-Subject: [PATCH 1/2] x86/ept: invalidate guest physical mappings on VMENTER
+Date: Mon, 21 Dec 2015 13:36:41 +0100
+Subject: [PATCH] x86/ept: invalidate guest physical mappings on VMENTER
 
 If a guest allocates a page and the tlbflush_timestamp on the page
 indicates that a TLB flush of the previous owner is required, only the
@@ -34,22 +34,12 @@ VMENTER or by IPIing active PCPUs this can never happen.
 
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
 Reviewed-by: George Dunlap <george.dunlap@citrix.com>
----
-v4:
-- __ept_sync_domain() is a no-op -- invalidates are done before VMENTER.
-- initialize ept->invalidate to all ones so the initial invalidate is
-  always done.
----
- xen/arch/x86/hvm/vmx/vmx.c         | 22 ++++++++++------------
- xen/arch/x86/mm/p2m-ept.c          | 29 ++++++++++++++---------------
- xen/include/asm-x86/hvm/vmx/vmcs.h |  3 +--
- 3 files changed, 25 insertions(+), 29 deletions(-)
-
+Acked-by: Kevin Tian <kevin.tian@intel.com>
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index f7c5e4f..cca35f2 100644
+index f78dc9d..1771915 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -744,24 +744,12 @@ static void vmx_ctxt_switch_from(struct vcpu *v)
+@@ -725,24 +725,12 @@ static void vmx_ctxt_switch_from(struct vcpu *v)
  
  static void vmx_ctxt_switch_to(struct vcpu *v)
  {
@@ -74,7 +64,7 @@ index f7c5e4f..cca35f2 100644
      vmx_restore_guest_msrs(v);
      vmx_restore_dr(v);
  }
-@@ -3507,6 +3495,16 @@ void vmx_vmenter_helper(const struct cpu_user_regs *regs)
+@@ -3484,6 +3472,18 @@ void vmx_vmenter_helper(const struct cpu_user_regs *regs)
      if ( unlikely(need_flush) )
          vpid_sync_all();
  
@@ -83,19 +73,21 @@ index f7c5e4f..cca35f2 100644
 +        struct ept_data *ept = &p2m_get_hostp2m(curr->domain)->ept;
 +        unsigned int cpu = smp_processor_id();
 +
-+        if ( cpumask_test_cpu(cpu, ept->invalidate)
-+             && cpumask_test_and_clear_cpu(cpu, ept->invalidate) )
++        if ( cpumask_test_cpu(cpu, ept->invalidate) )
++        {
++            cpumask_clear_cpu(cpu, ept->invalidate);
 +            __invept(INVEPT_SINGLE_CONTEXT, ept_get_eptp(ept), 0);
++        }
 +    }
 +
   out:
      HVMTRACE_ND(VMENTRY, 0, 1/*cycles*/, 0, 0, 0, 0, 0, 0, 0);
  
 diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
-index eef0372..6e0cf89 100644
+index 8418aad..67d0167 100644
 --- a/xen/arch/x86/mm/p2m-ept.c
 +++ b/xen/arch/x86/mm/p2m-ept.c
-@@ -1089,9 +1089,10 @@ static void ept_memory_type_changed(struct p2m_domain *p2m)
+@@ -1082,9 +1082,10 @@ static void ept_memory_type_changed(struct p2m_domain *p2m)
  
  static void __ept_sync_domain(void *info)
  {
@@ -103,25 +95,28 @@ index eef0372..6e0cf89 100644
 -
 -    __invept(INVEPT_SINGLE_CONTEXT, ept_get_eptp(ept), 0);
 +    /*
-+     * The invalidate will be done before VMENTER (see
++     * The invalidation will be done before VMENTER (see
 +     * vmx_vmenter_helper()).
 +     */
  }
  
  void ept_sync_domain(struct p2m_domain *p2m)
-@@ -1107,16 +1108,10 @@ void ept_sync_domain(struct p2m_domain *p2m)
-     if ( nestedhvm_enabled(d) && !p2m_is_nestedp2m(p2m) )
+@@ -1101,15 +1102,15 @@ void ept_sync_domain(struct p2m_domain *p2m)
          p2m_flush_nestedp2m(d);
  
--    /*
+     /*
 -     * Flush active cpus synchronously. Flush others the next time this domain
 -     * is scheduled onto them. We accept the race of other CPUs adding to
 -     * the ept_synced mask before on_selected_cpus() reads it, resulting in
 -     * unnecessary extra flushes, to avoid allocating a cpumask_t on the stack.
--     */
++     * Need to invalidate on all PCPUs because either:
++     *
++     * a) A VCPU has run and some translations may be cached.
++     * b) A VCPU has not run and and the initial invalidation in case
++     *    of an EP4TA reuse is still needed.
+      */
 -    cpumask_and(ept_get_synced_mask(ept),
 -                d->domain_dirty_cpumask, &cpu_online_map);
-+    /* May need to invalidate on all PCPUs. */
 +    cpumask_setall(ept->invalidate);
  
 -    on_selected_cpus(ept_get_synced_mask(ept),
@@ -129,7 +124,7 @@ index eef0372..6e0cf89 100644
                       __ept_sync_domain, p2m, 1);
  }
  
-@@ -1182,10 +1177,14 @@ int ept_p2m_init(struct p2m_domain *p2m)
+@@ -1159,10 +1160,14 @@ int ept_p2m_init(struct p2m_domain *p2m)
          p2m->flush_hardware_cached_dirty = ept_flush_pml_buffers;
      }
  
@@ -146,7 +141,7 @@ index eef0372..6e0cf89 100644
  
      return 0;
  }
-@@ -1193,7 +1192,7 @@ int ept_p2m_init(struct p2m_domain *p2m)
+@@ -1170,7 +1175,7 @@ int ept_p2m_init(struct p2m_domain *p2m)
  void ept_p2m_uninit(struct p2m_domain *p2m)
  {
      struct ept_data *ept = &p2m->ept;
@@ -156,19 +151,20 @@ index eef0372..6e0cf89 100644
  
  static void ept_dump_p2m_table(unsigned char key)
 diff --git a/xen/include/asm-x86/hvm/vmx/vmcs.h b/xen/include/asm-x86/hvm/vmx/vmcs.h
-index a8d4d5b..e778d86 100644
+index f1126d4..7a8b132 100644
 --- a/xen/include/asm-x86/hvm/vmx/vmcs.h
 +++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
-@@ -67,7 +67,7 @@ struct ept_data {
+@@ -67,7 +67,8 @@ struct ept_data {
          };
          u64 eptp;
      };
 -    cpumask_var_t synced_mask;
++    /* Set of PCPUs needing an INVEPT before a VMENTER. */
 +    cpumask_var_t invalidate;
  };
  
  #define _VMX_DOMAIN_PML_ENABLED    0
-@@ -97,7 +97,6 @@ struct pi_desc {
+@@ -87,7 +88,6 @@ struct pi_desc {
  #define ept_get_wl(ept)   ((ept)->ept_wl)
  #define ept_get_asr(ept)  ((ept)->asr)
  #define ept_get_eptp(ept) ((ept)->eptp)
@@ -176,6 +172,3 @@ index a8d4d5b..e778d86 100644
  
  #define NR_PML_ENTRIES   512
  
--- 
-2.1.4
-
