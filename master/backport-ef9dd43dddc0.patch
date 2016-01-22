@@ -1,7 +1,7 @@
-From 9fbc1c4c3be8998d41fa4f386c190204b91e50d4 Mon Sep 17 00:00:00 2001
+From ef9dd43dddc0a31a4343a58072935c1b5c0cbbee Mon Sep 17 00:00:00 2001
 From: Malcolm Crossley <malcolm.crossley@citrix.com>
-Date: Fri, 18 Dec 2015 09:51:13 +0000
-Subject: [PATCHv4 1/3] rwlock: Add per-cpu reader-writer lock infrastructure
+Date: Fri, 22 Jan 2016 16:04:41 +0100
+Subject: [PATCH] rwlock: add per-cpu reader-writer lock infrastructure
 
 Per-cpu read-write locks allow for the fast path read case to have
 low overhead by only setting/clearing a per-cpu variable for using
@@ -43,27 +43,11 @@ location and thus the write lock is not pre-emption safe. Therefore
 the per-cpu write lock can only be used with interrupts disabled.
 
 Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
---
-Changes since v3:
-- Fix the ASSERTS for the percpu_owner check
-
-Changes since v2:
-- Remove stray hard tabs
-- Added owner field to percpu_rwlock_t for debug builds. This allows
-  for ASSERTs to be added which verify the correct global percpu
-  structure is used for the local initialised percpu_rwlock lock
-
-Changes since v1:
-- Removed restriction on taking two or more different percpu rw
-locks simultaneously
-- Moved fast-path/slow-path barrier to be per lock instead of global
-- Created seperate percpu_rwlock_t type and added macros to
-initialise new type
-- Added helper macros for using the percpu rwlock itself
-- Moved active_readers cpumask off the stack and into a percpu
-variable
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: George Dunlap <george.dunlap@citrix.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
 diff --git a/xen/common/spinlock.c b/xen/common/spinlock.c
-index 9cf4136..edfe88c 100644
+index 7f89694..901c2b2 100644
 --- a/xen/common/spinlock.c
 +++ b/xen/common/spinlock.c
 @@ -10,6 +10,8 @@
@@ -75,8 +59,8 @@ index 9cf4136..edfe88c 100644
  #ifndef NDEBUG
  
  static atomic_t spin_debug __read_mostly = ATOMIC_INIT(0);
-@@ -400,6 +402,50 @@ unlock:
-     spin_unlock(&lock->lock);
+@@ -492,6 +494,49 @@ int _rw_is_write_locked(rwlock_t *lock)
+     return (lock->lock == RW_WRITE_FLAG); /* writer in critical section? */
  }
  
 +void _percpu_write_lock(percpu_rwlock_t **per_cpudata,
@@ -85,12 +69,11 @@ index 9cf4136..edfe88c 100644
 +    unsigned int cpu;
 +    cpumask_t *rwlock_readers = &this_cpu(percpu_rwlock_readers);
 +
-+#ifndef NDEBUG
 +    /* Validate the correct per_cpudata variable has been provided. */
-+    ASSERT(per_cpudata == percpu_rwlock->percpu_owner);
-+#endif
-+    /*
-+     * First take the write lock to protect against other writers or slow
++    _percpu_rwlock_owner_check(per_cpudata, percpu_rwlock);
++
++    /* 
++     * First take the write lock to protect against other writers or slow 
 +     * path readers.
 +     */
 +    write_lock(&percpu_rwlock->rwlock);
@@ -108,7 +91,7 @@ index 9cf4136..edfe88c 100644
 +    {
 +        for_each_cpu(cpu, rwlock_readers)
 +        {
-+            /*
++            /* 
 +             * Remove any percpu readers not contending on this rwlock
 +             * from our check mask.
 +             */
@@ -127,7 +110,7 @@ index 9cf4136..edfe88c 100644
  
  struct lock_profile_anc {
 diff --git a/xen/include/asm-arm/percpu.h b/xen/include/asm-arm/percpu.h
-index 71e7649..c308a56 100644
+index 71e7649..7968532 100644
 --- a/xen/include/asm-arm/percpu.h
 +++ b/xen/include/asm-arm/percpu.h
 @@ -27,6 +27,11 @@ void percpu_init_areas(void);
@@ -135,9 +118,9 @@ index 71e7649..c308a56 100644
      (*RELOC_HIDE(&per_cpu__##var, READ_SYSREG(TPIDR_EL2)))
  
 +#define per_cpu_ptr(var, cpu)  \
-+    (*RELOC_HIDE(&var, __per_cpu_offset[cpu]))
++    (*RELOC_HIDE(var, __per_cpu_offset[cpu]))
 +#define __get_cpu_ptr(var) \
-+    (*RELOC_HIDE(&var, READ_SYSREG(TPIDR_EL2)))
++    (*RELOC_HIDE(var, READ_SYSREG(TPIDR_EL2)))
 +
  #define DECLARE_PER_CPU(type, name) extern __typeof__(type) per_cpu__##name
  
@@ -173,18 +156,19 @@ index abe0b11..c896863 100644
  #define get_cpu_var(var) this_cpu(var)
  #define put_cpu_var(var)
 diff --git a/xen/include/xen/spinlock.h b/xen/include/xen/spinlock.h
-index 98f242c..09a644c 100644
+index fb0438e..5071b08 100644
 --- a/xen/include/xen/spinlock.h
 +++ b/xen/include/xen/spinlock.h
-@@ -4,6 +4,7 @@
- #include <xen/atomic.h>
+@@ -3,6 +3,8 @@
+ 
  #include <asm/system.h>
  #include <asm/spinlock.h>
 +#include <asm/types.h>
++#include <xen/percpu.h>
  
  #ifndef NDEBUG
  struct lock_debug {
-@@ -410,4 +411,118 @@ static inline int _rw_is_write_locked(rwlock_t *lock)
+@@ -261,4 +263,118 @@ int _rw_is_write_locked(rwlock_t *lock);
  #define rw_is_locked(l)               _rw_is_locked(l)
  #define rw_is_write_locked(l)         _rw_is_write_locked(l)
  
@@ -200,8 +184,14 @@ index 98f242c..09a644c 100644
 +
 +#ifndef NDEBUG
 +#define PERCPU_RW_LOCK_UNLOCKED(owner) { RW_LOCK_UNLOCKED, 0, owner }
++static inline void _percpu_rwlock_owner_check(percpu_rwlock_t **per_cpudata,
++                                         percpu_rwlock_t *percpu_rwlock)
++{
++    ASSERT(per_cpudata == percpu_rwlock->percpu_owner);
++}
 +#else
 +#define PERCPU_RW_LOCK_UNLOCKED(owner) { RW_LOCK_UNLOCKED, 0 }
++#define _percpu_rwlock_owner_check(data, lock) ((void)0)
 +#endif
 +
 +#define DEFINE_PERCPU_RWLOCK_RESOURCE(l, owner) \
@@ -209,14 +199,11 @@ index 98f242c..09a644c 100644
 +#define percpu_rwlock_resource_init(l, owner) \
 +    (*(l) = (percpu_rwlock_t)PERCPU_RW_LOCK_UNLOCKED(&get_per_cpu_var(owner)))
 +
-+
 +static inline void _percpu_read_lock(percpu_rwlock_t **per_cpudata,
 +                                         percpu_rwlock_t *percpu_rwlock)
 +{
-+#ifndef NDEBUG
 +    /* Validate the correct per_cpudata variable has been provided. */
-+    ASSERT(per_cpudata == percpu_rwlock->percpu_owner);
-+#endif
++    _percpu_rwlock_owner_check(per_cpudata, percpu_rwlock);
 +
 +    /* We cannot support recursion on the same lock. */
 +    ASSERT(this_cpu_ptr(per_cpudata) != percpu_rwlock);
@@ -250,10 +237,8 @@ index 98f242c..09a644c 100644
 +static inline void _percpu_read_unlock(percpu_rwlock_t **per_cpudata,
 +                percpu_rwlock_t *percpu_rwlock)
 +{
-+#ifndef NDEBUG
 +    /* Validate the correct per_cpudata variable has been provided. */
-+    ASSERT(per_cpudata == percpu_rwlock->percpu_owner);
-+#endif
++    _percpu_rwlock_owner_check(per_cpudata, percpu_rwlock);
 +
 +    /* Verify the read lock was taken for this lock */
 +    ASSERT(this_cpu_ptr(per_cpudata) != NULL);
@@ -277,10 +262,9 @@ index 98f242c..09a644c 100644
 +static inline void _percpu_write_unlock(percpu_rwlock_t **per_cpudata,
 +                percpu_rwlock_t *percpu_rwlock)
 +{
-+#ifndef NDEBUG
 +    /* Validate the correct per_cpudata variable has been provided. */
-+    ASSERT(per_cpudata == percpu_rwlock->percpu_owner);
-+#endif
++    _percpu_rwlock_owner_check(per_cpudata, percpu_rwlock);
++
 +    ASSERT(percpu_rwlock->writer_activating);
 +    percpu_rwlock->writer_activating = 0;
 +    write_unlock(&percpu_rwlock->rwlock);

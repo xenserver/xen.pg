@@ -32,16 +32,11 @@ above.
 
 Signed-off-by: Jennifer Herbert <jennifer.herbert@citrix.com>
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
----
- xen/common/spinlock.c      | 268 +++++++++++++++------------------------------
- xen/include/xen/spinlock.h | 195 +++++++++++++++++++++++++++++----
- 2 files changed, 260 insertions(+), 203 deletions(-)
-
 diff --git a/xen/common/spinlock.c b/xen/common/spinlock.c
-index c129a88..9cf4136 100644
+index 4aaafaa..7433e54 100644
 --- a/xen/common/spinlock.c
 +++ b/xen/common/spinlock.c
-@@ -288,208 +288,116 @@ void _spin_unlock_recursive(spinlock_t *lock)
+@@ -290,208 +290,116 @@ void _spin_unlock_recursive(spinlock_t *lock)
      }
  }
  
@@ -337,9 +332,9 @@ index c129a88..9cf4136 100644
 +    spin_unlock(&lock->lock);
  }
  
- #ifdef LOCK_PROFILE
+ void _percpu_write_lock(percpu_rwlock_t **per_cpudata,
 diff --git a/xen/include/xen/spinlock.h b/xen/include/xen/spinlock.h
-index 5e54407..98f242c 100644
+index 62ddd35..47afda5 100644
 --- a/xen/include/xen/spinlock.h
 +++ b/xen/include/xen/spinlock.h
 @@ -1,6 +1,7 @@
@@ -349,8 +344,8 @@ index 5e54407..98f242c 100644
 +#include <xen/atomic.h>
  #include <asm/system.h>
  #include <asm/spinlock.h>
- 
-@@ -148,17 +149,31 @@ typedef struct spinlock {
+ #include <asm/types.h>
+@@ -150,17 +151,31 @@ typedef struct spinlock {
  
  #define spin_lock_init(l) (*(l) = (spinlock_t)SPIN_LOCK_UNLOCKED)
  
@@ -386,32 +381,16 @@ index 5e54407..98f242c 100644
  void _spin_lock(spinlock_t *lock);
  void _spin_lock_irq(spinlock_t *lock);
  unsigned long _spin_lock_irqsave(spinlock_t *lock);
-@@ -175,26 +190,160 @@ int _spin_trylock_recursive(spinlock_t *lock);
+@@ -177,26 +192,160 @@ int _spin_trylock_recursive(spinlock_t *lock);
  void _spin_lock_recursive(spinlock_t *lock);
  void _spin_unlock_recursive(spinlock_t *lock);
  
 -void _read_lock(rwlock_t *lock);
 -void _read_lock_irq(rwlock_t *lock);
 -unsigned long _read_lock_irqsave(rwlock_t *lock);
--
--void _read_unlock(rwlock_t *lock);
--void _read_unlock_irq(rwlock_t *lock);
--void _read_unlock_irqrestore(rwlock_t *lock, unsigned long flags);
--int _read_trylock(rwlock_t *lock);
--
--void _write_lock(rwlock_t *lock);
--void _write_lock_irq(rwlock_t *lock);
--unsigned long _write_lock_irqsave(rwlock_t *lock);
--int _write_trylock(rwlock_t *lock);
 +void queue_read_lock_slowpath(rwlock_t *lock);
 +void queue_write_lock_slowpath(rwlock_t *lock);
- 
--void _write_unlock(rwlock_t *lock);
--void _write_unlock_irq(rwlock_t *lock);
--void _write_unlock_irqrestore(rwlock_t *lock, unsigned long flags);
--
--int _rw_is_locked(rwlock_t *lock);
--int _rw_is_write_locked(rwlock_t *lock);
++
 +/**
 + * queue_read_trylock - try to acquire read lock of a queue rwlock
 + * @lock : Pointer to queue rwlock structure
@@ -520,7 +499,11 @@ index 5e54407..98f242c 100644
 +    _write_lock(lock);
 +    return flags;
 +}
-+
+ 
+-void _read_unlock(rwlock_t *lock);
+-void _read_unlock_irq(rwlock_t *lock);
+-void _read_unlock_irqrestore(rwlock_t *lock, unsigned long flags);
+-int _read_trylock(rwlock_t *lock);
 +/**
 + * queue_write_trylock - try to acquire write lock of a queue rwlock
 + * @lock : Pointer to queue rwlock structure
@@ -529,11 +512,18 @@ index 5e54407..98f242c 100644
 +static inline int _write_trylock(rwlock_t *lock)
 +{
 +    u32 cnts;
-+
+ 
+-void _write_lock(rwlock_t *lock);
+-void _write_lock_irq(rwlock_t *lock);
+-unsigned long _write_lock_irqsave(rwlock_t *lock);
+-int _write_trylock(rwlock_t *lock);
 +    cnts = atomic_read(&lock->cnts);
 +    if ( unlikely(cnts) )
 +        return 0;
-+
+ 
+-void _write_unlock(rwlock_t *lock);
+-void _write_unlock_irq(rwlock_t *lock);
+-void _write_unlock_irqrestore(rwlock_t *lock, unsigned long flags);
 +    return likely(atomic_cmpxchg(&lock->cnts,
 +                                 cnts, cnts | _QW_LOCKED) == cnts);
 +}
@@ -546,7 +536,9 @@ index 5e54407..98f242c 100644
 +     */
 +    atomic_sub(_QW_LOCKED, &lock->cnts);
 +}
-+
+ 
+-int _rw_is_locked(rwlock_t *lock);
+-int _rw_is_write_locked(rwlock_t *lock);
 +static inline void _write_unlock_irq(rwlock_t *lock)
 +{
 +    _write_unlock(lock);
@@ -566,6 +558,3 @@ index 5e54407..98f242c 100644
  
  #define spin_lock(l)                  _spin_lock(l)
  #define spin_lock_irq(l)              _spin_lock_irq(l)
--- 
-2.1.4
-
