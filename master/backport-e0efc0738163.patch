@@ -1,27 +1,19 @@
-From b4d4760221ca463a7fb30635e99b8c5e26b38ae4 Mon Sep 17 00:00:00 2001
+From e0efc073816369fbf304a55600b3e41fb1e8aaae Mon Sep 17 00:00:00 2001
 From: David Vrabel <david.vrabel@citrix.com>
-Date: Tue, 15 Dec 2015 14:26:07 +0000
-Subject: [PATCH 1/4] atomic: replace atomic_compareandswap() with
+Date: Fri, 29 Jan 2016 17:51:15 +0100
+Subject: [PATCH] atomic: replace atomic_compareandswap() with
  atomic_cmpxchg()
 
 atomic_compareandswap() used atomic_t as the new, old and returned
-values which is less convinient than using just int.
+values which is less convenient than using just int.
 
 Signed-off-by: David Vrabel <david.vrabel@citrix.com>
----
- xen/common/domain.c          |  5 +----
- xen/include/asm-arm/atomic.h |  8 --------
- xen/include/asm-x86/atomic.h |  8 --------
- xen/include/xen/atomic.h     | 43 +++++++++++++++++++++++++++++++++++++++++++
- xen/include/xen/sched.h      | 11 +++++------
- 5 files changed, 49 insertions(+), 26 deletions(-)
- create mode 100644 xen/include/xen/atomic.h
-
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index f56b7ff..3fe385e 100644
+index 796c492..010d4fd 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -851,14 +851,11 @@ static void complete_domain_destroy(struct rcu_head *head)
+@@ -843,14 +843,11 @@ static void complete_domain_destroy(struct rcu_head *head)
  void domain_destroy(struct domain *d)
  {
      struct domain **pd;
@@ -57,10 +49,40 @@ index 5a38c67..29ab265 100644
  /*
   * Local variables:
 diff --git a/xen/include/asm-x86/atomic.h b/xen/include/asm-x86/atomic.h
-index 2b8c877..a40319e 100644
+index 2b8c877..d246b70 100644
 --- a/xen/include/asm-x86/atomic.h
 +++ b/xen/include/asm-x86/atomic.h
-@@ -272,12 +272,4 @@ static inline int atomic_add_negative(int i, atomic_t *v)
+@@ -135,6 +135,10 @@ static inline void _atomic_set(atomic_t *v, int i)
+     v->counter = i;
+ }
+ 
++static inline int atomic_cmpxchg(atomic_t *v, int old, int new)
++{
++    return cmpxchg(&v->counter, old, new);
++}
+ 
+ /**
+  * atomic_add - add integer to atomic variable
+@@ -152,6 +156,18 @@ static inline void atomic_add(int i, atomic_t *v)
+ }
+ 
+ /**
++ * atomic_add_return - add integer and return
++ * @i: integer value to add
++ * @v: pointer of type atomic_t
++ *
++ * Atomically adds @i to @v and returns @i + @v
++ */
++static inline int atomic_add_return(int i, atomic_t *v)
++{
++    return i + arch_fetch_and_add(&v->counter, i);
++}
++
++/**
+  * atomic_sub - subtract the atomic variable
+  * @i: integer value to subtract
+  * @v: pointer of type atomic_t
+@@ -272,12 +288,4 @@ static inline int atomic_add_negative(int i, atomic_t *v)
      return c;
  }
  
@@ -73,69 +95,11 @@ index 2b8c877..a40319e 100644
 -}
 -
  #endif /* __ARCH_X86_ATOMIC__ */
-diff --git a/xen/include/xen/atomic.h b/xen/include/xen/atomic.h
-new file mode 100644
-index 0000000..387ac04
---- /dev/null
-+++ b/xen/include/xen/atomic.h
-@@ -0,0 +1,43 @@
-+/******************************************************************************
-+ * atomic.h
-+ *
-+ * Generic atomic variables.
-+ *
-+ * Copyright (c) 2015 Citrix R&D Ltd.
-+ *
-+ * This program is free software; you can redistribute it and/or modify
-+ * it under the terms of the GNU General Public License as published by
-+ * the Free Software Foundation; either version 2 of the License, or
-+ * (at your option) any later version.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program; If not, see <http://www.gnu.org/licenses/>.
-+ */
-+#ifndef __ATOMIC_H__
-+#define __ATOMIC_H__
-+
-+#include <asm/atomic.h>
-+
-+static inline int atomic_cmpxchg(atomic_t *v, int old, int new)
-+{
-+    return cmpxchg(&v->counter, old, new);
-+}
-+
-+/**
-+ * atomic_add_return - add integer and return
-+ * @i: integer value to add
-+ * @v: pointer of type atomic_t
-+ *
-+ * Atomically adds @i to @v and returns @i + @v
-+ */
-+static inline int atomic_add_return(int i, atomic_t *v)
-+{
-+    return i + arch_fetch_and_add(&v->counter, i);
-+}
-+
-+#endif /* __ATOMIC_H__ */
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 3729b0f..cca5547 100644
+index 73d3bc8..7b10bfb 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -17,7 +17,7 @@
- #include <xen/mm.h>
- #include <xen/smp.h>
- #include <xen/perfc.h>
--#include <asm/atomic.h>
-+#include <xen/atomic.h>
- #include <xen/wait.h>
- #include <public/xen.h>
- #include <public/domctl.h>
-@@ -481,16 +481,15 @@ extern struct vcpu *idle_vcpu[NR_CPUS];
+@@ -505,16 +505,15 @@ extern struct vcpu *idle_vcpu[NR_CPUS];
   */
  static always_inline int get_domain(struct domain *d)
  {
@@ -156,6 +120,3 @@ index 3729b0f..cca5547 100644
      return 1;
  }
  
--- 
-2.1.4
-
