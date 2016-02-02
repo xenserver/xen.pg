@@ -1,5 +1,23 @@
+From b6171b7b9fe1666bc5eae38bc5e992c2c233c43d Mon Sep 17 00:00:00 2001
+From: David Vrabel <david.vrabel@citrix.com>
+Date: Tue, 2 Feb 2016 14:01:57 +0100
+Subject: [PATCH] x86: only check for two watchdog NMIs
+
+Since the NMI handler can now recognize watchdog NMIs, make
+check_nmi_watchdog() only check for at least two watchdog NMIs.  This
+prevents false negatives caused by other processors (which may be
+being power managed by the BIOS) running at reduced clock frequencies.
+
+We check for more than one NMI since there are apparently systems
+where the NMI works only once.
+
+This will also slightly speed up boot times since we only wait the
+full 10 ticks if the NMI watchdog on one or more CPUs is not working.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
 diff --git a/xen/arch/x86/nmi.c b/xen/arch/x86/nmi.c
-index 2ab97a0..725ea04 100644
+index 2ab97a0..9f356ec 100644
 --- a/xen/arch/x86/nmi.c
 +++ b/xen/arch/x86/nmi.c
 @@ -139,7 +139,18 @@ int nmi_active;
@@ -15,7 +33,7 @@ index 2ab97a0..725ea04 100644
 +    s = rdtsc();
 +    do {
 +        cpu_relax();
-+        if ( nmi_count(cpu) > start_count )
++        if ( nmi_count(cpu) >= start_count + 2 )
 +            break;
 +        e = rdtsc();
 +    } while( e - s < ticks );
@@ -32,7 +50,7 @@ index 2ab97a0..725ea04 100644
 -        smp_call_function(wait_for_nmis, NULL, 0);
 -    wait_for_nmis(NULL);
 +    /*
-+     * Wait at most 10 ticks for a watchdog NMI on each CPU.
++     * Wait at most 10 ticks for 2 watchdog NMIs on each CPU.
 +     * Busy-wait on all CPUs: the LAPIC counter that the NMI watchdog
 +     * uses only runs while the core's not halted
 +     */
@@ -41,7 +59,7 @@ index 2ab97a0..725ea04 100644
      for_each_online_cpu ( cpu )
      {
 -        if ( nmi_count(cpu) - prev_nmi_count[cpu] <= 5 )
-+        if ( nmi_count(cpu) - prev_nmi_count[cpu] < 1 )
++        if ( nmi_count(cpu) - prev_nmi_count[cpu] < 2 )
          {
              printk(" %d", cpu);
              ok = 0;

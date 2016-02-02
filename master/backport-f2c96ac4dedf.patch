@@ -1,0 +1,37 @@
+From f2c96ac4dedf4976e46de34c69c2cd8b289c4ef2 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 2 Feb 2016 14:03:06 +0100
+Subject: [PATCH] credit: update timeslice under lock
+
+When updating the timeslice of the credit scheduler protect the
+scheduler's private data by it's lock. Today a possible race could
+result only in some weird scheduling decisions during one timeslice,
+but further adjustments will need the lock anyway.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dario.faggioli@citrix.com>
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index 507e957..9fb2027 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -1096,6 +1096,7 @@ csched_sys_cntl(const struct scheduler *ops,
+     int rc = -EINVAL;
+     xen_sysctl_credit_schedule_t *params = &sc->u.sched_credit;
+     struct csched_private *prv = CSCHED_PRIV(ops);
++    unsigned long flags;
+ 
+     switch ( sc->cmd )
+     {
+@@ -1107,8 +1108,12 @@ csched_sys_cntl(const struct scheduler *ops,
+                     || params->ratelimit_us < XEN_SYSCTL_SCHED_RATELIMIT_MIN))
+             || MICROSECS(params->ratelimit_us) > MILLISECS(params->tslice_ms) )
+                 goto out;
++
++        spin_lock_irqsave(&prv->lock, flags);
+         __csched_set_tslice(prv, params->tslice_ms);
+         prv->ratelimit_us = params->ratelimit_us;
++        spin_unlock_irqrestore(&prv->lock, flags);
++
+         /* FALLTHRU */
+     case XEN_SYSCTL_SCHEDOP_getinfo:
+         params->tslice_ms = prv->tslice_ms;

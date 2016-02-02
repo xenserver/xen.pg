@@ -1,0 +1,72 @@
+From 78c93adf0a7f6a7abe249a63e7398ca1221a6d25 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 2 Feb 2016 14:00:52 +0100
+Subject: [PATCH] x86/vmx: don't clobber exception_bitmap when
+ entering/leaving emulated real mode
+
+Most updates to the exception bitmaps set or clear an individual bits.
+
+However, entering or exiting emulated real mode unilaterally clobbers it,
+leaving the exit code to recalculate what it should have been.  This is error
+prone, and indeed currently fails to recalculate the TRAP_no_device intercept
+appropriately.
+
+Instead of overwriting exception_bitmap when entering emulated real mode, move
+the override into vmx_update_exception_bitmap() and leave exception_bitmap
+unmodified.
+
+This means that recalculation is unnecessary, and that the use of
+vmx_fpu_leave() and vmx_update_debug_state() while in emulated real mode
+doesn't result in TRAP_no_device and TRAP_int3 being un-intercepted.
+
+This is only a functional change on hardware lacking unrestricted guest
+support.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 4de61f9..a39138a 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -383,10 +383,13 @@ void vmx_update_secondary_exec_control(struct vcpu *v)
+ 
+ void vmx_update_exception_bitmap(struct vcpu *v)
+ {
++    u32 bitmap = unlikely(v->arch.hvm_vmx.vmx_realmode)
++        ? 0xffffffffu : v->arch.hvm_vmx.exception_bitmap;
++
+     if ( nestedhvm_vcpu_in_guestmode(v) )
+-        nvmx_update_exception_bitmap(v, v->arch.hvm_vmx.exception_bitmap);
++        nvmx_update_exception_bitmap(v, bitmap);
+     else
+-        __vmwrite(EXCEPTION_BITMAP, v->arch.hvm_vmx.exception_bitmap);
++        __vmwrite(EXCEPTION_BITMAP, bitmap);
+ }
+ 
+ static int vmx_guest_x86_mode(struct vcpu *v)
+@@ -1287,8 +1290,6 @@ static void vmx_update_guest_cr(struct vcpu *v, unsigned int cr)
+             {
+                 for ( s = x86_seg_cs ; s <= x86_seg_tr ; s++ )
+                     vmx_set_segment_register(v, s, &reg[s]);
+-                v->arch.hvm_vmx.exception_bitmap = 0xffffffff;
+-                vmx_update_exception_bitmap(v);
+             }
+             else 
+             {
+@@ -1296,13 +1297,9 @@ static void vmx_update_guest_cr(struct vcpu *v, unsigned int cr)
+                     if ( !(v->arch.hvm_vmx.vm86_segment_mask & (1<<s)) )
+                         vmx_set_segment_register(
+                             v, s, &v->arch.hvm_vmx.vm86_saved_seg[s]);
+-                v->arch.hvm_vmx.exception_bitmap = HVM_TRAP_MASK
+-                          | (paging_mode_hap(v->domain) ?
+-                             0 : (1U << TRAP_page_fault))
+-                          | (1U << TRAP_no_device);
+-                vmx_update_exception_bitmap(v);
+-                vmx_update_debug_state(v);
+             }
++
++            vmx_update_exception_bitmap(v);
+         }
+ 
+         v->arch.hvm_vcpu.hw_cr[0] =
