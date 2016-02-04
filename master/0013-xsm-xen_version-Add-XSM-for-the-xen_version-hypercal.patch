@@ -1,0 +1,415 @@
+From 424f1799450edbafece492743c798018fde82127 Mon Sep 17 00:00:00 2001
+From: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date: Mon, 28 Sep 2015 09:00:58 -0400
+Subject: [PATCH 13/26] xsm/xen_version: Add XSM for the xen_version hypercall
+ (v8).
+
+All of XENVER_* have now an XSM check for their sub-ops.
+
+The subop for XENVER_commandline is now a priviliged operation.
+To not break guests we still return an string - but it is
+just '<denied>\0'.
+
+The rest: XENVER_[version|extraversion|capabilities|
+parameters|get_features|page_size|guest_handle|changeset|
+compile_info] behave as before - allowed by default for all
+guests if using the XSM default policy or with the dummy one.
+
+The admin can choose to change the sub-ops to be denied
+as they see fit.
+
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+---
+v2: Do XSM check for all the XENVER_ ops.
+v3: Add empty data conditions.
+v4: Return <denied> for priv subops.
+v5: Move extraversion from priv to normal. Drop the XSM check
+    for the non-priv subops.
+v6: Add +1 for strlen(xen_deny()) to include NULL. Move changeset,
+    compile_info to non-priv subops.
+v7: Remove the \0 on xen_deny()
+v8: Add new XSM domain for xenver hypercall. Add all subops to it.
+---
+ tools/flask/policy/policy/modules/xen/xen.te | 13 +++++++
+ xen/common/kernel.c                          | 53 +++++++++++++++++++++-------
+ xen/common/version.c                         |  5 +++
+ xen/include/xen/version.h                    |  1 +
+ xen/include/xsm/dummy.h                      | 22 ++++++++++++
+ xen/include/xsm/xsm.h                        |  5 +++
+ xen/xsm/dummy.c                              |  1 +
+ xen/xsm/flask/hooks.c                        | 44 +++++++++++++++++++++++
+ xen/xsm/flask/policy/access_vectors          | 28 +++++++++++++++
+ xen/xsm/flask/policy/security_classes        |  1 +
+ 10 files changed, 161 insertions(+), 12 deletions(-)
+
+diff --git a/tools/flask/policy/policy/modules/xen/xen.te b/tools/flask/policy/policy/modules/xen/xen.te
+index 2874c0b..c86ca6b 100644
+--- a/tools/flask/policy/policy/modules/xen/xen.te
++++ b/tools/flask/policy/policy/modules/xen/xen.te
+@@ -73,6 +73,14 @@ allow dom0_t xen_t:xen2 {
+     pmu_ctrl
+     xsplice_op
+ };
++
++# Allow dom0 to use all XENVER_ subops
++# Note that dom0 is part of domain_type so this has duplicates.
++allow dom0_t xen_t:version {
++    version extraversion compile_info capabilities changeset
++    platform_parameters get_features pagesize guest_handle commandline
++};
++
+ allow dom0_t xen_t:mmu memorymap;
+ 
+ # Allow dom0 to use these domctls on itself. For domctls acting on other
+@@ -137,6 +145,11 @@ if (guest_writeconsole) {
+ # pmu_ctrl is for)
+ allow domain_type xen_t:xen2 pmu_use;
+ 
++# For normal guests all except XENVER_commandline
++allow domain_type xen_t:version {
++    version extraversion compile_info capabilities changeset
++    platform_parameters get_features pagesize guest_handle
++};
+ ###############################################################################
+ #
+ # Domain creation
+diff --git a/xen/common/kernel.c b/xen/common/kernel.c
+index 6a3196a..dc295ac 100644
+--- a/xen/common/kernel.c
++++ b/xen/common/kernel.c
+@@ -13,6 +13,7 @@
+ #include <xen/nmi.h>
+ #include <xen/guest_access.h>
+ #include <xen/hypercall.h>
++#include <xsm/xsm.h>
+ #include <asm/current.h>
+ #include <public/nmi.h>
+ #include <public/version.h>
+@@ -226,12 +227,15 @@ void __init do_initcalls(void)
+ /*
+  * Simple hypercalls.
+  */
+-
+ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+ {
++    bool_t deny = !!xsm_version_op(XSM_OTHER, cmd);
++
+     switch ( cmd )
+     {
+     case XENVER_version:
++        if ( deny )
++            return 0;
+         return (xen_major_version() << 16) | xen_minor_version();
+ 
+     case XENVER_extraversion:
+@@ -239,7 +243,7 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+         xen_extraversion_t extraversion;
+ 
+         memset(extraversion, 0, sizeof(extraversion));
+-        safe_strcpy(extraversion, xen_extra_version());
++        safe_strcpy(extraversion, deny ? xen_deny() : xen_extra_version());
+         if ( copy_to_guest(arg, extraversion, ARRAY_SIZE(extraversion)) )
+             return -EFAULT;
+         return 0;
+@@ -250,10 +254,10 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+         xen_compile_info_t info;
+ 
+         memset(&info, 0, sizeof(info));
+-        safe_strcpy(info.compiler,       xen_compiler());
+-        safe_strcpy(info.compile_by,     xen_compile_by());
+-        safe_strcpy(info.compile_domain, xen_compile_domain());
+-        safe_strcpy(info.compile_date,   xen_compile_date());
++        safe_strcpy(info.compiler,       deny ? xen_deny() : xen_compiler());
++        safe_strcpy(info.compile_by,     deny ? xen_deny() : xen_compile_by());
++        safe_strcpy(info.compile_domain, deny ? xen_deny() : xen_compile_domain());
++        safe_strcpy(info.compile_date,   deny ? xen_deny() : xen_compile_date());
+         if ( copy_to_guest(arg, &info, 1) )
+             return -EFAULT;
+         return 0;
+@@ -264,7 +268,8 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+         xen_capabilities_info_t info;
+ 
+         memset(info, 0, sizeof(info));
+-        arch_get_xen_caps(&info);
++        if ( !deny )
++            arch_get_xen_caps(&info);
+ 
+         if ( copy_to_guest(arg, info, ARRAY_SIZE(info)) )
+             return -EFAULT;
+@@ -277,6 +282,9 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+             .virt_start = HYPERVISOR_VIRT_START
+         };
+ 
++        if ( deny )
++            params.virt_start = 0;
++
+         if ( copy_to_guest(arg, &params, 1) )
+             return -EFAULT;
+         return 0;
+@@ -288,7 +296,7 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+         xen_changeset_info_t chgset;
+ 
+         memset(chgset, 0, sizeof(chgset));
+-        safe_strcpy(chgset, xen_changeset());
++        safe_strcpy(chgset, deny ? xen_deny() : xen_changeset());
+         if ( copy_to_guest(arg, chgset, ARRAY_SIZE(chgset)) )
+             return -EFAULT;
+         return 0;
+@@ -305,6 +313,8 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+         switch ( fi.submap_idx )
+         {
+         case 0:
++            if ( deny )
++                break;
+             fi.submap = (1U << XENFEAT_memory_op_vnode_supported);
+             if ( VM_ASSIST(d, pae_extended_cr3) )
+                 fi.submap |= (1U << XENFEAT_pae_pgdir_above_4gb);
+@@ -345,19 +355,38 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+     }
+ 
+     case XENVER_pagesize:
++        if ( deny )
++            return 0;
+         return (!guest_handle_is_null(arg) ? -EINVAL : PAGE_SIZE);
+ 
+     case XENVER_guest_handle:
+-        if ( copy_to_guest(arg, current->domain->handle,
+-                           ARRAY_SIZE(current->domain->handle)) )
++    {
++        xen_domain_handle_t hdl;
++        ssize_t len;
++
++        if ( deny )
++        {
++            len = sizeof(hdl);
++            memset(&hdl, 0, len);
++        } else
++            len = ARRAY_SIZE(current->domain->handle);
++
++        if ( copy_to_guest(arg, deny ? hdl : current->domain->handle, len ) )
+             return -EFAULT;
+         return 0;
+-
++    }
+     case XENVER_commandline:
+-        if ( copy_to_guest(arg, saved_cmdline, ARRAY_SIZE(saved_cmdline)) )
++    {
++        size_t len = ARRAY_SIZE(saved_cmdline);
++
++        if ( deny )
++            len = strlen(xen_deny()) + 1;
++
++        if ( copy_to_guest(arg, deny ? xen_deny() : saved_cmdline, len) )
+             return -EFAULT;
+         return 0;
+     }
++    }
+ 
+     return -ENOSYS;
+ }
+diff --git a/xen/common/version.c b/xen/common/version.c
+index b152e27..786be4e 100644
+--- a/xen/common/version.c
++++ b/xen/common/version.c
+@@ -55,3 +55,8 @@ const char *xen_banner(void)
+ {
+     return XEN_BANNER;
+ }
++
++const char *xen_deny(void)
++{
++    return "<denied>";
++}
+diff --git a/xen/include/xen/version.h b/xen/include/xen/version.h
+index 81a3c7d..2015c0b 100644
+--- a/xen/include/xen/version.h
++++ b/xen/include/xen/version.h
+@@ -12,5 +12,6 @@ unsigned int xen_minor_version(void);
+ const char *xen_extra_version(void);
+ const char *xen_changeset(void);
+ const char *xen_banner(void);
++const char *xen_deny(void);
+ 
+ #endif /* __XEN_VERSION_H__ */
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index b5b6cf5..b7ec4d5 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -727,3 +727,25 @@ static XSM_INLINE int xsm_pmu_op (XSM_DEFAULT_ARG struct domain *d, unsigned int
+ }
+ 
+ #endif /* CONFIG_X86 */
++
++#include <public/version.h>
++static XSM_INLINE int xsm_version_op (XSM_DEFAULT_ARG uint32_t op)
++{
++    XSM_ASSERT_ACTION(XSM_OTHER);
++    switch ( op )
++    {
++    case XENVER_version:
++    case XENVER_extraversion:
++    case XENVER_compile_info:
++    case XENVER_capabilities:
++    case XENVER_changeset:
++    case XENVER_platform_parameters:
++    case XENVER_get_features:
++    case XENVER_pagesize:
++    case XENVER_guest_handle:
++        /* These MUST always be accessible to any guest by default. */
++        return xsm_default_action(XSM_HOOK, current->domain, NULL);
++    default:
++        return xsm_default_action(XSM_PRIV, current->domain, NULL);
++    }
++}
+diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
+index e97b961..9eec55b 100644
+--- a/xen/include/xsm/xsm.h
++++ b/xen/include/xsm/xsm.h
+@@ -191,6 +191,7 @@ struct xsm_operations {
+     int (*ioport_mapping) (struct domain *d, uint32_t s, uint32_t e, uint8_t allow);
+     int (*pmu_op) (struct domain *d, unsigned int op);
+ #endif
++    int (*version_op) (uint32_t cmd);
+ };
+ 
+ #ifdef XSM_ENABLE
+@@ -734,6 +735,10 @@ static inline int xsm_pmu_op (xsm_default_t def, struct domain *d, unsigned int
+ 
+ #endif /* CONFIG_X86 */
+ 
++static inline int xsm_version_op (xsm_default_t def, uint32_t op)
++{
++    return xsm_ops->version_op(op);
++}
+ #endif /* XSM_NO_WRAPPERS */
+ 
+ #ifdef CONFIG_MULTIBOOT
+diff --git a/xen/xsm/dummy.c b/xen/xsm/dummy.c
+index 72eba40..6105c07 100644
+--- a/xen/xsm/dummy.c
++++ b/xen/xsm/dummy.c
+@@ -162,4 +162,5 @@ void xsm_fixup_ops (struct xsm_operations *ops)
+     set_to_dummy_if_null(ops, ioport_mapping);
+     set_to_dummy_if_null(ops, pmu_op);
+ #endif
++    set_to_dummy_if_null(ops, version_op);
+ }
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 084dd4c..1cf071e 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -26,6 +26,7 @@
+ #include <public/xen.h>
+ #include <public/physdev.h>
+ #include <public/platform.h>
++#include <public/version.h>
+ 
+ #include <public/xsm/flask_op.h>
+ 
+@@ -1622,6 +1623,48 @@ static int flask_pmu_op (struct domain *d, unsigned int op)
+ }
+ #endif /* CONFIG_X86 */
+ 
++static int flask_version_op (uint32_t op)
++{
++    u32 dsid = domain_sid(current->domain);
++
++    switch ( op )
++    {
++    case XENVER_version:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__VERSION, NULL);
++    case XENVER_extraversion:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__EXTRAVERSION, NULL);
++    case XENVER_compile_info:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__COMPILE_INFO, NULL);
++    case XENVER_capabilities:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__CAPABILITIES, NULL);
++    case XENVER_changeset:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__CHANGESET, NULL);
++    case XENVER_platform_parameters:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__PLATFORM_PARAMETERS, NULL);
++    case XENVER_get_features:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__GET_FEATURES, NULL);
++    case XENVER_pagesize:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__PAGESIZE, NULL);
++    case XENVER_guest_handle:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__GUEST_HANDLE, NULL);
++        return 0; /* These MUST always be accessible to guests. */
++    case XENVER_commandline:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__COMMANDLINE, NULL);
++    default:
++        return -EPERM;
++    }
++}
++
+ long do_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op);
+ int compat_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op);
+ 
+@@ -1760,6 +1803,7 @@ static struct xsm_operations flask_ops = {
+     .ioport_mapping = flask_ioport_mapping,
+     .pmu_op = flask_pmu_op,
+ #endif
++    .version_op = flask_version_op,
+ };
+ 
+ static __init void flask_init(void)
+diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
+index 4f02acf..68a6b6e 100644
+--- a/xen/xsm/flask/policy/access_vectors
++++ b/xen/xsm/flask/policy/access_vectors
+@@ -495,3 +495,31 @@ class security
+ # remove ocontext label definitions for resources
+     del_ocontext
+ }
++
++# Class version is used to describe the XENVER_ hypercall.
++# Each sub-ops is described here - in the default case all of them should
++# be allowed except the XENVER_commandline.
++#
++class version
++{
++# Often called by PV kernels to force an callback.
++    version
++# Extra informations (-unstable).
++    extraversion
++# Compile information of the hypervisor.
++    compile_info
++# Such as "xen-3.0-x86_64 xen-3.0-x86_32p hvm-3.0-x86_32 hvm-3.0-x86_32p hvm-3.0-x86_64".
++    capabilities
++# Such as the virtual address of where the hypervisor resides.
++    platform_parameters
++# Source code changeset.
++    changeset
++# The features the hypervisor supports.
++    get_features
++# Page size the hypervisor uses.
++    pagesize
++# An value that the control stack can choose.
++    guest_handle
++# Xen command line.
++    commandline
++}
+diff --git a/xen/xsm/flask/policy/security_classes b/xen/xsm/flask/policy/security_classes
+index ca191db..cde4e1a 100644
+--- a/xen/xsm/flask/policy/security_classes
++++ b/xen/xsm/flask/policy/security_classes
+@@ -18,5 +18,6 @@ class shadow
+ class event
+ class grant
+ class security
++class version
+ 
+ # FLASK
+-- 
+2.4.3
+

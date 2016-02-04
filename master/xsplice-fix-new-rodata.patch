@@ -1,0 +1,71 @@
+xsplice: Ignore duplicate object symbols
+
+GCC may generate a duplicate symbol to rodata, so we
+ignore all duplicate data symbols for now.
+This means that two payloads could introduce the same global
+or local variable (although the build tool should disallow
+this).
+This can be reproduced by patching a function to use __func__.
+And then repatching it, still using the same __func__.
+
+diff --git a/xen/common/xsplice.c b/xen/common/xsplice.c
+index b44239d..905098f 100644
+--- a/xen/common/xsplice.c
++++ b/xen/common/xsplice.c
+@@ -902,7 +902,9 @@ static int build_symbol_table(struct payload *payload, struct xsplice_elf *elf)
+             symtab[nsyms].name = strtab + strtab_len;
+             symtab[nsyms].size = elf->sym[i].sym->st_size;
+             symtab[nsyms].value = elf->sym[i].sym->st_value;
+-            symtab[nsyms].flags = 0;
++            symtab[nsyms].flags =
++                (ELF64_ST_TYPE(elf->sym[i].sym->st_info) == STT_FUNC) ?
++                    XSPLICE_SYMBOL_FUNC : 0;
+             strtab_len += strlcpy(strtab + strtab_len, elf->sym[i].name,
+                                   KSYM_NAME_LEN) + 1;
+             nsyms++;
+@@ -926,11 +928,28 @@ static int build_symbol_table(struct payload *payload, struct xsplice_elf *elf)
+         {
+             if ( xsplice_symbols_lookup_by_name(symtab[i].name) )
+             {
+-                printk(XENLOG_ERR "%s: duplicate new symbol: %s\n", elf->name,
+-                       symtab[i].name);
+-                xfree(symtab);
+-                xfree(strtab);
+-                return -EEXIST;
++                if ( symtab[i].flags & XSPLICE_SYMBOL_FUNC )
++                {
++                    printk(XENLOG_ERR "%s: duplicate new symbol: %s\n", elf->name,
++                           symtab[i].name);
++                    xfree(symtab);
++                    xfree(strtab);
++                    return -EEXIST;
++                }
++                else
++                {
++                    /*
++                     * XXX GCC may generate a duplicate symbol to rodata, so we
++                     * ignore all duplicate data symbols for now.
++                     * This means that two payloads could introduce the same global
++                     * or local variable (although the build tool should disallow
++                     * this).
++                     * This can be reproduced by patching a function to use __func__.
++                     * And then repatching it, still using the same __func__.
++                     */
++                    printk(XENLOG_ERR "%s: ignoring duplicate new symbol: %s\n", elf->name,
++                           symtab[i].name);
++                }
+             }
+             symtab[i].flags |= XSPLICE_SYMBOL_NEW;
+             printk(XENLOG_DEBUG "%s: new symbol %s\n", elf->name,
+diff --git a/xen/include/xen/xsplice.h b/xen/include/xen/xsplice.h
+index 1063244..ae6a18c 100644
+--- a/xen/include/xen/xsplice.h
++++ b/xen/include/xen/xsplice.h
+@@ -29,6 +29,7 @@ struct xsplice_build_id {
+ };
+ 
+ #define XSPLICE_SYMBOL_NEW    0x1
++#define XSPLICE_SYMBOL_FUNC   0x2
+ 
+ struct xsplice_symbol {
+     const char *name;

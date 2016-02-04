@@ -1,0 +1,193 @@
+From e3ffc1764107de7892199350cb112b97dd106922 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Fri, 6 Nov 2015 12:54:36 +0000
+Subject: [PATCH 22/26] x86, xsplice: Print payload's symbol name and module in
+ backtraces
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+---
+ xen/arch/x86/traps.c      |  6 +++---
+ xen/common/vsprintf.c     | 18 ++++++++++++++--
+ xen/common/xsplice.c      | 52 +++++++++++++++++++++++++++++++++++++++++++----
+ xen/include/xen/xsplice.h |  4 ++++
+ 4 files changed, 71 insertions(+), 9 deletions(-)
+
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index f5292f0..a0b585f 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -270,7 +270,7 @@ static void _show_trace(unsigned long sp, unsigned long __maybe_unused bp)
+     while ( stack <= bottom )
+     {
+         addr = *stack++;
+-        if ( is_active_kernel_text(addr) )
++        if ( is_active_text(addr) )
+             printk("   [<%p>] %pS\n", _p(addr), _p(addr));
+     }
+ }
+@@ -332,8 +332,8 @@ static void show_trace(const struct cpu_user_regs *regs)
+      * If RIP looks sensible, or the top of the stack doesn't, print RIP at
+      * the top of the stack trace.
+      */
+-    if ( is_active_kernel_text(regs->rip) ||
+-         !is_active_kernel_text(*sp) )
++    if ( is_active_text(regs->rip) ||
++         !is_active_text(*sp) )
+         printk("   [<%p>] %pS\n", _p(regs->rip), _p(regs->rip));
+     /*
+      * Else RIP looks bad but the top of the stack looks good.  Perhaps we
+diff --git a/xen/common/vsprintf.c b/xen/common/vsprintf.c
+index 51b5e4e..cfe63a4 100644
+--- a/xen/common/vsprintf.c
++++ b/xen/common/vsprintf.c
+@@ -20,6 +20,7 @@
+ #include <xen/symbols.h>
+ #include <xen/lib.h>
+ #include <xen/sched.h>
++#include <xen/xsplice.h>
+ #include <asm/div64.h>
+ #include <asm/page.h>
+ 
+@@ -305,15 +306,21 @@ static char *pointer(char *str, char *end, const char **fmt_ptr,
+     {
+         unsigned long sym_size, sym_offset;
+         char namebuf[KSYM_NAME_LEN+1];
++        const char *module = NULL;
+ 
+         /* Advance parents fmt string, as we have consumed 's' or 'S' */
+         ++*fmt_ptr;
+ 
+         s = symbols_lookup((unsigned long)arg, &sym_size, &sym_offset, namebuf);
+ 
+-        /* If the symbol is not found, fall back to printing the address */
+         if ( !s )
+-            break;
++        {
++            s = xsplice_symbols_lookup((unsigned long)arg, &sym_size,
++                                       &sym_offset, &module);
++            /* If the symbol is not found, fall back to printing the address */
++            if ( !s )
++                break;
++        }
+ 
+         /* Print symbol name */
+         str = string(str, end, s, -1, -1, 0);
+@@ -328,6 +335,13 @@ static char *pointer(char *str, char *end, const char **fmt_ptr,
+             str = number(str, end, sym_size, 16, -1, -1, SPECIAL);
+         }
+ 
++        if ( module )
++        {
++            str = string(str, end, " [", -1, -1, 0);
++            str = string(str, end, module, -1, -1, 0);
++            str = string(str, end, "]", -1, -1, 0);
++        }
++
+         return str;
+     }
+ 
+diff --git a/xen/common/xsplice.c b/xen/common/xsplice.c
+index 7fa6213..fca6715 100644
+--- a/xen/common/xsplice.c
++++ b/xen/common/xsplice.c
+@@ -873,7 +873,6 @@ static int build_symbol_table(struct payload *payload, struct xsplice_elf *elf)
+             symtab[nsyms].name = strtab + strtab_len;
+             symtab[nsyms].size = elf->sym[i].sym->st_size;
+             symtab[nsyms].value = elf->sym[i].sym->st_value;
+-            symtab[nsyms].flags = 0;
+             strtab_len += strlcpy(strtab + strtab_len, elf->sym[i].name,
+                                   KSYM_NAME_LEN) + 1;
+             nsyms++;
+@@ -1274,7 +1273,7 @@ struct bug_frame *xsplice_find_bug(const char *eip, int *id)
+ {
+     struct payload *data;
+     struct bug_frame *bug;
+-    int i;
++    unsigned int i;
+ 
+     /* No locking since this list is only ever changed during apply or revert
+      * context. */
+@@ -1284,10 +1283,12 @@ struct bug_frame *xsplice_find_bug(const char *eip, int *id)
+             if (!data->start_bug_frames[i])
+                 continue;
+             if ( !((void *)eip >= data->payload_address &&
+-                   (void *)eip < (data->payload_address + data->core_text_size)))
++                   (void *)eip < (data->payload_address + data->core_text_size)) )
+                 continue;
+ 
+-            for ( bug = data->start_bug_frames[i]; bug != data->stop_bug_frames[i]; ++bug ) {
++            for ( bug = data->start_bug_frames[i];
++                  bug != data->stop_bug_frames[i]; ++bug )
++            {
+                 if ( bug_loc(bug) == eip )
+                 {
+                     *id = i;
+@@ -1383,6 +1384,49 @@ out:
+     return value;
+ }
+ 
++const char *xsplice_symbols_lookup(unsigned long addr,
++                                   unsigned long *symbolsize,
++                                   unsigned long *offset,
++                                   const char **module)
++{
++    struct payload *data;
++    unsigned int i;
++    int best;
++
++    /* No locking since this list is only ever changed during apply or revert
++     * context. */
++    list_for_each_entry ( data, &applied_list, applied_list )
++    {
++        if ( !((void *)addr >= data->payload_address &&
++               (void *)addr < (data->payload_address + data->core_text_size)) )
++            continue;
++
++        best = -1;
++
++        for ( i = 0; i < data->nsyms; i++ )
++        {
++            if ( data->symtab[i].value <= addr &&
++                 ( best == -1 ||
++                   data->symtab[best].value < data->symtab[i].value) )
++                best = i;
++        }
++
++        if ( best == -1 )
++            return NULL;
++
++        if ( symbolsize )
++            *symbolsize = data->symtab[best].size;
++        if ( offset )
++            *offset = addr - data->symtab[best].value;
++        if ( module )
++            *module = data->name;
++
++        return data->symtab[best].name;
++    }
++
++    return NULL;
++}
++
+ static struct keyhandler xsplice_keyhandler = {
+     .diagnostic = 1,
+     .u.fn = xsplice_printall,
+diff --git a/xen/include/xen/xsplice.h b/xen/include/xen/xsplice.h
+index 2e7fb57..bf19f4e 100644
+--- a/xen/include/xen/xsplice.h
++++ b/xen/include/xen/xsplice.h
+@@ -41,6 +41,10 @@ bool_t is_module(const void *addr);
+ bool_t is_active_module_text(unsigned long addr);
+ unsigned long search_module_extables(unsigned long addr);
+ uint64_t xsplice_symbols_lookup_by_name(const char *symname);
++const char *xsplice_symbols_lookup(unsigned long addr,
++                                   unsigned long *symbolsize,
++                                   unsigned long *offset,
++                                   const char **module);
+ 
+ /* Arch hooks */
+ int xsplice_verify_elf(struct xsplice_elf *elf, uint8_t *data);
+-- 
+2.4.3
+

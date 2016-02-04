@@ -1,0 +1,283 @@
+From d37d63d4b548b5fc214c71b2987a86ac0bbf4965 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 3 Nov 2015 18:05:35 +0100
+Subject: [PATCH] symbols: prefix static symbols with their source file names
+
+This requires adjustments to the tool generating the symbol table and
+its as well as nm's invocation.
+
+Note: Not warning about duplicate symbols in the EFI case for now, as
+a binutils bug causes misnamed file name entries to appear in EFI
+binaries' symbol tables when the file name is longer than 18 chars.
+(Not doing so also avoids other duplicates getting printed twice.)
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Ian Campbell <ian.campbell@citrix.com>
+diff --git a/xen/arch/arm/Makefile b/xen/arch/arm/Makefile
+index 1ef39f7..e47dd4c 100644
+--- a/xen/arch/arm/Makefile
++++ b/xen/arch/arm/Makefile
+@@ -80,11 +80,13 @@ $(BASEDIR)/common/symbols-dummy.o:
+ $(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o
+ 	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
+ 	    $(BASEDIR)/common/symbols-dummy.o -o $(@D)/.$(@F).0
+-	$(NM) -n $(@D)/.$(@F).0 | $(BASEDIR)/tools/symbols >$(@D)/.$(@F).0.S
++	$(NM) -pa --format=sysv $(@D)/.$(@F).0 \
++		| $(BASEDIR)/tools/symbols --sysv --sort >$(@D)/.$(@F).0.S
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).0.o
+ 	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
+ 	    $(@D)/.$(@F).0.o -o $(@D)/.$(@F).1
+-	$(NM) -n $(@D)/.$(@F).1 | $(BASEDIR)/tools/symbols >$(@D)/.$(@F).1.S
++	$(NM) -pa --format=sysv $(@D)/.$(@F).1 \
++		| $(BASEDIR)/tools/symbols --sysv --sort >$(@D)/.$(@F).1.S
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1.o
+ 	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
+ 	    $(@D)/.$(@F).1.o -o $@
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index 3e266e6..bbce067 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -106,11 +106,11 @@ $(BASEDIR)/common/symbols-dummy.o:
+ $(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o
+ 	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
+ 	    $(BASEDIR)/common/symbols-dummy.o -o $(@D)/.$(@F).0
+-	$(NM) -n $(@D)/.$(@F).0 | $(BASEDIR)/tools/symbols >$(@D)/.$(@F).0.S
++	$(NM) -pa --format=sysv $(@D)/.$(@F).0 | $(BASEDIR)/tools/symbols --sysv --sort >$(@D)/.$(@F).0.S
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).0.o
+ 	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
+ 	    $(@D)/.$(@F).0.o -o $(@D)/.$(@F).1
+-	$(NM) -n $(@D)/.$(@F).1 | $(BASEDIR)/tools/symbols >$(@D)/.$(@F).1.S
++	$(NM) -pa --format=sysv  $(@D)/.$(@F).1 | $(BASEDIR)/tools/symbols --sysv --sort --warn-dup >$(@D)/.$(@F).1.S
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1.o
+ 	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
+ 	    $(@D)/.$(@F).1.o -o $@
+@@ -133,13 +133,15 @@ $(TARGET).efi: prelink-efi.o efi.lds efi/relocs-dummy.o $(BASEDIR)/common/symbol
+ 	          $(guard) $(LD) $(call EFI_LDFLAGS,$(base)) -T efi.lds -N $< efi/relocs-dummy.o \
+ 	                $(BASEDIR)/common/symbols-dummy.o -o $(@D)/.$(@F).$(base).0 &&) :
+ 	$(guard) efi/mkreloc $(foreach base,$(VIRT_BASE) $(ALT_BASE),$(@D)/.$(@F).$(base).0) >$(@D)/.$(@F).0r.S
+-	$(guard) $(NM) -n $(@D)/.$(@F).$(VIRT_BASE).0 | $(guard) $(BASEDIR)/tools/symbols >$(@D)/.$(@F).0s.S
++	$(guard) $(NM) -pa --format=sysv $(@D)/.$(@F).$(VIRT_BASE).0 \
++		| $(guard) $(BASEDIR)/tools/symbols --sysv --sort >$(@D)/.$(@F).0s.S
+ 	$(guard) $(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).0r.o $(@D)/.$(@F).0s.o
+ 	$(foreach base, $(VIRT_BASE) $(ALT_BASE), \
+ 	          $(guard) $(LD) $(call EFI_LDFLAGS,$(base)) -T efi.lds -N $< \
+ 	                $(@D)/.$(@F).0r.o $(@D)/.$(@F).0s.o -o $(@D)/.$(@F).$(base).1 &&) :
+ 	$(guard) efi/mkreloc $(foreach base,$(VIRT_BASE) $(ALT_BASE),$(@D)/.$(@F).$(base).1) >$(@D)/.$(@F).1r.S
+-	$(guard) $(NM) -n $(@D)/.$(@F).$(VIRT_BASE).1 | $(guard) $(BASEDIR)/tools/symbols >$(@D)/.$(@F).1s.S
++	$(guard) $(NM) -pa --format=sysv $(@D)/.$(@F).$(VIRT_BASE).1 \
++		| $(guard) $(BASEDIR)/tools/symbols --sysv --sort >$(@D)/.$(@F).1s.S
+ 	$(guard) $(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1r.o $(@D)/.$(@F).1s.o
+ 	$(guard) $(LD) $(call EFI_LDFLAGS,$(VIRT_BASE)) -T efi.lds -N $< \
+ 	                $(@D)/.$(@F).1r.o $(@D)/.$(@F).1s.o -o $@
+diff --git a/xen/tools/symbols.c b/xen/tools/symbols.c
+index f39c906..dbf6a1a 100644
+--- a/xen/tools/symbols.c
++++ b/xen/tools/symbols.c
+@@ -30,6 +30,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdint.h>
++#include <stdbool.h>
+ #include <ctype.h>
+ 
+ #define KSYM_NAME_LEN		127
+@@ -40,13 +41,14 @@ struct sym_entry {
+ 	unsigned int len;
+ 	unsigned char *sym;
+ };
+-
++#define SYMBOL_NAME(s) ((char *)(s)->sym + 1)
+ 
+ static struct sym_entry *table;
+ static unsigned int table_size, table_cnt;
+ static unsigned long long _stext, _etext, _sinittext, _einittext, _sextratext, _eextratext;
+ static int all_symbols = 0;
+ static char symbol_prefix_char = '\0';
++static enum { fmt_bsd, fmt_sysv } input_format;
+ 
+ int token_profit[0x10000];
+ 
+@@ -73,11 +75,25 @@ static inline int is_arm_mapping_symbol(const char *str)
+ 
+ static int read_symbol(FILE *in, struct sym_entry *s)
+ {
+-	char str[500];
++	char str[500], type[20] = "";
+ 	char *sym, stype;
+-	int rc;
+-
+-	rc = fscanf(in, "%llx %c %499s\n", &s->addr, &stype, str);
++	static enum { symbol, single_source, multi_source } last;
++	static char *filename;
++	int rc = -1;
++
++	switch (input_format) {
++	case fmt_bsd:
++		rc = fscanf(in, "%llx %c %499s\n", &s->addr, &stype, str);
++		break;
++	case fmt_sysv:
++		while (fscanf(in, "\n") == 1)
++			/* nothing */;
++		rc = fscanf(in, "%499[^ |] |%llx | %c |",
++			    str, &s->addr, &stype);
++		if (rc == 3 && fscanf(in, " %19[^ |] |", type) != 1)
++			*type = '\0';
++		break;
++	}
+ 	if (rc != 3) {
+ 		if (rc != EOF) {
+ 			/* skip line */
+@@ -87,6 +103,31 @@ static int read_symbol(FILE *in, struct sym_entry *s)
+ 		return -1;
+ 	}
+ 
++	sym = strrchr(str, '.');
++	if (strcasecmp(type, "FILE") == 0 ||
++	    (/* GNU nm prior to XXX doesn't produce a type for EFI binaries. */
++	     input_format == fmt_sysv && !*type && stype == '?' && sym &&
++	     sym[1] && strchr("cSsoh", sym[1]) && !sym[2])) {
++		/*
++		 * gas prior to XXX outputs symbol table entries resulting
++		 * from .file in reverse order. If we get two consecutive file
++		 * symbols, prefer the first one if that names an object file
++		 * or has a directory component (to cover multiply compiled
++		 * files).
++		 */
++		bool multi = strchr(str, '/') || (sym && sym[1] == 'o');
++
++		if (multi || last != multi_source) {
++			free(filename);
++			filename = *str ? strdup(str) : NULL;
++		}
++		last = multi ? multi_source : single_source;
++		goto skip_tail;
++	}
++
++	last = symbol;
++	rc = -1;
++
+ 	sym = str;
+ 	/* skip prefix char */
+ 	if (symbol_prefix_char && str[0] == symbol_prefix_char)
+@@ -109,24 +150,37 @@ static int read_symbol(FILE *in, struct sym_entry *s)
+ 	{
+ 		/* Keep these useful absolute symbols */
+ 		if (strcmp(sym, "__gp"))
+-			return -1;
+-
++			goto skip_tail;
+ 	}
+ 	else if (toupper((uint8_t)stype) == 'U' ||
++		 toupper((uint8_t)stype) == 'N' ||
+ 		 is_arm_mapping_symbol(sym))
+-		return -1;
++		goto skip_tail;
+ 	/* exclude also MIPS ELF local symbols ($L123 instead of .L123) */
+ 	else if (str[0] == '$')
+-		return -1;
++		goto skip_tail;
+ 
+ 	/* include the type field in the symbol name, so that it gets
+ 	 * compressed together */
+ 	s->len = strlen(str) + 1;
++	if (islower(stype) && filename)
++		s->len += strlen(filename) + 1;
+ 	s->sym = malloc(s->len + 1);
+-	strcpy((char *)s->sym + 1, str);
++	sym = SYMBOL_NAME(s);
++	if (islower(stype) && filename) {
++		sym = stpcpy(sym, filename);
++		*sym++ = '#';
++	}
++	strcpy(sym, str);
+ 	s->sym[0] = stype;
+ 
+-	return 0;
++	rc = 0;
++
++ skip_tail:
++	if (input_format == fmt_sysv)
++		fgets(str, 500, in); /* discard rest of line */
++
++	return rc;
+ }
+ 
+ static int symbol_valid(struct sym_entry *s)
+@@ -460,11 +514,37 @@ static void optimize_token_table(void)
+ 	optimize_result();
+ }
+ 
++static int compare_value(const void *p1, const void *p2)
++{
++	const struct sym_entry *sym1 = p1;
++	const struct sym_entry *sym2 = p2;
++
++	if (sym1->addr < sym2->addr)
++		return -1;
++	if (sym1->addr > sym2->addr)
++		return +1;
++	/* Prefer global symbols. */
++	if (isupper(*sym1->sym))
++		return -1;
++	if (isupper(*sym2->sym))
++		return +1;
++	return 0;
++}
++
++static int compare_name(const void *p1, const void *p2)
++{
++	const struct sym_entry *sym1 = p1;
++	const struct sym_entry *sym2 = p2;
++
++	return strcmp(SYMBOL_NAME(sym1), SYMBOL_NAME(sym2));
++}
+ 
+ int main(int argc, char **argv)
+ {
++	unsigned int i;
++	bool unsorted = false, warn_dup = false;
++
+ 	if (argc >= 2) {
+-		int i;
+ 		for (i = 1; i < argc; i++) {
+ 			if(strcmp(argv[i], "--all-symbols") == 0)
+ 				all_symbols = 1;
+@@ -474,13 +554,36 @@ int main(int argc, char **argv)
+ 				if ((*p == '"' && *(p+2) == '"') || (*p == '\'' && *(p+2) == '\''))
+ 					p++;
+ 				symbol_prefix_char = *p;
+-			} else
++			} else if (strcmp(argv[i], "--sysv") == 0)
++				input_format = fmt_sysv;
++			else if (strcmp(argv[i], "--sort") == 0)
++				unsorted = true;
++			else if (strcmp(argv[i], "--warn-dup") == 0)
++				warn_dup = true;
++			else
+ 				usage();
+ 		}
+ 	} else if (argc != 1)
+ 		usage();
+ 
+ 	read_map(stdin);
++
++	if (warn_dup) {
++		qsort(table, table_cnt, sizeof(*table), compare_name);
++		for (i = 1; i < table_cnt; ++i)
++			if (strcmp(SYMBOL_NAME(table + i - 1),
++				   SYMBOL_NAME(table + i)) == 0 &&
++			    table[i - 1].addr != table[i].addr)
++				fprintf(stderr,
++					"Duplicate symbol '%s' (%llx != %llx)\n",
++					SYMBOL_NAME(table + i),
++					table[i].addr, table[i - 1].addr);
++		unsorted = true;
++	}
++
++	if (unsorted)
++		qsort(table, table_cnt, sizeof(*table), compare_value);
++
+ 	optimize_token_table();
+ 	write_src();
+ 

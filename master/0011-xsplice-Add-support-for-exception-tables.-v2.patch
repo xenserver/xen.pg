@@ -1,0 +1,207 @@
+From 6f6833829cd0f46d17745d8a413311d2fbbcbef0 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Wed, 10 Feb 2016 10:39:28 -0500
+Subject: [PATCH 11/26] xsplice: Add support for exception tables. (v2)
+
+Add support for exception tables contained within xSplice payloads. If an
+exception occurs search either the main exception table or a particular
+active payload's exception table depending on the instruction pointer.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+---
+v2:
+ - s/module/payload/
+ - sanity checks.
+---
+ xen/arch/x86/extable.c        | 36 +++++++++++++++++++++--------------
+ xen/common/xsplice.c          | 44 +++++++++++++++++++++++++++++++++++++++++++
+ xen/include/asm-x86/uaccess.h |  5 +++++
+ xen/include/xen/xsplice.h     |  1 +
+ 4 files changed, 72 insertions(+), 14 deletions(-)
+
+diff --git a/xen/arch/x86/extable.c b/xen/arch/x86/extable.c
+index 89b5bcb..2787a92 100644
+--- a/xen/arch/x86/extable.c
++++ b/xen/arch/x86/extable.c
+@@ -4,6 +4,7 @@
+ #include <xen/perfc.h>
+ #include <xen/sort.h>
+ #include <xen/spinlock.h>
++#include <xen/xsplice.h>
+ #include <asm/uaccess.h>
+ 
+ #define EX_FIELD(ptr, field) ((unsigned long)&(ptr)->field + (ptr)->field)
+@@ -18,7 +19,7 @@ static inline unsigned long ex_cont(const struct exception_table_entry *x)
+ 	return EX_FIELD(x, cont);
+ }
+ 
+-static int __init cmp_ex(const void *a, const void *b)
++static int cmp_ex(const void *a, const void *b)
+ {
+ 	const struct exception_table_entry *l = a, *r = b;
+ 	unsigned long lip = ex_addr(l);
+@@ -33,7 +34,7 @@ static int __init cmp_ex(const void *a, const void *b)
+ }
+ 
+ #ifndef swap_ex
+-static void __init swap_ex(void *a, void *b, int size)
++static void swap_ex(void *a, void *b, int size)
+ {
+ 	struct exception_table_entry *l = a, *r = b, tmp;
+ 	long delta = b - a;
+@@ -46,19 +47,23 @@ static void __init swap_ex(void *a, void *b, int size)
+ }
+ #endif
+ 
+-void __init sort_exception_tables(void)
++void sort_exception_table(struct exception_table_entry *start,
++                          struct exception_table_entry *stop)
+ {
+-    sort(__start___ex_table, __stop___ex_table - __start___ex_table,
+-         sizeof(struct exception_table_entry), cmp_ex, swap_ex);
+-    sort(__start___pre_ex_table,
+-         __stop___pre_ex_table - __start___pre_ex_table,
++    sort(start, stop - start,
+          sizeof(struct exception_table_entry), cmp_ex, swap_ex);
+ }
+ 
+-static inline unsigned long
+-search_one_table(const struct exception_table_entry *first,
+-                 const struct exception_table_entry *last,
+-                 unsigned long value)
++void __init sort_exception_tables(void)
++{
++    sort_exception_table(__start___ex_table, __stop___ex_table);
++    sort_exception_table(__start___pre_ex_table, __stop___pre_ex_table);
++}
++
++unsigned long
++search_one_extable(const struct exception_table_entry *first,
++                   const struct exception_table_entry *last,
++                   unsigned long value)
+ {
+     const struct exception_table_entry *mid;
+     long diff;
+@@ -80,15 +85,18 @@ search_one_table(const struct exception_table_entry *first,
+ unsigned long
+ search_exception_table(unsigned long addr)
+ {
+-    return search_one_table(
+-        __start___ex_table, __stop___ex_table-1, addr);
++    if ( likely(is_kernel(addr)) )
++        return search_one_extable(
++            __start___ex_table, __stop___ex_table-1, addr);
++    else
++        return search_module_extables(addr);
+ }
+ 
+ unsigned long
+ search_pre_exception_table(struct cpu_user_regs *regs)
+ {
+     unsigned long addr = (unsigned long)regs->eip;
+-    unsigned long fixup = search_one_table(
++    unsigned long fixup = search_one_extable(
+         __start___pre_ex_table, __stop___pre_ex_table-1, addr);
+     if ( fixup )
+     {
+diff --git a/xen/common/xsplice.c b/xen/common/xsplice.c
+index a88379d..977694e 100644
+--- a/xen/common/xsplice.c
++++ b/xen/common/xsplice.c
+@@ -46,6 +46,10 @@ struct payload {
+     size_t core_text_size;               /* Only .text size. */
+     struct bug_frame *start_bug_frames[BUGFRAME_NR]; /* .bug.frame patching. */
+     struct bug_frame *stop_bug_frames[BUGFRAME_NR];
++#ifdef CONFIG_X86
++    struct exception_table_entry *start_ex_table;
++    struct exception_table_entry *stop_ex_table;
++#endif
+     char name[XEN_XSPLICE_NAME_SIZE + 1];/* Name of it. */
+ };
+ 
+@@ -686,6 +690,20 @@ static int find_special_sections(struct payload *payload,
+         payload->start_bug_frames[i] = (struct bug_frame *)sec->load_addr;
+         payload->stop_bug_frames[i] = (struct bug_frame *)(sec->load_addr + sec->sec->sh_size);
+     }
++#ifdef CONFIG_X86
++    sec = xsplice_elf_sec_by_name(elf, ".ex_table");
++    if ( sec )
++    {
++        if ( ( !sec->sec->sh_size ) ||
++             ( sec->sec->sh_size % sizeof *sec->load_addr ) )
++            return -EINVAL;
++
++        payload->start_ex_table = (struct exception_table_entry *)sec->load_addr;
++        payload->stop_ex_table = (struct exception_table_entry *)(sec->load_addr + sec->sec->sh_size);
++
++        sort_exception_table(payload->start_ex_table, payload->stop_ex_table);
++    }
++#endif
+     return 0;
+ }
+ 
+@@ -1048,6 +1066,32 @@ bool_t is_active_module_text(unsigned long addr)
+     return 0;
+ }
+ 
++#ifdef CONFIG_X86
++unsigned long search_module_extables(unsigned long addr)
++{
++    struct payload *data;
++    unsigned long ret;
++
++    /* No locking since this list is only ever changed during apply or revert
++     * context. */
++    list_for_each_entry ( data, &applied_list, applied_list )
++    {
++        if ( !data->start_ex_table )
++            continue;
++        if ( !((void *)addr >= data->payload_address &&
++               (void *)addr < (data->payload_address + data->core_text_size)))
++            continue;
++
++        ret = search_one_extable(data->start_ex_table, data->stop_ex_table - 1,
++                                 addr);
++        if ( ret )
++            return ret;
++    }
++
++    return 0;
++}
++#endif
++
+ static struct keyhandler xsplice_keyhandler = {
+     .diagnostic = 1,
+     .u.fn = xsplice_printall,
+diff --git a/xen/include/asm-x86/uaccess.h b/xen/include/asm-x86/uaccess.h
+index 947470d..9e67bf0 100644
+--- a/xen/include/asm-x86/uaccess.h
++++ b/xen/include/asm-x86/uaccess.h
+@@ -276,6 +276,11 @@ extern struct exception_table_entry __start___pre_ex_table[];
+ extern struct exception_table_entry __stop___pre_ex_table[];
+ 
+ extern unsigned long search_exception_table(unsigned long);
++extern unsigned long search_one_extable(const struct exception_table_entry *first,
++                                        const struct exception_table_entry *last,
++                                        unsigned long value);
+ extern void sort_exception_tables(void);
++extern void sort_exception_table(struct exception_table_entry *start,
++                                 struct exception_table_entry *stop);
+ 
+ #endif /* __X86_UACCESS_H__ */
+diff --git a/xen/include/xen/xsplice.h b/xen/include/xen/xsplice.h
+index 79f49c1..ebdc531 100644
+--- a/xen/include/xen/xsplice.h
++++ b/xen/include/xen/xsplice.h
+@@ -28,6 +28,7 @@ void do_xsplice(void);
+ struct bug_frame *xsplice_find_bug(const char *eip, int *id);
+ bool_t is_module(const void *addr);
+ bool_t is_active_module_text(unsigned long addr);
++unsigned long search_module_extables(unsigned long addr);
+ 
+ /* Arch hooks */
+ int xsplice_verify_elf(struct xsplice_elf *elf, uint8_t *data);
+-- 
+2.4.3
+

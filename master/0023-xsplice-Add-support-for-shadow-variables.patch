@@ -1,0 +1,189 @@
+From 6bb8c8bb3741ad21d4c407a3668ed24372d87660 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Wed, 28 Oct 2015 09:33:01 +0000
+Subject: [PATCH 23/26] xsplice: Add support for shadow variables
+
+Shadow variables are a piece of infrastructure to be used by xsplice
+modules. They are used to attach a new piece of data to an existing
+structure in memory.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+---
+ xen/common/Makefile             |   1 +
+ xen/common/xsplice_shadow.c     | 105 ++++++++++++++++++++++++++++++++++++++++
+ xen/include/xen/xsplice_patch.h |  39 +++++++++++++++
+ 3 files changed, 145 insertions(+)
+ create mode 100644 xen/common/xsplice_shadow.c
+ create mode 100644 xen/include/xen/xsplice_patch.h
+
+diff --git a/xen/common/Makefile b/xen/common/Makefile
+index da47cfa..7c53128 100644
+--- a/xen/common/Makefile
++++ b/xen/common/Makefile
+@@ -58,6 +58,7 @@ obj-y += wait.o
+ obj-y += xmalloc_tlsf.o
+ obj-y += xsplice.o
+ obj-y += xsplice_elf.o
++obj-y += xsplice_shadow.o
+ 
+ obj-bin-$(CONFIG_X86) += $(foreach n,decompress bunzip2 unxz unlzma unlzo unlz4 earlycpio,$(n).init.o)
+ 
+diff --git a/xen/common/xsplice_shadow.c b/xen/common/xsplice_shadow.c
+new file mode 100644
+index 0000000..619cdee
+--- /dev/null
++++ b/xen/common/xsplice_shadow.c
+@@ -0,0 +1,105 @@
++#include <xen/init.h>
++#include <xen/kernel.h>
++#include <xen/lib.h>
++#include <xen/list.h>
++#include <xen/spinlock.h>
++#include <xen/xsplice_patch.h>
++
++#define SHADOW_SLOTS 256
++struct hlist_head shadow_tbl[SHADOW_SLOTS];
++static DEFINE_SPINLOCK(shadow_lock);
++
++struct shadow_var {
++    struct hlist_node list;         /* Linked to 'shadow_tbl' */
++    void *data;
++    const void *obj;
++    char var[16];
++};
++
++void *xsplice_shadow_alloc(const void *obj, const char *var, size_t size)
++{
++    struct shadow_var *shadow;
++    unsigned int slot;
++
++    shadow = xmalloc(struct shadow_var);
++    if ( !shadow )
++        return NULL;
++
++    shadow->obj = obj;
++    strlcpy(shadow->var, var, sizeof shadow->var);
++    shadow->data = xmalloc_bytes(size);
++    if ( !shadow->data )
++    {
++        xfree(shadow);
++        return NULL;
++    }
++
++    slot = (unsigned long)obj % SHADOW_SLOTS;
++    spin_lock(&shadow_lock);
++    hlist_add_head(&shadow->list, &shadow_tbl[slot]);
++    spin_unlock(&shadow_lock);
++
++    return shadow->data;
++}
++
++void xsplice_shadow_free(const void *obj, const char *var)
++{
++    struct shadow_var *entry, *shadow = NULL;
++    unsigned int slot;
++    struct hlist_node *next;
++
++    slot = (unsigned long)obj % SHADOW_SLOTS;
++
++    spin_lock(&shadow_lock);
++    hlist_for_each_entry(entry, next, &shadow_tbl[slot], list)
++    {
++        if ( entry->obj == obj &&
++             !strcmp(entry->var, var) )
++        {
++            shadow = entry;
++            break;
++        }
++    }
++    if (shadow)
++    {
++        hlist_del(&shadow->list);
++        xfree(shadow->data);
++        xfree(shadow);
++    }
++    spin_unlock(&shadow_lock);
++}
++
++void *xsplice_shadow_get(const void *obj, const char *var)
++{
++    struct shadow_var *entry;
++    unsigned int slot;
++    struct hlist_node *next;
++    void *ret = NULL;
++
++    slot = (unsigned long)obj % SHADOW_SLOTS;
++
++    spin_lock(&shadow_lock);
++    hlist_for_each_entry(entry, next, &shadow_tbl[slot], list)
++    {
++        if ( entry->obj == obj &&
++             !strcmp(entry->var, var) )
++        {
++            ret = entry->data;
++            break;
++        }
++    }
++
++    spin_unlock(&shadow_lock);
++    return ret;
++}
++
++static int __init xsplice_shadow_init(void)
++{
++    int i;
++
++    for ( i = 0; i < SHADOW_SLOTS; i++ )
++        INIT_HLIST_HEAD(&shadow_tbl[i]);
++
++    return 0;
++}
++__initcall(xsplice_shadow_init);
+diff --git a/xen/include/xen/xsplice_patch.h b/xen/include/xen/xsplice_patch.h
+new file mode 100644
+index 0000000..e3f344b
+--- /dev/null
++++ b/xen/include/xen/xsplice_patch.h
+@@ -0,0 +1,39 @@
++#ifndef __XEN_XSPLICE_PATCH_H__
++#define __XEN_XSPLICE_PATCH_H__
++
++/*
++ * The following definitions are to be used in patches. They are taken
++ * from kpatch.
++ */
++
++/*
++ * xsplice shadow variables
++ *
++ * These functions can be used to add new "shadow" fields to existing data
++ * structures.  For example, to allocate a "newpid" variable associated with an
++ * instance of task_struct, and assign it a value of 1000:
++ *
++ * struct task_struct *tsk = current;
++ * int *newpid;
++ * newpid = xsplice_shadow_alloc(tsk, "newpid", sizeof(int));
++ * if (newpid)
++ * 	*newpid = 1000;
++ *
++ * To retrieve a pointer to the variable:
++ *
++ * struct task_struct *tsk = current;
++ * int *newpid;
++ * newpid = xsplice_shadow_get(tsk, "newpid");
++ * if (newpid)
++ * 	printk("task newpid = %d\n", *newpid); // prints "task newpid = 1000"
++ *
++ * To free it:
++ *
++ * xsplice_shadow_free(tsk, "newpid");
++ */
++
++void *xsplice_shadow_alloc(const void *obj, const char *var, size_t size);
++void xsplice_shadow_free(const void *obj, const char *var);
++void *xsplice_shadow_get(const void *obj, const char *var);
++
++#endif /* __XEN_XSPLICE_PATCH_H__ */
+-- 
+2.4.3
+

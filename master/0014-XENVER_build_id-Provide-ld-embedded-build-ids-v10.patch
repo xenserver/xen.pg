@@ -1,0 +1,715 @@
+From 7507f31423c6b6bf216eb5c8244dfa1396405d35 Mon Sep 17 00:00:00 2001
+From: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date: Wed, 10 Feb 2016 10:32:40 -0500
+Subject: [PATCH 14/26] XENVER_build_id: Provide ld-embedded build-ids (v10)
+
+The mechanism to get this is via the XENVER hypercall and
+we add a new sub-command to retrieve the binary build-id
+called XENVER_build_id. The sub-hypercall parameter
+allows an arbitrary size (the buffer and len is provided
+to the hypervisor). A NULL parameter will probe the hypervisor
+for the length of the build-id.
+
+One can also retrieve the value of the build-id by doing
+'readelf -n xen-syms'.
+
+For EFI builds we re-use the same build-id that the xen-syms
+was built with.
+
+The version of ld that first implemented --build-id is v2.18.
+Hence we check for that or later version - if older version
+found we do not build the hypervisor with the build-id
+(and the return code is -ENODATA for that case).
+
+For x86 we have two binaries - the xen-syms and the xen - an
+smaller version with lots of sections removed. To make it possible
+for readelf -n xen we also modify mkelf32 and xen.lds.S to include
+the PT_NOTE ELF section.
+
+The EFI binary is more complicated. Having any non-recognizable
+sections (.note, .data.note, etc) causes the boot to hang.
+Moving the .note in the .data section makes it work. It is also
+worth noting that the PE/COFF does not have any "comment"
+sections to the author.
+
+Suggested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Martin Pohlack <mpohlack@amazon.de>
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+---
+v1: Rebase it on Martin's initial patch
+v2: Move it to XENVER hypercall
+v3: Fix EFI building (Ross's fix)
+v4: Don't use the third argument for length.
+v5: Use new structure for XENVER_build_id with variable buf.
+v6: Include Ross's fix.
+v7: Include detection of bin-utils for build-id support, add
+    probing for size, and return -EPERM for XSM denied calls.
+v8: Build xen_build_id under ARM, required adding ELFSIZE in proper file.
+v9: Rebase on top XSM version class.
+v10: Include the build-id .note in the xen ELF binary.
+     s/build_id/build_id_linker/
+    For EFI build, moved the --build-id values in .data section
+---
+ Config.mk                                    |  11 +++
+ tools/flask/policy/policy/modules/xen/xen.te |   4 +-
+ tools/libxc/xc_private.c                     |   7 ++
+ tools/libxc/xc_private.h                     |  10 ++
+ xen/arch/arm/Makefile                        |   2 +-
+ xen/arch/arm/xen.lds.S                       |  13 +++
+ xen/arch/x86/Makefile                        |  27 +++++-
+ xen/arch/x86/boot/mkelf32.c                  | 134 ++++++++++++++++++++++++---
+ xen/arch/x86/xen.lds.S                       |  23 +++++
+ xen/common/kernel.c                          |  36 +++++++
+ xen/common/version.c                         |  48 ++++++++++
+ xen/include/public/version.h                 |  16 +++-
+ xen/include/xen/version.h                    |   1 +
+ xen/xsm/flask/hooks.c                        |   3 +
+ xen/xsm/flask/policy/access_vectors          |   2 +
+ 15 files changed, 317 insertions(+), 20 deletions(-)
+
+diff --git a/Config.mk b/Config.mk
+index 1eb53d7..ab34c57 100644
+--- a/Config.mk
++++ b/Config.mk
+@@ -126,6 +126,17 @@ endef
+ check-$(gcc) = $(call cc-ver-check,CC,0x040100,"Xen requires at least gcc-4.1")
+ $(eval $(check-y))
+ 
++ld-ver-build-id = $(shell $(1) --build-id 2>&1 | \
++					grep -q unrecognized && echo n || echo y)
++
++# binutils 2.18 implement build-id.
++ifeq ($(call ld-ver-build-id,$(LD)),n)
++build_id_linker :=
++else
++CFLAGS += -DBUILD_ID
++build_id_linker := --build-id=sha1
++endif
++
+ # as-insn: Check whether assembler supports an instruction.
+ # Usage: cflags-y += $(call as-insn "insn",option-yes,option-no)
+ as-insn = $(if $(shell echo 'void _(void) { asm volatile ( $(2) ); }' \
+diff --git a/tools/flask/policy/policy/modules/xen/xen.te b/tools/flask/policy/policy/modules/xen/xen.te
+index c86ca6b..100e9d2 100644
+--- a/tools/flask/policy/policy/modules/xen/xen.te
++++ b/tools/flask/policy/policy/modules/xen/xen.te
+@@ -78,7 +78,7 @@ allow dom0_t xen_t:xen2 {
+ # Note that dom0 is part of domain_type so this has duplicates.
+ allow dom0_t xen_t:version {
+     version extraversion compile_info capabilities changeset
+-    platform_parameters get_features pagesize guest_handle commandline
++    platform_parameters get_features pagesize guest_handle commandline build_id
+ };
+ 
+ allow dom0_t xen_t:mmu memorymap;
+@@ -145,7 +145,7 @@ if (guest_writeconsole) {
+ # pmu_ctrl is for)
+ allow domain_type xen_t:xen2 pmu_use;
+ 
+-# For normal guests all except XENVER_commandline
++# For normal guests all except XENVER_commandline|build_id
+ allow domain_type xen_t:version {
+     version extraversion compile_info capabilities changeset
+     platform_parameters get_features pagesize guest_handle
+diff --git a/tools/libxc/xc_private.c b/tools/libxc/xc_private.c
+index 97e63c4..bee7adc 100644
+--- a/tools/libxc/xc_private.c
++++ b/tools/libxc/xc_private.c
+@@ -718,6 +718,13 @@ int xc_version(xc_interface *xch, int cmd, void *arg)
+     case XENVER_commandline:
+         sz = sizeof(xen_commandline_t);
+         break;
++    case XENVER_build_id:
++        {
++            xen_build_id_t *build_id = (xen_build_id_t *)arg;
++            sz = sizeof(*build_id) + build_id->len;
++            HYPERCALL_BOUNCE_SET_DIR(arg, XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
++            break;
++        }
+     default:
+         ERROR("xc_version: unknown command %d\n", cmd);
+         return -EINVAL;
+diff --git a/tools/libxc/xc_private.h b/tools/libxc/xc_private.h
+index 2df1d59..aa0cad7 100644
+--- a/tools/libxc/xc_private.h
++++ b/tools/libxc/xc_private.h
+@@ -202,6 +202,16 @@ enum {
+ #define DECLARE_HYPERCALL_BOUNCE(_ubuf, _sz, _dir) DECLARE_NAMED_HYPERCALL_BOUNCE(_ubuf, _ubuf, _sz, _dir)
+ 
+ /*
++ * Change the direction.
++ *
++ * Can only be used if the bounce_pre/bounce_post commands have
++ * not been used.
++ */
++#define HYPERCALL_BOUNCE_SET_DIR(_buf, _dir) do { if ((HYPERCALL_BUFFER(_buf))->hbuf)         \
++                                                        assert(1);                            \
++                                                   (HYPERCALL_BUFFER(_buf))->dir = _dir;      \
++                                                } while (0)
++/*
+  * Set the size of data to bounce. Useful when the size is not known
+  * when the bounce buffer is declared.
+  */
+diff --git a/xen/arch/arm/Makefile b/xen/arch/arm/Makefile
+index 90c131c..b4d016f 100644
+--- a/xen/arch/arm/Makefile
++++ b/xen/arch/arm/Makefile
+@@ -91,7 +91,7 @@ $(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o
+ 	    $(@D)/.$(@F).0.o -o $(@D)/.$(@F).1
+ 	$(NM) -n $(@D)/.$(@F).1 | $(BASEDIR)/tools/symbols >$(@D)/.$(@F).1.S
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1.o
+-	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
++	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o $(build_id_linker) \
+ 	    $(@D)/.$(@F).1.o -o $@
+ 	rm -f $(@D)/.$(@F).[0-9]*
+ 
+diff --git a/xen/arch/arm/xen.lds.S b/xen/arch/arm/xen.lds.S
+index 0488f37..2f9beba 100644
+--- a/xen/arch/arm/xen.lds.S
++++ b/xen/arch/arm/xen.lds.S
+@@ -22,6 +22,9 @@ OUTPUT_ARCH(FORMAT)
+ PHDRS
+ {
+   text PT_LOAD /* XXX should be AT ( XEN_PHYS_START ) */ ;
++#if defined(BUILD_ID)
++  note PT_NOTE ;
++#endif
+ }
+ SECTIONS
+ {
+@@ -53,6 +56,16 @@ SECTIONS
+         _erodata = .;          /* End of read-only data */
+   } :text
+ 
++#if defined(BUILD_ID)
++  .note : {
++       __note_gnu_build_id_start = .;
++       *(.note.gnu.build-id)
++       __note_gnu_build_id_end = .;
++       *(.note)
++       *(.note.*)
++  } :text
++#endif
++
+   .data : {                    /* Data */
+        . = ALIGN(PAGE_SIZE);
+        *(.data.page_aligned)
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index 8c9e24e..a194541 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -74,9 +74,16 @@ efi-$(x86_64) := $(shell if [ ! -r $(BASEDIR)/include/xen/compile.h -o \
+                                 -O $(BASEDIR)/include/xen/compile.h ]; then \
+                          echo '$(TARGET).efi'; fi)
+ 
++ifdef build_id_linker
++num_phdrs = 2
++else
++num_phdrs = 1
++endif
++
+ $(TARGET): $(TARGET)-syms $(efi-y) boot/mkelf32
+ 	./boot/mkelf32 $(TARGET)-syms $(TARGET) 0x100000 \
+-	`$(NM) $(TARGET)-syms | grep " _end$$" | sed -e 's/^\([^ ]*\).*/0x\1/'`
++	`$(NM) $(TARGET)-syms | grep " _end$$" | sed -e 's/^\([^ ]*\).*/0x\1/'` \
++	$(num_phdrs)
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk -C test
+ 
+ install:
+@@ -120,10 +127,17 @@ $(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o efi/relocs-d
+ 	    $(@D)/.$(@F).0.o -o $(@D)/.$(@F).1
+ 	$(NM) -n $(@D)/.$(@F).1 | $(BASEDIR)/tools/symbols >$(@D)/.$(@F).1.S
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1.o
+-	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o efi/relocs-dummy.o \
++	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o efi/relocs-dummy.o $(build_id_linker) \
+ 	    $(@D)/.$(@F).1.o -o $@
+ 	rm -f $(@D)/.$(@F).[0-9]*
+ 
++build_id.o: $(TARGET)-syms
++	$(OBJCOPY) --only-section=.note $< .$@.0
++	# Need to clear the CODE when the build_id.o is put in the .data
++	$(OBJCOPY) --set-section-flags=.note=alloc,load,data  \
++		   --rename-section=.note=.note.gnu.build-id .$@.0 $@
++	rm -f .$@.0
++
+ EFI_LDFLAGS = $(patsubst -m%,-mi386pep,$(LDFLAGS)) --subsystem=10
+ EFI_LDFLAGS += --image-base=$(1) --stack=0,0 --heap=0,0 --strip-debug
+ EFI_LDFLAGS += --section-alignment=0x200000 --file-alignment=0x20
+@@ -136,6 +150,13 @@ $(TARGET).efi: VIRT_BASE = 0x$(shell $(NM) efi/relocs-dummy.o | sed -n 's, A VIR
+ $(TARGET).efi: ALT_BASE = 0x$(shell $(NM) efi/relocs-dummy.o | sed -n 's, A ALT_START$$,,p')
+ # Don't use $(wildcard ...) here - at least make 3.80 expands this too early!
+ $(TARGET).efi: guard = $(if $(shell echo efi/dis* | grep disabled),:)
++ifdef build_id_linker
++$(TARGET).efi: build_id.o
++build_id_file := build_id.o
++else
++build_id_file :=
++endif
++
+ $(TARGET).efi: prelink-efi.o efi.lds efi/relocs-dummy.o $(BASEDIR)/common/symbols-dummy.o efi/mkreloc
+ 	$(foreach base, $(VIRT_BASE) $(ALT_BASE), \
+ 	          $(guard) $(LD) $(call EFI_LDFLAGS,$(base)) -T efi.lds -N $< efi/relocs-dummy.o \
+@@ -150,7 +171,7 @@ $(TARGET).efi: prelink-efi.o efi.lds efi/relocs-dummy.o $(BASEDIR)/common/symbol
+ 	$(guard) $(NM) -n $(@D)/.$(@F).$(VIRT_BASE).1 | $(guard) $(BASEDIR)/tools/symbols >$(@D)/.$(@F).1s.S
+ 	$(guard) $(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1r.o $(@D)/.$(@F).1s.o
+ 	$(guard) $(LD) $(call EFI_LDFLAGS,$(VIRT_BASE)) -T efi.lds -N $< \
+-	                $(@D)/.$(@F).1r.o $(@D)/.$(@F).1s.o -o $@
++	                $(@D)/.$(@F).1r.o $(@D)/.$(@F).1s.o $(build_id_file) -o $@
+ 	if $(guard) false; then rm -f $@; echo 'EFI support disabled'; fi
+ 	rm -f $(@D)/.$(@F).[0-9]*
+ 
+diff --git a/xen/arch/x86/boot/mkelf32.c b/xen/arch/x86/boot/mkelf32.c
+index b369222..b4256e0 100644
+--- a/xen/arch/x86/boot/mkelf32.c
++++ b/xen/arch/x86/boot/mkelf32.c
+@@ -45,9 +45,9 @@ static Elf32_Ehdr out_ehdr = {
+     0,                                       /* e_flags */
+     sizeof(Elf32_Ehdr),                      /* e_ehsize */
+     sizeof(Elf32_Phdr),                      /* e_phentsize */
+-    1,                                       /* e_phnum */
++    1,  /* modify based on num_phdrs */      /* e_phnum */
+     sizeof(Elf32_Shdr),                      /* e_shentsize */
+-    3,                                       /* e_shnum */
++    3,  /* modify based on num_phdrs */      /* e_shnum */
+     2                                        /* e_shstrndx */
+ };
+ 
+@@ -61,8 +61,20 @@ static Elf32_Phdr out_phdr = {
+     PF_R|PF_W|PF_X,                          /* p_flags */
+     64                                       /* p_align */
+ };
++static Elf32_Phdr note_phdr = {
++    PT_NOTE,                                 /* p_type */
++    DYNAMICALLY_FILLED,                      /* p_offset */
++    DYNAMICALLY_FILLED,                      /* p_vaddr */
++    DYNAMICALLY_FILLED,                      /* p_paddr */
++    DYNAMICALLY_FILLED,                      /* p_filesz */
++    DYNAMICALLY_FILLED,                      /* p_memsz */
++    PF_R,                                    /* p_flags */
++    4                                        /* p_align */
++};
+ 
+ static u8 out_shstrtab[] = "\0.text\0.shstrtab";
++/* If num_phdrs >= 2, we need to tack the .note. */
++static u8 out_shstrtab_extra[] = ".note\0";
+ 
+ static Elf32_Shdr out_shdr[] = {
+     { 0 },
+@@ -90,6 +102,23 @@ static Elf32_Shdr out_shdr[] = {
+     }
+ };
+ 
++/*
++ * The 17 points to the '.note' in the out_shstrtab and out_shstrtab_extra
++ * laid out in the file.
++ */
++static Elf32_Shdr out_shdr_extra = {
++      17,                                    /* sh_name */
++      SHT_NOTE,                              /* sh_type */
++      0,                                     /* sh_flags */
++      DYNAMICALLY_FILLED,                    /* sh_addr */
++      DYNAMICALLY_FILLED,                    /* sh_offset */
++      DYNAMICALLY_FILLED,                    /* sh_size */
++      0,                                     /* sh_link */
++      0,                                     /* sh_info */
++      4,                                     /* sh_addralign */
++      0                                      /* sh_entsize */
++};
++
+ /* Some system header files define these macros and pollute our namespace. */
+ #undef swap16
+ #undef swap32
+@@ -228,11 +257,12 @@ static void do_read(int fd, void *data, int len)
+ int main(int argc, char **argv)
+ {
+     u64        final_exec_addr;
+-    u32        loadbase, dat_siz, mem_siz;
++    u32        loadbase, dat_siz, mem_siz, note_base, note_sz, offset;
+     char      *inimage, *outimage;
+     int        infd, outfd;
+     char       buffer[1024];
+     int        bytes, todo, i;
++    int        num_phdrs;
+ 
+     Elf32_Ehdr in32_ehdr;
+     Elf32_Phdr in32_phdr;
+@@ -240,10 +270,10 @@ int main(int argc, char **argv)
+     Elf64_Ehdr in64_ehdr;
+     Elf64_Phdr in64_phdr;
+ 
+-    if ( argc != 5 )
++    if ( argc != 6 )
+     {
+         fprintf(stderr, "Usage: mkelf32 <in-image> <out-image> "
+-                "<load-base> <final-exec-addr>\n");
++                "<load-base> <final-exec-addr> <number of program headers>\n");
+         return 1;
+     }
+ 
+@@ -251,7 +281,13 @@ int main(int argc, char **argv)
+     outimage = argv[2];
+     loadbase = strtoul(argv[3], NULL, 16);
+     final_exec_addr = strtoull(argv[4], NULL, 16);
+-
++    num_phdrs = atoi(argv[5]);
++    if ( num_phdrs > 2 || num_phdrs < 1 )
++    {
++        fprintf(stderr, "Number of program headers MUST be 1 or 2, got %d!\n",
++                num_phdrs);
++        return 1;
++    }
+     infd = open(inimage, O_RDONLY);
+     if ( infd == -1 )
+     {
+@@ -312,10 +348,10 @@ int main(int argc, char **argv)
+             return 1;
+         }
+ 
+-        if ( in64_ehdr.e_phnum != 1 )
++        if ( in64_ehdr.e_phnum != num_phdrs )
+         {
+-            fprintf(stderr, "Expect precisly 1 program header; found %d.\n",
+-                    (int)in64_ehdr.e_phnum);
++            fprintf(stderr, "Expect precisly %d program header; found %d.\n",
++                    num_phdrs, (int)in64_ehdr.e_phnum);
+             return 1;
+         }
+ 
+@@ -336,6 +372,32 @@ int main(int argc, char **argv)
+         return 1;
+     }
+ 
++    note_sz = note_base = offset = 0;
++    if ( num_phdrs > 1 )
++    {
++        offset = in64_phdr.p_offset;
++        note_base = in64_phdr.p_vaddr;
++
++        (void)lseek(infd, in64_ehdr.e_phoff+sizeof(in64_phdr), SEEK_SET);
++        do_read(infd, &in64_phdr, sizeof(in64_phdr));
++        endianadjust_phdr64(&in64_phdr);
++
++        (void)lseek(infd, offset, SEEK_SET);
++
++        note_sz = in64_phdr.p_memsz;
++        note_base = in64_phdr.p_vaddr - note_base;
++
++        if ( in64_phdr.p_offset > dat_siz || offset > in64_phdr.p_offset )
++        {
++            fprintf(stderr, "Expected .note section within .text section!\n" \
++                    "Offset %ld not within %d!\n",
++                    in64_phdr.p_offset, dat_siz);
++            return 1;
++        }
++        /* Gets us the absolute offset within the .text section. */
++        offset = in64_phdr.p_offset - offset;
++    }
++
+     /*
+      * End the image on a page boundary. This gets round alignment bugs
+      * in the boot- or chain-loader (e.g., kexec on the XenoBoot CD).
+@@ -354,6 +416,31 @@ int main(int argc, char **argv)
+     out_shdr[1].sh_size   = dat_siz;
+     out_shdr[2].sh_offset = RAW_OFFSET + dat_siz + sizeof(out_shdr);
+ 
++    if ( num_phdrs > 1 )
++    {
++        /* We have two of them! */
++        out_ehdr.e_phnum = num_phdrs;
++        /* Extra .note section. */
++        out_ehdr.e_shnum++;
++
++        /* Fill out the PT_NOTE program header. */
++        note_phdr.p_vaddr   = note_base;
++        note_phdr.p_paddr   = note_base;
++        note_phdr.p_filesz  = note_sz;
++        note_phdr.p_memsz   = note_sz;
++        note_phdr.p_offset  = offset;
++
++        /* Tack on the .note\0 */
++        out_shdr[2].sh_size += sizeof(out_shstrtab_extra);
++        /* And move it past the .note section. */
++        out_shdr[2].sh_offset += sizeof(out_shdr_extra);
++
++        /* Fill out the .note section. */
++        out_shdr_extra.sh_size = note_sz;
++        out_shdr_extra.sh_addr = note_base;
++        out_shdr_extra.sh_offset = RAW_OFFSET + offset;
++    }
++
+     outfd = open(outimage, O_WRONLY|O_CREAT|O_TRUNC, 0775);
+     if ( outfd == -1 )
+     {
+@@ -367,8 +454,15 @@ int main(int argc, char **argv)
+ 
+     endianadjust_phdr32(&out_phdr);
+     do_write(outfd, &out_phdr, sizeof(out_phdr));
+-    
+-    if ( (bytes = RAW_OFFSET - sizeof(out_ehdr) - sizeof(out_phdr)) < 0 )
++
++    if ( num_phdrs > 1 )
++    {
++        endianadjust_phdr32(&note_phdr);
++        do_write(outfd, &note_phdr, sizeof(note_phdr));
++    }
++
++    if ( (bytes = RAW_OFFSET - sizeof(out_ehdr) - sizeof(out_phdr) -
++          ( num_phdrs > 1 ? sizeof(note_phdr) : 0 ) ) < 0 )
+     {
+         fprintf(stderr, "Header overflow.\n");
+         return 1;
+@@ -387,8 +481,22 @@ int main(int argc, char **argv)
+         endianadjust_shdr32(&out_shdr[i]);
+     do_write(outfd, &out_shdr[0], sizeof(out_shdr));
+ 
+-    do_write(outfd, out_shstrtab, sizeof(out_shstrtab));
+-    do_write(outfd, buffer, 4-((sizeof(out_shstrtab)+dat_siz)&3));
++    if ( num_phdrs > 1 )
++    {
++        endianadjust_shdr32(&out_shdr_extra);
++        /* Append the .note section. */
++        do_write(outfd, &out_shdr_extra, sizeof(out_shdr_extra));
++        /* The normal strings - .text\0.. */
++        do_write(outfd, out_shstrtab, sizeof(out_shstrtab));
++        /* Our .note */
++        do_write(outfd, out_shstrtab_extra, sizeof(out_shstrtab_extra));
++        do_write(outfd, buffer, 4-((sizeof(out_shstrtab)+sizeof(out_shstrtab_extra)+dat_siz)&3));
++    }
++    else
++    {
++        do_write(outfd, out_shstrtab, sizeof(out_shstrtab));
++        do_write(outfd, buffer, 4-((sizeof(out_shstrtab)+dat_siz)&3));
++    }
+ 
+     close(infd);
+     close(outfd);
+diff --git a/xen/arch/x86/xen.lds.S b/xen/arch/x86/xen.lds.S
+index 8e44553..bf1ba20 100644
+--- a/xen/arch/x86/xen.lds.S
++++ b/xen/arch/x86/xen.lds.S
+@@ -31,6 +31,9 @@ OUTPUT_ARCH(i386:x86-64)
+ PHDRS
+ {
+   text PT_LOAD ;
++#if defined(BUILD_ID) && !defined(EFI)
++  note PT_NOTE ;
++#endif
+ }
+ SECTIONS
+ {
+@@ -67,6 +70,21 @@ SECTIONS
+        *(.rodata.*)
+   } :text
+ 
++#if defined(BUILD_ID) && !defined(EFI)
++/*
++ * No mechanism to put an PT_NOTE in the EFI file - so put
++ * it in .data section.
++ */
++  . = ALIGN(4);
++  .note : {
++       __note_gnu_build_id_start = .;
++       *(.note.gnu.build-id)
++       __note_gnu_build_id_end = .;
++       *(.note)
++       *(.note.*)
++  } :note :text
++#endif
++
+   . = ALIGN(SMP_CACHE_BYTES);
+   .data.read_mostly : {
+        /* Exception table */
+@@ -82,6 +100,11 @@ SECTIONS
+        *(.data.read_mostly)
+        *(.data.rel.ro)
+        *(.data.rel.ro.*)
++#if defined(BUILD_ID) && defined(EFI)
++       __note_gnu_build_id_start = .;
++       *(.note.gnu.build-id)
++       __note_gnu_build_id_end = .;
++#endif
+   } :text
+ 
+   .data : {                    /* Data */
+diff --git a/xen/common/kernel.c b/xen/common/kernel.c
+index dc295ac..3b005c7 100644
+--- a/xen/common/kernel.c
++++ b/xen/common/kernel.c
+@@ -386,6 +386,42 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+             return -EFAULT;
+         return 0;
+     }
++
++    case XENVER_build_id:
++    {
++        xen_build_id_t build_id;
++        unsigned int sz = 0;
++        int rc = 0;
++        char *p = NULL;
++
++        if ( deny )
++            return -EPERM;
++
++        /* Only return size. */
++        if ( !guest_handle_is_null(arg) )
++        {
++            if ( copy_from_guest(&build_id, arg, 1) )
++                return -EFAULT;
++
++            if ( build_id.len == 0 )
++                return -EINVAL;
++        }
++
++        rc = xen_build_id(&p, &sz);
++        if ( rc )
++            return rc;
++
++        if ( guest_handle_is_null(arg) )
++            return sz;
++
++        if ( sz > build_id.len )
++            return -ENOBUFS;
++
++        if ( copy_to_guest_offset(arg, offsetof(xen_build_id_t, buf), p, sz) )
++            return -EFAULT;
++
++        return sz;
++    }
+     }
+ 
+     return -ENOSYS;
+diff --git a/xen/common/version.c b/xen/common/version.c
+index 786be4e..33c09e5 100644
+--- a/xen/common/version.c
++++ b/xen/common/version.c
+@@ -1,5 +1,9 @@
+ #include <xen/compile.h>
++#include <xen/errno.h>
++#include <xen/string.h>
++#include <xen/types.h>
+ #include <xen/version.h>
++#include <xen/elf.h>
+ 
+ const char *xen_compile_date(void)
+ {
+@@ -60,3 +64,47 @@ const char *xen_deny(void)
+ {
+     return "<denied>";
+ }
++#ifdef BUILD_ID
++#define NT_GNU_BUILD_ID 3
++/* Defined in linker script. */
++extern const Elf_Note __note_gnu_build_id_start[], __note_gnu_build_id_end[];
++
++int xen_build_id(char **p, unsigned int *len)
++{
++    const Elf_Note *n = __note_gnu_build_id_start;
++    static bool_t checked = 0;
++
++    if ( checked )
++    {
++        *len = n->descsz;
++        *p = ELFNOTE_DESC(n);
++        return 0;
++    }
++    /* --build-id invoked with wrong parameters. */
++    if ( __note_gnu_build_id_end <= __note_gnu_build_id_start )
++        return -ENODATA;
++
++    /* Check for full Note header. */
++    if ( &n[1] > __note_gnu_build_id_end )
++        return -ENODATA;
++
++    /* Check if we really have a build-id. */
++    if ( NT_GNU_BUILD_ID != n->type )
++        return -ENODATA;
++
++    /* Sanity check, name should be "GNU" for ld-generated build-id. */
++    if ( strncmp(ELFNOTE_NAME(n), "GNU", n->namesz) != 0 )
++        return -ENODATA;
++
++    *len = n->descsz;
++    *p = ELFNOTE_DESC(n);
++
++    checked = 1;
++    return 0;
++}
++#else
++int xen_build_id(char **p, unsigned int *len)
++{
++    return -ENODATA;
++}
++#endif
+diff --git a/xen/include/public/version.h b/xen/include/public/version.h
+index 44f26b0..adca602 100644
+--- a/xen/include/public/version.h
++++ b/xen/include/public/version.h
+@@ -30,7 +30,8 @@
+ 
+ #include "xen.h"
+ 
+-/* NB. All ops return zero on success, except XENVER_{version,pagesize} */
++/* NB. All ops return zero on success, except
++ * XENVER_{version,pagesize,build_id} */
+ 
+ /* arg == NULL; returns major:minor (16:16). */
+ #define XENVER_version      0
+@@ -83,6 +84,19 @@ typedef struct xen_feature_info xen_feature_info_t;
+ #define XENVER_commandline 9
+ typedef char xen_commandline_t[1024];
+ 
++/* Return value is the number of bytes written, or XEN_Exx on error.
++ * Calling with empty parameter returns the size of build_id. */
++#define XENVER_build_id 10
++struct xen_build_id {
++        uint32_t        len; /* IN: size of buf[]. */
++#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
++        unsigned char   buf[];
++#elif defined(__GNUC__)
++        unsigned char   buf[1]; /* OUT: Variable length buffer with build_id. */
++#endif
++};
++typedef struct xen_build_id xen_build_id_t;
++
+ #endif /* __XEN_PUBLIC_VERSION_H__ */
+ 
+ /*
+diff --git a/xen/include/xen/version.h b/xen/include/xen/version.h
+index 2015c0b..466c977 100644
+--- a/xen/include/xen/version.h
++++ b/xen/include/xen/version.h
+@@ -13,5 +13,6 @@ const char *xen_extra_version(void);
+ const char *xen_changeset(void);
+ const char *xen_banner(void);
+ const char *xen_deny(void);
++int xen_build_id(char **p, unsigned int *len);
+ 
+ #endif /* __XEN_VERSION_H__ */
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 1cf071e..9e466f0 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -1660,6 +1660,9 @@ static int flask_version_op (uint32_t op)
+     case XENVER_commandline:
+         return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
+                             VERSION__COMMANDLINE, NULL);
++    case XENVER_build_id:
++        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++                            VERSION__BUILD_ID, NULL);
+     default:
+         return -EPERM;
+     }
+diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
+index 68a6b6e..d73b02b 100644
+--- a/xen/xsm/flask/policy/access_vectors
++++ b/xen/xsm/flask/policy/access_vectors
+@@ -522,4 +522,6 @@ class version
+     guest_handle
+ # Xen command line.
+     commandline
++# Build id
++    build_id
+ }
+-- 
+2.4.3
+

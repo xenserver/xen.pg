@@ -1,0 +1,199 @@
+From eae9b251cca358ea19763b2e1d69f089ec9e1052 Mon Sep 17 00:00:00 2001
+From: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date: Fri, 12 Feb 2016 11:33:54 -0500
+Subject: [PATCH 24/26] xsplice: Add hooks functions and other macros
+
+Add hook functions which run during patch apply and patch revert. Hook
+functions are used by xsplice modules to manipulate data structures
+during patching, etc.
+
+Also add macros to be used by modules for excluding functions or
+sections from being included in a patch.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+---
+ docs/misc/xsplice.markdown      | 21 +++++++++++++++++++
+ xen/common/xsplice.c            | 38 ++++++++++++++++++++++++++++++++++
+ xen/include/xen/xsplice_patch.h | 46 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 105 insertions(+)
+
+diff --git a/docs/misc/xsplice.markdown b/docs/misc/xsplice.markdown
+index 1a982f2..d74293a 100644
+--- a/docs/misc/xsplice.markdown
++++ b/docs/misc/xsplice.markdown
+@@ -290,6 +290,12 @@ The payload contains at least three sections:
+     depends on.
+  *  `.note.gnu.build-id` - the build-id of this payload.
+ 
++It optionally may contain the address of functions to be called right before
++being applied and reverted:
++
++ * `.xsplice.hooks.load` - an array of function pointers.
++ * `.xsplice.hooks.unload` - an array of function pointers.
++
+ ### .xsplice.funcs
+ 
+ The `.xsplice.funcs` contains an array of xsplice_patch_func structures
+@@ -387,6 +393,21 @@ checksum, MD5 checksum or any unique value.
+ 
+ The size of these structures varies with the --build-id linker option.
+ 
++### .xsplice.hooks.load and .xsplice.hooks.unload
++
++This section contains an array of function pointers to be executed
++before payload is being applied (.xsplice.funcs) or after reverting
++the payload.
++
++Each entry in this array is eight bytes.
++
++The type definition of the function are as follow:
++
++<pre>
++typedef void (*xsplice_loadcall_t)(void);  
++typedef void (*xsplice_unloadcall_t)(void);   
++</pre>
++
+ ## Hypercalls
+ 
+ We will employ the sub operations of the system management hypercall (sysctl).
+diff --git a/xen/common/xsplice.c b/xen/common/xsplice.c
+index fca6715..1fe8fde 100644
+--- a/xen/common/xsplice.c
++++ b/xen/common/xsplice.c
+@@ -20,6 +20,7 @@
+ #include <xen/wait.h>
+ #include <xen/xsplice_elf.h>
+ #include <xen/xsplice.h>
++#include <xen/xsplice_patch.h>
+ 
+ #include <asm/event.h>
+ #include <asm/nmi.h>
+@@ -46,10 +47,15 @@ struct payload {
+     struct list_head applied_list;       /* Linked to 'applied_list'. */
+     struct xsplice_patch_func *funcs;    /* The array of functions to patch. */
+     unsigned int nfuncs;                 /* Nr of functions to patch. */
++    xsplice_loadcall_t *load_funcs;      /* The array of funcs to call after */
++    xsplice_unloadcall_t *unload_funcs;  /* load and unload of the payload. */
++    unsigned int n_load_funcs;           /* Nr of the funcs to load and execute. */
++    unsigned int n_unload_funcs;         /* Nr of funcs to call durung unload. */
+     size_t core_size;                    /* Everything else - .data,.rodata, etc. */
+     size_t core_text_size;               /* Only .text size. */
+     struct bug_frame *start_bug_frames[BUGFRAME_NR]; /* .bug.frame patching. */
+     struct bug_frame *stop_bug_frames[BUGFRAME_NR];
++
+ #ifdef CONFIG_X86
+     struct exception_table_entry *start_ex_table;
+     struct exception_table_entry *stop_ex_table;
+@@ -744,6 +750,28 @@ static int find_special_sections(struct payload *payload,
+         }
+     }
+ 
++    sec = xsplice_elf_sec_by_name(elf, ".xsplice.hooks.load");
++    if ( sec )
++    {
++        if ( ( !sec->sec->sh_size ) ||
++             ( sec->sec->sh_size % sizeof (*payload->load_funcs) ) )
++            return -EINVAL;
++
++        payload->load_funcs = (xsplice_loadcall_t *)sec->load_addr;
++        payload->n_load_funcs = sec->sec->sh_size / (sizeof *payload->load_funcs);
++    }
++
++    sec = xsplice_elf_sec_by_name(elf, ".xsplice.hooks.unload");
++    if ( sec )
++    {
++        if ( ( !sec->sec->sh_size ) ||
++             ( sec->sec->sh_size % sizeof (*payload->unload_funcs) ) )
++            return -EINVAL;
++
++        payload->unload_funcs = (xsplice_unloadcall_t *)sec->load_addr;
++        payload->n_unload_funcs = sec->sec->sh_size / (sizeof *payload->unload_funcs);
++    }
++
+     sec = xsplice_elf_sec_by_name(elf, ".note.gnu.build-id");
+     if ( sec )
+     {
+@@ -1028,6 +1056,11 @@ static int apply_payload(struct payload *data)
+     for ( i = 0; i < data->nfuncs; i++ )
+         xsplice_apply_jmp(data->funcs + i);
+ 
++    spin_debug_disable();
++    for (i = 0; i < data->n_load_funcs; i++)
++        data->load_funcs[i]();
++    spin_debug_enable();
++
+     list_add_tail(&data->applied_list, &applied_list);
+ 
+     return 0;
+@@ -1058,6 +1091,11 @@ static int revert_payload(struct payload *data)
+     for ( i = 0; i < data->nfuncs; i++ )
+         xsplice_revert_jmp(data->funcs + i);
+ 
++    spin_debug_disable();
++    for (i = 0; i < data->n_unload_funcs; i++)
++        data->unload_funcs[i]();
++    spin_debug_enable();
++
+     list_del(&data->applied_list);
+ 
+     return 0;
+diff --git a/xen/include/xen/xsplice_patch.h b/xen/include/xen/xsplice_patch.h
+index e3f344b..1450406 100644
+--- a/xen/include/xen/xsplice_patch.h
++++ b/xen/include/xen/xsplice_patch.h
+@@ -5,6 +5,52 @@
+  * The following definitions are to be used in patches. They are taken
+  * from kpatch.
+  */
++typedef void (*xsplice_loadcall_t)(void);
++typedef void (*xsplice_unloadcall_t)(void);
++
++/* This definition is taken from Linux. */
++#define __UNIQUE_ID(prefix) __PASTE(__PASTE(__UNIQUE_ID_, prefix), __COUNTER__)
++/*
++ * XSPLICE_IGNORE_SECTION macro
++ *
++ * This macro is for ignoring sections that may change as a side effect of
++ * another change or might be a non-bundlable section; that is one that does
++ * not honor -ffunction-section and create a one-to-one relation from function
++ * symbol to section.
++ */
++#define XSPLICE_IGNORE_SECTION(_sec) \
++	char *__UNIQUE_ID(xsplice_ignore_section_) __section(".xsplice.ignore.sections") = _sec;
++
++/*
++ * XSPLICE_IGNORE_FUNCTION macro
++ *
++ * This macro is for ignoring functions that may change as a side effect of a
++ * change in another function.
++ */
++#define XSPLICE_IGNORE_FUNCTION(_fn) \
++	void *__xsplice_ignore_func_##_fn __section(".xsplice.ignore.functions") = _fn;
++
++/*
++ * XSPLICE_LOAD_HOOK macro
++ *
++ * Declares a function pointer to be allocated in a new
++ * .xsplice.hook.load section.  This xsplice_load_data symbol is later
++ * stripped by create-diff-object so that it can be declared in multiple
++ * objects that are later linked together, avoiding global symbol
++ * collision.  Since multiple hooks can be registered, the
++ * .xsplice.hook.load section is a table of functions that will be
++ * executed in series by the xsplice infrastructure at patch load time.
++ */
++#define XSPLICE_LOAD_HOOK(_fn) \
++	xsplice_loadcall_t __attribute__((weak)) xsplice_load_data __section(".xsplice.hooks.load") = _fn;
++
++/*
++ * XSPLICE_UNLOAD_HOOK macro
++ *
++ * Same as LOAD hook with s/load/unload/
++ */
++#define XSPLICE_UNLOAD_HOOK(_fn) \
++	xsplice_unloadcall_t __attribute__((weak)) xsplice_unload_data __section(".xsplice.hooks.unload") = _fn;
+ 
+ /*
+  * xsplice shadow variables
+-- 
+2.4.3
+

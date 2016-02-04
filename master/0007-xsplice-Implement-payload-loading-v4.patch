@@ -1,0 +1,688 @@
+From 2c98bd0656006abf5c8f393562abc300e409a629 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Wed, 10 Feb 2016 10:30:30 -0500
+Subject: [PATCH 07/26] xsplice: Implement payload loading (v4)
+
+Add support for loading xsplice payloads. This is somewhat similar to
+the Linux kernel module loader, implementing the following steps:
+- Verify the elf file.
+- Parse the elf file.
+- Allocate a region of memory mapped within a free area of
+  [xen_virt_end, XEN_VIRT_END].
+- Copy allocated sections into the new region.
+- Resolve section symbols. All other symbols must be absolute addresses.
+- Perform relocations.
+
+Note that the structure 'xsplice_patch_func' differs a bit from the design
+by usurping 8 bytes from the padding. We use that for our own uses.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+---
+v2: - Change the 'xsplice_patch_func' structure layout/size.
+    - Add more error checking. Fix memory leak.
+    - Move elf_resolve and elf_perform relocs in elf file.
+    - Print the payload address and pages in keyhandler.
+v3:
+    - Make it build under ARM
+    - Build it without using the return_ macro.
+    - Add fixes from Ross.
+v4:
+    - Add the _return macro back - but only use it during debug builds.
+---
+ xen/arch/arm/Makefile             |   1 +
+ xen/arch/arm/xsplice.c            |  23 ++++
+ xen/arch/x86/Makefile             |   1 +
+ xen/arch/x86/setup.c              |   7 ++
+ xen/arch/x86/xsplice.c            | 113 ++++++++++++++++++
+ xen/common/xsplice.c              | 243 +++++++++++++++++++++++++++++++++++++-
+ xen/common/xsplice_elf.c          |  84 +++++++++++++
+ xen/include/asm-x86/x86_64/page.h |   2 +
+ xen/include/xen/xsplice.h         |  12 ++
+ xen/include/xen/xsplice_elf.h     |   5 +
+ 10 files changed, 489 insertions(+), 2 deletions(-)
+ create mode 100644 xen/arch/arm/xsplice.c
+ create mode 100644 xen/arch/x86/xsplice.c
+
+diff --git a/xen/arch/arm/Makefile b/xen/arch/arm/Makefile
+index 1ef39f7..f785c07 100644
+--- a/xen/arch/arm/Makefile
++++ b/xen/arch/arm/Makefile
+@@ -39,6 +39,7 @@ obj-y += device.o
+ obj-y += decode.o
+ obj-y += processor.o
+ obj-y += smc.o
++obj-y += xsplice.o
+ 
+ #obj-bin-y += ....o
+ 
+diff --git a/xen/arch/arm/xsplice.c b/xen/arch/arm/xsplice.c
+new file mode 100644
+index 0000000..8d85fa9
+--- /dev/null
++++ b/xen/arch/arm/xsplice.c
+@@ -0,0 +1,23 @@
++#include <xen/lib.h>
++#include <xen/errno.h>
++#include <xen/xsplice_elf.h>
++#include <xen/xsplice.h>
++
++int xsplice_verify_elf(uint8_t *data, ssize_t len)
++{
++    return -ENOSYS;
++}
++
++int xsplice_perform_rel(struct xsplice_elf *elf,
++                        struct xsplice_elf_sec *base,
++                        struct xsplice_elf_sec *rela)
++{
++    return -ENOSYS;
++}
++
++int xsplice_perform_rela(struct xsplice_elf *elf,
++                         struct xsplice_elf_sec *base,
++                         struct xsplice_elf_sec *rela)
++{
++    return -ENOSYS;
++}
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index 3f92806..9dc7665 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -64,6 +64,7 @@ obj-y += tboot.o
+ obj-y += hpet.o
+ obj-y += vm_event.o
+ obj-y += xstate.o
++obj-y += xsplice.o
+ 
+ obj-$(crash_debug) += gdbstub.o
+ 
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 4343a02..4dfe8cf 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -100,6 +100,9 @@ unsigned long __read_mostly xen_phys_start;
+ 
+ unsigned long __read_mostly xen_virt_end;
+ 
++unsigned long __read_mostly module_virt_start;
++unsigned long __read_mostly module_virt_end;
++
+ DEFINE_PER_CPU(struct tss_struct, init_tss);
+ 
+ char __section(".bss.stack_aligned") cpu0_stack[STACK_SIZE];
+@@ -1164,6 +1167,10 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+                    ~((1UL << L2_PAGETABLE_SHIFT) - 1);
+     destroy_xen_mappings(xen_virt_end, XEN_VIRT_START + BOOTSTRAP_MAP_BASE);
+ 
++    module_virt_start = xen_virt_end;
++    module_virt_end = XEN_VIRT_END - NR_CPUS * PAGE_SIZE;
++    BUG_ON(module_virt_end <= module_virt_start);
++
+     memguard_init();
+ 
+     nr_pages = 0;
+diff --git a/xen/arch/x86/xsplice.c b/xen/arch/x86/xsplice.c
+new file mode 100644
+index 0000000..814dd52
+--- /dev/null
++++ b/xen/arch/x86/xsplice.c
+@@ -0,0 +1,113 @@
++#include <xen/errno.h>
++#include <xen/lib.h>
++#include <xen/xsplice_elf.h>
++#include <xen/xsplice.h>
++
++#ifdef NDEBUG
++#define return_(x) return x
++#else
++#define return_(x) { printk(XENLOG_DEBUG "%s:%d rc: %d\n",  \
++                            __func__,__LINE__, x); return x; }
++#endif
++
++int xsplice_verify_elf(struct xsplice_elf *elf, uint8_t *data)
++{
++
++    Elf_Ehdr *hdr = (Elf_Ehdr *)data;
++
++    if ( elf->len < (sizeof *hdr) ||
++         !IS_ELF(*hdr) ||
++         hdr->e_ident[EI_CLASS] != ELFCLASS64 ||
++         hdr->e_ident[EI_DATA] != ELFDATA2LSB ||
++         hdr->e_ident[EI_OSABI] != ELFOSABI_SYSV ||
++         hdr->e_machine != EM_X86_64 ||
++         hdr->e_type != ET_REL ||
++         hdr->e_phnum != 0 )
++    {
++        printk(XENLOG_ERR "%s: Invalid ELF file.\n", elf->name);
++        return -EOPNOTSUPP;
++    }
++
++    return 0;
++}
++
++int xsplice_perform_rel(struct xsplice_elf *elf,
++                        struct xsplice_elf_sec *base,
++                        struct xsplice_elf_sec *rela)
++{
++    printk(XENLOG_ERR "%s: SHR_REL relocation unsupported\n", elf->name);
++    return -ENOSYS;
++}
++
++int xsplice_perform_rela(struct xsplice_elf *elf,
++                         struct xsplice_elf_sec *base,
++                         struct xsplice_elf_sec *rela)
++{
++    Elf_RelA *r;
++    unsigned int symndx, i;
++    uint64_t val;
++    uint8_t *dest;
++
++    if ( !rela->sec->sh_entsize || !rela->sec->sh_size )
++        return_(-EINVAL);
++
++    if ( rela->sec->sh_entsize != sizeof(Elf_RelA) )
++        return_(-EINVAL);
++
++    for ( i = 0; i < (rela->sec->sh_size / rela->sec->sh_entsize); i++ )
++    {
++        r = (Elf_RelA *)(rela->data + i * rela->sec->sh_entsize);
++        if ( (unsigned long)r > (unsigned long)(elf->hdr + elf->len) )
++            return_(-EINVAL);
++
++        symndx = ELF64_R_SYM(r->r_info);
++        if ( symndx > elf->nsym )
++            return_(-EINVAL);
++
++        dest = base->load_addr + r->r_offset;
++        val = r->r_addend + elf->sym[symndx].sym->st_value;
++
++        switch ( ELF64_R_TYPE(r->r_info) )
++        {
++            case R_X86_64_NONE:
++                break;
++            case R_X86_64_64:
++                *(uint64_t *)dest = val;
++                break;
++            case R_X86_64_32:
++                *(uint32_t *)dest = val;
++                if (val != *(uint32_t *)dest)
++                    goto overflow;
++                break;
++            case R_X86_64_32S:
++                *(int32_t *)dest = val;
++                if ((int64_t)val != *(int32_t *)dest)
++                    goto overflow;
++                break;
++            case R_X86_64_PLT32:
++                /*
++                 * Xen uses -fpic which normally uses PLT relocations
++                 * except that it sets visibility to hidden which means
++                 * that they are not used.  However, when gcc cannot
++                 * inline memcpy it emits memcpy with default visibility
++                 * which then creates a PLT relocation.  It can just be
++                 * treated the same as R_X86_64_PC32.
++                 */
++                /* Fall through */
++            case R_X86_64_PC32:
++                *(uint32_t *)dest = val - (uint64_t)dest;
++                break;
++            default:
++                printk(XENLOG_ERR "%s: Unhandled relocation %lu\n",
++                       elf->name, ELF64_R_TYPE(r->r_info));
++                return -EINVAL;
++        }
++    }
++
++    return 0;
++
++ overflow:
++    printk(XENLOG_ERR "%s: Overflow in relocation %d in %s for %s\n",
++           elf->name, i, rela->name, base->name);
++    return -EOVERFLOW;
++}
+diff --git a/xen/common/xsplice.c b/xen/common/xsplice.c
+index c7edd37..d0b7206 100644
+--- a/xen/common/xsplice.c
++++ b/xen/common/xsplice.c
+@@ -11,6 +11,7 @@
+ #include <xen/sched.h>
+ #include <xen/smp.h>
+ #include <xen/spinlock.h>
++#include <xen/xsplice_elf.h>
+ #include <xen/xsplice.h>
+ 
+ #include <asm/event.h>
+@@ -26,9 +27,15 @@ struct payload {
+     int32_t state;                       /* One of the XSPLICE_STATE_*. */
+     int32_t rc;                          /* 0 or -XEN_EXX. */
+     struct list_head list;               /* Linked to 'payload_list'. */
++    void *payload_address;               /* Virtual address mapped. */
++    size_t payload_pages;                /* Nr of the pages. */
++
+     char name[XEN_XSPLICE_NAME_SIZE + 1];/* Name of it. */
+ };
+ 
++static int load_payload_data(struct payload *payload, uint8_t *raw, ssize_t len);
++static void free_payload_data(struct payload *payload);
++
+ static const char *state2str(int32_t state)
+ {
+ #define STATE(x) [XSPLICE_STATE_##x] = #x
+@@ -58,8 +65,9 @@ static void xsplice_printall(unsigned char key)
+     spin_lock(&payload_lock);
+ 
+     list_for_each_entry ( data, &payload_list, list )
+-        printk(" name=%s state=%s(%d)\n", data->name,
+-               state2str(data->state), data->state);
++        printk(" name=%s state=%s(%d) %p using %zu pages.\n", data->name,
++               state2str(data->state), data->state, data->payload_address,
++               data->payload_pages);
+ 
+     spin_unlock(&payload_lock);
+ }
+@@ -136,6 +144,7 @@ static void free_payload(struct payload *data)
+     list_del(&data->list);
+     payload_cnt--;
+     payload_version++;
++    free_payload_data(data);
+     xfree(data);
+ }
+ 
+@@ -174,6 +183,10 @@ static int xsplice_upload(xen_sysctl_xsplice_upload_t *upload)
+     if ( copy_from_guest(raw_data, upload->payload, upload->size) )
+         goto err_raw;
+ 
++    rc = load_payload_data(data, raw_data, upload->size);
++    if ( rc )
++        goto err_raw;
++
+     data->state = XSPLICE_STATE_LOADED;
+     data->rc = 0;
+     INIT_LIST_HEAD(&data->list);
+@@ -378,6 +391,232 @@ int xsplice_control(xen_sysctl_xsplice_op_t *xsplice)
+     return rc;
+ }
+ 
++#ifdef CONFIG_X86
++static void find_hole(ssize_t pages, unsigned long *hole_start,
++                      unsigned long *hole_end)
++{
++    struct payload *data, *data2;
++
++    spin_lock(&payload_lock);
++    list_for_each_entry ( data, &payload_list, list )
++    {
++        list_for_each_entry ( data2, &payload_list, list )
++        {
++            unsigned long start, end;
++
++            start = (unsigned long)data2->payload_address;
++            end = start + data2->payload_pages * PAGE_SIZE;
++            if ( *hole_end > start && *hole_start < end )
++            {
++                *hole_start = end;
++                *hole_end = *hole_start + pages * PAGE_SIZE;
++                break;
++            }
++        }
++        if ( &data2->list == &payload_list )
++            break;
++    }
++    spin_unlock(&payload_lock);
++}
++
++/*
++ * The following functions prepare an xSplice payload to be executed by
++ * allocating space, loading the allocated sections, resolving symbols,
++ * performing relocations, etc.
++ */
++static void *alloc_payload(size_t size)
++{
++    mfn_t *mfn, *mfn_ptr;
++    size_t pages, i;
++    struct page_info *pg;
++    unsigned long hole_start, hole_end, cur;
++
++    ASSERT(size);
++
++    /*
++     * Copied from vmalloc which allocates pages and then maps them to an
++     * arbitrary virtual address with PAGE_HYPERVISOR. We need specific
++     * virtual address with PAGE_HYPERVISOR_RWX.
++     */
++    pages = PFN_UP(size);
++    mfn = xmalloc_array(mfn_t, pages);
++    if ( mfn == NULL )
++        return NULL;
++
++    for ( i = 0; i < pages; i++ )
++    {
++        pg = alloc_domheap_page(NULL, 0);
++        if ( pg == NULL )
++            goto error;
++        mfn[i] = _mfn(page_to_mfn(pg));
++    }
++
++    hole_start = (unsigned long)module_virt_start;
++    hole_end = hole_start + pages * PAGE_SIZE;
++    find_hole(pages, &hole_start, &hole_end);
++
++    if ( hole_end >= module_virt_end )
++        goto error;
++
++    for ( cur = hole_start, mfn_ptr = mfn; pages--; ++mfn_ptr, cur += PAGE_SIZE )
++    {
++        if ( map_pages_to_xen(cur, mfn_x(*mfn_ptr), 1, PAGE_HYPERVISOR_RWX) )
++        {
++            if ( cur != hole_start )
++                destroy_xen_mappings(hole_start, cur);
++            goto error;
++        }
++    }
++    xfree(mfn);
++    return (void *)hole_start;
++
++ error:
++    while ( i-- )
++        free_domheap_page(mfn_to_page(mfn_x(mfn[i])));
++    xfree(mfn);
++    return NULL;
++}
++#else
++static void *alloc_payload(size_t size)
++{
++    return NULL;
++}
++#endif
++
++static void free_payload_data(struct payload *payload)
++{
++    unsigned int i;
++    struct page_info *pg;
++    PAGE_LIST_HEAD(pg_list);
++    void *va = payload->payload_address;
++    unsigned long addr = (unsigned long)va;
++
++    if ( !va )
++        return;
++
++    payload->payload_address = NULL;
++
++    for ( i = 0; i < payload->payload_pages; i++ )
++        page_list_add(vmap_to_page(va + i * PAGE_SIZE), &pg_list);
++
++    destroy_xen_mappings(addr, addr + payload->payload_pages * PAGE_SIZE);
++
++    while ( (pg = page_list_remove_head(&pg_list)) != NULL )
++        free_domheap_page(pg);
++
++    payload->payload_pages = 0;
++}
++
++static void calc_section(struct xsplice_elf_sec *sec, size_t *size)
++{
++    size_t align_size = ROUNDUP(*size, sec->sec->sh_addralign);
++    sec->sec->sh_entsize = align_size;
++    *size = sec->sec->sh_size + align_size;
++}
++
++static int move_payload(struct payload *payload, struct xsplice_elf *elf)
++{
++    uint8_t *buf;
++    unsigned int i;
++    size_t size = 0;
++
++    /* Compute text regions */
++    for ( i = 0; i < elf->hdr->e_shnum; i++ )
++    {
++        if ( (elf->sec[i].sec->sh_flags & (SHF_ALLOC|SHF_EXECINSTR)) ==
++             (SHF_ALLOC|SHF_EXECINSTR) )
++            calc_section(&elf->sec[i], &size);
++    }
++
++    /* Compute rw data */
++    for ( i = 0; i < elf->hdr->e_shnum; i++ )
++    {
++        if ( (elf->sec[i].sec->sh_flags & SHF_ALLOC) &&
++             !(elf->sec[i].sec->sh_flags & SHF_EXECINSTR) &&
++             (elf->sec[i].sec->sh_flags & SHF_WRITE) )
++            calc_section(&elf->sec[i], &size);
++    }
++
++    /* Compute ro data */
++    for ( i = 0; i < elf->hdr->e_shnum; i++ )
++    {
++        if ( (elf->sec[i].sec->sh_flags & SHF_ALLOC) &&
++             !(elf->sec[i].sec->sh_flags & SHF_EXECINSTR) &&
++             !(elf->sec[i].sec->sh_flags & SHF_WRITE) )
++            calc_section(&elf->sec[i], &size);
++    }
++
++    buf = alloc_payload(size);
++    if ( !buf ) {
++        printk(XENLOG_ERR "%s: Could not allocate memory for module\n",
++               elf->name);
++        return -ENOMEM;
++    }
++    memset(buf, 0, size);
++
++    for ( i = 0; i < elf->hdr->e_shnum; i++ )
++    {
++        if ( elf->sec[i].sec->sh_flags & SHF_ALLOC )
++        {
++            elf->sec[i].load_addr = buf + elf->sec[i].sec->sh_entsize;
++            /* Don't copy NOBITS - such as BSS. */
++            if ( elf->sec[i].sec->sh_type != SHT_NOBITS )
++            {
++                memcpy(elf->sec[i].load_addr, elf->sec[i].data,
++                       elf->sec[i].sec->sh_size);
++                printk(XENLOG_DEBUG "%s: Loaded %s at 0x%p\n",
++                       elf->name, elf->sec[i].name, elf->sec[i].load_addr);
++            }
++        }
++    }
++
++    payload->payload_address = buf;
++    payload->payload_pages = PFN_UP(size);
++
++    return 0;
++}
++
++static int load_payload_data(struct payload *payload, uint8_t *raw, ssize_t len)
++{
++    struct xsplice_elf elf;
++    int rc = 0;
++
++    memset(&elf, 0, sizeof(elf));
++    elf.name = payload->name;
++    elf.len = len;
++
++    rc = xsplice_verify_elf(&elf, raw);
++    if ( rc )
++        return rc;
++
++    rc = xsplice_elf_load(&elf, raw);
++    if ( rc )
++        goto err_elf;
++
++    rc = move_payload(payload, &elf);
++    if ( rc )
++        goto err_elf;
++
++    rc = xsplice_elf_resolve_symbols(&elf);
++    if ( rc )
++        goto err_payload;
++
++    rc = xsplice_elf_perform_relocs(&elf);
++    if ( rc )
++        goto err_payload;
++
++    /* Free our temporary data structure. */
++    xsplice_elf_free(&elf);
++    return 0;
++
++ err_payload:
++    free_payload_data(payload);
++ err_elf:
++    xsplice_elf_free(&elf);
++
++    return rc;
++}
++
+ static struct keyhandler xsplice_keyhandler = {
+     .diagnostic = 1,
+     .u.fn = xsplice_printall,
+diff --git a/xen/common/xsplice_elf.c b/xen/common/xsplice_elf.c
+index d9f9002..0717263 100644
+--- a/xen/common/xsplice_elf.c
++++ b/xen/common/xsplice_elf.c
+@@ -203,3 +203,87 @@ void xsplice_elf_free(struct xsplice_elf *elf)
+     elf->name = NULL;
+     elf->len = 0;
+ }
++
++int xsplice_elf_resolve_symbols(struct xsplice_elf *elf)
++{
++    unsigned int i;
++
++    /*
++     * The first entry of an ELF symbol table is the "undefined symbol index".
++     * aka reserved so we skip it.
++     */
++    ASSERT( elf->sym );
++    for ( i = 1; i < elf->nsym; i++ )
++    {
++        switch ( elf->sym[i].sym->st_shndx )
++        {
++            case SHN_COMMON:
++                printk(XENLOG_ERR "%s: Unexpected common symbol: %s\n",
++                       elf->name, elf->sym[i].name);
++                return_(-EINVAL);
++                break;
++            case SHN_UNDEF:
++                printk(XENLOG_ERR "%s: Unknown symbol: %s\n", elf->name,
++                       elf->sym[i].name);
++                return_(-ENOENT);
++                break;
++            case SHN_ABS:
++                printk(XENLOG_DEBUG "%s: Absolute symbol: %s => 0x%p\n",
++                      elf->name, elf->sym[i].name,
++                      (void *)elf->sym[i].sym->st_value);
++                break;
++            default:
++                if ( elf->sec[elf->sym[i].sym->st_shndx].sec->sh_flags & SHF_ALLOC )
++                {
++                    elf->sym[i].sym->st_value +=
++                        (unsigned long)elf->sec[elf->sym[i].sym->st_shndx].load_addr;
++                    printk(XENLOG_DEBUG "%s: Symbol resolved: %s => 0x%p\n",
++                           elf->name, elf->sym[i].name,
++                           (void *)elf->sym[i].sym->st_value);
++                }
++        }
++    }
++
++    return 0;
++}
++
++int xsplice_elf_perform_relocs(struct xsplice_elf *elf)
++{
++    struct xsplice_elf_sec *rela, *base;
++    unsigned int i;
++    int rc;
++
++    /*
++     * The first entry of an ELF symbol table is the "undefined symbol index".
++     * aka reserved so we skip it.
++     */
++    ASSERT( elf->sym );
++    for ( i = 1; i < elf->hdr->e_shnum; i++ )
++    {
++        rela = &elf->sec[i];
++
++        if ( (rela->sec->sh_type != SHT_RELA ) &&
++             (rela->sec->sh_type != SHT_REL ) )
++            continue;
++
++         /* Is it a valid relocation section? */
++         if ( rela->sec->sh_info >= elf->hdr->e_shnum )
++            continue;
++
++         base = &elf->sec[rela->sec->sh_info];
++
++         /* Don't relocate non-allocated sections. */
++         if ( !(base->sec->sh_flags & SHF_ALLOC) )
++            continue;
++
++        if ( elf->sec[i].sec->sh_type == SHT_RELA )
++            rc = xsplice_perform_rela(elf, base, rela);
++        else /* SHT_REL */
++            rc = xsplice_perform_rel(elf, base, rela);
++
++        if ( rc )
++            return rc;
++    }
++
++    return 0;
++}
+diff --git a/xen/include/asm-x86/x86_64/page.h b/xen/include/asm-x86/x86_64/page.h
+index 19ab4d0..e6f08e9 100644
+--- a/xen/include/asm-x86/x86_64/page.h
++++ b/xen/include/asm-x86/x86_64/page.h
+@@ -38,6 +38,8 @@
+ #include <xen/pdx.h>
+ 
+ extern unsigned long xen_virt_end;
++extern unsigned long module_virt_start;
++extern unsigned long module_virt_end;
+ 
+ #define spage_to_pdx(spg) (((spg) - spage_table)<<(SUPERPAGE_SHIFT-PAGE_SHIFT))
+ #define pdx_to_spage(pdx) (spage_table + ((pdx)>>(SUPERPAGE_SHIFT-PAGE_SHIFT)))
+diff --git a/xen/include/xen/xsplice.h b/xen/include/xen/xsplice.h
+index 37955b4..b90742f 100644
+--- a/xen/include/xen/xsplice.h
++++ b/xen/include/xen/xsplice.h
+@@ -1,7 +1,19 @@
+ #ifndef __XEN_XSPLICE_H__
+ #define __XEN_XSPLICE_H__
+ 
++struct xsplice_elf;
++struct xsplice_elf_sec;
++struct xsplice_elf_sym;
+ struct xen_sysctl_xsplice_op;
+ 
+ int xsplice_control(struct xen_sysctl_xsplice_op *);
++
++/* Arch hooks */
++int xsplice_verify_elf(struct xsplice_elf *elf, uint8_t *data);
++int xsplice_perform_rel(struct xsplice_elf *elf,
++                        struct xsplice_elf_sec *base,
++                        struct xsplice_elf_sec *rela);
++int xsplice_perform_rela(struct xsplice_elf *elf,
++                         struct xsplice_elf_sec *base,
++                         struct xsplice_elf_sec *rela);
+ #endif /* __XEN_XSPLICE_H__ */
+diff --git a/xen/include/xen/xsplice_elf.h b/xen/include/xen/xsplice_elf.h
+index 42dbc6f..229c11f 100644
+--- a/xen/include/xen/xsplice_elf.h
++++ b/xen/include/xen/xsplice_elf.h
+@@ -11,6 +11,8 @@ struct xsplice_elf_sec {
+                                       elf_resolve_section_names. */
+     const uint8_t *data;           /* Pointer to the section (done by
+                                       elf_resolve_sections). */
++    uint8_t *load_addr;            /* A pointer to the allocated destination.
++                                      Done by load_payload_data. */
+ };
+ 
+ struct xsplice_elf_sym {
+@@ -34,4 +36,7 @@ struct xsplice_elf_sec *xsplice_elf_sec_by_name(const struct xsplice_elf *elf,
+ int xsplice_elf_load(struct xsplice_elf *elf, uint8_t *data);
+ void xsplice_elf_free(struct xsplice_elf *elf);
+ 
++int xsplice_elf_resolve_symbols(struct xsplice_elf *elf);
++int xsplice_elf_perform_relocs(struct xsplice_elf *elf);
++
+ #endif /* __XEN_XSPLICE_ELF_H__ */
+-- 
+2.4.3
+

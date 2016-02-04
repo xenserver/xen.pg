@@ -1,0 +1,301 @@
+From 52cf1feafcfb586a6777c87cfca71159fd08b6bc Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Mon, 21 Dec 2015 11:16:23 -0500
+Subject: [PATCH 06/26] xsplice: Add helper elf routines (v4)
+
+Add Elf routines and data structures in preparation for loading an
+xSplice payload.
+
+We also add an macro that will print where we failed during
+the ELF parsing - which is only available during debug builds.
+In production (debug=n) we only return the error value.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+---
+v2: - With the #define ELFSIZE in the ARM file we can use the common
+     #defines instead of using #ifdef CONFIG_ARM_32. Moved to another
+    patch.
+    - Add checks for ELF file.
+    - Add name to be printed.
+    - Add len for easier ELF checks.
+    - Expand on the checks. Add macro.
+v3: Remove the return_ macro
+v4: Add return_ macro back but make it depend on debug=y
+---
+ xen/common/Makefile           |   1 +
+ xen/common/xsplice_elf.c      | 205 ++++++++++++++++++++++++++++++++++++++++++
+ xen/include/xen/xsplice_elf.h |  37 ++++++++
+ 3 files changed, 243 insertions(+)
+ create mode 100644 xen/common/xsplice_elf.c
+ create mode 100644 xen/include/xen/xsplice_elf.h
+
+diff --git a/xen/common/Makefile b/xen/common/Makefile
+index 5512d1b..da47cfa 100644
+--- a/xen/common/Makefile
++++ b/xen/common/Makefile
+@@ -57,6 +57,7 @@ obj-y += vsprintf.o
+ obj-y += wait.o
+ obj-y += xmalloc_tlsf.o
+ obj-y += xsplice.o
++obj-y += xsplice_elf.o
+ 
+ obj-bin-$(CONFIG_X86) += $(foreach n,decompress bunzip2 unxz unlzma unlzo unlz4 earlycpio,$(n).init.o)
+ 
+diff --git a/xen/common/xsplice_elf.c b/xen/common/xsplice_elf.c
+new file mode 100644
+index 0000000..d9f9002
+--- /dev/null
++++ b/xen/common/xsplice_elf.c
+@@ -0,0 +1,205 @@
++#include <xen/errno.h>
++#include <xen/lib.h>
++#include <xen/xsplice_elf.h>
++#include <xen/xsplice.h>
++
++#ifdef NDEBUG
++#define return_(x) return x
++#else
++#define return_(x) { printk(XENLOG_DEBUG "%s:%d rc: %d\n",  \
++                            __func__,__LINE__, x); return x; }
++#endif
++
++struct xsplice_elf_sec *xsplice_elf_sec_by_name(const struct xsplice_elf *elf,
++                                                const char *name)
++{
++    unsigned int i;
++
++    for ( i = 0; i < elf->hdr->e_shnum; i++ )
++    {
++        if ( !strcmp(name, elf->sec[i].name) )
++            return &elf->sec[i];
++    }
++
++    return NULL;
++}
++
++static int elf_resolve_sections(struct xsplice_elf *elf, uint8_t *data)
++{
++    struct xsplice_elf_sec *sec;
++    unsigned int i;
++
++    sec = xmalloc_array(struct xsplice_elf_sec, elf->hdr->e_shnum);
++    if ( !sec )
++    {
++        printk(XENLOG_ERR "Could not allocate memory for section table!\n");
++        return_(-ENOMEM);
++    }
++
++    /* N.B. We also will ingest SHN_UNDEF sections. */
++    for ( i = 0; i < elf->hdr->e_shnum; i++ )
++    {
++        ssize_t delta = elf->hdr->e_shoff + i * elf->hdr->e_shentsize;
++
++        if ( delta + sizeof(Elf_Shdr) > elf->len )
++            return_(-EINVAL);
++
++        sec[i].sec = (Elf_Shdr *)(data + delta);
++        delta = sec[i].sec->sh_offset;
++
++        if ( delta > elf->len )
++            return_(-EINVAL);
++
++        sec[i].data = data + delta;
++        /* Name is populated in xsplice_elf_sections_name. */
++        sec[i].name = NULL;
++
++        if ( sec[i].sec->sh_type == SHT_SYMTAB )
++        {
++                if ( elf->symtab )
++                    return_(-EINVAL);
++                elf->symtab = &sec[i];
++                /* elf->symtab->sec->sh_link would point to the right section
++                 * but we hadn't finished parsing all the sections. */
++                if ( elf->symtab->sec->sh_link > elf->hdr->e_shnum )
++                    return_(-EINVAL);
++        }
++    }
++    elf->sec = sec;
++    if ( !elf->symtab )
++        return_(-EINVAL);
++
++    /* There can be multiple SHT_STRTAB so pick the right one. */
++    elf->strtab = &sec[elf->symtab->sec->sh_link];
++
++    if ( elf->symtab->sec->sh_size == 0 || elf->symtab->sec->sh_entsize == 0 )
++        return_(-EINVAL);
++
++    if ( elf->symtab->sec->sh_entsize != sizeof(Elf_Sym) )
++        return_(-EINVAL);
++
++    return 0;
++}
++
++static int elf_resolve_section_names(struct xsplice_elf *elf, uint8_t *data)
++{
++    const char *shstrtab;
++    unsigned int i;
++    unsigned int offset, delta;
++
++    /* The elf->sec[0 -> e_shnum] structures have been verified by elf_resolve_sections */
++    /* Find file offset for section string table. */
++    offset =  elf->sec[elf->hdr->e_shstrndx].sec->sh_offset;
++
++    if ( offset > elf->len )
++        return_(-EINVAL);
++
++    shstrtab = (const char *)(data + offset);
++
++    /* We could ignore the first as it is reserved.. */
++    for ( i = 0; i < elf->hdr->e_shnum; i++ )
++    {
++        delta = elf->sec[i].sec->sh_name;
++
++        if ( offset + delta > elf->len )
++            return_(-EINVAL);
++
++        elf->sec[i].name = shstrtab + delta;
++    }
++    return 0;
++}
++
++static int elf_get_sym(struct xsplice_elf *elf, uint8_t *data)
++{
++    struct xsplice_elf_sec *symtab_sec, *strtab_sec;
++    struct xsplice_elf_sym *sym;
++    unsigned int i, delta, offset;
++
++    symtab_sec = elf->symtab;
++
++    strtab_sec = elf->strtab;
++
++    /* Pointers arithmetic to get file offset. */
++    offset = strtab_sec->data - data;
++
++    ASSERT( offset == strtab_sec->sec->sh_offset );
++    /* symtab_sec->data was computed in elf_resolve_sections. */
++    ASSERT((symtab_sec->sec->sh_offset + data) == symtab_sec->data );
++
++    /* No need to check values as elf_resolve_sections did it. */
++    elf->nsym = symtab_sec->sec->sh_size / symtab_sec->sec->sh_entsize;
++
++    sym = xmalloc_array(struct xsplice_elf_sym, elf->nsym);
++    if ( !sym )
++    {
++        printk(XENLOG_ERR "%s: Could not allocate memory for symbols\n", elf->name);
++        return_(-ENOMEM);
++    }
++
++    for ( i = 0; i < elf->nsym; i++ )
++    {
++        Elf_Sym *s;
++
++        if ( i * sizeof(Elf_Sym) > elf->len )
++            return_(-EINVAL);
++
++        s = &((Elf_Sym *)symtab_sec->data)[i];
++
++        /* If st->name is STN_UNDEF it is zero, so the check will always be true. */
++        delta = s->st_name;
++        /* Offset has been computed earlier. */
++        if ( offset + delta > elf->len )
++            return_(-EINVAL);
++
++        sym[i].sym = s;
++        if ( s->st_name == STN_UNDEF )
++            sym[i].name = NULL;
++        else
++            sym[i].name = (const char *)data + ( delta + offset );
++    }
++    elf->sym = sym;
++
++    return 0;
++}
++
++int xsplice_elf_load(struct xsplice_elf *elf, uint8_t *data)
++{
++    int rc;
++
++    elf->hdr = (Elf_Ehdr *)data;
++
++    if ( sizeof(*elf->hdr) >= elf->len )
++        return_(-EINVAL);
++
++    if ( elf->hdr->e_shstrndx == SHN_UNDEF )
++        return_(-EINVAL);
++
++    /* Check that section name index is within the sections. */
++    if ( elf->hdr->e_shstrndx > elf->hdr->e_shnum )
++        return_(-EINVAL);
++
++    rc = elf_resolve_sections(elf, data);
++    if ( rc )
++        return rc;
++
++    rc = elf_resolve_section_names(elf, data);
++    if ( rc )
++        return rc;
++
++    rc = elf_get_sym(elf, data);
++    if ( rc )
++        return rc;
++
++    return 0;
++}
++
++void xsplice_elf_free(struct xsplice_elf *elf)
++{
++    xfree(elf->sec);
++    elf->sec = NULL;
++    xfree(elf->sym);
++    elf->sym = NULL;
++    elf->nsym = 0;
++    elf->name = NULL;
++    elf->len = 0;
++}
+diff --git a/xen/include/xen/xsplice_elf.h b/xen/include/xen/xsplice_elf.h
+new file mode 100644
+index 0000000..42dbc6f
+--- /dev/null
++++ b/xen/include/xen/xsplice_elf.h
+@@ -0,0 +1,37 @@
++#ifndef __XEN_XSPLICE_ELF_H__
++#define __XEN_XSPLICE_ELF_H__
++
++#include <xen/types.h>
++#include <xen/elfstructs.h>
++
++/* The following describes an Elf file as consumed by xSplice. */
++struct xsplice_elf_sec {
++    Elf_Shdr *sec;                 /* Hooked up in elf_resolve_sections. */
++    const char *name;              /* Human readable name hooked in
++                                      elf_resolve_section_names. */
++    const uint8_t *data;           /* Pointer to the section (done by
++                                      elf_resolve_sections). */
++};
++
++struct xsplice_elf_sym {
++    Elf_Sym *sym;
++    const char *name;
++};
++
++struct xsplice_elf {
++    const char *name;              /* Pointer to payload->name. */
++    ssize_t len;                   /* Length of the ELF file. */
++    Elf_Ehdr *hdr;                 /* ELF file. */
++    struct xsplice_elf_sec *sec;   /* Array of sections, allocated by us. */
++    struct xsplice_elf_sym *sym;   /* Array of symbols , allocated by us. */
++    unsigned int nsym;
++    struct xsplice_elf_sec *symtab;/* Pointer to .symtab section - aka to sec[x]. */
++    struct xsplice_elf_sec *strtab;/* Pointer to .strtab section - aka to sec[y]. */
++};
++
++struct xsplice_elf_sec *xsplice_elf_sec_by_name(const struct xsplice_elf *elf,
++                                                const char *name);
++int xsplice_elf_load(struct xsplice_elf *elf, uint8_t *data);
++void xsplice_elf_free(struct xsplice_elf *elf);
++
++#endif /* __XEN_XSPLICE_ELF_H__ */
+-- 
+2.4.3
+

@@ -1,0 +1,281 @@
+From c12927621922f82925126aa30d4e8538f03df468 Mon Sep 17 00:00:00 2001
+From: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date: Wed, 16 Sep 2015 10:37:12 -0400
+Subject: [PATCH 09/26] x86/xen_hello_world.xsplice: Test payload for patching
+ 'xen_extra_version'. (v2)
+
+This change demonstrates how to generate an xSplice ELF payload.
+
+The idea here is that we want to patch in the hypervisor
+the 'xen_version_extra' function with an function that will
+return 'Hello World'. The 'xl info | grep extraversion'
+will reflect the new value after the patching.
+
+To generate this ELF payload file we need:
+ - C code of the new code (xen_hello_world_func.c).
+ - C code generating the .xsplice.funcs structure
+   (xen_hello_world.c)
+ - The address of the old code (xen_extra_version). We
+   retrieve it by  using 'nm --defined' on xen-syms.
+ - The size of the new and old code for which we use
+   nm --defined -S on our code and xen-syms respectively.
+
+There are two C files and one header files generated
+during build. One could make this one C file if the
+size of the newly patched function size was known in
+advance (or an random value was choosen).
+
+There is also a strict order of compiling:
+ 1) xen_hello_world_func.c
+ 2) config.h - extract the size of the new function,
+    the old function and the old function address.
+ 3) xen_hello_world.c - which contains the .xsplice.funcs
+    structure.
+ 4) Link the object files in an xen_hello_world.xsplice file.
+
+The use-case is simple:
+
+$xen-xsplice load /usr/lib/debug/xen_hello_world.xsplice
+$xen-xsplice list
+ ID                                     | status
+----------------------------------------+------------
+xen_hello_world                           APPLIED
+$xl info | grep extra
+xen_extra              : Hello World
+$xen-xsplice revert xen_hello_world
+Performing revert: completed
+$xen-xsplice unload xen_hello_world
+Performing unload: completed
+$xl info | grep extra
+xen_extra              : -unstable
+
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+---
+ docs/misc/xsplice.markdown               | 36 ++++++++++++++++++++++++++
+ tools/misc/xsplice.lds                   | 11 ++++++++
+ xen/Makefile                             |  2 ++
+ xen/arch/arm/Makefile                    |  4 +++
+ xen/arch/x86/Makefile                    |  6 +++++
+ xen/arch/x86/test/Makefile               | 44 ++++++++++++++++++++++++++++++++
+ xen/arch/x86/test/xen_hello_world.c      | 15 +++++++++++
+ xen/arch/x86/test/xen_hello_world_func.c |  8 ++++++
+ 8 files changed, 126 insertions(+)
+ create mode 100644 tools/misc/xsplice.lds
+ create mode 100644 xen/arch/x86/test/Makefile
+ create mode 100644 xen/arch/x86/test/xen_hello_world.c
+ create mode 100644 xen/arch/x86/test/xen_hello_world_func.c
+
+diff --git a/docs/misc/xsplice.markdown b/docs/misc/xsplice.markdown
+index 9a95243..0a5b87b 100644
+--- a/docs/misc/xsplice.markdown
++++ b/docs/misc/xsplice.markdown
+@@ -321,11 +321,47 @@ size.
+ 
+ When applying the patch the hypervisor iterates over each `xsplice_patch_func`
+ structure and the core code inserts a trampoline at `old_addr` to `new_addr`.
++The `new_addr` is altered when the ELF payload is loaded.
+ 
+ When reverting a patch, the hypervisor iterates over each `xsplice_patch_func`
+ and the core code copies the data from the undo buffer (private internal copy)
+ to `old_addr`.
+ 
++### Example
++
++A simple example of what a payload file can be:
++
++<pre>
++/* MUST be in sync with hypervisor. */  
++struct xsplice_patch_func {  
++    const char *name;  
++    uint64_t new_addr;  
++    uint64_t old_addr;  
++    uint32_t new_size;  
++    uint32_t old_size;  
++    uint8_t pad[32];  
++};  
++
++/* Our replacement function for xen_extra_version. */  
++const char *xen_hello_world(void)  
++{  
++    return "Hello World";  
++}  
++
++static unsigned char name[] = "xen_hello_world";  
++
++struct xsplice_patch_func xsplice_hello_world = {  
++    .name = name,  
++    .new_addr = (unsigned long)(xen_hello_world),  
++    .old_addr = 0xffff82d08013963c, /* Extracted from xen-syms. */  
++    .new_size = 13, /* To be be computed by scripts. */  
++    .old_size = 13, /* -----------""---------------  */  
++} __attribute__((__section__(".xsplice.funcs")));  
++
++</pre>
++
++Code must be compiled with -fPIC.
++
+ ## Hypercalls
+ 
+ We will employ the sub operations of the system management hypercall (sysctl).
+diff --git a/tools/misc/xsplice.lds b/tools/misc/xsplice.lds
+new file mode 100644
+index 0000000..f52eb8c
+--- /dev/null
++++ b/tools/misc/xsplice.lds
+@@ -0,0 +1,11 @@
++OUTPUT_FORMAT("elf64-x86-64", "elf64-x86-64", "elf64-x86-64")
++OUTPUT_ARCH(i386:x86-64)
++ENTRY(xsplice_hello_world)
++SECTIONS
++{
++    /* The hypervisor expects ".xsplice.func", so change
++     * the ".data.xsplice_hello_world" to it. */
++
++    .xsplice.funcs : { *(*.xsplice_hello_world) }
++
++}
+diff --git a/xen/Makefile b/xen/Makefile
+index 80cfd1c..fb0ca3f 100644
+--- a/xen/Makefile
++++ b/xen/Makefile
+@@ -58,6 +58,7 @@ _install: $(TARGET)$(CONFIG_XEN_INSTALL_SUFFIX)
+ 			echo 'EFI installation only partially done (EFI_VENDOR not set)' >&2; \
+ 		fi; \
+ 	fi
++	$(MAKE) -f $(BASEDIR)/Rules.mk -C arch/$(TARGET_ARCH) install
+ 
+ .PHONY: _uninstall
+ _uninstall: D=$(DESTDIR)
+@@ -74,6 +75,7 @@ _uninstall:
+ 	rm -f $(D)$(EFI_DIR)/$(T)-$(XEN_VERSION).efi
+ 	rm -f $(D)$(EFI_DIR)/$(T).efi
+ 	rm -f $(D)$(EFI_MOUNTPOINT)/efi/$(EFI_VENDOR)/$(T)-$(XEN_FULLVERSION).efi
++	$(MAKE) -f $(BASEDIR)/Rules.mk -C arch/$(TARGET_ARCH) uninstall
+ 
+ .PHONY: _debug
+ _debug:
+diff --git a/xen/arch/arm/Makefile b/xen/arch/arm/Makefile
+index f785c07..90c131c 100644
+--- a/xen/arch/arm/Makefile
++++ b/xen/arch/arm/Makefile
+@@ -56,6 +56,10 @@ ifeq (arm64,$(XEN_TARGET_ARCH))
+ 	ln -sf $(notdir $@)  ../../$(notdir $@).efi
+ endif
+ 
++install:
++
++uninstall:
++
+ $(TARGET).axf: $(TARGET)-syms
+ 	# XXX: VE model loads by VMA so instead of
+ 	# making a proper ELF we link with LMA == VMA and adjust crudely
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index 9dc7665..e355e27 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -77,7 +77,12 @@ efi-$(x86_64) := $(shell if [ ! -r $(BASEDIR)/include/xen/compile.h -o \
+ $(TARGET): $(TARGET)-syms $(efi-y) boot/mkelf32
+ 	./boot/mkelf32 $(TARGET)-syms $(TARGET) 0x100000 \
+ 	`$(NM) $(TARGET)-syms | grep " _end$$" | sed -e 's/^\([^ ]*\).*/0x\1/'`
++	$(MAKE) -f $(BASEDIR)/Rules.mk -C test
+ 
++install:
++	$(MAKE) -f $(BASEDIR)/Rules.mk -C test install
++uninstall:
++	$(MAKE) -f $(BASEDIR)/Rules.mk -C test uninstall
+ 
+ ALL_OBJS := $(BASEDIR)/arch/x86/boot/built_in.o $(BASEDIR)/arch/x86/efi/built_in.o $(ALL_OBJS)
+ 
+@@ -174,3 +179,4 @@ clean::
+ 	rm -f $(BASEDIR)/.xen-syms.[0-9]* boot/.*.d
+ 	rm -f $(BASEDIR)/.xen.efi.[0-9]* efi/*.o efi/.*.d efi/*.efi efi/disabled efi/mkreloc
+ 	rm -f boot/reloc.S boot/reloc.lnk boot/reloc.bin
++	$(MAKE) -f $(BASEDIR)/Rules.mk -C test clean
+diff --git a/xen/arch/x86/test/Makefile b/xen/arch/x86/test/Makefile
+new file mode 100644
+index 0000000..00df15a
+--- /dev/null
++++ b/xen/arch/x86/test/Makefile
+@@ -0,0 +1,44 @@
++include $(XEN_ROOT)/Config.mk
++
++CODE_ADDR=$(shell nm --defined $(1) | grep $(2) | awk '{print "0x"$$1}')
++CODE_SZ=$(shell nm --defined -S $(1) | grep $(2) | awk '{ print "0x"$$2}')
++
++.PHONY: default
++
++XSPLICE := xen_hello_world.xsplice
++
++default: xsplice
++
++install: xsplice
++	$(INSTALL_DATA) $(XSPLICE) $(DESTDIR)$(DEBUG_DIR)/$(XSPLICE)
++uninstall:
++	rm -f $(DESTDIR)$(DEBUG_DIR)/$(XSPLICE)
++
++.PHONY: clean
++clean::
++	rm -f *.o .*.o.d $(XSPLICE) config.h
++
++#
++# To compute these values we need the binary files: xen-syms
++# and xen_hello_world_func.o to be already compiled.
++#
++# We can be assured that xen-syms is already built as we are
++# the last entry in the build target.
++#
++.PHONY: config.h
++config.h: OLD_CODE=$(call CODE_ADDR,$(BASEDIR)/xen-syms,xen_extra_version)
++config.h: OLD_CODE_SZ=$(call CODE_SZ,$<,xen_hello_world)
++config.h: NEW_CODE_SZ=$(call CODE_SZ,$(BASEDIR)/xen-syms,xen_extra_version)
++config.h: xen_hello_world_func.o
++	(set -e; \
++	 echo "#define NEW_CODE_SZ $(NEW_CODE_SZ)"; \
++	 echo "#define OLD_CODE_SZ $(OLD_CODE_SZ)"; \
++	 echo "#define OLD_CODE $(OLD_CODE)") > $@
++
++.PHONY: xsplice
++xsplice: config.h
++	# Need to have these done in sequential order
++	$(MAKE) -f $(BASEDIR)/Rules.mk xen_hello_world_func.o
++	$(MAKE) -f $(BASEDIR)/Rules.mk xen_hello_world.o
++	$(LD) $(LDFLAGS) -r -o $(XSPLICE) xen_hello_world_func.o xen_hello_world.o
++
+diff --git a/xen/arch/x86/test/xen_hello_world.c b/xen/arch/x86/test/xen_hello_world.c
+new file mode 100644
+index 0000000..6a1775b
+--- /dev/null
++++ b/xen/arch/x86/test/xen_hello_world.c
+@@ -0,0 +1,15 @@
++#include <xen/config.h>
++#include <xen/types.h>
++#include <xen/xsplice.h>
++#include "config.h"
++
++static char name[] = "xen_hello_world";
++extern const char *xen_hello_world(void);
++
++struct xsplice_patch_func __section(".xsplice.funcs") xsplice_xen_hello_world = {
++    .name = name,
++    .new_addr = (unsigned long)(xen_hello_world),
++    .old_addr = OLD_CODE,
++    .new_size = NEW_CODE_SZ,
++    .old_size = OLD_CODE_SZ,
++};
+diff --git a/xen/arch/x86/test/xen_hello_world_func.c b/xen/arch/x86/test/xen_hello_world_func.c
+new file mode 100644
+index 0000000..95ffcbd
+--- /dev/null
++++ b/xen/arch/x86/test/xen_hello_world_func.c
+@@ -0,0 +1,8 @@
++#include <xen/config.h>
++#include <xen/types.h>
++
++/* Our replacement function for xen_extra_version. */
++const char *xen_hello_world(void)
++{
++    return "Hello World";
++}
+-- 
+2.4.3
+
