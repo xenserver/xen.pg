@@ -1,0 +1,270 @@
+From 16eedef3a66870e9099e6028e795f195e1c27125 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 4 Aug 2015 15:37:43 +0100
+Subject: [PATCH 23/30] xen+tools: Export maximum host and guest cpu
+ featuresets via SYSCTL
+
+And provide stubs for toolstack use.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index c0d2d6f..26aa06a 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -2851,6 +2851,9 @@ int xc_psr_cat_get_domain_data(xc_interface *xch, uint32_t domid,
+                                uint64_t *data);
+ int xc_psr_cat_get_l3_info(xc_interface *xch, uint32_t socket,
+                            uint32_t *cos_max, uint32_t *cbm_len);
++
++int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
++                          uint32_t *nr_features, uint32_t *featureset);
+ #endif
+ 
+ #endif /* XENCTRL_H */
+diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
+index 031c848..6b52958 100644
+--- a/tools/libxc/xc_cpuid_x86.c
++++ b/tools/libxc/xc_cpuid_x86.c
+@@ -33,6 +33,33 @@
+ #define DEF_MAX_INTELEXT  0x80000008u
+ #define DEF_MAX_AMDEXT    0x8000001cu
+ 
++int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
++                          uint32_t *nr_features, uint32_t *featureset)
++{
++    DECLARE_SYSCTL;
++    DECLARE_HYPERCALL_BOUNCE(featureset,
++                             *nr_features * sizeof(*featureset),
++                             XC_HYPERCALL_BUFFER_BOUNCE_OUT);
++    int ret;
++
++    if ( xc_hypercall_bounce_pre(xch, featureset) )
++        return -1;
++
++    sysctl.cmd = XEN_SYSCTL_get_cpu_featureset;
++    sysctl.u.cpu_featureset.index = index;
++    sysctl.u.cpu_featureset.nr_features = *nr_features;
++    set_xen_guest_handle(sysctl.u.cpu_featureset.features, featureset);
++
++    ret = do_sysctl(xch, &sysctl);
++
++    xc_hypercall_bounce_post(xch, featureset);
++
++    if ( !ret )
++        *nr_features = sysctl.u.cpu_featureset.nr_features;
++
++    return ret;
++}
++
+ struct cpuid_domain_info
+ {
+     enum
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index b7ba8b7..20984e6 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -244,6 +244,9 @@ external version_changeset: handle -> string = "stub_xc_version_changeset"
+ external version_capabilities: handle -> string =
+   "stub_xc_version_capabilities"
+ 
++type featureset_index = Featureset_raw | Featureset_host | Featureset_pv | Featureset_hvm
++external get_cpu_featureset : handle -> featureset_index -> int64 array = "stub_xc_get_cpu_featureset"
++
+ external watchdog : handle -> int -> int32 -> int
+   = "stub_xc_watchdog"
+ 
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index bc4af56..88b6c85 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -148,6 +148,10 @@ external version_compile_info : handle -> compile_info
+ external version_changeset : handle -> string = "stub_xc_version_changeset"
+ external version_capabilities : handle -> string
+   = "stub_xc_version_capabilities"
++
++type featureset_index = Featureset_raw | Featureset_host | Featureset_pv | Featureset_hvm
++external get_cpu_featureset : handle -> featureset_index -> int64 array = "stub_xc_get_cpu_featureset"
++
+ type core_magic = Magic_hvm | Magic_pv
+ type core_header = {
+   xch_magic : core_magic;
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index b7de615..d6cd731 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -1220,6 +1220,41 @@ CAMLprim value stub_xc_domain_deassign_device(value xch, value domid, value desc
+ 	CAMLreturn(Val_unit);
+ }
+ 
++CAMLprim value stub_xc_get_cpu_featureset(value xch, value idx)
++{
++	CAMLparam2(xch, idx);
++	CAMLlocal1(bitmap_val);
++
++	/* Safe, because of the global ocaml lock. */
++	static uint32_t fs_len;
++
++	if (fs_len == 0)
++	{
++		int ret = xc_get_cpu_featureset(_H(xch), 0, &fs_len, NULL);
++
++		if (ret || (fs_len == 0))
++			failwith_xc(_H(xch));
++	}
++
++	{
++		/* To/from hypervisor to retrieve actual featureset */
++		uint32_t fs[fs_len], len = fs_len;
++		unsigned int i;
++
++		int ret = xc_get_cpu_featureset(_H(xch), Int_val(idx), &len, fs);
++
++		if (ret)
++			failwith_xc(_H(xch));
++
++		bitmap_val = caml_alloc(len, 0);
++
++		for (i = 0; i < len; ++i)
++			Store_field(bitmap_val, i, caml_copy_int64(fs[i]));
++	}
++
++	CAMLreturn(bitmap_val);
++}
++
+ CAMLprim value stub_xc_watchdog(value xch, value domid, value timeout)
+ {
+ 	CAMLparam3(xch, domid, timeout);
+diff --git a/xen/arch/x86/sysctl.c b/xen/arch/x86/sysctl.c
+index 38b5dcb..e938a14 100644
+--- a/xen/arch/x86/sysctl.c
++++ b/xen/arch/x86/sysctl.c
+@@ -29,6 +29,7 @@
+ #include <xen/cpu.h>
+ #include <xsm/xsm.h>
+ #include <asm/psr.h>
++#include <asm/cpuid.h>
+ 
+ #define get_xen_guest_handle(val, hnd)  do { val = (hnd).p; } while (0)
+ 
+@@ -190,6 +191,71 @@ long arch_do_sysctl(
+         }
+         break;
+ 
++    case XEN_SYSCTL_get_cpu_featureset:
++    {
++        const uint32_t *featureset;
++        unsigned int nr;
++
++        /* Request for maximum number of features? */
++        if ( guest_handle_is_null(sysctl->u.cpu_featureset.features) )
++        {
++            sysctl->u.cpu_featureset.nr_features = FSCAPINTS;
++            if ( __copy_field_to_guest(u_sysctl, sysctl,
++                                       u.cpu_featureset.nr_features) )
++                ret = -EFAULT;
++            break;
++        }
++
++        /* Clip the number of entries. */
++        nr = sysctl->u.cpu_featureset.nr_features;
++        if ( nr > FSCAPINTS )
++            nr = FSCAPINTS;
++
++        switch ( sysctl->u.cpu_featureset.index )
++        {
++        case XEN_SYSCTL_cpu_featureset_raw:
++            featureset = raw_featureset;
++            break;
++
++        case XEN_SYSCTL_cpu_featureset_host:
++            featureset = host_featureset;
++            break;
++
++        case XEN_SYSCTL_cpu_featureset_pv:
++            featureset = pv_featureset;
++            break;
++
++        case XEN_SYSCTL_cpu_featureset_hvm:
++            featureset = hvm_featureset;
++            break;
++
++        default:
++            featureset = NULL;
++            break;
++        }
++
++        /* Bad featureset index? */
++        if ( !ret && !featureset )
++            ret = -EINVAL;
++
++        /* Copy the requested featureset into place. */
++        if ( !ret && copy_to_guest(sysctl->u.cpu_featureset.features,
++                                   featureset, nr) )
++            ret = -EFAULT;
++
++        /* Inform the caller of how many features we wrote. */
++        sysctl->u.cpu_featureset.nr_features = nr;
++        if ( !ret && __copy_field_to_guest(u_sysctl, sysctl,
++                                           u.cpu_featureset.nr_features) )
++            ret = -EFAULT;
++
++        /* Inform the caller if there was more data to provide. */
++        if ( !ret && nr < FSCAPINTS )
++            ret = -ENOBUFS;
++
++        break;
++    }
++
+     default:
+         ret = -ENOSYS;
+         break;
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index 0cacacc..2b2d1a2 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -764,6 +764,29 @@ struct xen_sysctl_tmem_op {
+ typedef struct xen_sysctl_tmem_op xen_sysctl_tmem_op_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_sysctl_tmem_op_t);
+ 
++/*
++ * XEN_SYSCTL_get_cpu_featureset (x86 specific)
++ *
++ * Return information about the maximum sets of features which can be offered
++ * to different types of guests.  This is all strictly information as found in
++ * `cpuid` feature leaves with no synthetic additions.
++ */
++struct xen_sysctl_cpu_featureset {
++#define XEN_SYSCTL_cpu_featureset_raw      0
++#define XEN_SYSCTL_cpu_featureset_host     1
++#define XEN_SYSCTL_cpu_featureset_pv       2
++#define XEN_SYSCTL_cpu_featureset_hvm      3
++    uint32_t index;       /* IN: Which featureset to query? */
++    uint32_t nr_features; /* IN/OUT: Number of entries in/written to
++                           * 'features', or the maximum number of features if
++                           * the guest handle is NULL.  NB. All featuresets
++                           * come from the same numberspace, so have the same
++                           * maximum length. */
++    XEN_GUEST_HANDLE_64(uint32) features; /* OUT: */
++};
++typedef struct xen_sysctl_featureset xen_sysctl_featureset_t;
++DEFINE_XEN_GUEST_HANDLE(xen_sysctl_featureset_t);
++
+ struct xen_sysctl {
+     uint32_t cmd;
+ #define XEN_SYSCTL_readconsole                    1
+@@ -789,6 +812,7 @@ struct xen_sysctl {
+ #define XEN_SYSCTL_pcitopoinfo                   22
+ #define XEN_SYSCTL_psr_cat_op                    23
+ #define XEN_SYSCTL_tmem_op                       24
++#define XEN_SYSCTL_get_cpu_featureset            25
+     uint32_t interface_version; /* XEN_SYSCTL_INTERFACE_VERSION */
+     union {
+         struct xen_sysctl_readconsole       readconsole;
+@@ -814,6 +838,7 @@ struct xen_sysctl {
+         struct xen_sysctl_psr_cmt_op        psr_cmt_op;
+         struct xen_sysctl_psr_cat_op        psr_cat_op;
+         struct xen_sysctl_tmem_op           tmem_op;
++        struct xen_sysctl_cpu_featureset    cpu_featureset;
+         uint8_t                             pad[128];
+     } u;
+ };

@@ -1,7 +1,7 @@
-From 9a44ea48ecab1a08a9189f0592ee05a9be14fac5 Mon Sep 17 00:00:00 2001
+From ad287e690a3d0adaec406ea37b814327d14c1048 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Fri, 31 Jul 2015 20:38:13 +0100
-Subject: [PATCH 35/39] xen/x86: Rework Intel masking/faulting setup
+Subject: [PATCH 19/30] x86/cpu: Rework Intel masking/faulting setup
 
 This patch is best reviewed as its end result rather than as a diff, as it
 rewrites almost all of the setup.
@@ -17,7 +17,7 @@ switched into the default levelling state.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
-index d251b53..f1bb222 100644
+index d251b53..a691d7d 100644
 --- a/xen/arch/x86/cpu/intel.c
 +++ b/xen/arch/x86/cpu/intel.c
 @@ -18,11 +18,18 @@
@@ -42,7 +42,7 @@ index d251b53..f1bb222 100644
  }
  
  static DEFINE_PER_CPU(bool_t, cpuid_faulting_enabled);
-@@ -44,41 +51,45 @@ void set_cpuid_faulting(bool_t enable)
+@@ -44,41 +51,46 @@ void set_cpuid_faulting(bool_t enable)
  }
  
  /*
@@ -80,6 +80,7 @@ index d251b53..f1bb222 100644
  
 -	ASSERT((status == not_parsed) && (c == &boot_cpu_data));
 -	status = no_mask;
++/* Indicies of the masking MSRs, or 0 if unavailable. */
 +static unsigned int __read_mostly msr_basic, msr_ext, msr_xsave;
  
 -	if (!~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx &
@@ -110,7 +111,7 @@ index d251b53..f1bb222 100644
  		break;
  
  	case 0x1a: /* Bloomfield, Nehalem-EP(Gainestown) */
-@@ -88,72 +99,115 @@ static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
+@@ -88,71 +100,126 @@ static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
  	case 0x2c: /* Gulftown, Westmere-EP */
  	case 0x2e: /* Nehalem-EX(Beckton) */
  	case 0x2f: /* Westmere-EX */
@@ -133,13 +134,39 @@ index d251b53..f1bb222 100644
  
 -	status = set_mask;
 +	if (msr_basic)
-+		__probe_mask_msr(&msr_basic, LCAP_1cd, &cpumask_defaults._1cd);
-+
++		__probe_mask_msr(&msr_basic, LCAP_1cd, &cpuidmask_defaults._1cd);
+ 
+-	if (~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx)) {
+-		if (msr_basic)
+-			printk("Writing CPUID feature mask ecx:edx -> %08x:%08x\n",
+-			       opt_cpuid_mask_ecx, opt_cpuid_mask_edx);
+-		else
+-			printk("No CPUID feature mask available\n");
+-	}
+-	else
+-		msr_basic = 0;
+-
+-	if (~(opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx)) {
+-		if (msr_ext)
+-			printk("Writing CPUID extended feature mask ecx:edx -> %08x:%08x\n",
+-			       opt_cpuid_mask_ext_ecx, opt_cpuid_mask_ext_edx);
+-		else
+-			printk("No CPUID extended feature mask available\n");
+-	}
+-	else
+-		msr_ext = 0;
+-
+-	if (~opt_cpuid_mask_xsave_eax) {
+-		if (msr_xsave)
+-			printk("Writing CPUID xsave feature mask eax -> %08x\n",
+-			       opt_cpuid_mask_xsave_eax);
+-		else
+-			printk("No CPUID xsave feature mask available\n");
 +	if (msr_ext)
-+		__probe_mask_msr(&msr_ext, LCAP_e1cd, &cpumask_defaults.e1cd);
++		__probe_mask_msr(&msr_ext, LCAP_e1cd, &cpuidmask_defaults.e1cd);
 +
 +	if (msr_xsave)
-+		__probe_mask_msr(&msr_xsave, LCAP_Da1, &cpumask_defaults.Da1);
++		__probe_mask_msr(&msr_xsave, LCAP_Da1, &cpuidmask_defaults.Da1);
 +
 +	/*
 +	 * Don't bother warning about a mismatch if virtualised.  These MSRs
@@ -149,8 +176,8 @@ index d251b53..f1bb222 100644
 +	    cpu_has_hypervisor)
 +		return;
 +
-+	printk(XENLOG_WARNING "Mismatch between expected (%#x"
-+	       ") and real (%#x) levelling caps: missing %#x\n",
++	printk(XENLOG_WARNING "Mismatch between expected (%#x) "
++	       "and real (%#x) levelling caps: missing %#x\n",
 +	       expected_levelling_cap, levelling_caps,
 +	       (expected_levelling_cap ^ levelling_caps) & levelling_caps);
 +	printk(XENLOG_WARNING "Fam %#x, model %#x expected (%#x/%#x/%#x), "
@@ -161,14 +188,19 @@ index d251b53..f1bb222 100644
 +	       "If not running virtualised, please report a bug\n");
 +}
 +
-+void intel_ctxt_switch_levelling(const struct domain *nextd)
++/*
++ * Context switch levelling state to the next domain.  A parameter of NULL is
++ * used to context switch to the default host state, and is used by the BSP/AP
++ * startup code.
++ */
++static void intel_ctxt_switch_levelling(const struct domain *nextd)
 +{
-+	struct cpumasks *these_masks = &this_cpu(cpumasks);
-+	const struct cpumasks *masks = &cpumask_defaults;
++	struct cpuidmasks *these_masks = &this_cpu(cpuidmasks);
++	const struct cpuidmasks *masks = &cpuidmask_defaults;
 +
 +#define LAZY(msr, field)						\
 +	({								\
-+		if ( msr && (these_masks->field != masks->field) )	\
++		if (msr && (these_masks->field != masks->field))	\
 +		{							\
 +			wrmsrl(msr, masks->field);			\
 +			these_masks->field = masks->field;		\
@@ -181,9 +213,7 @@ index d251b53..f1bb222 100644
 +
 +#undef LAZY
 +}
- 
--	if (~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx)) {
--		if (msr_basic)
++
 +/*
 + * opt_cpuid_mask_ecx/edx: cpuid.1[ecx, edx] feature mask.
 + * For example, E8400[Intel Core 2 Duo Processor series] ecx = 0x0008E3FD,
@@ -192,57 +222,19 @@ index d251b53..f1bb222 100644
 + */
 +static void __init noinline intel_init_levelling(void)
 +{
-+	if ( !probe_intel_cpuid_faulting() )
++	if (!probe_intel_cpuid_faulting())
 +		probe_masking_msrs();
 +
-+	if ( msr_basic )
-+	{
-+		cpumask_defaults._1cd =
-+			((u64)opt_cpuid_mask_edx << 32) | opt_cpuid_mask_ecx;
++	if (msr_basic) {
++		uint32_t ecx, edx, tmp;
 +
-+		if ( !~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx) )
- 			printk("Writing CPUID feature mask ecx:edx -> %08x:%08x\n",
- 			       opt_cpuid_mask_ecx, opt_cpuid_mask_edx);
--		else
--			printk("No CPUID feature mask available\n");
++		cpuid(0x00000001, &tmp, &tmp, &ecx, &edx);
++
++		ecx &= opt_cpuid_mask_ecx;
++		edx &= opt_cpuid_mask_edx;
++
++		cpuidmask_defaults._1cd &= ((u64)edx << 32) | ecx;
  	}
--	else
--		msr_basic = 0;
-+	else if ( !~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx) )
-+		printk("No CPUID feature mask available\n");
-+
-+	if ( msr_ext )
-+	{
-+		cpumask_defaults.e1cd =
-+			((u64)opt_cpuid_mask_ext_edx << 32) |
-+			opt_cpuid_mask_ext_ecx;
- 
--	if (~(opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx)) {
--		if (msr_ext)
-+		if ( !~(opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx) )
- 			printk("Writing CPUID extended feature mask ecx:edx -> %08x:%08x\n",
- 			       opt_cpuid_mask_ext_ecx, opt_cpuid_mask_ext_edx);
--		else
--			printk("No CPUID extended feature mask available\n");
- 	}
--	else
--		msr_ext = 0;
-+	else if ( !~(opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx) )
-+		printk("No CPUID extended feature mask available\n");
-+
-+	if ( msr_xsave )
-+	{
-+		cpumask_defaults.Da1 &= (~0ULL << 32);
-+		cpumask_defaults.Da1 |= opt_cpuid_mask_xsave_eax;
- 
--	if (~opt_cpuid_mask_xsave_eax) {
--		if (msr_xsave)
-+		if ( !~opt_cpuid_mask_xsave_eax )
- 			printk("Writing CPUID xsave feature mask eax -> %08x\n",
- 			       opt_cpuid_mask_xsave_eax);
--		else
--			printk("No CPUID xsave feature mask available\n");
--	}
 -	else
 -		msr_xsave = 0;
 -
@@ -252,28 +244,53 @@ index d251b53..f1bb222 100644
 -		       ((u64)opt_cpuid_mask_edx << 32) | opt_cpuid_mask_ecx)){
 -		msr_basic = 0;
 -		printk("Failed to set CPUID feature mask\n");
--	}
--
++
++	if (msr_ext) {
++		uint32_t ecx, edx, tmp;
++
++		cpuid(0x80000001, &tmp, &tmp, &ecx, &edx);
++
++		ecx &= opt_cpuid_mask_ext_ecx;
++		edx &= opt_cpuid_mask_ext_edx;
++
++		cpuidmask_defaults.e1cd &= ((u64)edx << 32) | ecx;
+ 	}
+ 
 -	if (msr_ext &&
 -	    wrmsr_safe(msr_ext,
 -		       ((u64)opt_cpuid_mask_ext_edx << 32) | opt_cpuid_mask_ext_ecx)){
 -		msr_ext = 0;
 -		printk("Failed to set CPUID extended feature mask\n");
--	}
--
++	if (msr_xsave) {
++		uint32_t eax, tmp;
++
++		cpuid_count(0x0000000d, 1, &eax, &tmp, &tmp, &tmp);
++
++		eax &= opt_cpuid_mask_xsave_eax;
++
++		cpuidmask_defaults.Da1 &= (~0ULL << 32) | eax;
+ 	}
+ 
 -	if (msr_xsave &&
 -	    (rdmsr_safe(msr_xsave, msr_val) ||
 -	     wrmsr_safe(msr_xsave,
 -			(msr_val & (~0ULL << 32)) | opt_cpuid_mask_xsave_eax))){
 -		msr_xsave = 0;
 -		printk("Failed to set CPUID xsave feature mask\n");
++	if (opt_cpu_info) {
++		printk(XENLOG_INFO "Levelling caps: %#x\n", levelling_caps);
++		printk(XENLOG_INFO
++		       "MSR defaults: 1d 0x%08x, 1c 0x%08x, e1d 0x%08x, "
++		       "e1c 0x%08x, Da1 0x%08x\n",
++		       (uint32_t)(cpuidmask_defaults._1cd >> 32),
++		       (uint32_t)cpuidmask_defaults._1cd,
++		       (uint32_t)(cpuidmask_defaults.e1cd >> 32),
++		       (uint32_t)cpuidmask_defaults.e1cd,
++		       (uint32_t)cpuidmask_defaults.Da1);
  	}
-+	else if ( !~opt_cpuid_mask_xsave_eax )
-+		printk("No CPUID xsave feature mask available\n");
  }
  
- static void early_init_intel(struct cpuinfo_x86 *c)
-@@ -183,22 +237,13 @@ static void early_init_intel(struct cpuinfo_x86 *c)
+@@ -183,22 +250,13 @@ static void early_init_intel(struct cpuinfo_x86 *c)
  	    (boot_cpu_data.x86_mask == 3 || boot_cpu_data.x86_mask == 4))
  		paddr_bits = 36;
  

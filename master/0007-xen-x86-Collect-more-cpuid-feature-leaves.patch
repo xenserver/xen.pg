@@ -1,0 +1,107 @@
+From b5d5f36fa38b2e51f9efe4b7beaad95a6ba77ccc Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 2 Nov 2015 15:13:28 +0000
+Subject: [PATCH 07/30] xen/x86: Collect more cpuid feature leaves
+
+New words are:
+ * 0x80000007.edx - Contains Invarient TSC
+ * 0x80000008.ebx - Newly used for AMD Zen processors
+
+In addition, replace some open-coded ITSC and EFRO manipulation.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index 0943444..5da1e4f 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -294,21 +294,6 @@ int cpu_has_amd_erratum(const struct cpuinfo_x86 *cpu, int osvw_id, ...)
+ 	return 0;
+ }
+ 
+-/* Can this system suffer from TSC drift due to C1 clock ramping? */
+-static int c1_ramping_may_cause_clock_drift(struct cpuinfo_x86 *c) 
+-{ 
+-	if (cpuid_edx(0x80000007) & (1<<8)) {
+-		/*
+-		 * CPUID.AdvPowerMgmtInfo.TscInvariant
+-		 * EDX bit 8, 8000_0007
+-		 * Invariant TSC on 8th Gen or newer, use it
+-		 * (assume all cores have invariant TSC)
+-		 */
+-		return 0;
+-	}
+-	return 1;
+-}
+-
+ /*
+  * Disable C1-Clock ramping if enabled in PMM7.CpuLowPwrEnh on 8th-generation
+  * cores only. Assume BIOS has setup all Northbridges equivalently.
+@@ -483,7 +468,7 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
+ 	}
+ 
+ 	if (c->extended_cpuid_level >= 0x80000007) {
+-		if (cpuid_edx(0x80000007) & (1<<8)) {
++		if (cpu_has(c, X86_FEATURE_ITSC)) {
+ 			set_bit(X86_FEATURE_CONSTANT_TSC, c->x86_capability);
+ 			set_bit(X86_FEATURE_NONSTOP_TSC, c->x86_capability);
+ 			if (c->x86 != 0x11)
+@@ -607,14 +592,14 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
+ 		wrmsrl(MSR_K7_PERFCTR3, 0);
+ 	}
+ 
+-	if (cpuid_edx(0x80000007) & (1 << 10)) {
++	if (cpu_has(c, X86_FEATURE_EFRO)) {
+ 		rdmsr(MSR_K7_HWCR, l, h);
+ 		l |= (1 << 27); /* Enable read-only APERF/MPERF bit */
+ 		wrmsr(MSR_K7_HWCR, l, h);
+ 	}
+ 
+ 	/* Prevent TSC drift in non single-processor, single-core platforms. */
+-	if ((smp_processor_id() == 1) && c1_ramping_may_cause_clock_drift(c))
++	if ((smp_processor_id() == 1) && !cpu_has(c, X86_FEATURE_ITSC))
+ 		disable_c1_ramping();
+ 
+ 	set_cpuidmask(c);
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 87bd912..dbf1c45 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -260,6 +260,12 @@ static void __cpuinit generic_identify(struct cpuinfo_x86 *c)
+ 
+ 		if ( c->extended_cpuid_level >= 0x80000004 )
+ 			get_model_name(c); /* Default name */
++		if (c->extended_cpuid_level >= 0x80000007)
++			c->x86_capability[cpufeat_word(X86_FEATURE_ITSC)]
++				= cpuid_edx(0x80000007);
++		if (c->extended_cpuid_level >= 0x80000008)
++			c->x86_capability[cpufeat_word(X86_FEATURE_CLZERO)]
++				= cpuid_ebx(0x80000008);
+ 	}
+ 
+ 	/* Intel-defined flags: level 0x00000007 */
+diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
+index bf6f90d..bd595a5 100644
+--- a/xen/arch/x86/cpu/intel.c
++++ b/xen/arch/x86/cpu/intel.c
+@@ -273,7 +273,7 @@ static void __devinit init_intel(struct cpuinfo_x86 *c)
+ 	if ((c->x86 == 0xf && c->x86_model >= 0x03) ||
+ 		(c->x86 == 0x6 && c->x86_model >= 0x0e))
+ 		set_bit(X86_FEATURE_CONSTANT_TSC, c->x86_capability);
+-	if (cpuid_edx(0x80000007) & (1u<<8)) {
++	if (cpu_has(c, X86_FEATURE_ITSC)) {
+ 		set_bit(X86_FEATURE_CONSTANT_TSC, c->x86_capability);
+ 		set_bit(X86_FEATURE_NONSTOP_TSC, c->x86_capability);
+ 		set_bit(X86_FEATURE_TSC_RELIABLE, c->x86_capability);
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 0fb7486..55fb6f8 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -2179,7 +2179,7 @@ void domain_cpuid(
+              */
+             if ( (input == 0x80000007) && /* Advanced Power Management */
+                  !d->disable_migrate && !d->arch.vtsc )
+-                *edx &= ~(1u<<8); /* TSC Invariant */
++                *edx &= ~cpufeat_mask(X86_FEATURE_ITSC);
+ 
+             return;
+         }

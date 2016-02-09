@@ -1,0 +1,98 @@
+From 0a965efc7c364b9abb18a29b62f5c6ab63830c5f Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 26 Nov 2015 18:56:43 +0000
+Subject: [PATCH 21/30] x86/pv: Provide custom cpumasks for PV domains
+
+And use them in preference to cpumask_defaults on context switch.  HVM domains
+must not be masked (to avoid interfering with cpuid calls within the guest),
+so always lazily context switch to the host default.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index 641a663f..4f8f8b5 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -208,7 +208,9 @@ static void __init noinline probe_masking_msrs(void)
+ static void amd_ctxt_switch_levelling(const struct domain *nextd)
+ {
+ 	struct cpuidmasks *these_masks = &this_cpu(cpuidmasks);
+-	const struct cpuidmasks *masks = &cpuidmask_defaults;
++	const struct cpuidmasks *masks =
++            (nextd && is_pv_domain(nextd) && nextd->arch.pv_domain.cpuidmasks)
++            ? nextd->arch.pv_domain.cpuidmasks : &cpuidmask_defaults;
+ 
+ #define LAZY(cap, msr, field)						\
+ 	({								\
+diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
+index f8ca65f..88dfcc6 100644
+--- a/xen/arch/x86/cpu/intel.c
++++ b/xen/arch/x86/cpu/intel.c
+@@ -151,13 +151,16 @@ static void __init probe_masking_msrs(void)
+ static void intel_ctxt_switch_levelling(const struct domain *nextd)
+ {
+ 	struct cpuidmasks *these_masks = &this_cpu(cpuidmasks);
+-	const struct cpuidmasks *masks = &cpuidmask_defaults;
++	const struct cpuidmasks *masks;
+ 
+ 	if (cpu_has_cpuid_faulting) {
+ 		set_cpuid_faulting(nextd && is_pv_domain(nextd));
+ 		return;
+ 	}
+ 
++	masks = (nextd && is_pv_domain(nextd) && nextd->arch.pv_domain.cpuidmasks)
++		? nextd->arch.pv_domain.cpuidmasks : &cpuidmask_defaults;
++
+ #define LAZY(msr, field)						\
+ 	({								\
+ 		if (msr && (these_masks->field != masks->field))	\
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 5127b95..ed053d5 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -584,6 +584,11 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags,
+             goto fail;
+         clear_page(d->arch.pv_domain.gdt_ldt_l1tab);
+ 
++        d->arch.pv_domain.cpuidmasks = xmalloc(struct cpuidmasks);
++        if ( !d->arch.pv_domain.cpuidmasks )
++            goto fail;
++        *d->arch.pv_domain.cpuidmasks = cpuidmask_defaults;
++
+         rc = create_perdomain_mapping(d, GDT_LDT_VIRT_START,
+                                       GDT_LDT_MBYTES << (20 - PAGE_SHIFT),
+                                       NULL, NULL);
+@@ -673,7 +678,10 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags,
+         paging_final_teardown(d);
+     free_perdomain_mappings(d);
+     if ( is_pv_domain(d) )
++    {
++        xfree(d->arch.pv_domain.cpuidmasks);
+         free_xenheap_page(d->arch.pv_domain.gdt_ldt_l1tab);
++    }
+     psr_domain_free(d);
+     return rc;
+ }
+@@ -693,7 +701,10 @@ void arch_domain_destroy(struct domain *d)
+ 
+     free_perdomain_mappings(d);
+     if ( is_pv_domain(d) )
++    {
+         free_xenheap_page(d->arch.pv_domain.gdt_ldt_l1tab);
++        xfree(d->arch.pv_domain.cpuidmasks);
++    }
+ 
+     free_xenheap_page(d->shared_info);
+     cleanup_domain_irq_mapping(d);
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index d49b028..a58e15d 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -249,6 +249,8 @@ struct pv_domain
+ 
+     /* map_domain_page() mapping cache. */
+     struct mapcache_domain mapcache;
++
++    struct cpuidmasks *cpuidmasks;
+ };
+ 
+ struct monitor_write_data {

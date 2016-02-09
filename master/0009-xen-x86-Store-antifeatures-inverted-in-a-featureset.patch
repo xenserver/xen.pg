@@ -1,0 +1,176 @@
+From 2536d24e1fd72b473ff3ee74ff9e9bf4ac0ba284 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 25 Jan 2016 10:06:22 +0000
+Subject: [PATCH 09/30] xen/x86: Store antifeatures inverted in a featureset
+
+Awkwardly, some new feature bits mean "Feature $X no longer works".
+Store these inverted in a featureset.
+
+This permits safe zero-extending of a smaller featureset as part of a
+comparison, and safe reasoning (subset?, superset?, compatible? etc.)
+without specific knowldge of meaning of each bit.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 9b4399f..d778235 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -331,6 +331,7 @@ void __cpuinit identify_cpu(struct cpuinfo_x86 *c)
+ 	 */
+ 	for (i = 0; i < FSCAPINTS; ++i) {
+ 		c->x86_capability[i] &= known_features[i];
++		c->x86_capability[i] ^= inverted_features[i];
+ 	}
+ 
+ 	for (i = 0 ; i < NCAPINTS ; ++i)
+diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
+index fb3a6ac..30a3392 100644
+--- a/xen/arch/x86/cpuid.c
++++ b/xen/arch/x86/cpuid.c
+@@ -2,10 +2,12 @@
+ #include <asm/cpuid.h>
+ 
+ const uint32_t known_features[] = INIT_KNOWN_FEATURES;
++const uint32_t inverted_features[] = INIT_INVERTED_FEATURES;
+ 
+ static void __maybe_unused build_assertions(void)
+ {
+     BUILD_BUG_ON(ARRAY_SIZE(known_features) != FSCAPINTS);
++    BUILD_BUG_ON(ARRAY_SIZE(inverted_features) != FSCAPINTS);
+ }
+ 
+ /*
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index 88ca4b8..baa4a2b 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -71,7 +71,7 @@
+ 
+ #define cpu_has_smep            boot_cpu_has(X86_FEATURE_SMEP)
+ #define cpu_has_smap            boot_cpu_has(X86_FEATURE_SMAP)
+-#define cpu_has_fpu_sel         (!boot_cpu_has(X86_FEATURE_NO_FPU_SEL))
++#define cpu_has_fpu_sel         boot_cpu_has(X86_FEATURE_FPU_SEL)
+ 
+ #define cpu_has_ffxsr           ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) \
+                                  && boot_cpu_has(X86_FEATURE_FFXSR))
+diff --git a/xen/include/asm-x86/cpuid.h b/xen/include/asm-x86/cpuid.h
+index 6cca5ea..341dbc1 100644
+--- a/xen/include/asm-x86/cpuid.h
++++ b/xen/include/asm-x86/cpuid.h
+@@ -9,6 +9,7 @@
+ #include <xen/types.h>
+ 
+ extern const uint32_t known_features[FSCAPINTS];
++extern const uint32_t inverted_features[FSCAPINTS];
+ 
+ #endif /* __ASSEMBLY__ */
+ #endif /* !__X86_CPUID_H__ */
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index 02d695d..2748cfd 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -37,10 +37,26 @@
+  * contain any synthesied values.  New words may be added to the end of
+  * featureset.
+  *
++ * "Anti" features have their representation inverted.  This permits safe
++ * zero-extending of a smaller featureset as part of a comparison, and safe
++ * reasoning (subset?, superset?, compatible? etc.) without specific knowldge
++ * of meaning of each bit.
++ *
+  * All featureset words currently originate from leaves specified for the
+  * CPUID instruction, but this is not preclude other sources of information.
+  */
+ 
++/*
++ * Attribute syntax:
++ *
++ * Attributes for a particular feature are provided as characters before the
++ * first space in the comment immediately following the feature value.
++ *
++ * Inverted: '!'
++ *   This feature has its value in a featureset inverted, compared to how it
++ *   is specified by vendor architecture manuals.
++ */
++
+ /* Intel-defined CPU features, CPUID level 0x00000001.edx, word 0 */
+ #define X86_FEATURE_FPU           ( 0*32+ 0) /*   Onboard FPU */
+ #define X86_FEATURE_VME           ( 0*32+ 1) /*   Virtual Mode Extensions */
+@@ -158,7 +174,7 @@
+ #define X86_FEATURE_INVPCID       ( 5*32+10) /*   Invalidate Process Context ID */
+ #define X86_FEATURE_RTM           ( 5*32+11) /*   Restricted Transactional Memory */
+ #define X86_FEATURE_CMT           ( 5*32+12) /*   Cache Monitoring Technology */
+-#define X86_FEATURE_NO_FPU_SEL    ( 5*32+13) /*   FPU CS/DS stored as zero */
++#define X86_FEATURE_FPU_SEL       ( 5*32+13) /*!  FPU CS/DS stored as zero */
+ #define X86_FEATURE_MPX           ( 5*32+14) /*   Memory Protection Extensions */
+ #define X86_FEATURE_CAT           ( 5*32+15) /*   Cache Allocation Technology */
+ #define X86_FEATURE_RDSEED        ( 5*32+18) /*   RDSEED instruction */
+diff --git a/xen/tools/gen-cpuid.py b/xen/tools/gen-cpuid.py
+index 0843be6..9e0cc34 100755
+--- a/xen/tools/gen-cpuid.py
++++ b/xen/tools/gen-cpuid.py
+@@ -16,11 +16,13 @@ class State(object):
+ 
+         # State parsed from input
+         self.names = {} # Name => value mapping
++        self.raw_inverted = []
+ 
+         # State calculated
+         self.nr_entries = 0 # Number of words in a featureset
+         self.common = 0 # Common features between 1d and e1d
+         self.known = [] # All known features
++        self.inverted = [] # Features with inverted representations
+ 
+ def parse_definitions(state):
+     """
+@@ -29,7 +31,8 @@ def parse_definitions(state):
+     """
+     feat_regex = re.compile(
+         r"^#define X86_FEATURE_([A-Z0-9_]+)"
+-        "\s+\(([\s\d]+\*[\s\d]+\+[\s\d]+)\).*$")
++        "\s+\(([\s\d]+\*[\s\d]+\+[\s\d]+)\)"
++        "\s+/\*([!]*) .*$")
+ 
+     this = sys.modules[__name__]
+ 
+@@ -45,6 +48,7 @@ def parse_definitions(state):
+ 
+         name = res.groups()[0]
+         val = eval(res.groups()[1]) # Regex confines this to a very simple expression
++        attr = res.groups()[2]
+ 
+         if hasattr(this, name):
+             raise Fail("Duplicate symbol %s" % (name,))
+@@ -60,6 +64,11 @@ def parse_definitions(state):
+         # Construct a reverse mapping of value to name
+         state.names[val] = name
+ 
++        if len(attr):
++
++            if "!" in attr:
++                state.raw_inverted.append(val)
++
+ 
+ def featureset_to_uint32s(fs, nr):
+     """ Represent a featureset as a list of C-compatible uint32_t's """
+@@ -106,6 +115,7 @@ def crunch_numbers(state):
+         state.names[e1d_base + (f % 32)] = "E1D_" + state.names[f]
+ 
+     state.common = featureset_to_uint32s(common_1d, 1)[0]
++    state.inverted = featureset_to_uint32s(state.raw_inverted, nr_entries)
+ 
+ 
+ def write_results(state):
+@@ -125,9 +135,12 @@ def write_results(state):
+ #define INIT_COMMON_FEATURES %s
+ 
+ #define INIT_KNOWN_FEATURES { \\\n%s\n}
++
++#define INIT_INVERTED_FEATURES { \\\n%s\n}
+ """ % (state.nr_entries,
+        state.common,
+        format_uint32s(state.known, 4),
++       format_uint32s(state.inverted, 4),
+        ))
+ 
+     state.output.write(

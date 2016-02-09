@@ -1,7 +1,7 @@
-From f5a8ec5967b3752c60c8b96098428b16434750be Mon Sep 17 00:00:00 2001
+From 1b17d9086681633f8f34b3d759e795c3e40bf256 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 18 Nov 2015 11:43:01 +0000
-Subject: [PATCH 26/39] xen/x86: Improve disabling of features which have
+Subject: [PATCH 14/30] xen/x86: Improve disabling of features which have
  dependencies
 
 APIC and XSAVE have dependent features, which also need disabling if Xen
@@ -11,8 +11,9 @@ Use setup_clear_cpu_cap() rather than clear_bit(), as it takes care of
 dependent features as well.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <JBeulich@suse.com>
 diff --git a/xen/arch/x86/apic.c b/xen/arch/x86/apic.c
-index 44b1ac9..e72e126 100644
+index 44b1ac9..8db935e 100644
 --- a/xen/arch/x86/apic.c
 +++ b/xen/arch/x86/apic.c
 @@ -1375,7 +1375,7 @@ void pmu_apic_interrupt(struct cpu_user_regs *regs)
@@ -24,17 +25,8 @@ index 44b1ac9..e72e126 100644
  
      if (!smp_found_config && !cpu_has_apic) {
          skip_ioapic_setup = 1;
-@@ -1388,7 +1388,7 @@ int __init APIC_init_uniprocessor (void)
-     if (!cpu_has_apic && APIC_INTEGRATED(apic_version[boot_cpu_physical_apicid])) {
-         printk(KERN_ERR "BIOS bug, local APIC #%d not detected!...\n",
-                boot_cpu_physical_apicid);
--        clear_bit(X86_FEATURE_APIC, boot_cpu_data.x86_capability);
-+        setup_clear_cpu_cap(X86_FEATURE_APIC);
-         skip_ioapic_setup = 1;
-         return -1;
-     }
 diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
-index ba42ac0..7b89ebd 100644
+index dc27293..2d8c6ba 100644
 --- a/xen/arch/x86/cpu/common.c
 +++ b/xen/arch/x86/cpu/common.c
 @@ -16,9 +16,6 @@
@@ -47,7 +39,7 @@ index ba42ac0..7b89ebd 100644
  bool_t __devinitdata opt_arat = 1;
  boolean_param("arat", opt_arat);
  
-@@ -335,12 +332,6 @@ void __cpuinit identify_cpu(struct cpuinfo_x86 *c)
+@@ -334,13 +331,6 @@ void __cpuinit identify_cpu(struct cpuinfo_x86 *c)
  	if (this_cpu->c_init)
  		this_cpu->c_init(c);
  
@@ -57,10 +49,11 @@ index ba42ac0..7b89ebd 100644
 -
 -	if ( cpu_has_xsave )
 -		xstate_init(c);
- 
+-
  	/*
  	 * The vendor-specific functions might have changed features.  Now
-@@ -363,6 +354,9 @@ void __cpuinit identify_cpu(struct cpuinfo_x86 *c)
+ 	 * we do "generic changes."
+@@ -362,6 +352,9 @@ void __cpuinit identify_cpu(struct cpuinfo_x86 *c)
  
  	/* Now the feature flags better reflect actual CPU features! */
  
@@ -71,22 +64,21 @@ index ba42ac0..7b89ebd 100644
  	printk(KERN_DEBUG "CPU: After all inits, caps:");
  	for (i = 0; i < NCAPINTS; i++)
 diff --git a/xen/arch/x86/xstate.c b/xen/arch/x86/xstate.c
-index c6238d9..55d1360 100644
+index c6238d9..458420f 100644
 --- a/xen/arch/x86/xstate.c
 +++ b/xen/arch/x86/xstate.c
-@@ -278,11 +278,16 @@ unsigned int xstate_ctxt_size(u64 xcr0)
+@@ -278,11 +278,15 @@ unsigned int xstate_ctxt_size(u64 xcr0)
  /* Collect the information of processor's extended state */
  void xstate_init(struct cpuinfo_x86 *c)
  {
 +    static bool_t __initdata use_xsave = 1;
++    boolean_param("xsave", use_xsave);
 +
      bool_t bsp = c == &boot_cpu_data;
      u32 eax, ebx, ecx, edx;
      u64 feature_mask;
  
 -    if ( boot_cpu_data.cpuid_level < XSTATE_CPUID )
-+    boolean_param("xsave", use_xsave);
-+
 +    if ( (bsp && !use_xsave) ||
 +         boot_cpu_data.cpuid_level < XSTATE_CPUID )
      {
