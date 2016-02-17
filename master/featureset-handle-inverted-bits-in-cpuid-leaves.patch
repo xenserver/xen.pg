@@ -1,0 +1,254 @@
+diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
+index 1f81daa..440c0c0 100644
+--- a/tools/libxc/xc_cpuid_x86.c
++++ b/tools/libxc/xc_cpuid_x86.c
+@@ -710,6 +710,21 @@ static void sanitise_featureset(struct cpuid_domain_info *info)
+     }
+ }
+ 
++/*
++ * Flip any inverted featureset bits so they now have the same sense
++ * as the hardware.
++ */
++static void invert_featureset(struct cpuid_domain_info *info)
++{
++    const uint32_t *inverted;
++    unsigned int i;
++
++    inverted = xc_get_static_cpu_featuremask(XC_FEATUREMASK_INVERTED);
++
++    for ( i = 0; i < xc_get_cpu_featureset_size(); i++ )
++        info->featureset[i] ^= inverted[i];
++}
++
+ int xc_cpuid_apply_policy(xc_interface *xch, domid_t domid,
+                           uint32_t *featureset,
+                           unsigned int nr_features)
+@@ -734,6 +749,7 @@ int xc_cpuid_apply_policy(xc_interface *xch, domid_t domid,
+         ext_max = (regs[0] <= DEF_MAX_INTELEXT) ? regs[0] : DEF_MAX_INTELEXT;
+ 
+     sanitise_featureset(&info);
++    invert_featureset(&info);
+ 
+     input[0] = 0;
+     input[1] = XEN_CPUID_INPUT_UNUSED;
+diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
+index 45be18e..af6889d 100644
+--- a/xen/arch/x86/cpuid.c
++++ b/xen/arch/x86/cpuid.c
+@@ -159,7 +159,7 @@ static void calculate_hvm_featureset(void)
+             __clear_bit(X86_FEATURE_MPX, hvm_featureset);
+     }
+ 
+-    sanitise_featureset(pv_featureset);
++    sanitise_featureset(hvm_featureset);
+ }
+ 
+ void calculate_featuresets(void)
+@@ -200,6 +200,18 @@ const uint32_t *lookup_deep_deps(uint32_t feature)
+     return NULL;
+ }
+ 
++/*
++ * Return a mask from a featureset that can be applied to a CPUID
++ * leaf.
++ *
++ * Bits in CPUID leaves have the hardware sense, so if the featureset
++ * has inverted bits these must be flipped.
++ */
++uint32_t cpuid_mask_from_featureset(const uint32_t *featureset, unsigned int i)
++{
++    return featureset[i] ^ inverted_features[i];
++}
++
+ static void __maybe_unused build_assertions(void)
+ {
+     BUILD_BUG_ON(ARRAY_SIZE(known_features) != FSCAPINTS);
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index 0d581f3..8895dc3 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -92,8 +92,11 @@ static void update_domain_cpuid_info(struct domain *d,
+         if ( is_pv_domain(d) )
+         {
+             uint64_t mask = cpuidmask_defaults._1cd;
+-            uint32_t ecx = ctl->ecx & pv_featureset[FEATURESET_1c];
+-            uint32_t edx = ctl->edx & pv_featureset[FEATURESET_1d];
++            uint32_t ecx = ctl->ecx;
++            uint32_t edx = ctl->edx;
++
++            ecx &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_1c);
++            edx &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_1d);
+ 
+             switch ( boot_cpu_data.x86_vendor )
+             {
+@@ -139,7 +142,9 @@ static void update_domain_cpuid_info(struct domain *d,
+         {
+             uint64_t mask = cpuidmask_defaults._7ab0;
+             uint32_t eax = ctl->eax;
+-            uint32_t ebx = ctl->ebx & pv_featureset[FEATURESET_7b0];
++            uint32_t ebx = ctl->ebx;
++
++            ebx &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_7b0);
+ 
+             if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
+                 mask &= ((uint64_t)eax << 32) | ebx;
+@@ -155,7 +160,9 @@ static void update_domain_cpuid_info(struct domain *d,
+         if ( is_pv_domain(d) )
+         {
+             uint64_t mask = cpuidmask_defaults.Da1;
+-            uint32_t eax = ctl->eax & pv_featureset[FEATURESET_Da1];
++            uint32_t eax = ctl->eax;
++
++            eax &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_Da1);
+ 
+             if ( boot_cpu_data.x86_vendor == X86_VENDOR_INTEL )
+                 mask &= (~0ULL << 32) | eax;
+@@ -168,8 +175,11 @@ static void update_domain_cpuid_info(struct domain *d,
+         if ( is_pv_domain(d) )
+         {
+             uint64_t mask = cpuidmask_defaults.e1cd;
+-            uint32_t ecx = ctl->ecx & pv_featureset[FEATURESET_e1c];
+-            uint32_t edx = ctl->edx & pv_featureset[FEATURESET_e1d];
++            uint32_t ecx = ctl->ecx;
++            uint32_t edx = ctl->edx;
++
++            ecx &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_e1c);
++            edx &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_e1d);
+ 
+             switch ( boot_cpu_data.x86_vendor )
+             {
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index af842e1..ac5933e 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -4533,8 +4533,8 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+         *ebx &= 0x00FFFFFFu;
+         *ebx |= (v->vcpu_id * 2) << 24;
+ 
+-        *ecx &= hvm_featureset[FEATURESET_1c];
+-        *edx &= hvm_featureset[FEATURESET_1d];
++        *ecx &= cpuid_mask_from_featureset(hvm_featureset, FEATURESET_1c);
++        *edx &= cpuid_mask_from_featureset(hvm_featureset, FEATURESET_1d);
+ 
+         if ( vlapic_hw_disabled(vcpu_vlapic(v)) )
+             *edx &= ~cpufeat_bit(X86_FEATURE_APIC);
+@@ -4551,8 +4551,8 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+     case 0x7:
+         if ( count == 0 )
+         {
+-            *ebx &= hvm_featureset[FEATURESET_7b0];
+-            *ecx &= hvm_featureset[FEATURESET_7c0];
++            *ebx &= cpuid_mask_from_featureset(hvm_featureset, FEATURESET_7b0);
++            *ecx &= cpuid_mask_from_featureset(hvm_featureset, FEATURESET_7c0);
+ 
+             /* Don't expose INVPCID to non-hap hvm. */
+             if ( !hap_enabled(d) )
+@@ -4584,14 +4584,14 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+ 
+         if ( count == 1 )
+         {
+-            *eax &= hvm_featureset[FEATURESET_Da1];
++            *eax &= cpuid_mask_from_featureset(hvm_featureset, FEATURESET_Da1);
+             *ebx = *ecx = *edx = 0;
+         }
+         break;
+ 
+     case 0x80000001:
+-        *ecx &= hvm_featureset[FEATURESET_e1c];
+-        *edx &= hvm_featureset[FEATURESET_e1d];
++        *ecx &= cpuid_mask_from_featureset(hvm_featureset, FEATURESET_e1c);
++        *edx &= cpuid_mask_from_featureset(hvm_featureset, FEATURESET_e1d);
+ 
+         /* We expose RDTSCP feature to guest only when
+            tsc_mode == TSC_MODE_DEFAULT and host_tsc_is_safe() returns 1 */
+@@ -4604,7 +4604,7 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+         break;
+ 
+     case 0x80000007:
+-        *edx &= hvm_featureset[FEATURESET_e7d];
++        *edx &= cpuid_mask_from_featureset(hvm_featureset, FEATURESET_e7d);
+         break;
+ 
+     case 0x80000008:
+@@ -4623,7 +4623,7 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+         *eax = (*eax & ~0xffff00) | (_edx & cpufeat_mask(X86_FEATURE_LM)
+                                      ? 0x3000 : 0x2000);
+ 
+-        *ebx &= hvm_featureset[FEATURESET_e8b];
++        *ebx &= cpuid_mask_from_featureset(hvm_featureset, FEATURESET_e8b);
+         break;
+     }
+ }
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index 7a1fc15..7493811 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -918,8 +918,8 @@ void pv_cpuid(struct cpu_user_regs *regs)
+     switch ( leaf )
+     {
+     case 0x00000001:
+-        c &= pv_featureset[FEATURESET_1c];
+-        d &= pv_featureset[FEATURESET_1d];
++        c &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_1c);
++        d &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_1d);
+ 
+         if ( is_pv_32bit_domain(currd) )
+             c &= ~cpufeat_mask(X86_FEATURE_CX16);
+@@ -973,8 +973,8 @@ void pv_cpuid(struct cpu_user_regs *regs)
+     case 0x00000007:
+         if ( subleaf == 0 )
+         {
+-            b &= pv_featureset[FEATURESET_7b0];
+-            c &= pv_featureset[FEATURESET_7c0];
++            b &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_7b0);
++            c &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_7c0);
+         }
+         else
+             b = c = 0;
+@@ -1001,15 +1001,15 @@ void pv_cpuid(struct cpu_user_regs *regs)
+         }
+ 
+         case 1:
+-            a &= pv_featureset[FEATURESET_Da1];
++            a &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_Da1);
+             b = c = d = 0;
+             break;
+         }
+         break;
+ 
+     case 0x80000001:
+-        c &= pv_featureset[FEATURESET_e1c];
+-        d &= pv_featureset[FEATURESET_e1d];
++        c &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_e1c);
++        d &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_e1d);
+ 
+         if ( is_pv_32bit_domain(currd) )
+         {
+@@ -1022,11 +1022,11 @@ void pv_cpuid(struct cpu_user_regs *regs)
+         break;
+ 
+     case 0x80000007:
+-        d &= pv_featureset[FEATURESET_e7d];
++        d &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_e7d);
+         break;
+ 
+     case 0x80000008:
+-        b &= pv_featureset[FEATURESET_e8b];
++        b &= cpuid_mask_from_featureset(pv_featureset, FEATURESET_e8b);
+         break;
+ 
+     case 0x0000000a: /* Architectural Performance Monitor Features (Intel) */
+diff --git a/xen/include/asm-x86/cpuid.h b/xen/include/asm-x86/cpuid.h
+index cd7fa90..48d5663 100644
+--- a/xen/include/asm-x86/cpuid.h
++++ b/xen/include/asm-x86/cpuid.h
+@@ -30,6 +30,8 @@ void calculate_featuresets(void);
+ 
+ const uint32_t *lookup_deep_deps(uint32_t feature);
+ 
++uint32_t cpuid_mask_from_featureset(const uint32_t *featureset, unsigned int i);
++
+ #endif /* __ASSEMBLY__ */
+ #endif /* !__X86_CPUID_H__ */
+ 
