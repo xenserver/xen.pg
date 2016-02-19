@@ -1,0 +1,79 @@
+oxenstored: refactor request processing
+
+Encapsulate the request in a record that is passed from do_input to
+process_packet and input_handle_error.
+
+This will be helpful when keeping track of the requests made as part of a
+transaction.
+
+Signed-off-by: Jonathan Davies <jonathan.davies@citrix.com>
+
+diff --git a/tools/ocaml/xenstored/packet.ml b/tools/ocaml/xenstored/packet.ml
+index c8ecfe5..22cae1d 100644
+--- a/tools/ocaml/xenstored/packet.ml
++++ b/tools/ocaml/xenstored/packet.ml
+@@ -1,3 +1,10 @@
++type request = {
++	tid: int;
++	rid: int;
++	ty: Xenbus.Xb.Op.operation;
++	data: string;
++}
++
+ type response =
+ 	| Ack of (unit -> unit)  (* function is the action to execute after sending the ack *)
+ 	| Reply of string
+diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
+index d7e9bf9..9825f4d 100644
+--- a/tools/ocaml/xenstored/process.ml
++++ b/tools/ocaml/xenstored/process.ml
+@@ -345,11 +345,11 @@ let function_of_type ty =
+ 	| Xenbus.Xb.Op.Invalid           -> reply_ack do_error
+ 	| _                              -> reply_ack do_error
+ 
+-let input_handle_error ~cons ~doms ~fct ~ty ~con ~t ~rid ~data =
++let input_handle_error ~cons ~doms ~fct ~con ~t ~req =
+ 	let reply_error e =
+ 		Packet.Error e in
+ 	try
+-		fct con t doms cons data
++		fct con t doms cons req.Packet.data
+ 	with
+ 	| Define.Invalid_path          -> reply_error "EINVAL"
+ 	| Define.Already_exist         -> reply_error "EEXIST"
+@@ -371,7 +371,10 @@ let input_handle_error ~cons ~doms ~fct ~ty ~con ~t ~rid ~data =
+ (**
+  * Nothrow guarantee.
+  *)
+-let process_packet ~store ~cons ~doms ~con ~tid ~rid ~ty ~data =
++let process_packet ~store ~cons ~doms ~con ~req =
++	let ty = req.Packet.ty in
++	let tid = req.Packet.tid in
++	let rid = req.Packet.rid in
+ 	try
+ 		let fct = function_of_type ty in
+ 		let t =
+@@ -380,7 +383,7 @@ let process_packet ~store ~cons ~doms ~con ~tid ~rid ~ty ~data =
+ 			else
+ 				Connection.get_transaction con tid
+ 			in
+-		let response = input_handle_error ~cons ~doms ~fct ~ty ~con ~t ~rid ~data in
++		let response = input_handle_error ~cons ~doms ~fct ~con ~t ~req in
+ 
+ 		(* Put the response on the wire *)
+ 		send_response ty con t rid response
+@@ -413,11 +416,13 @@ let do_input store cons doms con =
+ 	if newpacket then (
+ 		let packet = Connection.pop_in con in
+ 		let tid, rid, ty, data = Xenbus.Xb.Packet.unpack packet in
++		let req = {Packet.tid; Packet.rid; Packet.ty; Packet.data} in
++
+ 		(* As we don't log IO, do not call an unnecessary sanitize_data 
+ 		   info "[%s] -> [%d] %s \"%s\""
+ 		         (Connection.get_domstr con) tid
+ 		         (Xenbus.Xb.Op.to_string ty) (sanitize_data data); *)
+-		process_packet ~store ~cons ~doms ~con ~tid ~rid ~ty ~data;
++		process_packet ~store ~cons ~doms ~con ~req;
+ 		write_access_log ~ty ~tid ~con ~data;
+ 		Connection.incr_ops con;
+ 	)
