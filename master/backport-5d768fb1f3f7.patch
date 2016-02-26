@@ -1,0 +1,115 @@
+From 5d768fb1f3f7b011e7b6e75909c7f4841730de60 Mon Sep 17 00:00:00 2001
+From: David Vrabel <david.vrabel@citrix.com>
+Date: Fri, 26 Feb 2016 12:30:11 +0100
+Subject: [PATCH] x86/hvm: add HVM_PARAM_X87_FIP_WIDTH
+
+The HVM parameter HVM_PARAM_X87_FIP_WIDTH to allow tools and the guest
+to adjust the width of the FIP/FDP registers to be saved/restored by
+the hypervisor.  This is in case the hypervisor hueristics do not do
+the right thing.
+
+Add this parameter to the set saved during domain save/migrate.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+---
+ tools/libxc/xc_sr_save_x86_hvm.c |  1 +
+ xen/arch/x86/hvm/hvm.c           | 13 +++++++++++++
+ xen/include/public/hvm/params.h  | 24 +++++++++++++++++++++++-
+ 3 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/tools/libxc/xc_sr_save_x86_hvm.c b/tools/libxc/xc_sr_save_x86_hvm.c
+index e347b3b..ba50a43 100644
+--- a/tools/libxc/xc_sr_save_x86_hvm.c
++++ b/tools/libxc/xc_sr_save_x86_hvm.c
+@@ -76,6 +76,7 @@ static int write_hvm_params(struct xc_sr_context *ctx)
+         HVM_PARAM_VM_GENERATION_ID_ADDR,
+         HVM_PARAM_IOREQ_SERVER_PFN,
+         HVM_PARAM_NR_IOREQ_SERVER_PAGES,
++        HVM_PARAM_X87_FIP_WIDTH,
+     };
+ 
+     xc_interface *xch = ctx->xch;
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 5ea4b5b..b5865f9 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -6025,6 +6025,7 @@ static int hvm_allow_set_param(struct domain *d,
+     case HVM_PARAM_VM_GENERATION_ID_ADDR:
+     case HVM_PARAM_STORE_EVTCHN:
+     case HVM_PARAM_CONSOLE_EVTCHN:
++    case HVM_PARAM_X87_FIP_WIDTH:
+         break;
+     /*
+      * The following parameters must not be set by the guest
+@@ -6220,6 +6221,14 @@ static int hvmop_set_param(
+ 
+         break;
+     }
++    case HVM_PARAM_X87_FIP_WIDTH:
++        if ( a.value != 0 && a.value != 4 && a.value != 8 )
++        {
++            rc = -EINVAL;
++            break;
++        }
++        d->arch.x87_fip_width = a.value;
++        break;
+     }
+ 
+     if ( rc != 0 )
+@@ -6256,6 +6265,7 @@ static int hvm_allow_get_param(struct domain *d,
+     case HVM_PARAM_CONSOLE_PFN:
+     case HVM_PARAM_CONSOLE_EVTCHN:
+     case HVM_PARAM_ALTP2M:
++    case HVM_PARAM_X87_FIP_WIDTH:
+         break;
+     /*
+      * The following parameters must not be read by the guest
+@@ -6305,6 +6315,9 @@ static int hvmop_get_param(
+     case HVM_PARAM_ACPI_S_STATE:
+         a.value = d->arch.hvm_domain.is_s3_suspended ? 3 : 0;
+         break;
++    case HVM_PARAM_X87_FIP_WIDTH:
++        a.value = d->arch.x87_fip_width;
++        break;
+     case HVM_PARAM_IOREQ_PFN:
+     case HVM_PARAM_BUFIOREQ_PFN:
+     case HVM_PARAM_BUFIOREQ_EVTCHN:
+diff --git a/xen/include/public/hvm/params.h b/xen/include/public/hvm/params.h
+index 81f9451..73d4718 100644
+--- a/xen/include/public/hvm/params.h
++++ b/xen/include/public/hvm/params.h
+@@ -210,6 +210,28 @@
+ /* Boolean: Enable altp2m */
+ #define HVM_PARAM_ALTP2M       35
+ 
+-#define HVM_NR_PARAMS          36
++/*
++ * Size of the x87 FPU FIP/FDP registers that the hypervisor needs to
++ * save/restore.  This is a workaround for a hardware limitation that
++ * does not allow the full FIP/FDP and FCS/FDS to be restored.
++ *
++ * Valid values are:
++ *
++ * 8: save/restore 64-bit FIP/FDP and clear FCS/FDS (default if CPU
++ *    has FPCSDS feature).
++ *
++ * 4: save/restore 32-bit FIP/FDP, FCS/FDS, and clear upper 32-bits of
++ *    FIP/FDP.
++ *
++ * 0: allow hypervisor to choose based on the value of FIP/FDP
++ *    (default if CPU does not have FPCSDS).
++ *
++ * If FPCSDS (bit 13 in CPUID leaf 0x7, subleaf 0x0) is set, the CPU
++ * never saves FCS/FDS and this parameter should be left at the
++ * default of 8.
++ */
++#define HVM_PARAM_X87_FIP_WIDTH 36
++
++#define HVM_NR_PARAMS 37
+ 
+ #endif /* __XEN_PUBLIC_HVM_PARAMS_H__ */
+-- 
+2.1.4
+
