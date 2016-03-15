@@ -1,7 +1,7 @@
-From 75cd5dc000be7c2cc43dbae79fe43c775f06671a Mon Sep 17 00:00:00 2001
+From ba22f1f4732acb4d5aebd779122e91753a0e374d Mon Sep 17 00:00:00 2001
 From: Ross Lagerwall <ross.lagerwall@citrix.com>
-Date: Fri, 11 Mar 2016 12:17:32 +0000
-Subject: [PATCH] vmx: Restore debug registers when injecting #DB traps
+Date: Tue, 15 Mar 2016 12:19:13 +0100
+Subject: [PATCH] vmx: restore debug registers when injecting #DB traps
 
 Commit a929bee0e652 ("x86/vmx: Fix injection of #DB traps following
 XSA-156") prevents an infinite loop in certain #DB traps. However, it
@@ -15,15 +15,13 @@ but ensure that the struct hvm_trap is populated with all the required
 data.
 
 Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
----
- xen/arch/x86/hvm/vmx/vmx.c | 25 ++++++++++++-------------
- 1 file changed, 12 insertions(+), 13 deletions(-)
-
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index de26f43..a0ec3e7 100644
+index 13d7809..7b3b064 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -2847,24 +2847,23 @@ static int vmx_handle_eoi_write(void)
+@@ -2810,24 +2810,31 @@ static int vmx_handle_eoi_write(void)
   * It is the callers responsibility to ensure that this function is only used
   * in the context of an appropriate vmexit.
   */
@@ -38,8 +36,9 @@ index de26f43..a0ec3e7 100644
 -
 -    __vmwrite(VM_ENTRY_INTR_INFO, intr);
 +    struct hvm_trap trap = {
-+        .vector = intr & INTR_INFO_VECTOR_MASK,
-+        .type = MASK_EXTR(intr, INTR_INFO_INTR_TYPE_MASK) };
++        .vector = MASK_EXTR(intr, INTR_INFO_VECTOR_MASK),
++        .type = MASK_EXTR(intr, INTR_INFO_INTR_TYPE_MASK),
++    };
 +    unsigned long tmp;
  
      if ( intr & INTR_INFO_DELIVER_CODE_MASK )
@@ -48,17 +47,24 @@ index de26f43..a0ec3e7 100644
 -        __vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, tmp);
 +        trap.error_code = tmp;
      }
--
 +    else
 +        trap.error_code = HVM_DELIVER_NO_ERROR_CODE;
-     __vmread(VM_EXIT_INSTRUCTION_LEN, &tmp);
++
++    if ( trap.type >= X86_EVENTTYPE_SW_INTERRUPT )
++    {
++        __vmread(VM_EXIT_INSTRUCTION_LEN, &tmp);
++        trap.insn_len = tmp;
++    }
++    else
++        trap.insn_len = 0;
+ 
+-    __vmread(VM_EXIT_INSTRUCTION_LEN, &tmp);
 -    __vmwrite(VM_ENTRY_INSTRUCTION_LEN, tmp);
-+    trap.insn_len = tmp;
 +    hvm_inject_trap(&trap);
  }
  
  static void vmx_idtv_reinject(unsigned long idtv_info)
-@@ -3164,7 +3163,7 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+@@ -3078,7 +3085,7 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
              HVMTRACE_1D(TRAP_DEBUG, exit_qualification);
              write_debugreg(6, exit_qualification | DR_STATUS_RESERVED_ONE);
              if ( !v->domain->debugger_attached )
@@ -67,7 +73,7 @@ index de26f43..a0ec3e7 100644
              else
                  domain_pause_for_debugger();
              break;
-@@ -3233,7 +3232,7 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+@@ -3147,7 +3154,7 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
              break;
          case TRAP_alignment_check:
              HVMTRACE_1D(TRAP, vector);
@@ -76,6 +82,3 @@ index de26f43..a0ec3e7 100644
              break;
          case TRAP_nmi:
              if ( MASK_EXTR(intr_info, INTR_INFO_INTR_TYPE_MASK) !=
--- 
-2.4.3
-
