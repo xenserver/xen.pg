@@ -1,7 +1,7 @@
-From 238a9ad1e12ea750e84c2a8939b894ddfefe37c8 Mon Sep 17 00:00:00 2001
+From eefbbdd1e19706b49a0b054b077332a2dba768e9 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Fri, 31 Jul 2015 20:18:22 +0100
-Subject: [PATCH 18/30] x86/cpu: Rework AMD masking MSR setup
+Subject: [PATCH] x86/cpu: Rework AMD masking MSR setup
 
 This patch is best reviewed as its end result rather than as a diff, as it
 rewrites almost all of the setup.
@@ -11,12 +11,13 @@ of masking MSRs, and they are unconditionally probed, filling in the
 availability information and hardware defaults.
 
 The command line parameters are then combined with the hardware defaults to
-further restrict the Xen default masking level.  Each cpu is then context
-switched into the default levelling state.
+further restrict the Xen default masking level.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <JBeulich@suse.com>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
 diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
-index 72f9740..175383c 100644
+index 27b9efc..9841dce 100644
 --- a/xen/arch/x86/cpu/amd.c
 +++ b/xen/arch/x86/cpu/amd.c
 @@ -80,6 +80,13 @@ static inline int wrmsr_amd_safe(unsigned int msr, unsigned int lo,
@@ -33,27 +34,25 @@ index 72f9740..175383c 100644
  static const struct cpuidmask {
  	uint16_t fam;
  	char rev[2];
-@@ -126,126 +133,200 @@ static const struct cpuidmask *__init noinline get_cpuidmask(const char *opt)
+@@ -126,126 +133,203 @@ static const struct cpuidmask *__init noinline get_cpuidmask(const char *opt)
  }
  
  /*
 + * Sets caps in expected_levelling_cap, probes for the specified mask MSR, and
 + * set caps in levelling_caps if it is found.  Processors prior to Fam 10h
-+ * required a 32-bit password for masking MSRs.  Reads the default value into
-+ * msr_val.
++ * required a 32-bit password for masking MSRs.  Returns the default value.
 + */
-+static void __init __probe_mask_msr(unsigned int msr, uint64_t caps,
-+                                    uint64_t *msr_val)
++static uint64_t __init _probe_mask_msr(unsigned int msr, uint64_t caps)
 +{
 +	unsigned int hi, lo;
 +
-+        expected_levelling_cap |= caps;
++	expected_levelling_cap |= caps;
 +
 +	if ((rdmsr_amd_safe(msr, &lo, &hi) == 0) &&
 +	    (wrmsr_amd_safe(msr, lo, hi) == 0))
 +		levelling_caps |= caps;
 +
-+	*msr_val = ((uint64_t)hi << 32) | lo;
++	return ((uint64_t)hi << 32) | lo;
 +}
 +
 +/*
@@ -73,18 +72,18 @@ index 72f9740..175383c 100644
 +	if (c->x86 == 0x11)
 +		return;
 +
-+	__probe_mask_msr(MSR_K8_FEATURE_MASK, LCAP_1cd,
-+			 &cpuidmask_defaults._1cd);
-+	__probe_mask_msr(MSR_K8_EXT_FEATURE_MASK, LCAP_e1cd,
-+			 &cpuidmask_defaults.e1cd);
++	cpuidmask_defaults._1cd =
++		_probe_mask_msr(MSR_K8_FEATURE_MASK, LCAP_1cd);
++	cpuidmask_defaults.e1cd =
++		_probe_mask_msr(MSR_K8_EXT_FEATURE_MASK, LCAP_e1cd);
 +
 +	if (c->cpuid_level >= 7)
-+		__probe_mask_msr(MSR_AMD_L7S0_FEATURE_MASK, LCAP_7ab0,
-+				 &cpuidmask_defaults._7ab0);
++		cpuidmask_defaults._7ab0 =
++			_probe_mask_msr(MSR_AMD_L7S0_FEATURE_MASK, LCAP_7ab0);
 +
 +	if (c->x86 == 0x15 && c->cpuid_level >= 6 && cpuid_ecx(6))
-+		__probe_mask_msr(MSR_AMD_THRM_FEATURE_MASK, LCAP_6c,
-+				 &cpuidmask_defaults._6c);
++		cpuidmask_defaults._6c =
++			_probe_mask_msr(MSR_AMD_THRM_FEATURE_MASK, LCAP_6c);
 +
 +	/*
 +	 * Don't bother warning about a mismatch if virtualised.  These MSRs
@@ -106,8 +105,8 @@ index 72f9740..175383c 100644
 +
 +/*
 + * Context switch levelling state to the next domain.  A parameter of NULL is
-+ * used to context switch to the default host state, and is used by the BSP/AP
-+ * startup code.
++ * used to context switch to the default host state (by the cpu bringup-code,
++ * crash path, etc).
 + */
 +static void amd_ctxt_switch_levelling(const struct domain *nextd)
 +{
@@ -116,8 +115,8 @@ index 72f9740..175383c 100644
 +
 +#define LAZY(cap, msr, field)						\
 +	({								\
-+		if (((levelling_caps & cap) == cap) &&			\
-+		    (these_masks->field != masks->field))		\
++		if (unlikely(these_masks->field != masks->field) &&	\
++		    ((levelling_caps & cap) == cap))			\
 +		{							\
 +			wrmsr_amd(msr, masks->field);			\
 +			these_masks->field = masks->field;		\
@@ -141,6 +140,11 @@ index 72f9740..175383c 100644
   *
 - * The processor revision string parameter has precedene.
 + * The user-defined masks take precedence.
++ *
++ * AMD "masking msrs" are actually overrides, making it possible to advertise
++ * features which are not supported by the hardware.  Care must be taken to
++ * avoid this, as the accidentally-advertised features will not actually
++ * function.
   */
 -static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
 +static void __init noinline amd_init_levelling(void)
@@ -198,10 +202,10 @@ index 72f9740..175383c 100644
 -			return;
 +		cpuid(0x00000001, &tmp, &tmp, &ecx, &edx);
 +
-+		if(~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx)) {
++		if (~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx)) {
 +			ecx &= opt_cpuid_mask_ecx;
 +			edx &= opt_cpuid_mask_edx;
-+		} else if ( m ) {
++		} else if (m) {
 +			ecx &= m->ecx;
 +			edx &= m->edx;
  		}
@@ -266,10 +270,10 @@ index 72f9740..175383c 100644
 -	    wrmsr_amd_safe(MSR_K8_FEATURE_MASK, feat_edx, feat_ecx)) {
 -		skip_feat = 1;
 -		printk("Failed to set CPUID feature mask\n");
-+		if(~(opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx)) {
++		if (~(opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx)) {
 +			ecx &= opt_cpuid_mask_ext_ecx;
 +			edx &= opt_cpuid_mask_ext_edx;
-+		} else if ( m ) {
++		} else if (m) {
 +			ecx &= m->ext_ecx;
 +			edx &= m->ext_edx;
 +		}
@@ -289,7 +293,7 @@ index 72f9740..175383c 100644
 +
 +		cpuid(0x00000007, &eax, &ebx, &tmp, &tmp);
 +
-+		if(~(opt_cpuid_mask_l7s0_eax & opt_cpuid_mask_l7s0_ebx)) {
++		if (~(opt_cpuid_mask_l7s0_eax & opt_cpuid_mask_l7s0_ebx)) {
 +			eax &= opt_cpuid_mask_l7s0_eax;
 +			ebx &= opt_cpuid_mask_l7s0_ebx;
 +		}
@@ -330,7 +334,7 @@ index 72f9740..175383c 100644
  	}
  }
  
-@@ -411,7 +492,10 @@ static void __devinit amd_get_topology(struct cpuinfo_x86 *c)
+@@ -411,7 +495,10 @@ static void __devinit amd_get_topology(struct cpuinfo_x86 *c)
  
  static void early_init_amd(struct cpuinfo_x86 *c)
  {
@@ -341,4 +345,4 @@ index 72f9740..175383c 100644
 +	amd_ctxt_switch_levelling(NULL);
  }
  
- static void __devinit init_amd(struct cpuinfo_x86 *c)
+ static void init_amd(struct cpuinfo_x86 *c)

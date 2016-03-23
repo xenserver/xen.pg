@@ -1,7 +1,7 @@
-From ad287e690a3d0adaec406ea37b814327d14c1048 Mon Sep 17 00:00:00 2001
+From 143b5963d5df244d32aa804368ff1c8f8d5d8a4f Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Fri, 31 Jul 2015 20:38:13 +0100
-Subject: [PATCH 19/30] x86/cpu: Rework Intel masking/faulting setup
+Subject: [PATCH] x86/cpu: Rework Intel masking/faulting setup
 
 This patch is best reviewed as its end result rather than as a diff, as it
 rewrites almost all of the setup.
@@ -12,12 +12,13 @@ availability information and hardware defaults.  A side effect of this is that
 probe_intel_cpuid_faulting() can move to being __init.
 
 The command line parameters are then combined with the hardware defaults to
-further restrict the Xen default masking level.  Each cpu is then context
-switched into the default levelling state.
+further restrict the Xen default masking level.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <JBeulich@suse.com>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
 diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
-index d251b53..a691d7d 100644
+index d251b53..9ca95a8 100644
 --- a/xen/arch/x86/cpu/intel.c
 +++ b/xen/arch/x86/cpu/intel.c
 @@ -18,11 +18,18 @@
@@ -31,8 +32,8 @@ index d251b53..a691d7d 100644
 -	return !rdmsr_safe(MSR_INTEL_PLATFORM_INFO, x) &&
 -		(x & MSR_PLATFORM_INFO_CPUID_FAULTING);
 +
-+	if ( rdmsr_safe(MSR_INTEL_PLATFORM_INFO, x) ||
-+	     !(x & MSR_PLATFORM_INFO_CPUID_FAULTING) )
++	if (rdmsr_safe(MSR_INTEL_PLATFORM_INFO, x) ||
++	    !(x & MSR_PLATFORM_INFO_CPUID_FAULTING))
 +		return 0;
 +
 +	expected_levelling_cap |= LCAP_faulting;
@@ -42,7 +43,7 @@ index d251b53..a691d7d 100644
  }
  
  static DEFINE_PER_CPU(bool_t, cpuid_faulting_enabled);
-@@ -44,41 +51,46 @@ void set_cpuid_faulting(bool_t enable)
+@@ -44,36 +51,40 @@ void set_cpuid_faulting(bool_t enable)
  }
  
  /*
@@ -55,13 +56,12 @@ index d251b53..a691d7d 100644
 + * If preset, reads the default value into msr_val.
   */
 -static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
-+static void __init __probe_mask_msr(unsigned int *msr, uint64_t caps,
-+				    uint64_t *msr_val)
++static uint64_t __init _probe_mask_msr(unsigned int *msr, uint64_t caps)
  {
 -	static unsigned int msr_basic, msr_ext, msr_xsave;
 -	static enum { not_parsed, no_mask, set_mask } status;
 -	u64 msr_val;
-+	uint64_t val;
++	uint64_t val = 0;
  
 -	if (status == no_mask)
 -		return;
@@ -72,21 +72,21 @@ index d251b53..a691d7d 100644
 +	if (rdmsr_safe(*msr, val) || wrmsr_safe(*msr, val))
 +		*msr = 0;
 +	else
-+	{
 +		levelling_caps |= caps;
-+		*msr_val = val;
-+	}
-+}
  
 -	ASSERT((status == not_parsed) && (c == &boot_cpu_data));
 -	status = no_mask;
-+/* Indicies of the masking MSRs, or 0 if unavailable. */
-+static unsigned int __read_mostly msr_basic, msr_ext, msr_xsave;
++	return val;
++}
  
 -	if (!~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx &
 -	       opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx &
 -	       opt_cpuid_mask_xsave_eax))
 -		return;
++/* Indices of the masking MSRs, or 0 if unavailable. */
++static unsigned int __read_mostly msr_basic, __read_mostly msr_ext,
++	__read_mostly msr_xsave;
++
 +/*
 + * Probe for the existance of the expected masking MSRs.  They might easily
 + * not be available if Xen is running virtualised.
@@ -94,7 +94,7 @@ index d251b53..a691d7d 100644
 +static void __init probe_masking_msrs(void)
 +{
 +	const struct cpuinfo_x86 *c = &boot_cpu_data;
-+	unsigned int exp_msr_basic = 0, exp_msr_ext = 0, exp_msr_xsave = 0;
++	unsigned int exp_msr_basic, exp_msr_ext, exp_msr_xsave;
  
  	/* Only family 6 supports this feature. */
 -	if (c->x86 != 6) {
@@ -105,36 +105,14 @@ index d251b53..a691d7d 100644
  
  	switch (c->x86_model) {
  	case 0x17: /* Yorkfield, Wolfdale, Penryn, Harpertown(DP) */
- 	case 0x1d: /* Dunnington(MP) */
--		msr_basic = MSR_INTEL_MASK_V1_CPUID1;
-+		exp_msr_basic = msr_basic = MSR_INTEL_MASK_V1_CPUID1;
- 		break;
- 
- 	case 0x1a: /* Bloomfield, Nehalem-EP(Gainestown) */
-@@ -88,71 +100,126 @@ static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
- 	case 0x2c: /* Gulftown, Westmere-EP */
- 	case 0x2e: /* Nehalem-EX(Beckton) */
- 	case 0x2f: /* Westmere-EX */
--		msr_basic = MSR_INTEL_MASK_V2_CPUID1;
--		msr_ext   = MSR_INTEL_MASK_V2_CPUID80000001;
-+		exp_msr_basic = msr_basic = MSR_INTEL_MASK_V2_CPUID1;
-+		exp_msr_ext   = msr_ext   = MSR_INTEL_MASK_V2_CPUID80000001;
- 		break;
- 
- 	case 0x2a: /* SandyBridge */
- 	case 0x2d: /* SandyBridge-E, SandyBridge-EN, SandyBridge-EP */
--		msr_basic = MSR_INTEL_MASK_V3_CPUID1;
--		msr_ext   = MSR_INTEL_MASK_V3_CPUID80000001;
--		msr_xsave = MSR_INTEL_MASK_V3_CPUIDD_01;
-+		exp_msr_basic = msr_basic = MSR_INTEL_MASK_V3_CPUID1;
-+		exp_msr_ext   = msr_ext   = MSR_INTEL_MASK_V3_CPUID80000001;
-+		exp_msr_xsave = msr_xsave = MSR_INTEL_MASK_V3_CPUIDD_01;
+@@ -100,59 +111,121 @@ static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
  		break;
  	}
  
 -	status = set_mask;
-+	if (msr_basic)
-+		__probe_mask_msr(&msr_basic, LCAP_1cd, &cpuidmask_defaults._1cd);
++	exp_msr_basic = msr_basic;
++	exp_msr_ext   = msr_ext;
++	exp_msr_xsave = msr_xsave;
  
 -	if (~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx)) {
 -		if (msr_basic)
@@ -162,11 +140,14 @@ index d251b53..a691d7d 100644
 -			       opt_cpuid_mask_xsave_eax);
 -		else
 -			printk("No CPUID xsave feature mask available\n");
++	if (msr_basic)
++		cpuidmask_defaults._1cd = _probe_mask_msr(&msr_basic, LCAP_1cd);
++
 +	if (msr_ext)
-+		__probe_mask_msr(&msr_ext, LCAP_e1cd, &cpuidmask_defaults.e1cd);
++		cpuidmask_defaults.e1cd = _probe_mask_msr(&msr_ext, LCAP_e1cd);
 +
 +	if (msr_xsave)
-+		__probe_mask_msr(&msr_xsave, LCAP_Da1, &cpuidmask_defaults.Da1);
++		cpuidmask_defaults.Da1 = _probe_mask_msr(&msr_xsave, LCAP_Da1);
 +
 +	/*
 +	 * Don't bother warning about a mismatch if virtualised.  These MSRs
@@ -190,8 +171,8 @@ index d251b53..a691d7d 100644
 +
 +/*
 + * Context switch levelling state to the next domain.  A parameter of NULL is
-+ * used to context switch to the default host state, and is used by the BSP/AP
-+ * startup code.
++ * used to context switch to the default host state (by the cpu bringup-code,
++ * crash path, etc).
 + */
 +static void intel_ctxt_switch_levelling(const struct domain *nextd)
 +{
@@ -200,9 +181,10 @@ index d251b53..a691d7d 100644
 +
 +#define LAZY(msr, field)						\
 +	({								\
-+		if (msr && (these_masks->field != masks->field))	\
++		if (unlikely(these_masks->field != masks->field) &&	\
++		    (msr))						\
 +		{							\
-+			wrmsrl(msr, masks->field);			\
++			wrmsrl((msr), masks->field);			\
 +			these_masks->field = masks->field;		\
 +		}							\
 +	})
@@ -279,18 +261,20 @@ index d251b53..a691d7d 100644
 -		printk("Failed to set CPUID xsave feature mask\n");
 +	if (opt_cpu_info) {
 +		printk(XENLOG_INFO "Levelling caps: %#x\n", levelling_caps);
-+		printk(XENLOG_INFO
-+		       "MSR defaults: 1d 0x%08x, 1c 0x%08x, e1d 0x%08x, "
-+		       "e1c 0x%08x, Da1 0x%08x\n",
-+		       (uint32_t)(cpuidmask_defaults._1cd >> 32),
-+		       (uint32_t)cpuidmask_defaults._1cd,
-+		       (uint32_t)(cpuidmask_defaults.e1cd >> 32),
-+		       (uint32_t)cpuidmask_defaults.e1cd,
-+		       (uint32_t)cpuidmask_defaults.Da1);
++
++		if (!cpu_has_cpuid_faulting)
++			printk(XENLOG_INFO
++			       "MSR defaults: 1d 0x%08x, 1c 0x%08x, e1d 0x%08x, "
++			       "e1c 0x%08x, Da1 0x%08x\n",
++			       (uint32_t)(cpuidmask_defaults._1cd >> 32),
++			       (uint32_t)cpuidmask_defaults._1cd,
++			       (uint32_t)(cpuidmask_defaults.e1cd >> 32),
++			       (uint32_t)cpuidmask_defaults.e1cd,
++			       (uint32_t)cpuidmask_defaults.Da1);
  	}
  }
  
-@@ -183,22 +250,13 @@ static void early_init_intel(struct cpuinfo_x86 *c)
+@@ -183,22 +256,13 @@ static void early_init_intel(struct cpuinfo_x86 *c)
  	    (boot_cpu_data.x86_mask == 3 || boot_cpu_data.x86_mask == 4))
  		paddr_bits = 36;
  
@@ -300,13 +284,12 @@ index d251b53..a691d7d 100644
 -				  c->x86_capability);
 -	} else if (boot_cpu_has(X86_FEATURE_CPUID_FAULTING)) {
 -		BUG_ON(!probe_intel_cpuid_faulting());
--		__set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
--	}
 +	if (c == &boot_cpu_data)
 +		intel_init_levelling();
 +
 +	if (test_bit(X86_FEATURE_CPUID_FAULTING, boot_cpu_data.x86_capability))
-+            __set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
+ 		__set_bit(X86_FEATURE_CPUID_FAULTING, c->x86_capability);
+-	}
  
 -	if (!cpu_has_cpuid_faulting)
 -		set_cpuidmask(c);

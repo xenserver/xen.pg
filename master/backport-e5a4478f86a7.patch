@@ -1,17 +1,19 @@
-From 4d4e381078bc01e9871776d2e743e20b3a20d51f Mon Sep 17 00:00:00 2001
+From a9af9c21bdd4be7e9e85ff205d3917bfadfb13e2 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Mon, 25 Jan 2016 17:07:13 +0000
-Subject: [PATCH 26/30] tools/libxc: Expose the automatically generated cpu
+Subject: [PATCH] tools/libxc: Expose the automatically generated cpu
  featuremask information
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
 diff --git a/tools/libxc/Makefile b/tools/libxc/Makefile
-index a0f899b..f3e8df5 100644
+index a0f899b..7a0977c 100644
 --- a/tools/libxc/Makefile
 +++ b/tools/libxc/Makefile
-@@ -145,6 +145,15 @@ $(eval $(genpath-target))
- 
- xc_private.h: _paths.h
+@@ -148,6 +148,16 @@ xc_private.h: _paths.h
+ $(CTRL_LIB_OBJS) $(GUEST_LIB_OBJS) $(OSDEP_LIB_OBJS) \
+ $(CTRL_PIC_OBJS) $(GUEST_PIC_OBJS) $(OSDEP_PIC_OBJS): xc_private.h
  
 +ifeq ($(CONFIG_X86),y)
 +
@@ -22,15 +24,16 @@ index a0f899b..f3e8df5 100644
 +build: _xc_cpuid_autogen.h
 +endif
 +
- $(CTRL_LIB_OBJS) $(GUEST_LIB_OBJS) $(OSDEP_LIB_OBJS) \
- $(CTRL_PIC_OBJS) $(GUEST_PIC_OBJS) $(OSDEP_PIC_OBJS): xc_private.h
++
+ .PHONY: all
+ all: build
  
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index 26aa06a..700bd76 100644
+index 22ff3a3..8a981ba 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
-@@ -2854,6 +2854,20 @@ int xc_psr_cat_get_l3_info(xc_interface *xch, uint32_t socket,
- 
+@@ -2855,6 +2855,20 @@ int xc_psr_cat_get_l3_info(xc_interface *xch, uint32_t socket,
+ int xc_get_cpu_levelling_caps(xc_interface *xch, uint32_t *caps);
  int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
                            uint32_t *nr_features, uint32_t *featureset);
 +
@@ -38,7 +41,7 @@ index 26aa06a..700bd76 100644
 +
 +enum xc_static_cpu_featuremask {
 +    XC_FEATUREMASK_KNOWN,
-+    XC_FEATUREMASK_INVERTED,
++    XC_FEATUREMASK_SPECIAL,
 +    XC_FEATUREMASK_PV,
 +    XC_FEATUREMASK_HVM_SHADOW,
 +    XC_FEATUREMASK_HVM_HAP,
@@ -51,18 +54,18 @@ index 26aa06a..700bd76 100644
  
  #endif /* XENCTRL_H */
 diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
-index 1a62b4e..575d6a7 100644
+index 862f931..b2c2440 100644
 --- a/tools/libxc/xc_cpuid_x86.c
 +++ b/tools/libxc/xc_cpuid_x86.c
-@@ -22,6 +22,7 @@
- #include <stdlib.h>
- #include <stdbool.h>
- #include "xc_private.h"
-+#include "_xc_cpuid_autogen.h"
+@@ -28,6 +28,7 @@ enum {
+ #define XEN_CPUFEATURE(name, value) X86_FEATURE_##name = value,
  #include <xen/arch-x86/cpufeatureset.h>
- #include <xen/hvm/params.h>
+ };
++#include "_xc_cpuid_autogen.h"
  
-@@ -60,6 +61,80 @@ int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
+ #define bitmaskof(idx)      (1u << ((idx) & 31))
+ #define clear_bit(idx, dst) ((dst) &= ~bitmaskof(idx))
+@@ -78,6 +79,80 @@ int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
      return ret;
  }
  
@@ -75,14 +78,14 @@ index 1a62b4e..575d6a7 100644
 +    enum xc_static_cpu_featuremask mask)
 +{
 +    const static uint32_t known[FEATURESET_NR_ENTRIES] = INIT_KNOWN_FEATURES,
-+        inverted[FEATURESET_NR_ENTRIES] = INIT_INVERTED_FEATURES,
++        special[FEATURESET_NR_ENTRIES] = INIT_SPECIAL_FEATURES,
 +        pv[FEATURESET_NR_ENTRIES] = INIT_PV_FEATURES,
 +        hvm_shadow[FEATURESET_NR_ENTRIES] = INIT_HVM_SHADOW_FEATURES,
 +        hvm_hap[FEATURESET_NR_ENTRIES] = INIT_HVM_HAP_FEATURES,
 +        deep_features[FEATURESET_NR_ENTRIES] = INIT_DEEP_FEATURES;
 +
 +    XC_BUILD_BUG_ON(ARRAY_SIZE(known) != FEATURESET_NR_ENTRIES);
-+    XC_BUILD_BUG_ON(ARRAY_SIZE(inverted) != FEATURESET_NR_ENTRIES);
++    XC_BUILD_BUG_ON(ARRAY_SIZE(special) != FEATURESET_NR_ENTRIES);
 +    XC_BUILD_BUG_ON(ARRAY_SIZE(pv) != FEATURESET_NR_ENTRIES);
 +    XC_BUILD_BUG_ON(ARRAY_SIZE(hvm_shadow) != FEATURESET_NR_ENTRIES);
 +    XC_BUILD_BUG_ON(ARRAY_SIZE(hvm_hap) != FEATURESET_NR_ENTRIES);
@@ -93,8 +96,8 @@ index 1a62b4e..575d6a7 100644
 +    case XC_FEATUREMASK_KNOWN:
 +        return known;
 +
-+    case XC_FEATUREMASK_INVERTED:
-+        return inverted;
++    case XC_FEATUREMASK_SPECIAL:
++        return special;
 +
 +    case XC_FEATUREMASK_PV:
 +        return pv;

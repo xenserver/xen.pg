@@ -1,0 +1,167 @@
+From 4fdff9419b9962567b0c712ff0a0e468b80ae2cb Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 14 Mar 2016 13:02:00 +0100
+Subject: [PATCH] x86: rename XMM* features to SSE*
+
+The latter are their canonical names, used already in the instruction
+emulator.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 29cbde4..bddd090 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -201,12 +201,12 @@ static void __init early_cpu_detect(void)
+ 		c->x86_model += ((eax >> 16) & 0xF) << 4;
+ 	c->x86_mask = eax & 15;
+ 	edx &= ~cleared_caps[cpufeat_word(X86_FEATURE_FPU)];
+-	ecx &= ~cleared_caps[cpufeat_word(X86_FEATURE_XMM3)];
++	ecx &= ~cleared_caps[cpufeat_word(X86_FEATURE_SSE3)];
+ 	if (edx & cpufeat_mask(X86_FEATURE_CLFLUSH))
+ 		c->x86_cache_alignment = ((ebx >> 8) & 0xff) * 8;
+ 	/* Leaf 0x1 capabilities filled in early for Xen. */
+ 	c->x86_capability[cpufeat_word(X86_FEATURE_FPU)] = edx;
+-	c->x86_capability[cpufeat_word(X86_FEATURE_XMM3)] = ecx;
++	c->x86_capability[cpufeat_word(X86_FEATURE_SSE3)] = ecx;
+ 
+ 	if ( cpuid_eax(0x80000000) >= 0x80000008 )
+ 		paddr_bits = cpuid_eax(0x80000008) & 0xff;
+@@ -245,7 +245,7 @@ static void __cpuinit generic_identify(struct cpuinfo_x86 *c)
+ 	c->cpuid_level = cpuid_eax(0);
+ 	cpuid(0x00000001, &eax, &ebx, &ecx, &edx);
+ 	c->x86_capability[cpufeat_word(X86_FEATURE_FPU)] = edx;
+-	c->x86_capability[cpufeat_word(X86_FEATURE_XMM3)] = ecx;
++	c->x86_capability[cpufeat_word(X86_FEATURE_SSE3)] = ecx;
+ 
+ 	if ( cpu_has(c, X86_FEATURE_CLFLUSH) )
+ 		c->x86_clflush_size = ((ebx >> 8) & 0xff) * 8;
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index f62ef1a..93c98c1 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -1552,7 +1552,7 @@ static int hvmemul_get_fpu(
+             return X86EMUL_UNHANDLEABLE;
+         break;
+     case X86EMUL_FPU_xmm:
+-        if ( !cpu_has_xmm ||
++        if ( !cpu_has_sse ||
+              (curr->arch.hvm_vcpu.guest_cr[0] & X86_CR0_EM) ||
+              !(curr->arch.hvm_vcpu.guest_cr[4] & X86_CR4_OSFXSR) )
+             return X86EMUL_UNHANDLEABLE;
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 998ed30..f1647fe 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -1950,7 +1950,7 @@ static unsigned long hvm_cr4_guest_reserved_bits(const struct vcpu *v,
+              X86_CR4_PCE |
+              (leaf1_edx & cpufeat_mask(X86_FEATURE_FXSR) ?
+               X86_CR4_OSFXSR : 0) |
+-             (leaf1_edx & cpufeat_mask(X86_FEATURE_XMM) ?
++             (leaf1_edx & cpufeat_mask(X86_FEATURE_SSE) ?
+               X86_CR4_OSXMMEXCPT : 0) |
+              ((restore || nestedhvm_enabled(v->domain)) &&
+               (leaf1_ecx & cpufeat_mask(X86_FEATURE_VMXE)) ?
+diff --git a/xen/arch/x86/hvm/vmx/vvmx.c b/xen/arch/x86/hvm/vmx/vvmx.c
+index cb6f9b8..15385b9 100644
+--- a/xen/arch/x86/hvm/vmx/vvmx.c
++++ b/xen/arch/x86/hvm/vmx/vvmx.c
+@@ -2005,7 +2005,7 @@ int nvmx_msr_read_intercept(unsigned int msr, u64 *msr_content)
+             data |= X86_CR4_PGE;
+         if ( edx & cpufeat_mask(X86_FEATURE_FXSR) )
+             data |= X86_CR4_OSFXSR;
+-        if ( edx & cpufeat_mask(X86_FEATURE_XMM) )
++        if ( edx & cpufeat_mask(X86_FEATURE_SSE) )
+             data |= X86_CR4_OSXMMEXCPT;
+         if ( ecx & cpufeat_mask(X86_FEATURE_VMXE) )
+             data |= X86_CR4_VMXE;
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 54995ed..3d9a6ce 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -1291,7 +1291,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+ 
+     if ( cpu_has_fxsr )
+         set_in_cr4(X86_CR4_OSFXSR);
+-    if ( cpu_has_xmm )
++    if ( cpu_has_sse )
+         set_in_cr4(X86_CR4_OSXMMEXCPT);
+ 
+     if ( disable_smep )
+diff --git a/xen/include/asm-x86/amd.h b/xen/include/asm-x86/amd.h
+index 984d482..9b74c49 100644
+--- a/xen/include/asm-x86/amd.h
++++ b/xen/include/asm-x86/amd.h
+@@ -22,7 +22,7 @@
+ 	cpufeat_mask(X86_FEATURE_CMOV)  | cpufeat_mask(X86_FEATURE_PAT)    | \
+ 	cpufeat_mask(X86_FEATURE_PSE36) | cpufeat_mask(X86_FEATURE_CLFLUSH)| \
+ 	cpufeat_mask(X86_FEATURE_MMX)   | cpufeat_mask(X86_FEATURE_FXSR)   | \
+-	cpufeat_mask(X86_FEATURE_XMM)   | cpufeat_mask(X86_FEATURE_XMM2))
++	cpufeat_mask(X86_FEATURE_SSE)   | cpufeat_mask(X86_FEATURE_SSE2))
+ #define AMD_EXTFEATURES_K8_REV_C_ECX  0
+ #define AMD_EXTFEATURES_K8_REV_C_EDX  (					       \
+ 	cpufeat_mask(X86_FEATURE_FPU)	   | cpufeat_mask(X86_FEATURE_VME)   | \
+@@ -48,7 +48,7 @@
+ 
+ /* Family 0Fh, Revision E */
+ #define AMD_FEATURES_K8_REV_E_ECX        (AMD_FEATURES_K8_REV_D_ECX |	\
+-	cpufeat_mask(X86_FEATURE_XMM3))
++	cpufeat_mask(X86_FEATURE_SSE3))
+ #define AMD_FEATURES_K8_REV_E_EDX        (AMD_FEATURES_K8_REV_D_EDX | 	\
+ 	cpufeat_mask(X86_FEATURE_HT))
+ #define AMD_EXTFEATURES_K8_REV_E_ECX     (AMD_EXTFEATURES_K8_REV_D_ECX |\
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index 1789126..d201107 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -38,8 +38,8 @@
+ #define X86_FEATURE_MMX		(0*32+23) /* Multimedia Extensions */
+ #define X86_FEATURE_FXSR	(0*32+24) /* FXSAVE and FXRSTOR instructions (fast save and restore */
+ 				          /* of FPU context), and CR4.OSFXSR available */
+-#define X86_FEATURE_XMM		(0*32+25) /* Streaming SIMD Extensions */
+-#define X86_FEATURE_XMM2	(0*32+26) /* Streaming SIMD Extensions-2 */
++#define X86_FEATURE_SSE		(0*32+25) /* Streaming SIMD Extensions */
++#define X86_FEATURE_SSE2	(0*32+26) /* Streaming SIMD Extensions-2 */
+ #define X86_FEATURE_SELFSNOOP	(0*32+27) /* CPU self snoop */
+ #define X86_FEATURE_HT		(0*32+28) /* Hyper-Threading */
+ #define X86_FEATURE_ACC		(0*32+29) /* Automatic clock control */
+@@ -77,7 +77,7 @@
+ #define X86_FEATURE_CLFLUSH_MONITOR (3*32+15) /* clflush reqd with monitor */
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000001 (ecx), word 4 */
+-#define X86_FEATURE_XMM3	(4*32+ 0) /* Streaming SIMD Extensions-3 */
++#define X86_FEATURE_SSE3	(4*32+ 0) /* Streaming SIMD Extensions-3 */
+ #define X86_FEATURE_PCLMULQDQ	(4*32+ 1) /* Carry-less mulitplication */
+ #define X86_FEATURE_DTES64	(4*32+ 2) /* 64-bit Debug Store */
+ #define X86_FEATURE_MWAIT	(4*32+ 3) /* Monitor/Mwait support */
+@@ -176,9 +176,9 @@
+ #define cpu_has_mtrr		1
+ #define cpu_has_mmx		1
+ #define cpu_has_fxsr		1
+-#define cpu_has_xmm		1
+-#define cpu_has_xmm2		1
+-#define cpu_has_xmm3		boot_cpu_has(X86_FEATURE_XMM3)
++#define cpu_has_sse		boot_cpu_has(X86_FEATURE_SSE)
++#define cpu_has_sse2		boot_cpu_has(X86_FEATURE_SSE2)
++#define cpu_has_sse3		boot_cpu_has(X86_FEATURE_SSE3)
+ #define cpu_has_ht		boot_cpu_has(X86_FEATURE_HT)
+ #define cpu_has_syscall		1
+ #define cpu_has_mp		1
+diff --git a/xen/include/asm-x86/page.h b/xen/include/asm-x86/page.h
+index 66b611c..e9a6e46 100644
+--- a/xen/include/asm-x86/page.h
++++ b/xen/include/asm-x86/page.h
+@@ -209,11 +209,11 @@ typedef struct { u64 pfn; } pagetable_t;
+ #define pagetable_null()        pagetable_from_pfn(0)
+ 
+ void clear_page_sse2(void *);
+-#define clear_page(_p)      (cpu_has_xmm2 ?                             \
++#define clear_page(_p)      (cpu_has_sse2 ?                             \
+                              clear_page_sse2((void *)(_p)) :            \
+                              (void)memset((void *)(_p), 0, PAGE_SIZE))
+ void copy_page_sse2(void *, const void *);
+-#define copy_page(_t,_f)    (cpu_has_xmm2 ?                             \
++#define copy_page(_t,_f)    (cpu_has_sse2 ?                             \
+                              copy_page_sse2(_t, _f) :                   \
+                              (void)memcpy(_t, _f, PAGE_SIZE))
+ 

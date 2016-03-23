@@ -1,34 +1,66 @@
-From 16eedef3a66870e9099e6028e795f195e1c27125 Mon Sep 17 00:00:00 2001
+From 7e2dea9dac522f2fd32cd37d5ee7ac347e5390e5 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Tue, 4 Aug 2015 15:37:43 +0100
-Subject: [PATCH 23/30] xen+tools: Export maximum host and guest cpu
- featuresets via SYSCTL
+Subject: [PATCH] xen+tools: Export maximum host and guest cpu featuresets via
+ SYSCTL
 
 And provide stubs for toolstack use.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+Acked-by: David Scott <dave@recoil.org>
+Acked-by: Jan Beulich <JBeulich@suse.com>
+Acked-by: Daniel De Graaf <dgdegra@tycho.nsa.gov>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+diff --git a/tools/flask/policy/policy/modules/xen/xen.te b/tools/flask/policy/policy/modules/xen/xen.te
+index 02d9a74..8ae11ba 100644
+--- a/tools/flask/policy/policy/modules/xen/xen.te
++++ b/tools/flask/policy/policy/modules/xen/xen.te
+@@ -72,6 +72,7 @@ allow dom0_t xen_t:xen2 {
+ allow dom0_t xen_t:xen2 {
+     pmu_ctrl
+     get_cpu_levelling_caps
++    get_cpu_featureset
+ };
+ allow dom0_t xen_t:mmu memorymap;
+ 
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index c0d2d6f..26aa06a 100644
+index c0d2d6f..22ff3a3 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
-@@ -2851,6 +2851,9 @@ int xc_psr_cat_get_domain_data(xc_interface *xch, uint32_t domid,
+@@ -2851,6 +2851,10 @@ int xc_psr_cat_get_domain_data(xc_interface *xch, uint32_t domid,
                                 uint64_t *data);
  int xc_psr_cat_get_l3_info(xc_interface *xch, uint32_t socket,
                             uint32_t *cos_max, uint32_t *cbm_len);
 +
++int xc_get_cpu_levelling_caps(xc_interface *xch, uint32_t *caps);
 +int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
 +                          uint32_t *nr_features, uint32_t *featureset);
  #endif
  
  #endif /* XENCTRL_H */
 diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
-index 031c848..6b52958 100644
+index 031c848..ddffbba 100644
 --- a/tools/libxc/xc_cpuid_x86.c
 +++ b/tools/libxc/xc_cpuid_x86.c
-@@ -33,6 +33,33 @@
+@@ -33,6 +33,47 @@
  #define DEF_MAX_INTELEXT  0x80000008u
  #define DEF_MAX_AMDEXT    0x8000001cu
  
++int xc_get_cpu_levelling_caps(xc_interface *xch, uint32_t *caps)
++{
++    DECLARE_SYSCTL;
++    int ret;
++
++    sysctl.cmd = XEN_SYSCTL_get_cpu_levelling_caps;
++    ret = do_sysctl(xch, &sysctl);
++
++    if ( !ret )
++        *caps = sysctl.u.cpu_levelling_caps.caps;
++
++    return ret;
++}
++
 +int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
 +                          uint32_t *nr_features, uint32_t *featureset)
 +{
@@ -135,10 +167,10 @@ index b7de615..d6cd731 100644
  {
  	CAMLparam3(xch, domid, timeout);
 diff --git a/xen/arch/x86/sysctl.c b/xen/arch/x86/sysctl.c
-index 38b5dcb..e938a14 100644
+index e4f6305..af3b8a1 100644
 --- a/xen/arch/x86/sysctl.c
 +++ b/xen/arch/x86/sysctl.c
-@@ -29,6 +29,7 @@
+@@ -30,6 +30,7 @@
  #include <xen/cpu.h>
  #include <xsm/xsm.h>
  #include <asm/psr.h>
@@ -146,13 +178,19 @@ index 38b5dcb..e938a14 100644
  
  #define get_xen_guest_handle(val, hnd)  do { val = (hnd).p; } while (0)
  
-@@ -190,6 +191,71 @@ long arch_do_sysctl(
-         }
+@@ -197,6 +198,56 @@ long arch_do_sysctl(
+             ret = -EFAULT;
          break;
  
 +    case XEN_SYSCTL_get_cpu_featureset:
 +    {
-+        const uint32_t *featureset;
++        static const uint32_t *const featureset_table[] = {
++            [XEN_SYSCTL_cpu_featureset_raw]  = raw_featureset,
++            [XEN_SYSCTL_cpu_featureset_host] = host_featureset,
++            [XEN_SYSCTL_cpu_featureset_pv]   = pv_featureset,
++            [XEN_SYSCTL_cpu_featureset_hvm]  = hvm_featureset,
++        };
++        const uint32_t *featureset = NULL;
 +        unsigned int nr;
 +
 +        /* Request for maximum number of features? */
@@ -166,35 +204,14 @@ index 38b5dcb..e938a14 100644
 +        }
 +
 +        /* Clip the number of entries. */
-+        nr = sysctl->u.cpu_featureset.nr_features;
-+        if ( nr > FSCAPINTS )
-+            nr = FSCAPINTS;
++        nr = min(sysctl->u.cpu_featureset.nr_features, FSCAPINTS);
 +
-+        switch ( sysctl->u.cpu_featureset.index )
-+        {
-+        case XEN_SYSCTL_cpu_featureset_raw:
-+            featureset = raw_featureset;
-+            break;
-+
-+        case XEN_SYSCTL_cpu_featureset_host:
-+            featureset = host_featureset;
-+            break;
-+
-+        case XEN_SYSCTL_cpu_featureset_pv:
-+            featureset = pv_featureset;
-+            break;
-+
-+        case XEN_SYSCTL_cpu_featureset_hvm:
-+            featureset = hvm_featureset;
-+            break;
-+
-+        default:
-+            featureset = NULL;
-+            break;
-+        }
++        /* Look up requested featureset. */
++        if ( sysctl->u.cpu_featureset.index < ARRAY_SIZE(featureset_table) )
++            featureset = featureset_table[sysctl->u.cpu_featureset.index];
 +
 +        /* Bad featureset index? */
-+        if ( !ret && !featureset )
++        if ( !featureset )
 +            ret = -EINVAL;
 +
 +        /* Copy the requested featureset into place. */
@@ -219,19 +236,21 @@ index 38b5dcb..e938a14 100644
          ret = -ENOSYS;
          break;
 diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
-index 0cacacc..2b2d1a2 100644
+index 89f9f68..3ad34b5 100644
 --- a/xen/include/public/sysctl.h
 +++ b/xen/include/public/sysctl.h
-@@ -764,6 +764,29 @@ struct xen_sysctl_tmem_op {
- typedef struct xen_sysctl_tmem_op xen_sysctl_tmem_op_t;
- DEFINE_XEN_GUEST_HANDLE(xen_sysctl_tmem_op_t);
+@@ -785,6 +785,31 @@ struct xen_sysctl_cpu_levelling_caps {
+ typedef struct xen_sysctl_cpu_levelling_caps xen_sysctl_cpu_levelling_caps_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_sysctl_cpu_levelling_caps_t);
  
 +/*
 + * XEN_SYSCTL_get_cpu_featureset (x86 specific)
 + *
-+ * Return information about the maximum sets of features which can be offered
-+ * to different types of guests.  This is all strictly information as found in
-+ * `cpuid` feature leaves with no synthetic additions.
++ * Return information about featuresets available on this host.
++ *  -  Raw: The real cpuid values.
++ *  - Host: The values Xen is using, (after command line overrides, etc).
++ *  -   PV: Maximum set of features which can be given to a PV guest.
++ *  -  HVM: Maximum set of features which can be given to a HVM guest.
 + */
 +struct xen_sysctl_cpu_featureset {
 +#define XEN_SYSCTL_cpu_featureset_raw      0
@@ -252,19 +271,46 @@ index 0cacacc..2b2d1a2 100644
  struct xen_sysctl {
      uint32_t cmd;
  #define XEN_SYSCTL_readconsole                    1
-@@ -789,6 +812,7 @@ struct xen_sysctl {
- #define XEN_SYSCTL_pcitopoinfo                   22
+@@ -811,6 +836,7 @@ struct xen_sysctl {
  #define XEN_SYSCTL_psr_cat_op                    23
  #define XEN_SYSCTL_tmem_op                       24
-+#define XEN_SYSCTL_get_cpu_featureset            25
+ #define XEN_SYSCTL_get_cpu_levelling_caps        25
++#define XEN_SYSCTL_get_cpu_featureset            26
      uint32_t interface_version; /* XEN_SYSCTL_INTERFACE_VERSION */
      union {
          struct xen_sysctl_readconsole       readconsole;
-@@ -814,6 +838,7 @@ struct xen_sysctl {
-         struct xen_sysctl_psr_cmt_op        psr_cmt_op;
+@@ -837,6 +863,7 @@ struct xen_sysctl {
          struct xen_sysctl_psr_cat_op        psr_cat_op;
          struct xen_sysctl_tmem_op           tmem_op;
+         struct xen_sysctl_cpu_levelling_caps cpu_levelling_caps;
 +        struct xen_sysctl_cpu_featureset    cpu_featureset;
          uint8_t                             pad[128];
      } u;
  };
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 294ba8d..e7f35e7 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -807,6 +807,9 @@ static int flask_sysctl(int cmd)
+     case XEN_SYSCTL_get_cpu_levelling_caps:
+         return domain_has_xen(current->domain, XEN2__GET_CPU_LEVELLING_CAPS);
+ 
++    case XEN_SYSCTL_get_cpu_featureset:
++        return domain_has_xen(current->domain, XEN2__GET_CPU_FEATURESET);
++
+     default:
+         printk("flask_sysctl: Unknown op %d\n", cmd);
+         return -EPERM;
+diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
+index 5716d0a..e86d35b 100644
+--- a/xen/xsm/flask/policy/access_vectors
++++ b/xen/xsm/flask/policy/access_vectors
+@@ -95,6 +95,8 @@ class xen2
+     pmu_use
+ # XEN_SYSCTL_get_cpu_levelling_caps
+     get_cpu_levelling_caps
++# XEN_SYSCTL_get_cpu_featureset
++    get_cpu_featureset
+ }
+ 
+ # Classes domain and domain2 consist of operations that a domain performs on

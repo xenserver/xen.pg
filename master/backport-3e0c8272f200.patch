@@ -1,7 +1,7 @@
-From e8c53cc251b6e5f5919bc78968523842acb6b8e8 Mon Sep 17 00:00:00 2001
+From 8d5fa03c1a189330ae9e692d6528ceda96d558ac Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 7 Oct 2015 16:51:54 +0100
-Subject: [PATCH 29/30] tools/libxc: Use featuresets rather than guesswork
+Subject: [PATCH] tools/libxc: Use featuresets rather than guesswork
 
 It is conceptually wrong to base a VM's featureset on the features visible to
 the toolstack which happens to construct it.
@@ -13,36 +13,39 @@ Collect all the feature manipulation into a single function which adjusts the
 featureset, and perform deep dependency removal.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
 diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
-index 0870a95..c3e0888 100644
+index 637d5e7..fc7e20a 100644
 --- a/tools/libxc/xc_cpuid_x86.c
 +++ b/tools/libxc/xc_cpuid_x86.c
-@@ -21,18 +21,22 @@
+@@ -21,7 +21,9 @@
  
  #include <stdlib.h>
  #include <stdbool.h>
 +#include <limits.h>
  #include "xc_private.h"
 +#include "xc_bitops.h"
- #include "_xc_cpuid_autogen.h"
- #include <xen/arch-x86/cpufeatureset.h>
  #include <xen/hvm/params.h>
  
-+#define featureword_of(idx) ((idx) >> 5)
+ enum {
+@@ -31,12 +33,14 @@ enum {
+ #include "_xc_cpuid_autogen.h"
+ 
  #define bitmaskof(idx)      (1u << ((idx) & 31))
 -#define clear_bit(idx, dst) ((dst) &= ~bitmaskof(idx))
 -#define set_bit(idx, dst)   ((dst) |=  bitmaskof(idx))
++#define featureword_of(idx) ((idx) >> 5)
 +#define clear_feature(idx, dst) ((dst) &= ~bitmaskof(idx))
 +#define set_feature(idx, dst)   ((dst) |=  bitmaskof(idx))
  
  #define DEF_MAX_BASE 0x0000000du
  #define DEF_MAX_INTELEXT  0x80000008u
  #define DEF_MAX_AMDEXT    0x8000001cu
-+#define COMMON_1D INIT_COMMON_FEATURES
++#define COMMON_1D CPUID_COMMON_1D_FEATURES
  
- int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
-                           uint32_t *nr_features, uint32_t *featureset)
-@@ -304,38 +308,6 @@ static void amd_xc_cpuid_policy(xc_interface *xch,
+ int xc_get_cpu_levelling_caps(xc_interface *xch, uint32_t *caps)
+ {
+@@ -322,37 +326,6 @@ static void amd_xc_cpuid_policy(xc_interface *xch,
              regs[0] = DEF_MAX_AMDEXT;
          break;
  
@@ -70,7 +73,6 @@ index 0870a95..c3e0888 100644
 -                    bitmaskof(X86_FEATURE_LM) |
 -                    bitmaskof(X86_FEATURE_PAGE1GB) |
 -                    bitmaskof(X86_FEATURE_SYSCALL) |
--                    bitmaskof(X86_FEATURE_MP) |
 -                    bitmaskof(X86_FEATURE_MMXEXT) |
 -                    bitmaskof(X86_FEATURE_FFXSR) |
 -                    bitmaskof(X86_FEATURE_3DNOW) |
@@ -81,20 +83,20 @@ index 0870a95..c3e0888 100644
      case 0x80000008:
          /*
           * ECX[15:12] is ApicIdCoreSize: ECX[7:0] is NumberOfCores (minus one).
-@@ -382,12 +354,6 @@ static void intel_xc_cpuid_policy(xc_interface *xch,
+@@ -399,12 +372,6 @@ static void intel_xc_cpuid_policy(xc_interface *xch,
  {
      switch ( input[0] )
      {
 -    case 0x00000001:
 -        /* ECX[5] is availability of VMX */
 -        if ( info->nestedhvm )
--            set_bit(X86_FEATURE_VMXE, regs[2]);
+-            set_bit(X86_FEATURE_VMX, regs[2]);
 -        break;
 -
      case 0x00000004:
          /*
           * EAX[31:26] is Maximum Cores Per Package (minus one).
-@@ -403,19 +369,6 @@ static void intel_xc_cpuid_policy(xc_interface *xch,
+@@ -420,19 +387,6 @@ static void intel_xc_cpuid_policy(xc_interface *xch,
              regs[0] = DEF_MAX_INTELEXT;
          break;
  
@@ -114,20 +116,31 @@ index 0870a95..c3e0888 100644
      case 0x80000005:
          regs[0] = regs[1] = regs[2] = 0;
          break;
-@@ -464,7 +417,7 @@ static void xc_cpuid_config_xsave(xc_interface *xch,
+@@ -444,7 +398,6 @@ static void intel_xc_cpuid_policy(xc_interface *xch,
+     }
+ }
+ 
+-#define XSAVEOPT        (1 << 0)
+ /* Configure extended state enumeration leaves (0x0000000D for xsave) */
+ static void xc_cpuid_config_xsave(xc_interface *xch,
+                                   const struct cpuid_domain_info *info,
+@@ -481,8 +434,9 @@ static void xc_cpuid_config_xsave(xc_interface *xch,
          regs[1] = 512 + 64; /* FP/SSE + XSAVE.HEADER */
          break;
      case 1: /* leaf 1 */
 -        regs[0] &= XSAVEOPT;
+-        regs[1] = regs[2] = regs[3] = 0;
 +        regs[0] = info->featureset[featureword_of(X86_FEATURE_XSAVEOPT)];
-         regs[1] = regs[2] = regs[3] = 0;
++        regs[2] &= info->xfeature_mask;
++        regs[3] = 0;
          break;
      case 2 ... 63: /* sub-leaves */
-@@ -497,79 +450,22 @@ static void xc_cpuid_hvm_policy(xc_interface *xch,
+         if ( !(info->xfeature_mask & (1ULL << input[1])) )
+@@ -514,79 +468,23 @@ static void xc_cpuid_hvm_policy(xc_interface *xch,
           */
          regs[1] = (regs[1] & 0x0000ffffu) | ((regs[1] & 0x007f0000u) << 1);
  
--        regs[2] &= (bitmaskof(X86_FEATURE_XMM3) |
+-        regs[2] &= (bitmaskof(X86_FEATURE_SSE3) |
 -                    bitmaskof(X86_FEATURE_PCLMULQDQ) |
 -                    bitmaskof(X86_FEATURE_SSSE3) |
 -                    bitmaskof(X86_FEATURE_FMA) |
@@ -137,7 +150,7 @@ index 0870a95..c3e0888 100644
 -                    bitmaskof(X86_FEATURE_SSE4_2) |
 -                    bitmaskof(X86_FEATURE_MOVBE)  |
 -                    bitmaskof(X86_FEATURE_POPCNT) |
--                    bitmaskof(X86_FEATURE_AES) |
+-                    bitmaskof(X86_FEATURE_AESNI) |
 -                    bitmaskof(X86_FEATURE_F16C) |
 -                    bitmaskof(X86_FEATURE_RDRAND) |
 -                    ((info->xfeature_mask != 0) ?
@@ -164,13 +177,13 @@ index 0870a95..c3e0888 100644
 -                    bitmaskof(X86_FEATURE_MCA) |
 -                    bitmaskof(X86_FEATURE_CMOV) |
 -                    bitmaskof(X86_FEATURE_PAT) |
--                    bitmaskof(X86_FEATURE_CLFLSH) |
+-                    bitmaskof(X86_FEATURE_CLFLUSH) |
 -                    bitmaskof(X86_FEATURE_PSE36) |
 -                    bitmaskof(X86_FEATURE_MMX) |
 -                    bitmaskof(X86_FEATURE_FXSR) |
--                    bitmaskof(X86_FEATURE_XMM) |
--                    bitmaskof(X86_FEATURE_XMM2) |
--                    bitmaskof(X86_FEATURE_HT));
+-                    bitmaskof(X86_FEATURE_SSE) |
+-                    bitmaskof(X86_FEATURE_SSE2) |
+-                    bitmaskof(X86_FEATURE_HTT));
 -            
 -        /* We always support MTRR MSRs. */
 -        regs[3] |= bitmaskof(X86_FEATURE_MTRR);
@@ -180,8 +193,9 @@ index 0870a95..c3e0888 100644
 -            clear_bit(X86_FEATURE_PAE, regs[3]);
 -            clear_bit(X86_FEATURE_PSE36, regs[3]);
 -        }
-+        regs[2] = info->featureset[featureword_of(X86_FEATURE_XMM3)];
-+        regs[3] = info->featureset[featureword_of(X86_FEATURE_FPU)];
++        regs[2] = info->featureset[featureword_of(X86_FEATURE_SSE3)];
++        regs[3] = (info->featureset[featureword_of(X86_FEATURE_FPU)] |
++                   bitmaskof(X86_FEATURE_HTT));
          break;
  
      case 0x00000007: /* Intel-defined CPU features */
@@ -215,7 +229,7 @@ index 0870a95..c3e0888 100644
          break;
  
      case 0x0000000d:
-@@ -581,14 +477,8 @@ static void xc_cpuid_hvm_policy(xc_interface *xch,
+@@ -598,14 +496,9 @@ static void xc_cpuid_hvm_policy(xc_interface *xch,
          break;
  
      case 0x80000001:
@@ -227,12 +241,13 @@ index 0870a95..c3e0888 100644
 -            clear_bit(X86_FEATURE_PSE36, regs[3]);
 -            clear_bit(X86_FEATURE_PAGE1GB, regs[3]);
 -        }
-+        regs[2] = info->featureset[featureword_of(X86_FEATURE_LAHF_LM)];
++        regs[2] = (info->featureset[featureword_of(X86_FEATURE_LAHF_LM)] &
++                   ~bitmaskof(X86_FEATURE_CMP_LEGACY));
 +        regs[3] = info->featureset[featureword_of(X86_FEATURE_SYSCALL)];
          break;
  
      case 0x80000007:
-@@ -632,64 +522,25 @@ static void xc_cpuid_pv_policy(xc_interface *xch,
+@@ -649,64 +542,34 @@ static void xc_cpuid_pv_policy(xc_interface *xch,
                                 const struct cpuid_domain_info *info,
                                 const unsigned int *input, unsigned int *regs)
  {
@@ -256,15 +271,15 @@ index 0870a95..c3e0888 100644
 -        if ( info->vendor == VENDOR_AMD )
 -            clear_bit(X86_FEATURE_SEP, regs[3]);
 -        clear_bit(X86_FEATURE_DS, regs[3]);
--        clear_bit(X86_FEATURE_ACC, regs[3]);
+-        clear_bit(X86_FEATURE_TM1, regs[3]);
 -        clear_bit(X86_FEATURE_PBE, regs[3]);
 -
 -        clear_bit(X86_FEATURE_DTES64, regs[2]);
--        clear_bit(X86_FEATURE_MWAIT, regs[2]);
+-        clear_bit(X86_FEATURE_MONITOR, regs[2]);
 -        clear_bit(X86_FEATURE_DSCPL, regs[2]);
--        clear_bit(X86_FEATURE_VMXE, regs[2]);
--        clear_bit(X86_FEATURE_SMXE, regs[2]);
--        clear_bit(X86_FEATURE_EST, regs[2]);
+-        clear_bit(X86_FEATURE_VMX, regs[2]);
+-        clear_bit(X86_FEATURE_SMX, regs[2]);
+-        clear_bit(X86_FEATURE_EIST, regs[2]);
 -        clear_bit(X86_FEATURE_TM2, regs[2]);
 -        if ( !info->pv64 )
 -            clear_bit(X86_FEATURE_CX16, regs[2]);
@@ -278,9 +293,18 @@ index 0870a95..c3e0888 100644
 -        clear_bit(X86_FEATURE_PCID, regs[2]);
 -        clear_bit(X86_FEATURE_DCA, regs[2]);
 -        set_bit(X86_FEATURE_HYPERVISOR, regs[2]);
-+        regs[2] = info->featureset[featureword_of(X86_FEATURE_XMM3)];
-+        regs[3] = info->featureset[featureword_of(X86_FEATURE_FPU)];
++    {
++        /* Host topology exposed to PV guest.  Provide host value. */
++        bool host_htt = regs[3] & bitmaskof(X86_FEATURE_HTT);
++
++        regs[2] = info->featureset[featureword_of(X86_FEATURE_SSE3)];
++        regs[3] = (info->featureset[featureword_of(X86_FEATURE_FPU)] &
++                   ~bitmaskof(X86_FEATURE_HTT));
++
++        if ( host_htt )
++            regs[3] |= bitmaskof(X86_FEATURE_HTT);
          break;
++    }
  
      case 0x00000007:
          if ( input[1] == 0 )
@@ -307,7 +331,7 @@ index 0870a95..c3e0888 100644
          break;
  
      case 0x0000000d:
-@@ -697,29 +548,8 @@ static void xc_cpuid_pv_policy(xc_interface *xch,
+@@ -714,30 +577,19 @@ static void xc_cpuid_pv_policy(xc_interface *xch,
          break;
  
      case 0x80000001:
@@ -334,12 +358,23 @@ index 0870a95..c3e0888 100644
 -        clear_bit(X86_FEATURE_LWP, regs[2]);
 -        clear_bit(X86_FEATURE_NODEID_MSR, regs[2]);
 -        clear_bit(X86_FEATURE_TOPOEXT, regs[2]);
-+        regs[2] = info->featureset[featureword_of(X86_FEATURE_LAHF_LM)];
++    {
++        /* Host topology exposed to PV guest.  Provide host CMP_LEGACY value. */
++        bool host_cmp_legacy = regs[2] & bitmaskof(X86_FEATURE_CMP_LEGACY);
++
++        regs[2] = (info->featureset[featureword_of(X86_FEATURE_LAHF_LM)] &
++                   ~bitmaskof(X86_FEATURE_CMP_LEGACY));
 +        regs[3] = info->featureset[featureword_of(X86_FEATURE_SYSCALL)];
++
++        if ( host_cmp_legacy )
++            regs[2] |= bitmaskof(X86_FEATURE_CMP_LEGACY);
++
          break;
++    }
  
      case 0x00000005: /* MONITOR/MWAIT */
-@@ -799,6 +629,87 @@ void xc_cpuid_to_str(const unsigned int *regs, char **strs)
+     case 0x0000000a: /* Architectural Performance Monitor Features */
+@@ -816,6 +668,87 @@ void xc_cpuid_to_str(const unsigned int *regs, char **strs)
      }
  }
  
@@ -360,7 +395,7 @@ index 0870a95..c3e0888 100644
 +        if ( !info->nestedhvm )
 +        {
 +            clear_bit(X86_FEATURE_SVM, info->featureset);
-+            clear_bit(X86_FEATURE_VMXE, info->featureset);
++            clear_bit(X86_FEATURE_VMX, info->featureset);
 +        }
 +    }
 +    else
@@ -427,7 +462,7 @@ index 0870a95..c3e0888 100644
  int xc_cpuid_apply_policy(xc_interface *xch, domid_t domid,
                            uint32_t *featureset,
                            unsigned int nr_features)
-@@ -822,6 +733,8 @@ int xc_cpuid_apply_policy(xc_interface *xch, domid_t domid,
+@@ -839,6 +772,8 @@ int xc_cpuid_apply_policy(xc_interface *xch, domid_t domid,
      else
          ext_max = (regs[0] <= DEF_MAX_INTELEXT) ? regs[0] : DEF_MAX_INTELEXT;
  
@@ -436,7 +471,7 @@ index 0870a95..c3e0888 100644
      input[0] = 0;
      input[1] = XEN_CPUID_INPUT_UNUSED;
      for ( ; ; )
-@@ -993,9 +906,9 @@ int xc_cpuid_set(
+@@ -1010,9 +945,9 @@ int xc_cpuid_set(
                  val = polval;
  
              if ( val )

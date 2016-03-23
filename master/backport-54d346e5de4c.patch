@@ -1,8 +1,7 @@
-From 42d1e301b2cab6f553a3db711fdfe8898bdbb1cf Mon Sep 17 00:00:00 2001
+From 40f95bf8faf8276d68fff7c44170babc3a9a94cc Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Sat, 23 Jan 2016 20:27:34 +0000
-Subject: [PATCH 08/30] xen/x86: Mask out unknown features from Xen's
- capabilities
+Date: Thu, 24 Mar 2016 16:05:37 +0100
+Subject: [PATCH] x86: mask out unknown features from Xen's capabilities
 
 If Xen doesn't know about a feature, it is unsafe for use and should be
 deliberately hidden from Xen's capabilities.
@@ -11,6 +10,8 @@ This doesn't make a practical difference yet, but will make a difference
 later when the guest featuresets are seeded from the host featureset.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
 diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
 index bbce067..756ef57 100644
 --- a/xen/arch/x86/Makefile
@@ -24,31 +25,31 @@ index bbce067..756ef57 100644
  obj-y += delay.o
  obj-bin-y += dmi_scan.init.o
 diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
-index dbf1c45..9b4399f 100644
+index 0e39944..d63f7f3 100644
 --- a/xen/arch/x86/cpu/common.c
 +++ b/xen/arch/x86/cpu/common.c
-@@ -329,6 +329,9 @@ void __cpuinit identify_cpu(struct cpuinfo_x86 *c)
+@@ -329,6 +329,8 @@ void __cpuinit identify_cpu(struct cpuinfo_x86 *c)
  	 * The vendor-specific functions might have changed features.  Now
  	 * we do "generic changes."
  	 */
-+	for (i = 0; i < FSCAPINTS; ++i) {
++	for (i = 0; i < FSCAPINTS; ++i)
 +		c->x86_capability[i] &= known_features[i];
-+	}
  
  	for (i = 0 ; i < NCAPINTS ; ++i)
  		c->x86_capability[i] &= ~cleared_caps[i];
 diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
 new file mode 100644
-index 0000000..fb3a6ac
+index 0000000..05cd646
 --- /dev/null
 +++ b/xen/arch/x86/cpuid.c
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,20 @@
++#include <xen/init.h>
 +#include <xen/lib.h>
 +#include <asm/cpuid.h>
 +
 +const uint32_t known_features[] = INIT_KNOWN_FEATURES;
 +
-+static void __maybe_unused build_assertions(void)
++static void __init __maybe_unused build_assertions(void)
 +{
 +    BUILD_BUG_ON(ARRAY_SIZE(known_features) != FSCAPINTS);
 +}
@@ -63,29 +64,31 @@ index 0000000..fb3a6ac
 + * End:
 + */
 diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
-index ce21dd1..88ca4b8 100644
+index 820c755..c878318 100644
 --- a/xen/include/asm-x86/cpufeature.h
 +++ b/xen/include/asm-x86/cpufeature.h
-@@ -13,9 +13,8 @@
+@@ -10,10 +10,8 @@
+ #endif
  
- #include <public/arch-x86/cpufeatureset.h>
- 
+ #include <xen/const.h>
+-#include <asm/cpufeatureset.h>
 -#include <asm/cpuid-autogen.h>
 +#include <asm/cpuid.h>
  
 -#define FSCAPINTS FEATURESET_NR_ENTRIES
  #define NCAPINTS (FSCAPINTS + 1) /* N 32-bit words worth of info */
  
- /* Other features, Linux-defined mapping, FSMAX+1 */
+ /* Other features, Xen-defined mapping. */
 diff --git a/xen/include/asm-x86/cpuid.h b/xen/include/asm-x86/cpuid.h
 new file mode 100644
-index 0000000..6cca5ea
+index 0000000..b72d88f
 --- /dev/null
 +++ b/xen/include/asm-x86/cpuid.h
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,25 @@
 +#ifndef __X86_CPUID_H__
 +#define __X86_CPUID_H__
 +
++#include <asm/cpufeatureset.h>
 +#include <asm/cpuid-autogen.h>
 +
 +#define FSCAPINTS FEATURESET_NR_ENTRIES
@@ -108,19 +111,19 @@ index 0000000..6cca5ea
 + * End:
 + */
 diff --git a/xen/tools/gen-cpuid.py b/xen/tools/gen-cpuid.py
-index c8240c0..0843be6 100755
+index c6bd98d..ae337e3 100755
 --- a/xen/tools/gen-cpuid.py
 +++ b/xen/tools/gen-cpuid.py
 @@ -19,6 +19,8 @@ class State(object):
  
          # State calculated
          self.nr_entries = 0 # Number of words in a featureset
-+        self.common = 0 # Common features between 1d and e1d
++        self.common_1d = 0 # Common features between 1d and e1d
 +        self.known = [] # All known features
  
  def parse_definitions(state):
      """
-@@ -89,6 +91,22 @@ def crunch_numbers(state):
+@@ -95,6 +97,22 @@ def crunch_numbers(state):
      # Size of bitmaps
      state.nr_entries = nr_entries = (max(state.names.keys()) >> 5) + 1
  
@@ -129,7 +132,7 @@ index c8240c0..0843be6 100755
 +                 MTRR, PGE, MCA, CMOV, PAT, PSE36, MMX, FXSR)
 +
 +    # All known features.  Duplicate the common features in e1d
-+    e1d_base = (SYSCALL >> 5) << 5
++    e1d_base = SYSCALL & ~31
 +    state.known = featureset_to_uint32s(
 +        state.names.keys() + [ e1d_base + (x % 32) for x in common_1d ],
 +        nr_entries)
@@ -138,21 +141,21 @@ index c8240c0..0843be6 100755
 +    for f in common_1d:
 +        state.names[e1d_base + (f % 32)] = "E1D_" + state.names[f]
 +
-+    state.common = featureset_to_uint32s(common_1d, 1)[0]
++    state.common_1d = featureset_to_uint32s(common_1d, 1)[0]
 +
  
  def write_results(state):
      state.output.write(
-@@ -103,7 +121,13 @@ def write_results(state):
+@@ -109,7 +127,13 @@ def write_results(state):
      state.output.write(
  """
- #define FEATURESET_NR_ENTRIES %s
+ #define FEATURESET_NR_ENTRIES %sU
 +
-+#define INIT_COMMON_FEATURES %s
++#define CPUID_COMMON_1D_FEATURES %s
 +
-+#define INIT_KNOWN_FEATURES { \\\n%s\n}
++#define INIT_KNOWN_FEATURES { \\\n%s\n} 
  """ % (state.nr_entries,
-+       state.common,
++       state.common_1d,
 +       format_uint32s(state.known, 4),
         ))
  

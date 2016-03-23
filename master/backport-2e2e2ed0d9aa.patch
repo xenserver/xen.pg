@@ -1,14 +1,17 @@
-From 1f8167633dd602eee93f00856624c1b17a6ecc8a Mon Sep 17 00:00:00 2001
+From ea5aa82e9bff4d87b0698ed727157be3228c3154 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Sat, 23 Jan 2016 16:33:35 +0000
-Subject: [PATCH 06/30] xen/x86: Script to automatically process featureset
- information
+Date: Thu, 24 Mar 2016 16:02:37 +0100
+Subject: [PATCH] x86: script to automatically process featureset information
 
 This script consumes include/public/arch-x86/cpufeatureset.h and generates a
 single include/asm-x86/cpuid-autogen.h containing all the processed
 information.
 
+It currently generates just FEATURESET_NR_ENTRIES.  Future changes will
+generate more information.
+
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
 diff --git a/.gitignore b/.gitignore
 index 9ead7c4..6bdb2f1 100644
 --- a/.gitignore
@@ -22,7 +25,7 @@ index 9ead7c4..6bdb2f1 100644
  xen/include/public/public
  xen/include/xen/*.new
 diff --git a/xen/include/Makefile b/xen/include/Makefile
-index 6664107..e563ba8 100644
+index c674f7f..67dea91 100644
 --- a/xen/include/Makefile
 +++ b/xen/include/Makefile
 @@ -116,5 +116,15 @@ headers++.chk: $(PUBLIC_HEADERS) Makefile
@@ -42,26 +45,26 @@ index 6664107..e563ba8 100644
  	rm -rf compat headers.chk headers++.chk
 +	rm -f $(BASEDIR)/include/asm-x86/cpuid-autogen.h
 diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
-index 16f9cb7..ce21dd1 100644
+index b13a704..820c755 100644
 --- a/xen/include/asm-x86/cpufeature.h
 +++ b/xen/include/asm-x86/cpufeature.h
-@@ -13,7 +13,9 @@
+@@ -11,8 +11,9 @@
  
- #include <public/arch-x86/cpufeatureset.h>
+ #include <xen/const.h>
+ #include <asm/cpufeatureset.h>
++#include <asm/cpuid-autogen.h>
  
 -#define FSCAPINTS 9
-+#include <asm/cpuid-autogen.h>
-+
 +#define FSCAPINTS FEATURESET_NR_ENTRIES
  #define NCAPINTS (FSCAPINTS + 1) /* N 32-bit words worth of info */
  
- /* Other features, Linux-defined mapping, FSMAX+1 */
+ /* Other features, Xen-defined mapping. */
 diff --git a/xen/tools/gen-cpuid.py b/xen/tools/gen-cpuid.py
 new file mode 100755
-index 0000000..c8240c0
+index 0000000..c6bd98d
 --- /dev/null
 +++ b/xen/tools/gen-cpuid.py
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,197 @@
 +#!/usr/bin/env python
 +# -*- coding: utf-8 -*-
 +
@@ -90,14 +93,14 @@ index 0000000..c8240c0
 +    namespace with symbols
 +    """
 +    feat_regex = re.compile(
-+        r"^#define X86_FEATURE_([A-Z0-9_]+)"
-+        "\s+\(([\s\d]+\*[\s\d]+\+[\s\d]+)\).*$")
++        r"^XEN_CPUFEATURE\(([A-Z0-9_]+),"
++        "\s+([\s\d]+\*[\s\d]+\+[\s\d]+)\).*$")
 +
 +    this = sys.modules[__name__]
 +
 +    for l in state.input.readlines():
 +        # Short circuit the regex...
-+        if not l.startswith("#define X86_FEATURE_"):
++        if not l.startswith("XEN_CPUFEATURE("):
 +            continue
 +
 +        res = feat_regex.match(l)
@@ -113,15 +116,21 @@ index 0000000..c8240c0
 +
 +        if val in state.names:
 +            raise Fail("Aliased value between %s and %s" %
-+                            (name, state.names[val]))
++                       (name, state.names[val]))
 +
 +        # Mutate the current namespace to insert a feature literal with its
-+        # bit index
-+        setattr(this, name, val)
++        # bit index.  Prepend an underscore if the name starts with a digit.
++        if name[0] in "0123456789":
++            this_name = "_" + name
++        else:
++            this_name = name
++        setattr(this, this_name, val)
 +
 +        # Construct a reverse mapping of value to name
 +        state.names[val] = name
 +
++    if len(state.names) == 0:
++        raise Fail("No features found")
 +
 +def featureset_to_uint32s(fs, nr):
 +    """ Represent a featureset as a list of C-compatible uint32_t's """
@@ -143,7 +152,7 @@ index 0000000..c8240c0
 +    return [ "0x%08xU" % x for x in words ]
 +
 +def format_uint32s(words, indent):
-+    """ Format a list of uint32_t's sutable for a macro definition """
++    """ Format a list of uint32_t's suitable for a macro definition """
 +    spaces = " " * indent
 +    return spaces + (", \\\n" + spaces).join(words) + ", \\"
 +
@@ -166,7 +175,7 @@ index 0000000..c8240c0
 +
 +    state.output.write(
 +"""
-+#define FEATURESET_NR_ENTRIES %s
++#define FEATURESET_NR_ENTRIES %sU
 +""" % (state.nr_entries,
 +       ))
 +
@@ -247,7 +256,7 @@ index 0000000..c8240c0
 +    try:
 +        sys.exit(main())
 +    except Fail, e:
-+        print >>sys.stderr, e
++        print >>sys.stderr, "%s:" % (sys.argv[0],), e
 +        sys.exit(1)
 +    except SystemExit, e:
 +        sys.exit(e.code)

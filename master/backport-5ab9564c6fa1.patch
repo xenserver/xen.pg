@@ -1,8 +1,8 @@
-From 503e50333d2cf31dcb7ba25a93b6e09fa9b2f69f Mon Sep 17 00:00:00 2001
+From c96e973c0aa58c1500c1c9dc5485ab8ad24e4a6e Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 26 Nov 2015 18:36:52 +0000
-Subject: [PATCH 20/30] x86/cpu: Context switch cpuid masks and faulting state
- in context_switch()
+Subject: [PATCH] x86/cpu: Context switch cpuid masks and faulting state in
+ context_switch()
 
 A single ctxt_switch_levelling() function pointer is provided
 (defaulting to an empty nop), which is overridden in the appropriate
@@ -11,16 +11,22 @@ $VENDOR_init_levelling().
 set_cpuid_faulting() is made private and included within
 intel_ctxt_switch_levelling().
 
-One functional change is that the faulting configuration is no longer special
-cased for dom0.  There was never any need to, and it will cause dom0 to
-observe the same information through native and enlightened cpuid.
+One (attempted) functional change is that the faulting configuration should
+not be special cased for dom0.  It turns out that the toolstack relies on the
+special case (and indeed, on being a PV domain in the first place) to
+correctly build HVM domains.
+
+For now, the control domain is left as a special case, until futher work can
+be completed to remove the restriction.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <JBeulich@suse.com>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
 diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
-index 175383c..641a663f 100644
+index 9841dce..a25816d 100644
 --- a/xen/arch/x86/cpu/amd.c
 +++ b/xen/arch/x86/cpu/amd.c
-@@ -328,6 +328,9 @@ static void __init noinline amd_init_levelling(void)
+@@ -331,6 +331,9 @@ static void __init noinline amd_init_levelling(void)
  		       (uint32_t)cpuidmask_defaults._7ab0,
  		       (uint32_t)cpuidmask_defaults._6c);
  	}
@@ -31,10 +37,10 @@ index 175383c..641a663f 100644
  
  /*
 diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
-index 6066196..df682e3 100644
+index cd52f3f..17482de 100644
 --- a/xen/arch/x86/cpu/common.c
 +++ b/xen/arch/x86/cpu/common.c
-@@ -86,6 +86,13 @@ static const struct cpu_dev default_cpu = {
+@@ -84,6 +84,13 @@ static const struct cpu_dev default_cpu = {
  };
  static const struct cpu_dev *this_cpu = &default_cpu;
  
@@ -49,7 +55,7 @@ index 6066196..df682e3 100644
  boolean_param("cpuinfo", opt_cpu_info);
  
 diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
-index a691d7d..f8ca65f 100644
+index 9ca95a8..d52f2d4 100644
 --- a/xen/arch/x86/cpu/intel.c
 +++ b/xen/arch/x86/cpu/intel.c
 @@ -32,13 +32,15 @@ static bool_t __init probe_intel_cpuid_faulting(void)
@@ -81,21 +87,38 @@ index a691d7d..f8ca65f 100644
  }
  
  /*
-@@ -151,6 +153,11 @@ static void intel_ctxt_switch_levelling(const struct domain *nextd)
+@@ -154,6 +156,28 @@ static void intel_ctxt_switch_levelling(const struct domain *nextd)
  	struct cpuidmasks *these_masks = &this_cpu(cpuidmasks);
  	const struct cpuidmasks *masks = &cpuidmask_defaults;
  
 +	if (cpu_has_cpuid_faulting) {
-+		set_cpuid_faulting(nextd && is_pv_domain(nextd));
++		/*
++		 * We *should* be enabling faulting for the control domain.
++		 *
++		 * Unfortunately, the domain builder (having only ever been a
++		 * PV guest) expects to be able to see host cpuid state in a
++		 * native CPUID instruction, to correctly build a CPUID policy
++		 * for HVM guests (notably the xstate leaves).
++		 *
++		 * This logic is fundimentally broken for HVM toolstack
++		 * domains, and faulting causes PV guests to behave like HVM
++		 * guests from their point of view.
++		 *
++		 * Future development plans will move responsibility for
++		 * generating the maximum full cpuid policy into Xen, at which
++		 * this problem will disappear.
++		 */
++		set_cpuid_faulting(nextd && is_pv_domain(nextd) &&
++				   !is_control_domain(nextd));
 +		return;
 +	}
 +
  #define LAZY(msr, field)						\
  	({								\
- 		if (msr && (these_masks->field != masks->field))	\
-@@ -221,6 +228,9 @@ static void __init noinline intel_init_levelling(void)
- 		       (uint32_t)cpuidmask_defaults.e1cd,
- 		       (uint32_t)cpuidmask_defaults.Da1);
+ 		if (unlikely(these_masks->field != masks->field) &&	\
+@@ -227,6 +251,9 @@ static void __init noinline intel_init_levelling(void)
+ 			       (uint32_t)cpuidmask_defaults.e1cd,
+ 			       (uint32_t)cpuidmask_defaults.Da1);
  	}
 +
 +	if (levelling_caps)
@@ -103,11 +126,25 @@ index a691d7d..f8ca65f 100644
  }
  
  static void early_init_intel(struct cpuinfo_x86 *c)
+diff --git a/xen/arch/x86/crash.c b/xen/arch/x86/crash.c
+index 888a214..f28f527 100644
+--- a/xen/arch/x86/crash.c
++++ b/xen/arch/x86/crash.c
+@@ -189,6 +189,9 @@ void machine_crash_shutdown(void)
+ 
+     nmi_shootdown_cpus();
+ 
++    /* Reset CPUID masking and faulting to the host's default. */
++    ctxt_switch_levelling(NULL);
++
+     info = kexec_crash_save_info();
+     info->xen_phys_start = xen_phys_start;
+     info->dom0_pfn_to_mfn_frame_list_list =
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 55fb6f8..5127b95 100644
+index 54bae95..b8e388f 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -1653,9 +1653,7 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
+@@ -1704,9 +1704,7 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
              load_segments(next);
          }
  
@@ -119,7 +156,7 @@ index 55fb6f8..5127b95 100644
  
      context_saved(prev);
 diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
-index 21ff55c..3c03324 100644
+index bb23e6a..c9caf49 100644
 --- a/xen/include/asm-x86/processor.h
 +++ b/xen/include/asm-x86/processor.h
 @@ -203,7 +203,7 @@ extern struct cpuinfo_x86 boot_cpu_data;

@@ -1,0 +1,208 @@
+From 928589ddf643791473f3e510f6ea11a7435c982a Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 31 Jul 2015 15:24:03 +0100
+Subject: [PATCH] x86/cpu: Sysctl and common infrastructure for levelling
+ context switching
+
+A toolstack needs to know how much control Xen has over the visible cpuid
+values in PV guests.  Provide an explicit mechanism to query what Xen is
+capable of.
+
+This interface will currently report no capabilities.  This change is
+scaffolding for future patches, which will introduce detection and switching
+logic, after which the interface will report hardware capabilities correctly.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <JBeulich@suse.com>
+Acked-by: Daniel De Graaf <dgdegra@tycho.nsa.gov>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+diff --git a/tools/flask/policy/policy/modules/xen/xen.te b/tools/flask/policy/policy/modules/xen/xen.te
+index 5e94ee3..02d9a74 100644
+--- a/tools/flask/policy/policy/modules/xen/xen.te
++++ b/tools/flask/policy/policy/modules/xen/xen.te
+@@ -71,6 +71,7 @@ allow dom0_t xen_t:xen2 {
+ };
+ allow dom0_t xen_t:xen2 {
+     pmu_ctrl
++    get_cpu_levelling_caps
+ };
+ allow dom0_t xen_t:mmu memorymap;
+ 
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index e4b4917..cd52f3f 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -32,6 +32,12 @@ integer_param("cpuid_mask_ext_ecx", opt_cpuid_mask_ext_ecx);
+ unsigned int __devinitdata opt_cpuid_mask_ext_edx = ~0u;
+ integer_param("cpuid_mask_ext_edx", opt_cpuid_mask_ext_edx);
+ 
++unsigned int __initdata expected_levelling_cap;
++unsigned int __read_mostly levelling_caps;
++
++DEFINE_PER_CPU(struct cpuidmasks, cpuidmasks);
++struct cpuidmasks __read_mostly cpuidmask_defaults;
++
+ const struct cpu_dev *__read_mostly cpu_devs[X86_VENDOR_NUM] = {};
+ 
+ unsigned int paddr_bits __read_mostly = 36;
+diff --git a/xen/arch/x86/sysctl.c b/xen/arch/x86/sysctl.c
+index 6294daf..e4f6305 100644
+--- a/xen/arch/x86/sysctl.c
++++ b/xen/arch/x86/sysctl.c
+@@ -191,6 +191,12 @@ long arch_do_sysctl(
+         }
+         break;
+ 
++    case XEN_SYSCTL_get_cpu_levelling_caps:
++        sysctl->u.cpu_levelling_caps.caps = levelling_caps;
++        if ( __copy_field_to_guest(u_sysctl, sysctl, u.cpu_levelling_caps.caps) )
++            ret = -EFAULT;
++        break;
++
+     default:
+         ret = -ENOSYS;
+         break;
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index 91d91ca..c5125e1 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -83,6 +83,7 @@
+ #define cpu_has_xsaves		boot_cpu_has(X86_FEATURE_XSAVES)
+ #define cpu_has_monitor		boot_cpu_has(X86_FEATURE_MONITOR)
+ #define cpu_has_eist		boot_cpu_has(X86_FEATURE_EIST)
++#define cpu_has_hypervisor	boot_cpu_has(X86_FEATURE_HYPERVISOR)
+ 
+ enum _cache_type {
+     CACHE_TYPE_NULL = 0,
+diff --git a/xen/include/asm-x86/cpuid.h b/xen/include/asm-x86/cpuid.h
+index 4725672..9a21c25 100644
+--- a/xen/include/asm-x86/cpuid.h
++++ b/xen/include/asm-x86/cpuid.h
+@@ -3,6 +3,7 @@
+ 
+ #include <asm/cpufeatureset.h>
+ #include <asm/cpuid-autogen.h>
++#include <asm/percpu.h>
+ 
+ #define FSCAPINTS FEATURESET_NR_ENTRIES
+ 
+@@ -18,6 +19,7 @@
+ 
+ #ifndef __ASSEMBLY__
+ #include <xen/types.h>
++#include <public/sysctl.h>
+ 
+ extern const uint32_t known_features[FSCAPINTS];
+ extern const uint32_t special_features[FSCAPINTS];
+@@ -31,6 +33,36 @@ void calculate_featuresets(void);
+ 
+ const uint32_t *lookup_deep_deps(uint32_t feature);
+ 
++/*
++ * Expected levelling capabilities (given cpuid vendor/family information),
++ * and levelling capabilities actually available (given MSR probing).
++ */
++#define LCAP_faulting XEN_SYSCTL_CPU_LEVELCAP_faulting
++#define LCAP_1cd      (XEN_SYSCTL_CPU_LEVELCAP_ecx |        \
++                       XEN_SYSCTL_CPU_LEVELCAP_edx)
++#define LCAP_e1cd     (XEN_SYSCTL_CPU_LEVELCAP_extd_ecx |   \
++                       XEN_SYSCTL_CPU_LEVELCAP_extd_edx)
++#define LCAP_Da1      XEN_SYSCTL_CPU_LEVELCAP_xsave_eax
++#define LCAP_6c       XEN_SYSCTL_CPU_LEVELCAP_thermal_ecx
++#define LCAP_7ab0     (XEN_SYSCTL_CPU_LEVELCAP_l7s0_eax |   \
++                       XEN_SYSCTL_CPU_LEVELCAP_l7s0_ebx)
++extern unsigned int expected_levelling_cap, levelling_caps;
++
++struct cpuidmasks
++{
++    uint64_t _1cd;
++    uint64_t e1cd;
++    uint64_t Da1;
++    uint64_t _6c;
++    uint64_t _7ab0;
++};
++
++/* Per CPU shadows of masking MSR values, for lazy context switching. */
++DECLARE_PER_CPU(struct cpuidmasks, cpuidmasks);
++
++/* Default masking MSR values, calculated at boot. */
++extern struct cpuidmasks cpuidmask_defaults;
++
+ #endif /* __ASSEMBLY__ */
+ #endif /* !__X86_CPUID_H__ */
+ 
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index 0cacacc..89f9f68 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -764,6 +764,27 @@ struct xen_sysctl_tmem_op {
+ typedef struct xen_sysctl_tmem_op xen_sysctl_tmem_op_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_sysctl_tmem_op_t);
+ 
++/*
++ * XEN_SYSCTL_get_cpu_levelling_caps (x86 specific)
++ *
++ * Return hardware capabilities concerning masking or faulting of the cpuid
++ * instruction for PV guests.
++ */
++struct xen_sysctl_cpu_levelling_caps {
++#define XEN_SYSCTL_CPU_LEVELCAP_faulting    (1ul <<  0) /* CPUID faulting    */
++#define XEN_SYSCTL_CPU_LEVELCAP_ecx         (1ul <<  1) /* 0x00000001.ecx    */
++#define XEN_SYSCTL_CPU_LEVELCAP_edx         (1ul <<  2) /* 0x00000001.edx    */
++#define XEN_SYSCTL_CPU_LEVELCAP_extd_ecx    (1ul <<  3) /* 0x80000001.ecx    */
++#define XEN_SYSCTL_CPU_LEVELCAP_extd_edx    (1ul <<  4) /* 0x80000001.edx    */
++#define XEN_SYSCTL_CPU_LEVELCAP_xsave_eax   (1ul <<  5) /* 0x0000000D:1.eax  */
++#define XEN_SYSCTL_CPU_LEVELCAP_thermal_ecx (1ul <<  6) /* 0x00000006.ecx    */
++#define XEN_SYSCTL_CPU_LEVELCAP_l7s0_eax    (1ul <<  7) /* 0x00000007:0.eax  */
++#define XEN_SYSCTL_CPU_LEVELCAP_l7s0_ebx    (1ul <<  8) /* 0x00000007:0.ebx  */
++    uint32_t caps;
++};
++typedef struct xen_sysctl_cpu_levelling_caps xen_sysctl_cpu_levelling_caps_t;
++DEFINE_XEN_GUEST_HANDLE(xen_sysctl_cpu_levelling_caps_t);
++
+ struct xen_sysctl {
+     uint32_t cmd;
+ #define XEN_SYSCTL_readconsole                    1
+@@ -789,6 +810,7 @@ struct xen_sysctl {
+ #define XEN_SYSCTL_pcitopoinfo                   22
+ #define XEN_SYSCTL_psr_cat_op                    23
+ #define XEN_SYSCTL_tmem_op                       24
++#define XEN_SYSCTL_get_cpu_levelling_caps        25
+     uint32_t interface_version; /* XEN_SYSCTL_INTERFACE_VERSION */
+     union {
+         struct xen_sysctl_readconsole       readconsole;
+@@ -814,6 +836,7 @@ struct xen_sysctl {
+         struct xen_sysctl_psr_cmt_op        psr_cmt_op;
+         struct xen_sysctl_psr_cat_op        psr_cat_op;
+         struct xen_sysctl_tmem_op           tmem_op;
++        struct xen_sysctl_cpu_levelling_caps cpu_levelling_caps;
+         uint8_t                             pad[128];
+     } u;
+ };
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index fafb1a4..294ba8d 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -804,6 +804,9 @@ static int flask_sysctl(int cmd)
+     case XEN_SYSCTL_tmem_op:
+         return domain_has_xen(current->domain, XEN__TMEM_CONTROL);
+ 
++    case XEN_SYSCTL_get_cpu_levelling_caps:
++        return domain_has_xen(current->domain, XEN2__GET_CPU_LEVELLING_CAPS);
++
+     default:
+         printk("flask_sysctl: Unknown op %d\n", cmd);
+         return -EPERM;
+diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
+index 0aa68f8..5716d0a 100644
+--- a/xen/xsm/flask/policy/access_vectors
++++ b/xen/xsm/flask/policy/access_vectors
+@@ -93,6 +93,8 @@ class xen2
+     pmu_ctrl
+ # PMU use (domains, including unprivileged ones, will be using this operation)
+     pmu_use
++# XEN_SYSCTL_get_cpu_levelling_caps
++    get_cpu_levelling_caps
+ }
+ 
+ # Classes domain and domain2 consist of operations that a domain performs on
