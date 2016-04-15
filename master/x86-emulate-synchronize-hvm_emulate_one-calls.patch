@@ -1,0 +1,286 @@
+diff --git a/tools/tests/x86_emulator/test_x86_emulator.c b/tools/tests/x86_emulator/test_x86_emulator.c
+index 1b78bf7..4e11aaa 100644
+--- a/tools/tests/x86_emulator/test_x86_emulator.c
++++ b/tools/tests/x86_emulator/test_x86_emulator.c
+@@ -9,6 +9,8 @@
+ 
+ #define __packed __attribute__((packed))
+ 
++typedef bool bool_t;
++
+ #include "x86_emulate/x86_emulate.h"
+ #include "blowfish.h"
+ 
+@@ -154,6 +156,14 @@ int get_fpu(
+     return X86EMUL_OKAY;
+ }
+ 
++static void smp_lock(bool_t locked)
++{
++}
++
++static void smp_unlock(bool_t locked)
++{
++}
++
+ static struct x86_emulate_ops emulops = {
+     .read       = read,
+     .insn_fetch = fetch,
+@@ -161,6 +171,8 @@ static struct x86_emulate_ops emulops = {
+     .cmpxchg    = cmpxchg,
+     .cpuid      = cpuid,
+     .get_fpu    = get_fpu,
++    .smp_lock   = smp_lock,
++    .smp_unlock = smp_unlock,
+ };
+ 
+ int main(int argc, char **argv)
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index d1714a1..b1c35d9 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -558,6 +558,8 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags,
+     int i, paging_initialised = 0;
+     int rc = -ENOMEM;
+ 
++    percpu_rwlock_resource_init(&d->arch.emulate_lock, emulate_locked_rwlock);
++
+     d->arch.s3_integrity = !!(domcr_flags & DOMCRF_s3_integrity);
+ 
+     INIT_LIST_HEAD(&d->arch.pdev_list);
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 92b4bb9..e4b13c6 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -24,6 +24,8 @@
+ #include <asm/hvm/svm/svm.h>
+ #include <asm/vm_event.h>
+ 
++DEFINE_PERCPU_RWLOCK_GLOBAL(emulate_locked_rwlock);
++
+ static void hvmtrace_io_assist(const ioreq_t *p)
+ {
+     unsigned int size, event;
+@@ -1616,6 +1618,26 @@ static int hvmemul_vmfunc(
+     return rc;
+ }
+ 
++void emulate_smp_lock(bool_t locked)
++{
++    struct domain *d = current->domain;
++
++    if ( locked )
++        percpu_write_lock(emulate_locked_rwlock, &d->arch.emulate_lock);
++    else
++        percpu_read_lock(emulate_locked_rwlock, &d->arch.emulate_lock);
++}
++
++void emulate_smp_unlock(bool_t locked)
++{
++    struct domain *d = current->domain;
++
++    if ( locked )
++        percpu_write_unlock(emulate_locked_rwlock, &d->arch.emulate_lock);
++    else
++        percpu_read_unlock(emulate_locked_rwlock, &d->arch.emulate_lock);
++}
++
+ static const struct x86_emulate_ops hvm_emulate_ops = {
+     .read          = hvmemul_read,
+     .insn_fetch    = hvmemul_insn_fetch,
+@@ -1641,6 +1663,8 @@ static const struct x86_emulate_ops hvm_emulate_ops = {
+     .put_fpu       = hvmemul_put_fpu,
+     .invlpg        = hvmemul_invlpg,
+     .vmfunc        = hvmemul_vmfunc,
++    .smp_lock      = emulate_smp_lock,
++    .smp_unlock    = emulate_smp_unlock,
+ };
+ 
+ static const struct x86_emulate_ops hvm_emulate_ops_no_write = {
+@@ -1668,6 +1692,8 @@ static const struct x86_emulate_ops hvm_emulate_ops_no_write = {
+     .put_fpu       = hvmemul_put_fpu,
+     .invlpg        = hvmemul_invlpg,
+     .vmfunc        = hvmemul_vmfunc,
++    .smp_lock      = emulate_smp_lock,
++    .smp_unlock    = emulate_smp_unlock,
+ };
+ 
+ static int _hvm_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt,
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 635f89e..a435dc1 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -5322,6 +5322,8 @@ static const struct x86_emulate_ops ptwr_emulate_ops = {
+     .insn_fetch = ptwr_emulated_read,
+     .write      = ptwr_emulated_write,
+     .cmpxchg    = ptwr_emulated_cmpxchg,
++    .smp_lock   = emulate_smp_lock,
++    .smp_unlock = emulate_smp_unlock,
+ };
+ 
+ /* Write page fault handler: check if guest is trying to modify a PTE. */
+diff --git a/xen/arch/x86/mm/shadow/common.c b/xen/arch/x86/mm/shadow/common.c
+index 462d4a0..58025a5 100644
+--- a/xen/arch/x86/mm/shadow/common.c
++++ b/xen/arch/x86/mm/shadow/common.c
+@@ -291,6 +291,8 @@ static const struct x86_emulate_ops hvm_shadow_emulator_ops = {
+     .insn_fetch = hvm_emulate_insn_fetch,
+     .write      = hvm_emulate_write,
+     .cmpxchg    = hvm_emulate_cmpxchg,
++    .smp_lock   = emulate_smp_lock,
++    .smp_unlock = emulate_smp_unlock,
+ };
+ 
+ static int
+@@ -362,6 +364,8 @@ static const struct x86_emulate_ops pv_shadow_emulator_ops = {
+     .insn_fetch = pv_emulate_read,
+     .write      = pv_emulate_write,
+     .cmpxchg    = pv_emulate_cmpxchg,
++    .smp_lock   = emulate_smp_lock,
++    .smp_unlock = emulate_smp_unlock,
+ };
+ 
+ const struct x86_emulate_ops *shadow_init_emulation(
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
+index 67d1944..930d06e 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate/x86_emulate.c
+@@ -1504,6 +1504,8 @@ x86_emulate(
+     struct operand ea = { .type = OP_MEM, .reg = REG_POISON };
+     ea.mem.seg = x86_seg_ds; /* gcc may reject anon union initializer */
+ 
++    ASSERT(ops->smp_lock && ops->smp_unlock);
++
+     ctxt->retire.byte = 0;
+ 
+     op_bytes = def_op_bytes = ad_bytes = def_ad_bytes = ctxt->addr_size/8;
+@@ -1578,6 +1580,9 @@ x86_emulate(
+ 
+     /* Opcode byte(s). */
+     d = opcode_table[b];
++
++    ops->smp_lock(lock_prefix);
++
+     if ( d == 0 )
+     {
+         /* Two-byte opcode? */
+@@ -2036,7 +2041,10 @@ x86_emulate(
+         generate_exception_if(mode_64bit() && !twobyte, EXC_UD, -1);
+         fail_if(ops->read_segment == NULL);
+         if ( (rc = ops->read_segment(src.val, &reg, ctxt)) != 0 )
++        {
++            ops->smp_unlock(lock_prefix);
+             return rc;
++        }
+         /* 64-bit mode: PUSH defaults to a 64-bit operand. */
+         if ( mode_64bit() && (op_bytes == 4) )
+             op_bytes = 8;
+@@ -2058,7 +2066,10 @@ x86_emulate(
+                               &dst.val, op_bytes, ctxt, ops)) != 0 )
+             goto done;
+         if ( (rc = load_seg(src.val, dst.val, 0, NULL, ctxt, ops)) != 0 )
++        {
++            ops->smp_unlock(lock_prefix);
+             return rc;
++        }
+         break;
+ 
+     case 0x0e: /* push %%cs */
+@@ -2375,6 +2386,12 @@ x86_emulate(
+         break;
+ 
+     case 0x86 ... 0x87: xchg: /* xchg */
++        if ( !lock_prefix )
++        {
++            ops->smp_unlock(lock_prefix);
++            lock_prefix = 1;
++            ops->smp_lock(lock_prefix);
++        }
+         /* Write back the register source. */
+         switch ( dst.bytes )
+         {
+@@ -2385,7 +2402,6 @@ x86_emulate(
+         }
+         /* Write back the memory destination with implicit LOCK prefix. */
+         dst.val = src.val;
+-        lock_prefix = 1;
+         break;
+ 
+     case 0xc6 ... 0xc7: /* mov (sole member of Grp11) */
+@@ -3863,8 +3879,11 @@ x86_emulate(
+     *ctxt->regs = _regs;
+ 
+  done:
++    ops->smp_unlock(lock_prefix);
++
+     _put_fpu();
+     put_stub(stub);
++
+     return rc;
+ 
+  twobyte_insn:
+@@ -4737,7 +4756,10 @@ x86_emulate(
+     goto writeback;
+ 
+  cannot_emulate:
++    ops->smp_unlock(lock_prefix);
++
+     _put_fpu();
+     put_stub(stub);
++
+     return X86EMUL_UNHANDLEABLE;
+ }
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.h b/xen/arch/x86/x86_emulate/x86_emulate.h
+index 9e4bca9..14ccc3c 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.h
++++ b/xen/arch/x86/x86_emulate/x86_emulate.h
+@@ -400,6 +400,14 @@ struct x86_emulate_ops
+     /* vmfunc: Emulate VMFUNC via given set of EAX ECX inputs */
+     int (*vmfunc)(
+         struct x86_emulate_ctxt *ctxt);
++
++    /* smp_lock: Take a write lock if locked, read lock otherwise. */
++    void (*smp_lock)(
++        bool_t locked);
++
++    /* smp_unlock: Write unlock if locked, read unlock otherwise. */
++    void (*smp_unlock)(
++        bool_t locked);
+ };
+ 
+ struct cpu_user_regs;
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index 0c75724..ca60b1b 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -276,6 +276,8 @@ struct monitor_write_data {
+     uint64_t cr4;
+ };
+ 
++DECLARE_PERCPU_RWLOCK_GLOBAL(emulate_locked_rwlock);
++
+ struct arch_domain
+ {
+     struct page_info *perdomain_l3_pg;
+@@ -414,6 +416,7 @@ struct arch_domain
+     bool_t mem_access_emulate_each_rep;
+ 
+     spinlock_t rexec_lock;
++    percpu_rwlock_t emulate_lock;
+ } __cacheline_aligned;
+ 
+ #define has_arch_pdevs(d)    (!list_empty(&(d)->arch.pdev_list))
+diff --git a/xen/include/asm-x86/hvm/emulate.h b/xen/include/asm-x86/hvm/emulate.h
+index 142d1b6..863f01d 100644
+--- a/xen/include/asm-x86/hvm/emulate.h
++++ b/xen/include/asm-x86/hvm/emulate.h
+@@ -67,6 +67,9 @@ int hvmemul_do_pio_buffer(uint16_t port,
+ void hvm_dump_emulation_state(const char *prefix,
+                               struct hvm_emulate_ctxt *hvmemul_ctxt);
+ 
++void emulate_smp_lock(bool_t locked);
++void emulate_smp_unlock(bool_t locked);
++
+ #endif /* __ASM_X86_HVM_EMULATE_H__ */
+ 
+ /*
