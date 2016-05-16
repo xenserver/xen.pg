@@ -11,10 +11,10 @@ index 06556ae..1ab39ed 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index a928627..834fddc 100644
+index 94b8fdb..369ebc9 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
-@@ -440,6 +440,7 @@ rm -rf $RPM_BUILD_ROOT
+@@ -441,6 +441,7 @@ rm -rf $RPM_BUILD_ROOT
  %{_libexecdir}/%{name}/bin/xenconsole
  %{_libexecdir}/%{name}/bin/xenctx
  %{_libexecdir}/%{name}/bin/xendomains
@@ -768,10 +768,10 @@ index 0000000..c43d473
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..be3b51d
+index 0000000..9b0f279
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1006 @@
+@@ -0,0 +1,1028 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -920,7 +920,7 @@ index 0000000..be3b51d
 +    return xenstore_putsv(key, "%s", val);
 +}
 +
-+static uint32_t *featureset, nr_features;
++static uint32_t *host_featureset, *featureset, nr_features;
 +
 +/*
 + * Choose the featureset to use for a VM.
@@ -1004,10 +1004,21 @@ index 0000000..be3b51d
 +        goto out;
 +    }
 +
++    host_featureset = calloc(nr_features, sizeof(*host_featureset));
 +    featureset = calloc(nr_features, sizeof(*featureset));
-+    if ( !featureset )
++    if ( !host_featureset || !featureset )
 +    {
 +        xg_err("Failed to allocate memory for featureset\n");
++        goto out;
++    }
++
++    if ( xc_get_cpu_featureset(xch,
++                               XEN_SYSCTL_cpu_featureset_host,
++                               &nr_features, host_featureset) ||
++         nr_features == 0 )
++    {
++        xg_err("Failed to obtain featureset size %d %s\n",
++               errno, strerror(errno));
 +        goto out;
 +    }
 +
@@ -1016,6 +1027,13 @@ index 0000000..be3b51d
 +
 +    if ( !f->nx )
 +        clear_bit(X86_FEATURE_NX, featureset);
++
++    /*
++     * Optionally advertise ITSC, given hardware support an a non-migratealbe
++     * domain.
++     */
++    if ( f->nested_hvm && test_bit(X86_FEATURE_ITSC, host_featureset) )
++        set_bit(X86_FEATURE_ITSC, featureset);
 +
 +    rc = xc_cpuid_apply_policy(xch, domid, featureset, nr_features);
 +
@@ -1323,7 +1341,11 @@ index 0000000..be3b51d
 +
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
-+    xc_set_hvm_param(xch, domid, HVM_PARAM_NESTEDHVM, f.nested_hvm);
++    if ( f.nested_hvm )
++    {
++        xc_set_hvm_param(xch, domid, HVM_PARAM_NESTEDHVM, f.nested_hvm);
++        xc_domain_disable_migrate(xch, domid);
++    }
 +    xc_get_hvm_param(xch, domid, HVM_PARAM_CONSOLE_PFN, console_mfn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_CONSOLE_EVTCHN, console_evtchn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_TRIPLE_FAULT_REASON, SHUTDOWN_crash);
