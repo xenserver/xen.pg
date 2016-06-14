@@ -1,8 +1,8 @@
 diff --git a/.gitignore b/.gitignore
-index 06556ae..1ab39ed 100644
+index 7347801..a5f98b0 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -197,6 +197,7 @@ tools/tests/mem-sharing/memshrtool
+@@ -209,6 +209,7 @@ tools/tests/mem-sharing/memshrtool
  tools/tests/mce-test/tools/xen-mceinj
  tools/xcutils/lsevtchn
  tools/xcutils/readnotes
@@ -11,10 +11,10 @@ index 06556ae..1ab39ed 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index 94b8fdb..369ebc9 100644
+index 81da3f2..571d06a 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
-@@ -441,6 +441,7 @@ rm -rf $RPM_BUILD_ROOT
+@@ -459,6 +459,7 @@ rm -rf $RPM_BUILD_ROOT
  %{_libexecdir}/%{name}/bin/xenconsole
  %{_libexecdir}/%{name}/bin/xenctx
  %{_libexecdir}/%{name}/bin/xendomains
@@ -23,10 +23,10 @@ index 94b8fdb..369ebc9 100644
  %{_libexecdir}/%{name}/bin/xenpvnetboot
  %{_libexecdir}/%{name}/boot/hvmloader
 diff --git a/tools/Makefile b/tools/Makefile
-index 6abba6f..4beea67 100644
+index 772f5f0..4c6127e 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
-@@ -20,6 +20,7 @@ SUBDIRS-$(CONFIG_BLKTAP2) += blktap2
+@@ -21,6 +21,7 @@ SUBDIRS-$(CONFIG_BLKTAP2) += blktap2
  SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
  SUBDIRS-y += libfsimage
  SUBDIRS-$(CONFIG_Linux) += libvchan
@@ -36,7 +36,7 @@ index 6abba6f..4beea67 100644
  ifneq "$(MAKECMDGOALS)" "distclean"
 diff --git a/tools/xenguest/Makefile b/tools/xenguest/Makefile
 new file mode 100644
-index 0000000..53532e8
+index 0000000..daaa3ba
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,31 @@
@@ -45,8 +45,8 @@ index 0000000..53532e8
 +
 +CFLAGS += -Werror -Wshadow
 +CFLAGS += -I. -I$(XEN_ROOT)/tools/libxc
-+CFLAGS += $(CFLAGS_libxenctrl) $(CFLAGS_libguest) $(CFLAGS_libxenstore)
-+CFLAGS += -D_GNU_SOURCE -D_BSD_SOURCE
++CFLAGS += $(CFLAGS_libxentoollog) $(CFLAGS_libxenctrl) $(CFLAGS_libguest) $(CFLAGS_libxenstore)
++CFLAGS += -D_GNU_SOURCE -D_BSD_SOURCE -DXC_WANT_COMPAT_MAP_FOREIGN_API
 +
 +PROGRAMS := xenguest
 +
@@ -58,7 +58,7 @@ index 0000000..53532e8
 +
 +xenguest: xenguest.o xenguest_stubs.o
 +	$(CC) $(CFLAGS) -o $@ $(LDFLAGS) $^ \
-+		$(LDLIBS_libxenctrl) $(LDLIBS_libxenguest) $(LDLIBS_libxenstore)
++		$(LDLIBS_libxentoollog) $(LDLIBS_libxenctrl) $(LDLIBS_libxenguest) $(LDLIBS_libxenstore)
 +
 +.PHONY: install
 +install: build
@@ -768,10 +768,10 @@ index 0000000..c43d473
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..9b0f279
+index 0000000..f964387
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1028 @@
+@@ -0,0 +1,1074 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1163,8 +1163,6 @@ index 0000000..9b0f279
 +    exit(1);
 +}
 +
-+extern struct xc_dom_image *xc_dom_allocate(xc_interface *xch, const char *cmdline, const char *features);
-+
 +static void configure_vcpus(struct flags f){
 +    struct xen_domctl_sched_credit sdom;
 +    int i, j, r, size, pcpus_supplied, min;
@@ -1244,39 +1242,62 @@ index 0000000..9b0f279
 +                        unsigned long *store_mfn, unsigned long *console_mfn,
 +                        char *protocol)
 +{
-+    int r;
 +    struct xc_dom_image *dom;
 +
 +    struct flags f;
 +    get_flags(&f);
 +
 +    xc_dom_loginit(xch);
++
 +    dom = xc_dom_allocate(xch, cmdline, features);
 +    if (!dom)
 +        failwith_oss_xc("xc_dom_allocate");
 +
++    dom->container_type = XC_DOM_PV_CONTAINER;
++
 +    /* The default image size limits are too large. */
-+    xc_dom_kernel_max_size(dom, get_image_max_size("kernel"));
-+    xc_dom_ramdisk_max_size(dom, get_image_max_size("ramdisk"));
++    if ( xc_dom_kernel_max_size(dom, get_image_max_size("kernel")) )
++        failwith_oss_xc("xc_dom_kernel_max_size");
++    if ( xc_dom_ramdisk_max_size(dom, get_image_max_size("ramdisk")) )
++        failwith_oss_xc("xc_dom_ramdisk_max_size");
 +
 +    configure_vcpus(f);
 +    configure_tsc(f);
 +
-+    r = xc_dom_linux_build(xch, dom, domid, mem_start_mib,
-+                           image_name, ramdisk_name, flags,
-+                           store_evtchn, store_mfn,
-+                           console_evtchn, console_mfn);
-+    if ( r )
-+        failwith_oss_xc("xc_dom_linux_build");
++    if ( xc_dom_kernel_file(dom, image_name) )
++        failwith_oss_xc("xc_dom_kernel_file");
++    if ( ramdisk_name && strlen(ramdisk_name) &&
++         xc_dom_ramdisk_file(dom, ramdisk_name) )
++        failwith_oss_xc("xc_dom_ramdisk_file");
 +
-+    r = construct_cpuid_policy(&f, false);
-+    if ( r )
++    dom->flags = flags;
++    dom->console_evtchn = console_evtchn;
++    dom->xenstore_evtchn = store_evtchn;
++
++    if ( xc_dom_boot_xen_init(dom, xch, domid) )
++        failwith_oss_xc("xc_dom_boot_xen_init");
++    if ( xc_dom_parse_image(dom) )
++        failwith_oss_xc("xc_dom_parse_image");
++    if ( xc_dom_mem_init(dom, mem_start_mib) )
++        failwith_oss_xc("xc_dom_mem_init");
++    if ( xc_dom_boot_mem_init(dom) )
++        failwith_oss_xc("xc_dom_boot_mem_init");
++    if ( xc_dom_build_image(dom) )
++        failwith_oss_xc("xc_dom_build_image");
++    if ( xc_dom_boot_image(dom) )
++        failwith_oss_xc("xc_dom_boot_image");
++    if ( xc_dom_gnttab_init(dom))
++        failwith_oss_xc("xc_dom_gnttab_init");
++
++    *console_mfn = xc_dom_p2m(dom, dom->console_pfn);
++    *store_mfn = xc_dom_p2m(dom, dom->xenstore_pfn);
++
++    if ( construct_cpuid_policy(&f, false) )
 +        failwith_oss_xc("construct_cpuid_policy");
 +
-+    r = xc_dom_gnttab_seed(xch, domid,
-+                           *console_mfn, *store_mfn,
-+                           console_domid, store_domid);
-+    if ( r )
++    if ( xc_dom_gnttab_seed(xch, domid,
++                            *console_mfn, *store_mfn,
++                            console_domid, store_domid) )
 +        failwith_oss_xc("xc_dom_gnttab_seed");
 +
 +    strncpy(protocol, xc_domain_get_native_protocol(xch, domid), 64);
@@ -1440,16 +1461,11 @@ index 0000000..9b0f279
 +int stub_xc_hvm_build_with_mem(uint64_t max_mem_mib, uint64_t max_start_mib,
 +                               const char *image)
 +{
-+    uint64_t lowmem_end, highmem_start, highmem_end, mmio_start;
-+    struct xc_hvm_build_args args = {
-+        .mem_size   = max_mem_mib   << 20,
-+        .mem_target = max_start_mib << 20,
-+        .mmio_size  = HVM_BELOW_4G_MMIO_LENGTH,
-+        .image_file_name = image,
-+    };
++    struct xc_dom_image *dom;
++
++    uint64_t lowmem_end, highmem_start, highmem_end, mmio_start, mmio_size;
 +    unsigned int i, j, nr = 0;
 +    struct e820entry *e820;
-+    int rc;
 +    unsigned int nr_rdm_entries[MAX_RMRR_DEVICES] = {0};
 +    unsigned int nr_rmrr_devs = 0;
 +    struct xen_reserved_device_memory *xrdm[MAX_RMRR_DEVICES] = {0};
@@ -1482,9 +1498,21 @@ index 0000000..9b0f279
 +    if (!e820)
 +	    return -ENOMEM;
 +
-+    lowmem_end  = args.mem_size;
++    xc_dom_loginit(xch);
++
++    dom = xc_dom_allocate(xch, NULL, NULL);
++    if ( !dom )
++        failwith_oss_xc("xc_dom_allocate");
++
++    dom->container_type = XC_DOM_HVM_CONTAINER;
++    dom->device_model = true;
++
++    dom->target_pages = max_start_mib << 20;
++
++    lowmem_end  = max_mem_mib << 20;
 +    highmem_end = highmem_start = 1ull << 32;
-+    mmio_start  = highmem_start - args.mmio_size;
++    mmio_size   = HVM_BELOW_4G_MMIO_LENGTH;
++    mmio_start  = highmem_start - mmio_size;
 +
 +    if ( lowmem_end > mmio_start )
 +    {
@@ -1492,13 +1520,9 @@ index 0000000..9b0f279
 +        lowmem_end = mmio_start;
 +    }
 +
-+    args.lowmem_end = lowmem_end;
-+    args.highmem_end = highmem_end;
-+    args.mmio_start = mmio_start;
-+
 +    /* Leave low 1MB to HVMLoader... */
 +    e820[nr].addr = 0x100000u;
-+    e820[nr].size = args.lowmem_end - 0x100000u;
++    e820[nr].size = lowmem_end - 0x100000u;
 +    e820[nr].type = E820_RAM;
 +    nr++;
 +
@@ -1511,39 +1535,61 @@ index 0000000..9b0f279
 +            e820[nr].size = xrdm[i][j].nr_pages << XC_PAGE_SHIFT;
 +            e820[nr].type = E820_RESERVED;
 +            xg_info("Adding RMRR 0x%lx size 0x%lx\n", e820[nr].addr, e820[nr].size);
-+            if ( e820[nr].addr < args.lowmem_end ) {
-+                rmrr_overlapped_ram += ( args.lowmem_end - e820[nr].addr );
-+                args.lowmem_end = e820[nr].addr;
++            if ( e820[nr].addr < lowmem_end ) {
++                rmrr_overlapped_ram += ( lowmem_end - e820[nr].addr );
++                lowmem_end = e820[nr].addr;
 +            }
 +            nr++;
 +        }
 +    }
 +    e820[0].size -= rmrr_overlapped_ram;
-+    args.highmem_end += rmrr_overlapped_ram;
-+    args.mmio_size += rmrr_overlapped_ram;
-+    args.mmio_start -= rmrr_overlapped_ram;
++    highmem_end += rmrr_overlapped_ram;
++    mmio_size += rmrr_overlapped_ram;
++    mmio_start -= rmrr_overlapped_ram;
 +
 +    for (i = 0; i < nr_rmrr_devs; i++)
 +    {
 +        free(xrdm[i]);
 +    }
 +
-+    if ( args.highmem_end > highmem_start )
++    if ( highmem_end > highmem_start )
 +    {
 +        e820[nr].addr = highmem_start;
-+        e820[nr].size = args.highmem_end - e820[nr].addr;
++        e820[nr].size = highmem_end - e820[nr].addr;
 +        e820[nr].type = E820_RAM;
 +        nr++;
 +    }
 +
-+    rc = xc_hvm_build(xch, domid, &args);
++    dom->lowmem_end = lowmem_end;
++    dom->highmem_end = highmem_end;
++    dom->mmio_size = mmio_size;
++    dom->mmio_start = mmio_start;
 +
-+    if (!rc)
-+        rc = xc_domain_set_memory_map(xch, domid, e820, nr);
++    if ( xc_dom_kernel_file(dom, image) )
++        failwith_oss_xc("xc_dom_kernel_file");
 +
++    if ( xc_dom_boot_xen_init(dom, xch, domid) )
++        failwith_oss_xc("xc_dom_boot_xen_init");
++    if ( xc_dom_parse_image(dom) )
++        failwith_oss_xc("xc_dom_parse_image");
++    if ( xc_dom_mem_init(dom, max_mem_mib) )
++        failwith_oss_xc("xc_dom_mem_init");
++    if ( xc_dom_boot_mem_init(dom) )
++        failwith_oss_xc("xc_dom_boot_mem_init");
++    if ( xc_dom_build_image(dom) )
++        failwith_oss_xc("xc_dom_build_image");
++    if ( xc_dom_boot_image(dom) )
++        failwith_oss_xc("xc_dom_boot_image");
++    if ( xc_dom_gnttab_init(dom))
++        failwith_oss_xc("xc_dom_gnttab_init");
++
++    if ( xc_domain_set_memory_map(xch, domid, e820, nr) )
++        failwith_oss_xc("xc_domain_set_memory_map");
++
++    xc_dom_release(dom);
 +    free(e820);
 +
-+    return rc;
++    return 0;
 +}
 +
 +int stub_xc_hvm_build(int mem_max_mib, int mem_start_mib, const char *image_name,
@@ -1647,7 +1693,7 @@ index 0000000..9b0f279
 +
 +    r = xc_domain_save(xch, fd, domid,
 +                       max_iters, max_factors,
-+                       flags, &callbacks, hvm);
++                       flags, &callbacks, hvm, 0, -1);
 +    if (r)
 +        failwith_oss_xc("xc_domain_save");
 +
@@ -1755,7 +1801,7 @@ index 0000000..9b0f279
 +    r = xc_domain_restore(xch, fd, domid,
 +                          store_evtchn, store_mfn, 0,
 +                          console_evtchn, console_mfn, 0,
-+                          hvm, f.pae, 0, 0, NULL);
++                          hvm, f.pae, 0, 0, NULL, -1);
 +    if ( r )
 +        failwith_oss_xc("xc_domain_restore");
 +    /*

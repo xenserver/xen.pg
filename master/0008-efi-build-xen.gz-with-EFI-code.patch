@@ -21,10 +21,10 @@ can generate xen.efi directly from xen ELF using just simple objcopy.
 
 Signed-off-by: Daniel Kiper <daniel.kiper@oracle.com>
 diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
-index 756ef57..4b89d83 100644
+index 4665a68..cc8f8d1 100644
 --- a/xen/arch/x86/Makefile
 +++ b/xen/arch/x86/Makefile
-@@ -91,29 +91,29 @@ prelink-efi_lto.o: $(ALL_OBJS) efi/runtime.o efi/compat.o
+@@ -111,33 +111,33 @@ prelink-efi_lto.o: $(ALL_OBJS) efi/runtime.o efi/compat.o
  prelink.o: $(patsubst %/built_in.o,%/built_in_bin.o,$(ALL_OBJS)) prelink_lto.o
  	$(LD) $(LDFLAGS) -r -o $@ $^
  
@@ -36,32 +36,35 @@ index 756ef57..4b89d83 100644
  	$(LD) $(LDFLAGS) -r -o $@ $^
  
 -prelink-efi.o: $(ALL_OBJS) efi/boot.init.o efi/runtime.o efi/compat.o
--	$(guard) $(LD) $(LDFLAGS) -r -o $@ $(filter-out %/efi/built_in.o,$^)
 +prelink-efi.o: $(ALL_OBJS)
-+	$(guard) $(LD) $(LDFLAGS) -r -o $@ $^
+ 	$(guard) $(LD) $(LDFLAGS) -r -o $@ $(filter-out %/efi/built_in.o,$^)
  endif
  
  $(BASEDIR)/common/symbols-dummy.o:
  	$(MAKE) -f $(BASEDIR)/Rules.mk -C $(BASEDIR)/common symbols-dummy.o
  
 -$(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o
--	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
+-	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o $(build_id_linker) \
 +$(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o efi/relocs-dummy.o
-+	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o efi/relocs-dummy.o \
++	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o $(build_id_linker) efi/relocs-dummy.o \
  	    $(BASEDIR)/common/symbols-dummy.o -o $(@D)/.$(@F).0
- 	$(NM) -pa --format=sysv $(@D)/.$(@F).0 | $(BASEDIR)/tools/symbols --sysv --sort >$(@D)/.$(@F).0.S
+ 	$(NM) -pa --format=sysv $(@D)/.$(@F).0 \
+ 		| $(BASEDIR)/tools/symbols $(all_symbols) --sysv --sort \
+ 		>$(@D)/.$(@F).0.S
  	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).0.o
--	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
-+	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o efi/relocs-dummy.o \
+-	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o $(build_id_linker) \
++	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o $(build_id_linker) efi/relocs-dummy.o \
  	    $(@D)/.$(@F).0.o -o $(@D)/.$(@F).1
- 	$(NM) -pa --format=sysv  $(@D)/.$(@F).1 | $(BASEDIR)/tools/symbols --sysv --sort --warn-dup >$(@D)/.$(@F).1.S
+ 	$(NM) -pa --format=sysv $(@D)/.$(@F).1 \
+ 		| $(BASEDIR)/tools/symbols $(all_symbols) --sysv --sort --warn-dup \
+ 		>$(@D)/.$(@F).1.S
  	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1.o
--	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
-+	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o efi/relocs-dummy.o \
+-	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o $(build_id_linker) \
++	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o $(build_id_linker) efi/relocs-dummy.o \
  	    $(@D)/.$(@F).1.o -o $@
  	rm -f $(@D)/.$(@F).[0-9]*
  
-@@ -149,9 +149,6 @@ $(TARGET).efi: prelink-efi.o efi.lds efi/relocs-dummy.o $(BASEDIR)/common/symbol
+@@ -186,9 +186,6 @@ $(TARGET).efi: prelink-efi.o efi.lds efi/relocs-dummy.o $(BASEDIR)/common/symbol
  	if $(guard) false; then rm -f $@; echo 'EFI support disabled'; fi
  	rm -f $(@D)/.$(@F).[0-9]*
  
@@ -72,7 +75,7 @@ index 756ef57..4b89d83 100644
  	$(CC) $(filter-out -flto,$(CFLAGS)) -S -o $@ $<
  
 diff --git a/xen/arch/x86/efi/Makefile b/xen/arch/x86/efi/Makefile
-index 1daa7ac..13e59dc 100644
+index 5099430..1e62518 100644
 --- a/xen/arch/x86/efi/Makefile
 +++ b/xen/arch/x86/efi/Makefile
 @@ -1,14 +1,14 @@
@@ -87,7 +90,7 @@ index 1daa7ac..13e59dc 100644
  
  create = test -e $(1) || touch -t 199901010000 $(1)
  
- efi := $(filter y,$(x86_64)$(shell rm -f disabled))
+ efi := y$(shell rm -f disabled)
  efi := $(if $(efi),$(shell $(CC) $(filter-out $(CFLAGS-y) .%.d,$(CFLAGS)) -c check.c 2>disabled && echo y))
  efi := $(if $(efi),$(shell $(LD) -mi386pep --subsystem=10 -o check.efi check.o 2>disabled && echo y))
 -efi := $(if $(efi),$(shell rm disabled)y,$(shell $(call create,boot.init.o); $(call create,runtime.o)))
@@ -148,10 +151,10 @@ index 51e0660..0000000
 -int efi_compat_runtime_call(struct compat_pf_efi_runtime_call *)
 -    __attribute__((__alias__("efi_runtime_call")));
 diff --git a/xen/arch/x86/xen.lds.S b/xen/arch/x86/xen.lds.S
-index 6553cff..8e44553 100644
+index b14bcd2..58a0508 100644
 --- a/xen/arch/x86/xen.lds.S
 +++ b/xen/arch/x86/xen.lds.S
-@@ -189,8 +189,6 @@ SECTIONS
+@@ -261,8 +261,6 @@ SECTIONS
    .pad : {
      . = ALIGN(MB(16));
    } :text

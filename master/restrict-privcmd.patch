@@ -1,5 +1,5 @@
 diff --git a/tools/include/xen-sys/Linux/privcmd.h b/tools/include/xen-sys/Linux/privcmd.h
-index 5be860a..2a7e297 100644
+index e4e666a..eea9377 100644
 --- a/tools/include/xen-sys/Linux/privcmd.h
 +++ b/tools/include/xen-sys/Linux/privcmd.h
 @@ -75,6 +75,10 @@ typedef struct privcmd_mmapbatch_v2 {
@@ -21,75 +21,175 @@ index 5be860a..2a7e297 100644
 +	_IOC(_IOC_NONE, 'P', 100, sizeof(privcmd_restrict_domid_t))
  
  #endif /* __LINUX_PUBLIC_PRIVCMD_H__ */
+diff --git a/tools/libs/call/core.c b/tools/libs/call/core.c
+index bbf88de..e55581f 100644
+--- a/tools/libs/call/core.c
++++ b/tools/libs/call/core.c
+@@ -70,6 +70,11 @@ int xencall_close(xencall_handle *xcall)
+     return rc;
+ }
+ 
++int xencall_restrict(xencall_handle *xcall, uint32_t dom)
++{
++    return osdep_xencall_restrict(xcall, dom);
++}
++
+ int xencall0(xencall_handle *xcall, unsigned int op)
+ {
+     privcmd_hypercall_t call = {
+diff --git a/tools/libs/call/include/xencall.h b/tools/libs/call/include/xencall.h
+index 559624a..a7f8966 100644
+--- a/tools/libs/call/include/xencall.h
++++ b/tools/libs/call/include/xencall.h
+@@ -72,6 +72,8 @@ xencall_handle *xencall_open(xentoollog_logger *logger, unsigned open_flags);
+  */
+ int xencall_close(xencall_handle *xcall);
+ 
++int xencall_restrict(xencall_handle *xcall, uint32_t domid);
++
+ /*
+  * Call hypercalls with varying numbers of arguments.
+  *
+diff --git a/tools/libs/call/libxencall.map b/tools/libs/call/libxencall.map
+index 2f96144..d9a675c 100644
+--- a/tools/libs/call/libxencall.map
++++ b/tools/libs/call/libxencall.map
+@@ -2,6 +2,7 @@ VERS_1.0 {
+ 	global:
+ 		xencall_open;
+ 		xencall_close;
++		xencall_restrict;
+ 
+ 		xencall0;
+ 		xencall1;
+diff --git a/tools/libs/call/linux.c b/tools/libs/call/linux.c
+index e8e0311..242b82b 100644
+--- a/tools/libs/call/linux.c
++++ b/tools/libs/call/linux.c
+@@ -63,6 +63,12 @@ int osdep_xencall_close(xencall_handle *xcall)
+     return close(fd);
+ }
+ 
++int osdep_xencall_restrict(xencall_handle *xcall, uint32_t dom)
++{
++    struct privcmd_restrict_domid restrict_domid = { dom };
++    return ioctl(xcall->fd, IOCTL_PRIVCMD_RESTRICT_DOMID, &restrict_domid);
++}
++
+ int osdep_hypercall(xencall_handle *xcall, privcmd_hypercall_t *hypercall)
+ {
+     return ioctl(xcall->fd, IOCTL_PRIVCMD_HYPERCALL, hypercall);
+diff --git a/tools/libs/call/private.h b/tools/libs/call/private.h
+index 37dd15f..16750e9 100644
+--- a/tools/libs/call/private.h
++++ b/tools/libs/call/private.h
+@@ -45,6 +45,7 @@ struct xencall_handle {
+ 
+ int osdep_xencall_open(xencall_handle *xcall);
+ int osdep_xencall_close(xencall_handle *xcall);
++int osdep_xencall_restrict(xencall_handle *xcall, uint32_t dom);
+ 
+ int osdep_hypercall(xencall_handle *xcall, privcmd_hypercall_t *hypercall);
+ 
+diff --git a/tools/libs/foreignmemory/core.c b/tools/libs/foreignmemory/core.c
+index cfb0a73..7f42268 100644
+--- a/tools/libs/foreignmemory/core.c
++++ b/tools/libs/foreignmemory/core.c
+@@ -62,6 +62,11 @@ int xenforeignmemory_close(xenforeignmemory_handle *fmem)
+     return rc;
+ }
+ 
++int xenforeignmemory_restrict(xenforeignmemory_handle *fmem, uint32_t dom)
++{
++    return osdep_xenforeignmemory_restrict(fmem, dom);
++}
++
+ void *xenforeignmemory_map(xenforeignmemory_handle *fmem,
+                            uint32_t dom, int prot,
+                            size_t num,
+diff --git a/tools/libs/foreignmemory/include/xenforeignmemory.h b/tools/libs/foreignmemory/include/xenforeignmemory.h
+index 3724c63..7336ed3 100644
+--- a/tools/libs/foreignmemory/include/xenforeignmemory.h
++++ b/tools/libs/foreignmemory/include/xenforeignmemory.h
+@@ -73,6 +73,8 @@ xenforeignmemory_handle *xenforeignmemory_open(xentoollog_logger *logger,
+  */
+ int xenforeignmemory_close(xenforeignmemory_handle *fmem);
+ 
++int xenforeignmemory_restrict(xenforeignmemory_handle *fmem, uint32_t domid);
++
+ /*
+  * Maps a range within one domain to a local address range.  Mappings
+  * must be unmapped with xenforeignmemory_unmap and should follow the
+diff --git a/tools/libs/foreignmemory/libxenforeignmemory.map b/tools/libs/foreignmemory/libxenforeignmemory.map
+index df206b3..fee3c6f 100644
+--- a/tools/libs/foreignmemory/libxenforeignmemory.map
++++ b/tools/libs/foreignmemory/libxenforeignmemory.map
+@@ -2,6 +2,7 @@ VERS_1.0 {
+ 	global:
+ 		xenforeignmemory_open;
+ 		xenforeignmemory_close;
++		xenforeignmemory_restrict;
+ 		xenforeignmemory_map;
+ 		xenforeignmemory_unmap;
+ 	local: *; /* Do not expose anything by default */
+diff --git a/tools/libs/foreignmemory/linux.c b/tools/libs/foreignmemory/linux.c
+index 423c744..2b61e04 100644
+--- a/tools/libs/foreignmemory/linux.c
++++ b/tools/libs/foreignmemory/linux.c
+@@ -65,6 +65,11 @@ int osdep_xenforeignmemory_close(xenforeignmemory_handle *fmem)
+     return close(fd);
+ }
+ 
++int osdep_xenforeignmemory_restrict(xenforeignmemory_handle *fmem, uint32_t dom)
++{
++    struct privcmd_restrict_domid restrict_domid = { dom };
++    return ioctl(fmem->fd, IOCTL_PRIVCMD_RESTRICT_DOMID, &restrict_domid);
++}
+ static int map_foreign_batch_single(int fd, uint32_t dom,
+                                     xen_pfn_t *mfn, unsigned long addr)
+ {
+diff --git a/tools/libs/foreignmemory/private.h b/tools/libs/foreignmemory/private.h
+index 9cc7814..f8fcf67 100644
+--- a/tools/libs/foreignmemory/private.h
++++ b/tools/libs/foreignmemory/private.h
+@@ -24,6 +24,7 @@ struct xenforeignmemory_handle {
+ 
+ int osdep_xenforeignmemory_open(xenforeignmemory_handle *fmem);
+ int osdep_xenforeignmemory_close(xenforeignmemory_handle *fmem);
++int osdep_xenforeignmemory_restrict(xenforeignmemory_handle *fmem, uint32_t dom);
+ 
+ void *osdep_xenforeignmemory_map(xenforeignmemory_handle *fmem,
+                                  uint32_t dom, int prot,
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index 4adf90c..43c0866 100644
+index f70cadc..871e50d 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
-@@ -187,6 +187,11 @@ enum xc_open_flags {
+@@ -181,6 +181,11 @@ enum xc_open_flags {
+  */
  int xc_interface_close(xc_interface *xch);
  
- /**
++/**
 + * Restrict interface to a given domain
 + */
 +int xc_interface_restrict(xc_interface *xch, uint32_t domid);
 +
-+/**
-  * Query the active OS interface (i.e. that which would be returned by
-  * xc_interface_open) to find out if it is fake (i.e. backends onto
-  * something other than an actual Xen hypervisor).
-diff --git a/tools/libxc/include/xenctrlosdep.h b/tools/libxc/include/xenctrlosdep.h
-index e97944b..d55a0bd 100644
---- a/tools/libxc/include/xenctrlosdep.h
-+++ b/tools/libxc/include/xenctrlosdep.h
-@@ -89,6 +89,7 @@ struct xc_osdep_ops
-             void *(*map_foreign_ranges)(xc_interface *xch, xc_osdep_handle h, uint32_t dom, size_t size, int prot,
-                                         size_t chunksize, privcmd_mmap_entry_t entries[],
-                                         int nentries);
-+            int (*restrict_to_domain)(xc_interface *xch, xc_osdep_handle h, uint32_t dom);
-         } privcmd;
-         struct {
-             int (*fd)(xc_evtchn *xce, xc_osdep_handle h);
-diff --git a/tools/libxc/xc_linux_osdep.c b/tools/libxc/xc_linux_osdep.c
-index a19e4b6..b6c435a 100644
---- a/tools/libxc/xc_linux_osdep.c
-+++ b/tools/libxc/xc_linux_osdep.c
-@@ -134,6 +134,13 @@ static int linux_privcmd_hypercall(xc_interface *xch, xc_osdep_handle h, privcmd
-     return ioctl(fd, IOCTL_PRIVCMD_HYPERCALL, hypercall);
- }
- 
-+static int linux_privcmd_restrict(xc_interface *xch, xc_osdep_handle h, uint32_t dom)
-+{
-+    int fd = (int)h;
-+    struct privcmd_restrict_domid restrict_domid = { dom };
-+    return ioctl(fd, IOCTL_PRIVCMD_RESTRICT_DOMID, &restrict_domid);
-+}
-+
- static int xc_map_foreign_batch_single(int fd, uint32_t dom,
-                                        xen_pfn_t *mfn, unsigned long addr)
- {
-@@ -448,6 +455,8 @@ static struct xc_osdep_ops linux_privcmd_ops = {
-         .map_foreign_bulk = &linux_privcmd_map_foreign_bulk,
-         .map_foreign_range = &linux_privcmd_map_foreign_range,
-         .map_foreign_ranges = &linux_privcmd_map_foreign_ranges,
-+
-+        .restrict_to_domain = &linux_privcmd_restrict,
-     },
- };
- 
+ /*
+  * HYPERCALL SAFE MEMORY BUFFER
+  *
 diff --git a/tools/libxc/xc_private.c b/tools/libxc/xc_private.c
-index 45537af..7a6cbcc 100644
+index c41e433..1655c7e 100644
 --- a/tools/libxc/xc_private.c
 +++ b/tools/libxc/xc_private.c
-@@ -247,6 +247,12 @@ int xc_interface_close(xc_interface *xch)
-     return xc_interface_close_common(xch);
+@@ -97,6 +97,12 @@ int xc_interface_close(xc_interface *xch)
+     return rc;
  }
  
 +int xc_interface_restrict(xc_interface *xch, uint32_t domid)
 +{
-+    if (!xch->ops->u.privcmd.restrict_to_domain)
-+        return -1;
-+    return xch->ops->u.privcmd.restrict_to_domain(xch, xch->ops_handle, domid);
++    return xencall_restrict(xch->xcall, domid) ?:
++        xenforeignmemory_restrict(xch->fmem, domid);
 +}
++
+ static pthread_key_t errbuf_pkey;
+ static pthread_once_t errbuf_pkey_once = PTHREAD_ONCE_INIT;
  
- int do_xen_hypercall(xc_interface *xch, privcmd_hypercall_t *hypercall)
- {

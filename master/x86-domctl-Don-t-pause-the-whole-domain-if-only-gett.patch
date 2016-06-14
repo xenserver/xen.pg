@@ -4,7 +4,7 @@ Date: Tue, 12 Apr 2016 17:05:47 +0300
 Subject: x86/domctl: Don't pause the whole domain if only getting vcpu state
 
 diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
-index c660a28..ae2b3a2 100644
+index 6e709cb..49271aa 100644
 --- a/xen/arch/x86/domctl.c
 +++ b/xen/arch/x86/domctl.c
 @@ -507,6 +507,26 @@ long arch_do_domctl(
@@ -35,10 +35,10 @@ index c660a28..ae2b3a2 100644
          ret = hvm_save_one(d, domctl->u.hvmcontext_partial.type,
                             domctl->u.hvmcontext_partial.instance,
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index 9429654..23b2899 100644
+index 043904d..56926c8 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
-@@ -1739,11 +1739,106 @@ static int hvm_load_tsc_adjust(struct domain *d, hvm_domain_context_t *h)
+@@ -765,11 +765,109 @@ static int hvm_load_tsc_adjust(struct domain *d, hvm_domain_context_t *h)
  HVM_REGISTER_SAVE_RESTORE(TSC_ADJUST, hvm_save_tsc_adjust,
                            hvm_load_tsc_adjust, 1, HVMSR_PER_VCPU);
  
@@ -48,6 +48,8 @@ index 9429654..23b2899 100644
 +
 +    /* Architecture-specific vmcs/vmcb bits */
 +    hvm_funcs.save_cpu_ctxt(v, ctxt);
++
++    ctxt->tsc = hvm_get_guest_tsc_fixed(v, v->domain->arch.hvm_domain.sync_tsc);
 +
 +    ctxt->msr_tsc_aux = hvm_msr_tsc_aux(v);
 +
@@ -108,9 +110,10 @@ index 9429654..23b2899 100644
 +    ctxt->ldtr_arbytes = seg.attr.bytes;
 +
 +    if ( v->fpu_initialised )
++    {
 +        memcpy(ctxt->fpu_regs, v->arch.fpu_ctxt, sizeof(ctxt->fpu_regs));
-+    else
-+        memset(ctxt->fpu_regs, 0, sizeof(ctxt->fpu_regs));
++        ctxt->flags = XEN_X86_FPU_INITIALISED;
++    }
 +
 +    ctxt->rax = v->arch.user_regs.eax;
 +    ctxt->rbx = v->arch.user_regs.ebx;
@@ -146,12 +149,14 @@ index 9429654..23b2899 100644
  
      for_each_vcpu ( d, v )
      {
-@@ -1752,96 +1847,7 @@ static int hvm_save_cpu_ctxt(struct domain *d, hvm_domain_context_t *h)
-         if ( test_bit(_VPF_down, &v->pause_flags) ) 
-             continue;
+@@ -780,99 +878,7 @@ static int hvm_save_cpu_ctxt(struct domain *d, hvm_domain_context_t *h)
+ 
+         memset(&ctxt, 0, sizeof(ctxt));
  
 -        /* Architecture-specific vmcs/vmcb bits */
 -        hvm_funcs.save_cpu_ctxt(v, &ctxt);
+-
+-        ctxt.tsc = hvm_get_guest_tsc_fixed(v, d->arch.hvm_domain.sync_tsc);
 -
 -        ctxt.msr_tsc_aux = hvm_msr_tsc_aux(v);
 -
@@ -212,9 +217,10 @@ index 9429654..23b2899 100644
 -        ctxt.ldtr_arbytes = seg.attr.bytes;
 -
 -        if ( v->fpu_initialised )
+-        {
 -            memcpy(ctxt.fpu_regs, v->arch.fpu_ctxt, sizeof(ctxt.fpu_regs));
--        else 
--            memset(ctxt.fpu_regs, 0, sizeof(ctxt.fpu_regs));
+-            ctxt.flags = XEN_X86_FPU_INITIALISED;
+-        }
 -
 -        ctxt.rax = v->arch.user_regs.eax;
 -        ctxt.rbx = v->arch.user_regs.ebx;
@@ -245,15 +251,15 @@ index 9429654..23b2899 100644
          if ( hvm_save_entry(CPU, v->vcpu_id, h, &ctxt) != 0 )
              return 1; 
 diff --git a/xen/include/asm-x86/hvm/hvm.h b/xen/include/asm-x86/hvm/hvm.h
-index e47c4c8..5ef6635 100644
+index 84376a0..ce0913a 100644
 --- a/xen/include/asm-x86/hvm/hvm.h
 +++ b/xen/include/asm-x86/hvm/hvm.h
-@@ -576,6 +576,8 @@ bool_t altp2m_vcpu_emulate_ve(struct vcpu *v);
+@@ -602,6 +602,8 @@ bool_t altp2m_vcpu_emulate_ve(struct vcpu *v);
  /* introspection extensions commandline argument value */
  extern bool_t opt_introspection_extn;
  
 +void hvm_save_one_cpu_ctxt(struct vcpu *v, struct hvm_hw_cpu *ctxt);
 +
- #endif /* __ASM_X86_HVM_HVM_H__ */
- 
- /*
+ /* Check CR4/EFER values */
+ const char *hvm_efer_valid(const struct vcpu *v, uint64_t value,
+                            signed int cr0_pg);
