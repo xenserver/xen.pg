@@ -1,6 +1,6 @@
-From 08cffe6696c047123bd552e095163924c8ef4353 Mon Sep 17 00:00:00 2001
+From 41b61be1c244b27985f92061aa9670088340a37f Mon Sep 17 00:00:00 2001
 From: Daniel De Graaf <dgdegra@tycho.nsa.gov>
-Date: Mon, 20 Jun 2016 10:04:26 -0400
+Date: Thu, 14 Jul 2016 10:18:47 -0400
 Subject: [PATCH] xsm: add a default policy to .init.data
 
 This adds a Kconfig option and support for including the XSM policy from
@@ -9,16 +9,53 @@ need to provide a policy to get sane behavior from an XSM-enabled
 hypervisor.  The policy provided by the bootloader, if present, will
 override the built-in policy.
 
-Enabling this option only builds the policy if checkpolicy is available
-during compilation of the hypervisor; otherwise, it does nothing.  The
-XSM policy is not moved out of tools because that remains the primary
-location for installing and configuring the policy.
+The XSM policy is not moved out of tools because that remains the
+primary location for installing and configuring the policy.
 
 Signed-off-by: Daniel De Graaf <dgdegra@tycho.nsa.gov>
 Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
-Reviewed-by: Doug Goldstein <cardoe@cardoe.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
 Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
-Acked-by: Julien Grall <julien.grall@arm.com>
+diff --git a/Config.mk b/Config.mk
+index bd991c6..b50dd4b 100644
+--- a/Config.mk
++++ b/Config.mk
+@@ -147,6 +147,12 @@ export XEN_HAS_BUILD_ID=y
+ build_id_linker := --build-id=sha1
+ endif
+ 
++ifndef XEN_HAS_CHECKPOLICY
++    CHECKPOLICY ?= checkpolicy
++    XEN_HAS_CHECKPOLICY := $(shell $(CHECKPOLICY) -h 2>&1 | grep -q xen && echo y || echo n)
++    export XEN_HAS_CHECKPOLICY
++endif
++
+ # as-insn: Check whether assembler supports an instruction.
+ # Usage: cflags-y += $(call as-insn "insn",option-yes,option-no)
+ as-insn = $(if $(shell echo 'void _(void) { asm volatile ( $(2) ); }' \
+diff --git a/INSTALL b/INSTALL
+index 623887d..f3cf594 100644
+--- a/INSTALL
++++ b/INSTALL
+@@ -270,10 +270,16 @@ Building the python tools may fail unless certain options are passed to
+ setup.py. Config.mk contains additional info how to use this variable.
+ PYTHON_PREFIX_ARG=
+ 
+-The hypervisor may be build with XSM/Flask support, which can be changed
++The hypervisor may be built with XSM/Flask support, which can be changed
+ by running:
+ make -C xen menuconfig
+-and enabling XSM/Flask in the 'Common Features' menu.
++and enabling XSM/Flask in the 'Common Features' menu.  A security policy
++is required to use XSM/Flask; if the SELinux policy compiler is
++available, the policy from tools can be included in the hypervisor.
++This option is enabled by default if XSM is enabled and the compiler
++(checkpolicy) is found.  The location of this executable can be set
++using the environment variable.
++CHECKPOLICY=
+ 
+ Do a build for coverage.
+ coverage=y
 diff --git a/docs/misc/xen-command-line.markdown b/docs/misc/xen-command-line.markdown
 index b4bae11..16b52fa 100644
 --- a/docs/misc/xen-command-line.markdown
@@ -87,48 +124,28 @@ index 2f42585..62f15dd 100644
  
  The example policy included with Xen demonstrates most of the features of FLASK
  that can be used without dom0 disaggregation. The main types for domUs are:
-diff --git a/xen/arch/arm/xen.lds.S b/xen/arch/arm/xen.lds.S
-index c544524..2c2c57f 100644
---- a/xen/arch/arm/xen.lds.S
-+++ b/xen/arch/arm/xen.lds.S
-@@ -139,6 +139,10 @@ SECTIONS
-        *(.init.data.rel)
-        *(.init.data.rel.*)
- 
-+       __xsm_init_policy_start = .;
-+       *(.init.xsm_policy)
-+       __xsm_init_policy_end = .;
-+
-        . = ALIGN(8);
-        __ctors_start = .;
-        *(.init_array)
-diff --git a/xen/arch/x86/xen.lds.S b/xen/arch/x86/xen.lds.S
-index 8da6e9b..bba7a15 100644
---- a/xen/arch/x86/xen.lds.S
-+++ b/xen/arch/x86/xen.lds.S
-@@ -155,6 +155,11 @@ SECTIONS
-        *(.init.data)
-        *(.init.data.rel)
-        *(.init.data.rel.*)
-+
-+       __xsm_init_policy_start = .;
-+       *(.init.xsm_policy)
-+       __xsm_init_policy_end = .;
-+
-        . = ALIGN(4);
-        __trampoline_rel_start = .;
-        *(.trampoline_rel)
 diff --git a/xen/common/Kconfig b/xen/common/Kconfig
-index daab832..bcaf953 100644
+index daab832..51afa24 100644
 --- a/xen/common/Kconfig
 +++ b/xen/common/Kconfig
-@@ -143,6 +143,23 @@ config FLASK_AVC_STATS
+@@ -46,6 +46,10 @@ config HAS_BUILD_ID
+ 	string
+ 	option env="XEN_HAS_BUILD_ID"
+ 
++config HAS_CHECKPOLICY
++	string
++	option env="XEN_HAS_CHECKPOLICY"
++
+ # Enable/Disable kexec support
+ config KEXEC
+ 	bool "kexec support"
+@@ -143,6 +147,22 @@ config FLASK_AVC_STATS
  
  	  If unsure, say Y.
  
 +config XSM_POLICY
 +	bool "Compile Xen with a built-in security policy"
-+	default y
++	default y if HAS_CHECKPOLICY = "y"
 +	depends on XSM
 +	---help---
 +	  This includes a default XSM policy in the hypervisor so that the
@@ -138,29 +155,45 @@ index daab832..bcaf953 100644
 +	  policy provided by the bootloader will override it.
 +
 +	  This requires that the SELinux policy compiler (checkpolicy) be
-+	  available when compiling the hypervisor; if this tool is not found, no
-+	  policy will be added.
++	  available when compiling the hypervisor.
 +
 +	  If unsure, say Y.
 +
  # Enable schedulers
  menu "Schedulers"
  	visible if EXPERT = "y"
+diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
+index e83dca2..5dc59dd 100644
+--- a/xen/include/xsm/xsm.h
++++ b/xen/include/xsm/xsm.h
+@@ -761,6 +761,11 @@ static inline void flask_init(const void *policy_buffer, size_t policy_size)
+ }
+ #endif
+ 
++#ifdef CONFIG_XSM_POLICY
++extern const unsigned char xsm_init_policy[];
++extern const unsigned int xsm_init_policy_size;
++#endif
++
+ #else /* CONFIG_XSM */
+ 
+ #include <xsm/dummy.h>
+diff --git a/xen/xsm/flask/.gitignore b/xen/xsm/flask/.gitignore
+new file mode 100644
+index 0000000..024edbe
+--- /dev/null
++++ b/xen/xsm/flask/.gitignore
+@@ -0,0 +1 @@
++/policy.c
 diff --git a/xen/xsm/flask/Makefile b/xen/xsm/flask/Makefile
-index 12fc3a9..eefd37c 100644
+index 12fc3a9..a04f605 100644
 --- a/xen/xsm/flask/Makefile
 +++ b/xen/xsm/flask/Makefile
-@@ -27,6 +27,23 @@ $(FLASK_H_FILES): $(FLASK_H_DEPEND)
+@@ -27,6 +27,17 @@ $(FLASK_H_FILES): $(FLASK_H_DEPEND)
  $(AV_H_FILES): $(AV_H_DEPEND)
  	$(CONFIG_SHELL) policy/mkaccess_vector.sh $(AWK) $(AV_H_DEPEND)
  
-+ifeq ($(CONFIG_XSM_POLICY),y)
-+HAS_CHECKPOLICY := $(shell checkpolicy -h 2>&1 | grep -q xen && echo y || echo n)
-+
-+obj-$(HAS_CHECKPOLICY) += policy.o
-+endif
-+
-+LDFLAGS += --accept-unknown-input-arch
++obj-$(CONFIG_XSM_POLICY) += policy.o
 +
 +POLICY_SRC := $(XEN_ROOT)/tools/flask/policy/xenpolicy-$(XEN_FULLVERSION)
 +
@@ -168,49 +201,58 @@ index 12fc3a9..eefd37c 100644
 +	$(MAKE) -C $(XEN_ROOT)/tools/flask/policy
 +	cmp -s $(POLICY_SRC) $@ || cp $(POLICY_SRC) $@
 +
-+policy.o: policy.bin
-+	$(OBJCOPY) -S -I binary -O elf64-little --rename-section=.data=.init.xsm_policy $< $@
++policy.c: policy.bin gen-policy.py
++	$(PYTHON) gen-policy.py < $< > $@
 +
  .PHONY: clean
  clean::
- 	rm -f $(ALL_H_FILES) *.o $(DEPS)
+-	rm -f $(ALL_H_FILES) *.o $(DEPS)
++	rm -f $(ALL_H_FILES) *.o $(DEPS) policy.c policy.bin
+diff --git a/xen/xsm/flask/gen-policy.py b/xen/xsm/flask/gen-policy.py
+new file mode 100644
+index 0000000..5168d6e
+--- /dev/null
++++ b/xen/xsm/flask/gen-policy.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python
++import sys
++
++policy_size = 0
++
++sys.stdout.write("""
++/* This file is autogenerated by gen_policy.py */
++#include <xen/init.h>
++#include <xsm/xsm.h>
++
++const unsigned char xsm_init_policy[] __initconst = {
++""")
++
++for char in sys.stdin.read():
++    sys.stdout.write(" 0x%02x," % ord(char))
++    policy_size = policy_size + 1
++    if policy_size % 13 == 0:
++        sys.stdout.write("\n")
++
++sys.stdout.write("""
++};
++const unsigned int __initconst xsm_init_policy_size = %d;
++""" % policy_size)
 diff --git a/xen/xsm/xsm_core.c b/xen/xsm/xsm_core.c
-index 8df1a3c..509210c 100644
+index 3d132be..61463da 100644
 --- a/xen/xsm/xsm_core.c
 +++ b/xen/xsm/xsm_core.c
-@@ -36,6 +36,17 @@ static inline int verify(struct xsm_operations *ops)
-     return 0;
- }
+@@ -38,6 +38,14 @@ static inline int verify(struct xsm_operations *ops)
  
-+extern char __xsm_init_policy_start[], __xsm_init_policy_end[];
-+
-+static void __init xsm_policy_init(void)
-+{
-+    if ( policy_size == 0 && __xsm_init_policy_end != __xsm_init_policy_start )
-+    {
-+        policy_buffer = __xsm_init_policy_start;
-+        policy_size = __xsm_init_policy_end - __xsm_init_policy_start;
-+    }
-+}
-+
- static int __init xsm_core_init(void)
+ static int __init xsm_core_init(const void *policy_buffer, size_t policy_size)
  {
++#ifdef CONFIG_XSM_POLICY
++    if ( policy_size == 0 )
++    {
++        policy_buffer = xsm_init_policy;
++        policy_size = xsm_init_policy_size;
++    }
++#endif
++
      if ( verify(&dummy_xsm_ops) )
-@@ -46,6 +57,7 @@ static int __init xsm_core_init(void)
-     }
- 
-     xsm_ops = &dummy_xsm_ops;
-+    xsm_policy_init();
-     flask_init();
- 
-     return 0;
-@@ -98,7 +110,8 @@ int __init xsm_dt_init(void)
- 
-     ret = xsm_core_init();
- 
--    xfree(policy_buffer);
-+    if ( policy_buffer != __xsm_init_policy_start )
-+        xfree(policy_buffer);
- 
-     return ret;
- }
+     {
+         printk("%s could not verify "
