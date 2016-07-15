@@ -768,10 +768,10 @@ index 0000000..c43d473
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..ceba087
+index 0000000..5d693bc
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1116 @@
+@@ -0,0 +1,1131 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -816,10 +816,26 @@ index 0000000..ceba087
 +char *xs_domain_path = NULL;
 +char *pci_passthrough_sbdf_list = NULL;
 +
++static void failwith_oss_xc(char *fct)
++{
++    char buf[80];
++    const xc_error *error;
++
++    error = xc_get_last_error(xch);
++    if (error->code == XC_ERROR_NONE)
++        snprintf(buf, 80, "%s: [%d] %s", fct, errno, strerror(errno));
++    else
++        snprintf(buf, 80, "%s: [%d] %s", fct, error->code, error->message);
++    xc_clear_last_error(xch);
++    xg_err("xenguest: %s\n", buf);
++    exit(1);
++}
++
 +/* The following boolean flags are all set by their value
 +   in the platform area of xenstore. The only value that
 +   is considered true is the string 'true' */
 +struct flags {
++    xc_dominfo_t dominfo;
 +    int vcpus;
 +    int vcpus_current;
 +    char** vcpu_affinity; /* 0 means unset */
@@ -1088,6 +1104,11 @@ index 0000000..ceba087
 +{
 +    char * tmp;
 +    int n;
++
++    if ( xc_domain_getinfo(xch, domid, 1, &f->dominfo) != 1 ||
++         f->dominfo.domid != domid )
++        failwith_oss_xc("xc_domain_getinfo");
++
 +    f->vcpus = xenstore_get("platform/vcpu/number");
 +    f->vcpu_affinity = malloc(sizeof(char*) * f->vcpus);
 +
@@ -1135,6 +1156,9 @@ index 0000000..ceba087
 +        f->hpet = 1;
 +    free(tmp);
 +
++    xg_info("Domain Properties: Type %s, hap %u\n",
++            f->dominfo.hvm ? "HVM" : "PV", f->dominfo.hap);
++
 +    xg_info("Determined the following parameters from xenstore:\n");
 +    xg_info("vcpu/number:%d vcpu/weight:%d vcpu/cap:%d\n",
 +            f->vcpus, f->vcpu_weight, f->vcpu_cap);
@@ -1155,21 +1179,6 @@ index 0000000..ceba087
 +    for ( n = 0; n < f->vcpus; ++n )
 +        free(f->vcpu_affinity[n]);
 +    free(f->vcpu_affinity);
-+}
-+
-+static void failwith_oss_xc(char *fct)
-+{
-+    char buf[80];
-+    const xc_error *error;
-+
-+    error = xc_get_last_error(xch);
-+    if (error->code == XC_ERROR_NONE)
-+        snprintf(buf, 80, "%s: [%d] %s", fct, errno, strerror(errno));
-+    else
-+        snprintf(buf, 80, "%s: [%d] %s", fct, error->code, error->message);
-+    xc_clear_last_error(xch);
-+    xg_err("xenguest: %s\n", buf);
-+    exit(1);
 +}
 +
 +static void configure_vcpus(struct flags f){
@@ -1622,6 +1631,12 @@ index 0000000..ceba087
 +            xg_err("Populate on Demand and PCI Passthrough are mutually exclusive\n");
 +            goto fail;
 +        }
++    }
++
++    if ( !f->dominfo.hap && f->nested_virt )
++    {
++        xg_err("Shadow Paging and Nested Virtualisation are mutually exclusive\n");
++        goto fail;
 +    }
 +
 +    return;
