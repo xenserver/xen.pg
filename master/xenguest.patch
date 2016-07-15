@@ -11,10 +11,10 @@ index 7347801..a5f98b0 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index 8befdbd..6d159b4 100644
+index db6d8f3..5cf0a1d 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
-@@ -471,6 +471,7 @@ rm -rf $RPM_BUILD_ROOT
+@@ -474,6 +474,7 @@ rm -rf $RPM_BUILD_ROOT
  %{_libexecdir}/%{name}/bin/xenconsole
  %{_libexecdir}/%{name}/bin/xenctx
  %{_libexecdir}/%{name}/bin/xendomains
@@ -768,10 +768,10 @@ index 0000000..c43d473
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..d4faf1a
+index 0000000..ceba087
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1074 @@
+@@ -0,0 +1,1116 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -836,7 +836,7 @@ index 0000000..d4faf1a
 +    int acpi_s4;
 +    int tsc_mode;
 +    int hpet;
-+    int nested_hvm;
++    int nested_virt;
 +    unsigned cores_per_socket;
 +    unsigned x87_fip_width;
 +};
@@ -1032,7 +1032,7 @@ index 0000000..d4faf1a
 +     * Optionally advertise ITSC, given hardware support an a non-migratealbe
 +     * domain.
 +     */
-+    if ( f->nested_hvm && test_bit(X86_FEATURE_ITSC, host_featureset) )
++    if ( f->nested_virt && test_bit(X86_FEATURE_ITSC, host_featureset) )
 +        set_bit(X86_FEATURE_ITSC, featureset);
 +
 +    rc = xc_cpuid_apply_policy(xch, domid, featureset, nr_features);
@@ -1104,9 +1104,18 @@ index 0000000..d4faf1a
 +    f->apic     = xenstore_get("platform/apic");
 +    f->pae      = xenstore_get("platform/pae");
 +    f->tsc_mode = xenstore_get("platform/tsc_mode");
-+    f->nested_hvm = xenstore_get("platform/exp-nested-hvm");
 +    f->cores_per_socket = xenstore_get("platform/cores-per-socket");
 +    f->x87_fip_width = xenstore_get("platform/x87-fip-width");
++
++    /*
++     * Follow 'nested-virt' if present.  Fall back to checking
++     * 'exp-nested-hvm' for compatibility.
++     */
++    tmp = xenstore_gets("platform/nested-virt");
++    f->nested_virt = tmp
++        ? xenstore_get("platform/nested-virt")
++        : xenstore_get("platform/exp-nested-hvm");
++    free(tmp);
 +
 +    /* Params going to hvmloader - need to convert "true" -> '1' as Xapi gets
 +     * this wrong when migrating from older hosts. */
@@ -1129,8 +1138,8 @@ index 0000000..d4faf1a
 +    xg_info("Determined the following parameters from xenstore:\n");
 +    xg_info("vcpu/number:%d vcpu/weight:%d vcpu/cap:%d\n",
 +            f->vcpus, f->vcpu_weight, f->vcpu_cap);
-+    xg_info("nx: %d, pae %d, cores-per-socket %u, x86-fip-width %u\n",
-+            f->nx, f->pae, f->cores_per_socket, f->x87_fip_width);
++    xg_info("nx: %d, pae %d, cores-per-socket %u, x86-fip-width %u, nested %u\n",
++            f->nx, f->pae, f->cores_per_socket, f->x87_fip_width, f->nested_virt);
 +    xg_info("apic: %d acpi: %d acpi_s4: %d acpi_s3: %d tsc_mode: %d hpet: %d\n",
 +            f->apic, f->acpi, f->acpi_s4, f->acpi_s3, f->tsc_mode, f->hpet);
 +    xg_info("viridian: %d, time_ref_count: %d, reference_tsc: %d\n",
@@ -1362,9 +1371,9 @@ index 0000000..d4faf1a
 +
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
-+    if ( f.nested_hvm )
++    if ( f.nested_virt )
 +    {
-+        xc_set_hvm_param(xch, domid, HVM_PARAM_NESTEDHVM, f.nested_hvm);
++        xc_set_hvm_param(xch, domid, HVM_PARAM_NESTEDHVM, f.nested_virt);
 +        xc_domain_disable_migrate(xch, domid);
 +    }
 +    xc_get_hvm_param(xch, domid, HVM_PARAM_CONSOLE_PFN, console_mfn);
@@ -1592,6 +1601,36 @@ index 0000000..d4faf1a
 +    return 0;
 +}
 +
++static void hvm_safety_check(struct flags *f, bool pod)
++{
++    if ( xenstore_get("platform/force") )
++    {
++        xg_info("Found platform/force - skipping safety checks\n");
++        return;
++    }
++
++    if ( pod )
++    {
++        if ( f->nested_virt )
++        {
++            xg_err("Populate on Demand and Nested Virtualisation are mutually exclusive\n");
++            goto fail;
++        }
++
++        if ( pci_passthrough_sbdf_list )
++        {
++            xg_err("Populate on Demand and PCI Passthrough are mutually exclusive\n");
++            goto fail;
++        }
++    }
++
++    return;
++
++ fail:
++    xg_info("Safety checks failed.  Aborting domain build\n");
++    exit(1);
++}
++
 +int stub_xc_hvm_build(int mem_max_mib, int mem_start_mib, const char *image_name,
 +                      int store_evtchn, int store_domid,
 +                      int console_evtchn, int console_domid,
@@ -1599,7 +1638,10 @@ index 0000000..d4faf1a
 +{
 +    int r;
 +    struct flags f;
++
 +    get_flags(&f);
++
++    hvm_safety_check(&f, mem_start_mib < mem_max_mib);
 +
 +    configure_vcpus(f);
 +    configure_tsc(f);
