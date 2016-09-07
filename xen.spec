@@ -686,8 +686,23 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %doc
 
 %post hypervisor
+# Update the debug and release symlinks
 ln -sf %{name}-%{version}%{vendor_version}-d.gz /boot/xen-debug.gz
-ln -sf %{name}-%{version}%{vendor_version}.gz /boot/xen.gz
+ln -sf %{name}-%{version}%{vendor_version}.gz /boot/xen-release.gz
+
+# Point /boot/xen.gz appropriately
+if [ ! -e /boot/xen.gz ]; then
+    # Use a debug hypervisor by default
+    ln -sf %{name}-%{version}%{vendor_version}-d.gz /boot/xen.gz
+else
+    # Else look at the current link, and whether it is debug
+    path="`readlink -f /boot/xen.gz`"
+    if [ ${path} != ${path%%-d.gz} ]; then
+        ln -sf %{name}-%{version}%{vendor_version}-d.gz /boot/xen.gz
+    else
+        ln -sf %{name}-%{version}%{vendor_version}.gz /boot/xen.gz
+    fi
+fi
 
 if [ -e %{_sysconfdir}/sysconfig/kernel ] && ! grep -q '^HYPERVISOR' %{_sysconfdir}/sysconfig/kernel ; then
   cat %{_sysconfdir}/sysconfig/kernel-xen >> %{_sysconfdir}/sysconfig/kernel
