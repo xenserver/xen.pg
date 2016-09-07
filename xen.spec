@@ -708,6 +708,9 @@ if [ -e %{_sysconfdir}/sysconfig/kernel ] && ! grep -q '^HYPERVISOR' %{_sysconfd
   cat %{_sysconfdir}/sysconfig/kernel-xen >> %{_sysconfdir}/sysconfig/kernel
 fi
 
+mkdir -p %{_rundir}/reboot-required.d/%{name}
+touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
+
 %if %with_systemd
 %post dom0-tools
 %systemd_post proc-xen.mount
