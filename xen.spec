@@ -27,7 +27,7 @@ Version: 4.7.0
 Release: 1
 License: GPL
 URL:     http://www.xen.org
-Source0: http://hg.uk.xensource.com/git/carbon/trunk-ring0/%{name}-4.7.git/snapshot/refs/heads/master#/%{name}-4.7.tar.gz
+Source0: http://hg.uk.xensource.com/git/carbon/%{branch}/%{name}-4.7.git/snapshot/refs/heads/master#/%{name}-4.7.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
