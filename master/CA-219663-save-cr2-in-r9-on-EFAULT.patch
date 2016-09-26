@@ -1,0 +1,52 @@
+diff --git a/xen/arch/x86/usercopy.c b/xen/arch/x86/usercopy.c
+index 4cc78f5..c95713c 100644
+--- a/xen/arch/x86/usercopy.c
++++ b/xen/arch/x86/usercopy.c
+@@ -45,6 +45,10 @@ unsigned long __copy_to_user_ll(void __user *to, const void *from, unsigned n)
+         : "memory" );
+     clac();
+ 
++    if (current->in_hypercall && current->domain->domain_id == 0 && __n) {
++        guest_cpu_user_regs()->r9 = read_cr2();
++    }
++
+     return __n;
+ }
+ 
+@@ -90,6 +94,10 @@ __copy_from_user_ll(void *to, const void __user *from, unsigned n)
+         : "memory" );
+     clac();
+ 
++    if (current->in_hypercall && current->domain->domain_id == 0 && __n) {
++        guest_cpu_user_regs()->r9 = read_cr2();
++    }
++
+     return __n;
+ }
+ 
+diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
+index ff2600a..ec6fb2c 100644
+--- a/xen/arch/x86/x86_64/entry.S
++++ b/xen/arch/x86/x86_64/entry.S
+@@ -137,7 +137,9 @@ UNLIKELY_START(ne, trace)
+ UNLIKELY_END(trace)
+         leaq  hypercall_table(%rip),%r10
+         PERFC_INCR(hypercalls, %rax, %rbx)
++        movl $1, 4(%rbx)
+         callq *(%r10,%rax,8)
++        movl $0, 4(%rbx)
+ #ifndef NDEBUG
+         /* Deliberately corrupt parameter regs used by this hypercall. */
+         popq  %r10         # Shadow RIP
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 15a8fbe..669a60a 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -142,6 +142,7 @@ struct waitqueue_vcpu;
+ struct vcpu 
+ {
+     int              vcpu_id;
++    int in_hypercall;
+ 
+     int              processor;
+ 
