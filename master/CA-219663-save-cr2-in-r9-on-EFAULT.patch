@@ -1,25 +1,147 @@
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index e275674..1efc13a 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -1499,6 +1499,7 @@ enum pf_type {
+ static enum pf_type __page_fault_type(
+     unsigned long addr, const struct cpu_user_regs *regs)
+ {
++    struct guest_pf_info *this_info = &this_cpu(pf_info);
+     unsigned long mfn, cr3 = read_cr3();
+     l4_pgentry_t l4e, *l4t;
+     l3_pgentry_t l3e, *l3t;
+@@ -1535,6 +1536,8 @@ static enum pf_type __page_fault_type(
+ 
+     l4t = map_domain_page(_mfn(mfn));
+     l4e = l4e_read_atomic(&l4t[l4_table_offset(addr)]);
++    if ( this_info->active )
++        this_info->l4e = l4e.l4;
+     mfn = l4e_get_pfn(l4e);
+     unmap_domain_page(l4t);
+     if ( ((l4e_get_flags(l4e) & required_flags) != required_flags) ||
+@@ -1544,6 +1547,8 @@ static enum pf_type __page_fault_type(
+ 
+     l3t  = map_domain_page(_mfn(mfn));
+     l3e = l3e_read_atomic(&l3t[l3_table_offset(addr)]);
++    if ( this_info->active )
++        this_info->l3e = l3e.l3;
+     mfn = l3e_get_pfn(l3e);
+     unmap_domain_page(l3t);
+     if ( ((l3e_get_flags(l3e) & required_flags) != required_flags) ||
+@@ -1555,6 +1560,8 @@ static enum pf_type __page_fault_type(
+ 
+     l2t = map_domain_page(_mfn(mfn));
+     l2e = l2e_read_atomic(&l2t[l2_table_offset(addr)]);
++    if ( this_info->active )
++        this_info->l2e = l2e.l2;
+     mfn = l2e_get_pfn(l2e);
+     unmap_domain_page(l2t);
+     if ( ((l2e_get_flags(l2e) & required_flags) != required_flags) ||
+@@ -1566,6 +1573,8 @@ static enum pf_type __page_fault_type(
+ 
+     l1t = map_domain_page(_mfn(mfn));
+     l1e = l1e_read_atomic(&l1t[l1_table_offset(addr)]);
++    if ( this_info->active )
++        this_info->l1e = l1e.l1;
+     mfn = l1e_get_pfn(l1e);
+     unmap_domain_page(l1t);
+     if ( ((l1e_get_flags(l1e) & required_flags) != required_flags) ||
+@@ -1691,6 +1700,7 @@ static int fixup_page_fault(unsigned long addr, struct cpu_user_regs *regs)
+  */
+ void do_page_fault(struct cpu_user_regs *regs)
+ {
++    struct guest_pf_info *this_info = &this_cpu(pf_info);
+     unsigned long addr, fixup;
+     unsigned int error_code;
+     enum pf_type pf_type;
+@@ -1700,6 +1710,13 @@ void do_page_fault(struct cpu_user_regs *regs)
+     /* fixup_page_fault() might change regs->error_code, so cache it here. */
+     error_code = regs->error_code;
+ 
++    if ( this_info->active )
++    {
++        this_info->fault = 1;
++        this_info->cr2 = addr;
++        this_info->pfec = error_code;
++    }
++
+     DEBUGGER_trap_entry(TRAP_page_fault, regs);
+ 
+     perfc_incr(page_faults);
 diff --git a/xen/arch/x86/usercopy.c b/xen/arch/x86/usercopy.c
-index 4cc78f5..c95713c 100644
+index 4cc78f5..1a6b8d6 100644
 --- a/xen/arch/x86/usercopy.c
 +++ b/xen/arch/x86/usercopy.c
-@@ -45,6 +45,10 @@ unsigned long __copy_to_user_ll(void __user *to, const void *from, unsigned n)
+@@ -10,10 +10,40 @@
+ #include <xen/sched.h>
+ #include <asm/uaccess.h>
+ 
++DEFINE_PER_CPU(struct guest_pf_info, pf_info);
++
++static void process_guest_pf_info(struct guest_pf_info *info)
++{
++    if ( info->fault )
++    {
++        printk("*** %pv Hypercall -EFAULT accessing %p, ec %04x[%c%c%c%c%c%c]\n",
++               current, _p(info->cr2), info->pfec,
++               (info->pfec & PFEC_prot_key)     ? 'K' : '-',
++               (info->pfec & PFEC_insn_fetch)   ? 'I' : 'd',
++               (info->pfec & PFEC_reserved_bit) ? 'R' : '-',
++               (info->pfec & PFEC_user_mode)    ? 'U' : 's',
++               (info->pfec & PFEC_write_access) ? 'W' : 'r',
++               (info->pfec & PFEC_page_present) ? 'P' : '-');
++        printk("*** l4e: %p\n", _p(info->l4e));
++        printk("*** l3e: %p\n", _p(info->l3e));
++        printk("*** l2e: %p\n", _p(info->l2e));
++        printk("*** l1e: %p\n", _p(info->l1e));
++
++        guest_cpu_user_regs()->r9 = info->cr2;
++    }
++
++    *info = (struct guest_pf_info){};
++}
++
+ unsigned long __copy_to_user_ll(void __user *to, const void *from, unsigned n)
+ {
++    struct vcpu *curr = current;
++    struct guest_pf_info *this_info = &this_cpu(pf_info);
++
+     unsigned long __d0, __d1, __d2, __n = n;
+ 
++    this_info->active = (curr->in_hypercall && curr->domain->domain_id == 0);
++
+     stac();
+     asm volatile (
+         "    cmp  $"STR(2*BYTES_PER_LONG-1)",%0\n"
+@@ -45,14 +75,22 @@ unsigned long __copy_to_user_ll(void __user *to, const void *from, unsigned n)
          : "memory" );
      clac();
  
-+    if (current->in_hypercall && current->domain->domain_id == 0 && __n) {
-+        guest_cpu_user_regs()->r9 = read_cr2();
-+    }
++    if ( this_info->active )
++        process_guest_pf_info(this_info);
 +
      return __n;
  }
  
-@@ -90,6 +94,10 @@ __copy_from_user_ll(void *to, const void __user *from, unsigned n)
+ unsigned long
+ __copy_from_user_ll(void *to, const void __user *from, unsigned n)
+ {
++    struct vcpu *curr = current;
++    struct guest_pf_info *this_info = &this_cpu(pf_info);
++
+     unsigned long __d0, __d1, __d2, __n = n;
+ 
++    this_info->active = (curr->in_hypercall && curr->domain->domain_id == 0);
++
+     stac();
+     asm volatile (
+         "    cmp  $"STR(2*BYTES_PER_LONG-1)",%0\n"
+@@ -90,6 +128,9 @@ __copy_from_user_ll(void *to, const void __user *from, unsigned n)
          : "memory" );
      clac();
  
-+    if (current->in_hypercall && current->domain->domain_id == 0 && __n) {
-+        guest_cpu_user_regs()->r9 = read_cr2();
-+    }
++    if ( this_info->active )
++        process_guest_pf_info(this_info);
 +
      return __n;
  }
@@ -38,6 +160,25 @@ index ff2600a..ec6fb2c 100644
  #ifndef NDEBUG
          /* Deliberately corrupt parameter regs used by this hypercall. */
          popq  %r10         # Shadow RIP
+diff --git a/xen/include/asm-x86/uaccess.h b/xen/include/asm-x86/uaccess.h
+index 5df26c2..e48535c 100644
+--- a/xen/include/asm-x86/uaccess.h
++++ b/xen/include/asm-x86/uaccess.h
+@@ -11,6 +11,14 @@
+ 
+ #include <asm/x86_64/uaccess.h>
+ 
++struct guest_pf_info
++{
++    bool_t active, fault;
++    unsigned int pfec;
++    unsigned long cr2, l4e, l3e, l2e, l1e;
++};
++DECLARE_PER_CPU(struct guest_pf_info, pf_info);
++
+ unsigned long copy_to_user(void *to, const void *from, unsigned len);
+ unsigned long clear_user(void *to, unsigned len);
+ unsigned long copy_from_user(void *to, const void *from, unsigned len);
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
 index 15a8fbe..669a60a 100644
 --- a/xen/include/xen/sched.h
