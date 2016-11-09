@@ -13,7 +13,7 @@
 %define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_32 debug=n
 %endif
 
-%define vendor_version %{release}
+%define vendor_version -%{release}
 
 # For 64bit
 %ifarch x86_64
