@@ -225,7 +225,7 @@ cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}%{vendor_vers
 %{?cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug build
 %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version}-d \
-    KCONFIG_CONFIG=../builfconfigs/config-debug MAP
+    KCONFIG_CONFIG=../buildconfigs/config-debug MAP
 
 cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}%{vendor_version}-d.gz
 cp xen/System.map %{buildroot}/boot/%{name}-%{version}%{vendor_version}-d.map
@@ -298,7 +298,6 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/%{name}/foreign/arm64.h
 %{_includedir}/%{name}/foreign/x86_32.h
 %{_includedir}/%{name}/foreign/x86_64.h
-%{_includedir}/%{name}/gcov.h
 %{_includedir}/%{name}/grant_table.h
 %{_includedir}/%{name}/hvm/e820.h
 %{_includedir}/%{name}/hvm/hvm_info_table.h
