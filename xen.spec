@@ -692,8 +692,8 @@ ln -sf %{name}-%{version}%{vendor_version}.gz /boot/xen-release.gz
 
 # Point /boot/xen.gz appropriately
 if [ ! -e /boot/xen.gz ]; then
-    # Use a debug hypervisor by default
-    ln -sf %{name}-%{version}%{vendor_version}-d.gz /boot/xen.gz
+    # Use a release hypervisor by default
+    ln -sf %{name}-%{version}%{vendor_version}.gz /boot/xen.gz
 else
     # Else look at the current link, and whether it is debug
     path="`readlink -f /boot/xen.gz`"
