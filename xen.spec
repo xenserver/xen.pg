@@ -13,8 +13,6 @@
 %define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_32 debug=n
 %endif
 
-%define vendor_version -%{release}
-
 # For 64bit
 %ifarch x86_64
 %define HVSOR_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64
@@ -24,7 +22,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.7.1
-Release: 1
+Release: 2.0
 License: GPL
 URL:     http://www.xen.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XS/repos/%{name}/archive?at=RELEASE-%{version}&format=tar.gz#/%{name}-%{version}.tar.gz
@@ -208,31 +206,31 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 mkdir -p %{buildroot}/boot/
 
 # Regular build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version} \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
     KCONFIG_CONFIG=../buildconfigs/config-release olddefconfig
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version} \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
     KCONFIG_CONFIG=../buildconfigs/config-release build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version} \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
     KCONFIG_CONFIG=../buildconfigs/config-release MAP
 
-cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}%{vendor_version}.gz
-cp xen/System.map %{buildroot}/boot/%{name}-%{version}%{vendor_version}.map
-cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}%{vendor_version}
-cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}%{vendor_version}.config
+cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}.gz
+cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{release}.map
+cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{release}
+cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{release}.config
 
 # Debug build of Xen
 %{__make} %{HVSOR_OPTIONS} -C xen clean
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version}-d \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug olddefconfig
-%{?cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version}-d \
+%{?cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=%{vendor_version}-d \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug MAP
 
-cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}%{vendor_version}-d.gz
-cp xen/System.map %{buildroot}/boot/%{name}-%{version}%{vendor_version}-d.map
-cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}%{vendor_version}-d
-cp buildconfigs/config-debug %{buildroot}/boot/%{name}-%{version}%{vendor_version}-d.config
+cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}-d.gz
+cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{release}-d.map
+cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{release}-d
+cp buildconfigs/config-debug %{buildroot}/boot/%{name}-%{version}-%{release}-d.config
 
 # do not strip the hypervisor-debuginfo targerts
 chmod -x %{buildroot}/boot/xen-syms-*
@@ -247,18 +245,18 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{__install} -D -m 644 %{SOURCE3} %{buildroot}%{_sysconfdir}/logrotate.d/xen-tools
 
 %files hypervisor
-/boot/%{name}-%{version}%{vendor_version}.gz
-/boot/%{name}-%{version}%{vendor_version}.map
-/boot/%{name}-%{version}%{vendor_version}.config
-/boot/%{name}-%{version}%{vendor_version}-d.gz
-/boot/%{name}-%{version}%{vendor_version}-d.map
-/boot/%{name}-%{version}%{vendor_version}-d.config
+/boot/%{name}-%{version}-%{release}.gz
+/boot/%{name}-%{version}-%{release}.map
+/boot/%{name}-%{version}-%{release}.config
+/boot/%{name}-%{version}-%{release}-d.gz
+/boot/%{name}-%{version}-%{release}-d.map
+/boot/%{name}-%{version}-%{release}-d.config
 %config %{_sysconfdir}/sysconfig/kernel-xen
 %ghost %attr(0644,root,root) %{_sysconfdir}/sysconfig/kernel-xen-args
 
 %files hypervisor-debuginfo
-/boot/%{name}-syms-%{version}%{vendor_version}
-/boot/%{name}-syms-%{version}%{vendor_version}-d
+/boot/%{name}-syms-%{version}-%{release}
+/boot/%{name}-syms-%{version}-%{release}-d
 
 %files tools
 %{_bindir}/xenstore
@@ -688,20 +686,20 @@ chmod -x %{buildroot}/boot/xen-syms-*
 
 %post hypervisor
 # Update the debug and release symlinks
-ln -sf %{name}-%{version}%{vendor_version}-d.gz /boot/xen-debug.gz
-ln -sf %{name}-%{version}%{vendor_version}.gz /boot/xen-release.gz
+ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen-debug.gz
+ln -sf %{name}-%{version}-%{release}.gz /boot/xen-release.gz
 
 # Point /boot/xen.gz appropriately
 if [ ! -e /boot/xen.gz ]; then
     # Use a debug hypervisor by default
-    ln -sf %{name}-%{version}%{vendor_version}-d.gz /boot/xen.gz
+    ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen.gz
 else
     # Else look at the current link, and whether it is debug
     path="`readlink -f /boot/xen.gz`"
     if [ ${path} != ${path%%-d.gz} ]; then
-        ln -sf %{name}-%{version}%{vendor_version}-d.gz /boot/xen.gz
+        ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen.gz
     else
-        ln -sf %{name}-%{version}%{vendor_version}.gz /boot/xen.gz
+        ln -sf %{name}-%{version}-%{release}.gz /boot/xen.gz
     fi
 fi
 
