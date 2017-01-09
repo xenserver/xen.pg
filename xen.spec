@@ -186,8 +186,8 @@ mkdir -p tools/firmware/etherboot/ipxe/
 cp /usr/src/ipxe-source.tar.gz tools/firmware/etherboot/ipxe.tar.gz
 rm -f tools/firmware/etherboot/patches/series
 #%patch0 -p1 -b ~development
-base_cset=$(sed -ne 's/Changeset: \(.*\)/\1/' < .gitarchive-info)
-pq_cset=$(sed -ne 's/Changeset: \(.*\)/\1/' < .gitarchive-info-pq)
+base_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info)
+pq_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info-pq)
 echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
 
 %build
