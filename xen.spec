@@ -63,6 +63,9 @@ BuildRequires: libblkid-devel
 # For xentop
 BuildRequires: ncurses-devel
 
+# For the banner
+BuildRequires: figlet
+
 # For libfsimage
 BuildRequires: e2fsprogs-devel
 %if 0%{?centos}%{!?centos:5} < 6 && 0%{?rhel}%{!?rhel:5} < 6
