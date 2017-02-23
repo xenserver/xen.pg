@@ -25,7 +25,7 @@ Version: 4.7.1
 Release: 2.0
 License: GPL
 URL:     http://www.xen.org
-Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=RELEASE-%{version}&format=tar.gz#/%{name}-%{version}.tar.gz
+Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=RELEASE-%{version}&prefix=%{name}-%{version}&format=tar.gz#/%{name}-%{version}.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
