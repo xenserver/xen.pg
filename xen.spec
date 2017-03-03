@@ -25,7 +25,7 @@ Version: 4.7.1
 Release: 1.1
 License: GPL
 URL:     http://www.xen.org
-Source0: https://code.citrite.net/rest/archive/latest/projects/XS/repos/%{name}/archive?at=RELEASE-%{version}&format=tar.gz#/%{name}-%{version}.tar.gz
+Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=RELEASE-%{version}&prefix=%{name}-%{version}&format=tar.gz#/%{name}-%{version}.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
@@ -62,6 +62,9 @@ BuildRequires: libblkid-devel
 
 # For xentop
 BuildRequires: ncurses-devel
+
+# For the banner
+BuildRequires: figlet
 
 # For libfsimage
 BuildRequires: e2fsprogs-devel
@@ -225,7 +228,7 @@ cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{release}.c
 %{?cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug build
 %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
-    KCONFIG_CONFIG=../builfconfigs/config-debug MAP
+    KCONFIG_CONFIG=../buildconfigs/config-debug MAP
 
 cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}-d.gz
 cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{release}-d.map
