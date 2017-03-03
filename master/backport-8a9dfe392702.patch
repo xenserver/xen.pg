@@ -1,0 +1,100 @@
+From 8a9dfe392702cb987cab725fbda7345f4c3053da Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 20 Feb 2017 16:02:47 +0100
+Subject: [PATCH] VMX: fix VMCS race on context-switch paths
+
+When __context_switch() is being bypassed during original context
+switch handling, the vCPU "owning" the VMCS partially loses control of
+it: It will appear non-running to remote CPUs, and hence their attempt
+to pause the owning vCPU will have no effect on it (as it already
+looks to be paused). At the same time the "owning" CPU will re-enable
+interrupts eventually (the lastest when entering the idle loop) and
+hence becomes subject to IPIs from other CPUs requesting access to the
+VMCS. As a result, when __context_switch() finally gets run, the CPU
+may no longer have the VMCS loaded, and hence any accesses to it would
+fail. Hence we may need to re-load the VMCS in vmx_ctxt_switch_from().
+
+For consistency use the new function also in vmx_do_resume(), to
+avoid leaving an open-coded incarnation of it around.
+
+Reported-by: Kevin Mayer <Kevin.Mayer@gdata.de>
+Reported-by: Anshul Makkar <anshul.makkar@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
+Reviewed-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+Tested-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+master commit: 2f4d2198a9b3ba94c959330b5c94fe95917c364c
+master date: 2017-02-17 15:49:56 +0100
+diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
+index 776b585..6548aa2 100644
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -563,6 +563,20 @@ static void vmx_load_vmcs(struct vcpu *v)
+     local_irq_restore(flags);
+ }
+ 
++void vmx_vmcs_reload(struct vcpu *v)
++{
++    /*
++     * As we may be running with interrupts disabled, we can't acquire
++     * v->arch.hvm_vmx.vmcs_lock here. However, with interrupts disabled
++     * the VMCS can't be taken away from us anymore if we still own it.
++     */
++    ASSERT(v->is_running || !local_irq_is_enabled());
++    if ( v->arch.hvm_vmx.vmcs_pa == this_cpu(current_vmcs) )
++        return;
++
++    vmx_load_vmcs(v);
++}
++
+ int vmx_cpu_up_prepare(unsigned int cpu)
+ {
+     /*
+@@ -1667,10 +1681,7 @@ void vmx_do_resume(struct vcpu *v)
+     bool_t debug_state;
+ 
+     if ( v->arch.hvm_vmx.active_cpu == smp_processor_id() )
+-    {
+-        if ( v->arch.hvm_vmx.vmcs_pa != this_cpu(current_vmcs) )
+-            vmx_load_vmcs(v);
+-    }
++        vmx_vmcs_reload(v);
+     else
+     {
+         /*
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 43a7afc..16321a3 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -894,6 +894,18 @@ static void vmx_ctxt_switch_from(struct vcpu *v)
+     if ( unlikely(!this_cpu(vmxon)) )
+         return;
+ 
++    if ( !v->is_running )
++    {
++        /*
++         * When this vCPU isn't marked as running anymore, a remote pCPU's
++         * attempt to pause us (from vmx_vmcs_enter()) won't have a reason
++         * to spin in vcpu_sleep_sync(), and hence that pCPU might have taken
++         * away the VMCS from us. As we're running with interrupts disabled,
++         * we also can't call vmx_vmcs_enter().
++         */
++        vmx_vmcs_reload(v);
++    }
++
+     vmx_fpu_leave(v);
+     vmx_save_guest_msrs(v);
+     vmx_restore_host_msrs();
+diff --git a/xen/include/asm-x86/hvm/vmx/vmcs.h b/xen/include/asm-x86/hvm/vmx/vmcs.h
+index e82b34e..1567fbe 100644
+--- a/xen/include/asm-x86/hvm/vmx/vmcs.h
++++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
+@@ -238,6 +238,7 @@ void vmx_destroy_vmcs(struct vcpu *v);
+ void vmx_vmcs_enter(struct vcpu *v);
+ bool_t __must_check vmx_vmcs_try_enter(struct vcpu *v);
+ void vmx_vmcs_exit(struct vcpu *v);
++void vmx_vmcs_reload(struct vcpu *v);
+ 
+ #define CPU_BASED_VIRTUAL_INTR_PENDING        0x00000004
+ #define CPU_BASED_USE_TSC_OFFSETING           0x00000008
