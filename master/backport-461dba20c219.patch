@@ -1,0 +1,84 @@
+From 461dba20c219d8b9c66309f3054f7e8933eb863e Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 14 Mar 2017 13:59:14 +0100
+Subject: [PATCH] x86/layout: Correct Xen's idea of its own memory layout
+
+c/s b4cd59fe "x86: reorder .data and .init when linking" had an unintended
+side effect, where xen_in_range() and the tboot S3 MAC were no longer correct.
+
+In practice, it means that Xen's .data section is excluded from consideration,
+which means:
+ 1) Default IOMMU construction for the hardware domain could create mappings.
+ 2) .data isn't included in the tboot MAC checked on resume from S3.
+
+Adjust the comments and virtual address anchors used to define the regions.
+
+Reported-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: c9a4a1c419cebac83a8fb60c4532ad8ccc973dc4
+master date: 2017-02-28 16:18:38 +0000
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 3459156..41c30a9 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -1617,7 +1617,7 @@ int __hwdom_init xen_in_range(unsigned long mfn)
+     paddr_t start, end;
+     int i;
+ 
+-    enum { region_s3, region_text, region_bss, nr_regions };
++    enum { region_s3, region_ro, region_rw, nr_regions };
+     static struct {
+         paddr_t s, e;
+     } xen_regions[nr_regions] __hwdom_initdata;
+@@ -1628,12 +1628,12 @@ int __hwdom_init xen_in_range(unsigned long mfn)
+         /* S3 resume code (and other real mode trampoline code) */
+         xen_regions[region_s3].s = bootsym_phys(trampoline_start);
+         xen_regions[region_s3].e = bootsym_phys(trampoline_end);
+-        /* hypervisor code + data */
+-        xen_regions[region_text].s =__pa(&_stext);
+-        xen_regions[region_text].e = __pa(&__init_begin);
+-        /* bss */
+-        xen_regions[region_bss].s = __pa(&__bss_start);
+-        xen_regions[region_bss].e = __pa(&__bss_end);
++        /* hypervisor .text + .rodata */
++        xen_regions[region_ro].s = __pa(&_stext);
++        xen_regions[region_ro].e = __pa(&__2M_rodata_end);
++        /* hypervisor .data + .bss */
++        xen_regions[region_rw].s = __pa(&__2M_rwdata_start);
++        xen_regions[region_rw].e = __pa(&__2M_rwdata_end);
+     }
+ 
+     start = (paddr_t)mfn << PAGE_SHIFT;
+diff --git a/xen/arch/x86/tboot.c b/xen/arch/x86/tboot.c
+index e5d7c42..3c00cfc 100644
+--- a/xen/arch/x86/tboot.c
++++ b/xen/arch/x86/tboot.c
+@@ -12,6 +12,7 @@
+ #include <asm/processor.h>
+ #include <asm/e820.h>
+ #include <asm/tboot.h>
++#include <asm/setup.h>
+ #include <crypto/vmac.h>
+ 
+ /* tboot=<physical address of shared page> */
+@@ -370,13 +371,14 @@ void tboot_shutdown(uint32_t shutdown_type)
+         g_tboot_shared->mac_regions[0].start = bootsym_phys(trampoline_start);
+         g_tboot_shared->mac_regions[0].size = bootsym_phys(trampoline_end) -
+                                               bootsym_phys(trampoline_start);
+-        /* hypervisor code + data */
++        /* hypervisor .text + .rodata */
+         g_tboot_shared->mac_regions[1].start = (uint64_t)__pa(&_stext);
+-        g_tboot_shared->mac_regions[1].size = __pa(&__init_begin) -
++        g_tboot_shared->mac_regions[1].size = __pa(&__2M_rodata_end) -
+                                               __pa(&_stext);
+-        /* bss */
+-        g_tboot_shared->mac_regions[2].start = (uint64_t)__pa(&__bss_start);
+-        g_tboot_shared->mac_regions[2].size = __pa(&__bss_end) - __pa(&__bss_start);
++        /* hypervisor .data + .bss */
++        g_tboot_shared->mac_regions[2].start = (uint64_t)__pa(&__2M_rwdata_start);
++        g_tboot_shared->mac_regions[2].size = __pa(&__2M_rwdata_end) -
++                                              __pa(&__2M_rwdata_start);
+ 
+         /*
+          * MAC domains and other Xen memory
