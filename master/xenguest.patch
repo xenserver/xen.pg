@@ -1,5 +1,5 @@
 diff --git a/.gitignore b/.gitignore
-index 7347801..a5f98b0 100644
+index 2156b80..d649316 100644
 --- a/.gitignore
 +++ b/.gitignore
 @@ -209,6 +209,7 @@ tools/tests/mem-sharing/memshrtool
@@ -11,10 +11,10 @@ index 7347801..a5f98b0 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index db6d8f3..5cf0a1d 100644
+index a6d4920..1f0c125 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
-@@ -474,6 +474,7 @@ rm -rf $RPM_BUILD_ROOT
+@@ -463,6 +463,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
  %{_libexecdir}/%{name}/bin/xenconsole
  %{_libexecdir}/%{name}/bin/xenctx
  %{_libexecdir}/%{name}/bin/xendomains
@@ -775,10 +775,10 @@ index 0000000..8998dd1
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..e655a01
+index 0000000..e3a14eb
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1165 @@
+@@ -0,0 +1,1238 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -809,6 +809,7 @@ index 0000000..e655a01
 +#include <xenstore.h>
 +#include <xc_dom.h>
 +#include <xen/hvm/hvm_info_table.h>
++#include <xen/hvm/hvm_xs_strings.h>
 +#include <xen/hvm/params.h>
 +#include <xen/hvm/e820.h>
 +
@@ -822,6 +823,9 @@ index 0000000..e655a01
 +
 +char *xs_domain_path = NULL;
 +char *pci_passthrough_sbdf_list = NULL;
++
++#define SYSFS_PCI_DEV "/sys/bus/pci/devices"
++#define PCI_SBDF      "%04x:%02x:%02x.%01x"
 +
 +static void failwith_oss_xc(char *fct)
 +{
@@ -1425,6 +1429,47 @@ index 0000000..e655a01
 +    return rc;
 +}
 +
++static int get_mmio_dev(uint16_t seg, uint8_t bus, uint8_t dev, uint8_t func,
++                        uint64_t *mmio_dev)
++{
++    char namebuf[64], buf[256];
++    FILE *file;
++    int i, rc = 0;
++
++    snprintf(namebuf, sizeof(namebuf), SYSFS_PCI_DEV"/"PCI_SBDF"/resource",
++             seg, bus, dev, func);
++
++    file = fopen(namebuf, "r");
++    if (!file) {
++        xg_err("Cannot open '%s': %s\n", namebuf, strerror(errno));
++        return -1;
++    }
++
++    *mmio_dev = 0;
++    for (i = 0; i < 7; i++)
++    {
++        unsigned long long start, end, size, flags;
++        if (!fgets(buf, sizeof(buf), file))
++            break;
++
++        if (sscanf(buf, "%llx %llx %llx", &start, &end, &flags) != 3) {
++            xg_err("Syntax error in '%s'\n", namebuf);
++            rc = -1;
++            goto out;
++        }
++
++        if (start)
++            size = end - start + 1;
++        else
++            size = 0;
++
++        *mmio_dev += size;
++    }
++out:
++    fclose(file);
++    return rc;
++}
++
 +static int get_rdm(uint16_t seg, uint8_t bus, uint8_t devfn,
 +                   unsigned int *nr_entries,
 +                   struct xen_reserved_device_memory **xrdm)
@@ -1492,6 +1537,7 @@ index 0000000..e655a01
 +}
 +
 +#define MAX_RMRR_DEVICES 16
++#define ALLOW_MEMORY_RELOCATE 1
 +
 +int stub_xc_hvm_build_with_mem(uint64_t max_mem_mib, uint64_t max_start_mib,
 +                               const char *image)
@@ -1499,12 +1545,14 @@ index 0000000..e655a01
 +    struct xc_dom_image *dom;
 +
 +    uint64_t lowmem_end, highmem_start, highmem_end, mmio_start, mmio_size;
++    uint64_t mmio_total = 0;
 +    unsigned int i, j, nr = 0;
 +    struct e820entry *e820;
 +    unsigned int nr_rdm_entries[MAX_RMRR_DEVICES] = {0};
 +    unsigned int nr_rmrr_devs = 0;
 +    struct xen_reserved_device_memory *xrdm[MAX_RMRR_DEVICES] = {0};
 +    unsigned long rmrr_overlapped_ram = 0;
++    bool allow_memory_relocate = ALLOW_MEMORY_RELOCATE;
 +    char *s;
 +
 +    if ( pci_passthrough_sbdf_list )
@@ -1513,6 +1561,8 @@ index 0000000..e655a01
 +        while ( s != NULL )
 +        {
 +            unsigned int seg, bus, device, func;
++            uint64_t mmio_dev;
++
 +            xg_info("Getting RMRRs for device '%s'\n",s);
 +            if ( parse_pci_sbdf(s, &seg, &bus, &device, &func) )
 +            {
@@ -1526,6 +1576,15 @@ index 0000000..e655a01
 +                            MAX_RMRR_DEVICES);
 +                exit(1);
 +            }
++
++            xg_info("Getting total MMIO space occupied for device '%s'\n",s);
++            if ( get_mmio_dev(seg, bus, device, func, &mmio_dev) )
++            {
++                xg_err("Error: unable to get PCI MMIO info\n");
++                exit(1);
++            }
++            mmio_total += mmio_dev;
++
 +            s = strtok (NULL, ",");
 +        }
 +    }
@@ -1547,6 +1606,15 @@ index 0000000..e655a01
 +    lowmem_end  = max_mem_mib << 20;
 +    highmem_end = highmem_start = 1ull << 32;
 +    mmio_size   = HVM_BELOW_4G_MMIO_LENGTH;
++
++    if (allow_memory_relocate)
++    {
++        while (mmio_size < mmio_total && (uint32_t)(mmio_size << 1) != 0)
++            mmio_size <<= 1;
++
++        xg_info("Calculated provisional MMIO hole size as 0x%lx\n", mmio_size);
++    }
++
 +    mmio_start  = highmem_start - mmio_size;
 +
 +    if ( lowmem_end > mmio_start )
@@ -1599,6 +1667,11 @@ index 0000000..e655a01
 +    dom->highmem_end = highmem_end;
 +    dom->mmio_size = mmio_size;
 +    dom->mmio_start = mmio_start;
++
++    xg_info("Final lower MMIO hole size is 0x%lx\n", mmio_size);
++    /* Put the lower MMIO hole size to Xenstore so we could
++     * read it later from QEMU wrapper */
++    xenstore_putsv("data/mmio-hole-size", "%lu", mmio_size);
 +
 +    if ( xc_dom_kernel_file(dom, image) )
 +        failwith_oss_xc("xc_dom_kernel_file");
