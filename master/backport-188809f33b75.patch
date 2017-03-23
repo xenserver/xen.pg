@@ -1,0 +1,98 @@
+From 188809f33b75e6f5a2d34e8c0051c01b372e2a6b Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 14 Mar 2017 13:58:21 +0100
+Subject: [PATCH] x86/vmx: Don't leak host syscall MSR state into HVM guests
+
+hvm_hw_cpu->msr_flags is in fact the VMX dirty bitmap of MSRs needing to be
+restored when switching into guest context.  It should never have been part of
+the migration state to start with, and Xen must not make any decisions based
+on the value seen during restore.
+
+Identify it as obsolete in the header files, consistently save it as zero and
+ignore it on restore.
+
+The MSRs must be considered dirty during VMCS creation to cause the proper
+defaults of 0 to be visible to the guest.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+master commit: 2f1add6e1c8789d979daaafa3d80ddc1bc375783
+master date: 2017-02-21 11:06:39 +0000
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index 41392a1..b0715e6 100644
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -356,7 +356,7 @@ static void svm_save_cpu_state(struct vcpu *v, struct hvm_hw_cpu *data)
+     data->msr_cstar        = vmcb->cstar;
+     data->msr_syscall_mask = vmcb->sfmask;
+     data->msr_efer         = v->arch.hvm_vcpu.guest_efer;
+-    data->msr_flags        = -1ULL;
++    data->msr_flags        = 0;
+ }
+ 
+ 
+diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
+index 6131a23..ea2c665 100644
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -1124,6 +1124,9 @@ static int construct_vmcs(struct vcpu *v)
+             vmx_disable_intercept_for_msr(v, MSR_IA32_BNDCFGS, MSR_TYPE_R | MSR_TYPE_W);
+     }
+ 
++    /* All guest MSR state is dirty. */
++    v->arch.hvm_vmx.msr_state.flags = ((1u << VMX_MSR_COUNT) - 1);
++
+     /* I/O access bitmap. */
+     __vmwrite(IO_BITMAP_A, __pa(d->arch.hvm_domain.io_bitmap));
+     __vmwrite(IO_BITMAP_B, __pa(d->arch.hvm_domain.io_bitmap) + PAGE_SIZE);
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 3d19b76..9d958e8 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -737,13 +737,12 @@ static int vmx_vmcs_restore(struct vcpu *v, struct hvm_hw_cpu *c)
+ static void vmx_save_cpu_state(struct vcpu *v, struct hvm_hw_cpu *data)
+ {
+     struct vmx_msr_state *guest_state = &v->arch.hvm_vmx.msr_state;
+-    unsigned long guest_flags = guest_state->flags;
+ 
+     data->shadow_gs = v->arch.hvm_vmx.shadow_gs;
+     data->msr_cstar = v->arch.hvm_vmx.cstar;
+ 
+     /* save msrs */
+-    data->msr_flags        = guest_flags;
++    data->msr_flags        = 0;
+     data->msr_lstar        = guest_state->msrs[VMX_INDEX_MSR_LSTAR];
+     data->msr_star         = guest_state->msrs[VMX_INDEX_MSR_STAR];
+     data->msr_syscall_mask = guest_state->msrs[VMX_INDEX_MSR_SYSCALL_MASK];
+@@ -754,7 +753,7 @@ static void vmx_load_cpu_state(struct vcpu *v, struct hvm_hw_cpu *data)
+     struct vmx_msr_state *guest_state = &v->arch.hvm_vmx.msr_state;
+ 
+     /* restore msrs */
+-    guest_state->flags = data->msr_flags & 7;
++    guest_state->flags = ((1u << VMX_MSR_COUNT) - 1);
+     guest_state->msrs[VMX_INDEX_MSR_LSTAR]        = data->msr_lstar;
+     guest_state->msrs[VMX_INDEX_MSR_STAR]         = data->msr_star;
+     guest_state->msrs[VMX_INDEX_MSR_SYSCALL_MASK] = data->msr_syscall_mask;
+diff --git a/xen/include/public/arch-x86/hvm/save.h b/xen/include/public/arch-x86/hvm/save.h
+index 8d73b51..419a3b2 100644
+--- a/xen/include/public/arch-x86/hvm/save.h
++++ b/xen/include/public/arch-x86/hvm/save.h
+@@ -135,7 +135,7 @@ struct hvm_hw_cpu {
+     uint64_t shadow_gs;
+ 
+     /* msr content saved/restored. */
+-    uint64_t msr_flags;
++    uint64_t msr_flags; /* Obsolete, ignored. */
+     uint64_t msr_lstar;
+     uint64_t msr_star;
+     uint64_t msr_cstar;
+@@ -249,7 +249,7 @@ struct hvm_hw_cpu_compat {
+     uint64_t shadow_gs;
+ 
+     /* msr content saved/restored. */
+-    uint64_t msr_flags;
++    uint64_t msr_flags; /* Obsolete, ignored. */
+     uint64_t msr_lstar;
+     uint64_t msr_star;
+     uint64_t msr_cstar;
