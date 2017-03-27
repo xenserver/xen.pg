@@ -19,13 +19,16 @@
 %define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 debug=n
 %endif
 
+%define base_cset RELEASE-%{version}
+%define base_dir  %{name}-%{version}
+
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.7.2
 Release: 2.0
 License: GPL
 URL:     http://www.xen.org
-Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=RELEASE-%{version}&prefix=%{name}-%{version}&format=tar.gz#/%{name}-%{version}.tar.gz
+Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
