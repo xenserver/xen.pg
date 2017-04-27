@@ -1,0 +1,152 @@
+From 6d191358f75404307bcbe654634aa6a2958586c4 Mon Sep 17 00:00:00 2001
+From: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Date: Wed, 26 Apr 2017 18:10:48 +0300
+Subject: [PATCH] x86/vm_event: fix race between vmx_vmexit_handler() and
+ vm_event_resume()
+
+The introspection agent can reply to a vm_event faster than
+vmx_vmexit_handler() can complete in some cases, where it is then
+not safe for vm_event_set_registers() to modify v->arch.user_regs.
+This patch ensures that vm_event_resume() code only sets per-VCPU
+data to be used for the actual setting of registers only in
+hvm_do_resume() (similar to the model used to control setting of CRs
+and MSRs).
+The patch additionally removes the sync_vcpu_execstate(v) call from
+vm_event_resume(), which is no longer necessary, which removes the
+associated broadcast TLB flush (read: performance improvement).
+
+Signed-off-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index a08ca43..4896e7c 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -481,6 +481,39 @@ static bool_t hvm_get_pending_event(struct vcpu *v, struct hvm_trap *info)
+     return hvm_funcs.get_pending_event(v, info);
+ }
+ 
++static void hvm_vm_event_set_registers(struct vcpu *v)
++{
++    ASSERT(v == current);
++
++    if ( v->arch.vm_event->set_registers )
++    {
++        struct cpu_user_regs *regs = guest_cpu_user_regs();
++
++        regs->eax = v->arch.vm_event->user_regs.rax;
++        regs->ebx = v->arch.vm_event->user_regs.rbx;
++        regs->ecx = v->arch.vm_event->user_regs.rcx;
++        regs->edx = v->arch.vm_event->user_regs.rdx;
++        regs->esp = v->arch.vm_event->user_regs.rsp;
++        regs->ebp = v->arch.vm_event->user_regs.rbp;
++        regs->esi = v->arch.vm_event->user_regs.rsi;
++        regs->edi = v->arch.vm_event->user_regs.rdi;
++
++        regs->r8 = v->arch.vm_event->user_regs.r8;
++        regs->r9 = v->arch.vm_event->user_regs.r9;
++        regs->r10 = v->arch.vm_event->user_regs.r10;
++        regs->r11 = v->arch.vm_event->user_regs.r11;
++        regs->r12 = v->arch.vm_event->user_regs.r12;
++        regs->r13 = v->arch.vm_event->user_regs.r13;
++        regs->r14 = v->arch.vm_event->user_regs.r14;
++        regs->r15 = v->arch.vm_event->user_regs.r15;
++
++        regs->eflags = v->arch.vm_event->user_regs.rflags;
++        regs->eip = v->arch.vm_event->user_regs.rip;
++
++        v->arch.vm_event->set_registers = 0;
++    }
++}
++
+ void hvm_do_resume(struct vcpu *v)
+ {
+     check_wakeup_from_wait();
+@@ -495,6 +528,8 @@ void hvm_do_resume(struct vcpu *v)
+     {
+         struct monitor_write_data *w = &v->arch.vm_event->write_data;
+ 
++        hvm_vm_event_set_registers(v);
++
+         if ( v->arch.vm_event->emulate_flags )
+         {
+             enum emul_kind kind = EMUL_KIND_NORMAL;
+diff --git a/xen/arch/x86/vm_event.c b/xen/arch/x86/vm_event.c
+index c270508..1f49d30 100644
+--- a/xen/arch/x86/vm_event.c
++++ b/xen/arch/x86/vm_event.c
+@@ -100,26 +100,8 @@ void vm_event_register_write_resume(struct vcpu *v, vm_event_response_t *rsp)
+ 
+ void vm_event_set_registers(struct vcpu *v, vm_event_response_t *rsp)
+ {
+-    v->arch.user_regs.eax = rsp->data.regs.x86.rax;
+-    v->arch.user_regs.ebx = rsp->data.regs.x86.rbx;
+-    v->arch.user_regs.ecx = rsp->data.regs.x86.rcx;
+-    v->arch.user_regs.edx = rsp->data.regs.x86.rdx;
+-    v->arch.user_regs.esp = rsp->data.regs.x86.rsp;
+-    v->arch.user_regs.ebp = rsp->data.regs.x86.rbp;
+-    v->arch.user_regs.esi = rsp->data.regs.x86.rsi;
+-    v->arch.user_regs.edi = rsp->data.regs.x86.rdi;
+-
+-    v->arch.user_regs.r8 = rsp->data.regs.x86.r8;
+-    v->arch.user_regs.r9 = rsp->data.regs.x86.r9;
+-    v->arch.user_regs.r10 = rsp->data.regs.x86.r10;
+-    v->arch.user_regs.r11 = rsp->data.regs.x86.r11;
+-    v->arch.user_regs.r12 = rsp->data.regs.x86.r12;
+-    v->arch.user_regs.r13 = rsp->data.regs.x86.r13;
+-    v->arch.user_regs.r14 = rsp->data.regs.x86.r14;
+-    v->arch.user_regs.r15 = rsp->data.regs.x86.r15;
+-
+-    v->arch.user_regs.eflags = rsp->data.regs.x86.rflags;
+-    v->arch.user_regs.eip = rsp->data.regs.x86.rip;
++    v->arch.vm_event->user_regs = rsp->data.regs.x86;
++    v->arch.vm_event->set_registers = 1;
+ }
+ 
+ void vm_event_monitor_next_interrupt(struct vcpu *v)
+diff --git a/xen/common/vm_event.c b/xen/common/vm_event.c
+index d666288..3acd878 100644
+--- a/xen/common/vm_event.c
++++ b/xen/common/vm_event.c
+@@ -358,6 +358,13 @@ void vm_event_resume(struct domain *d, struct vm_event_domain *ved)
+ {
+     vm_event_response_t rsp;
+ 
++    /*
++     * vm_event_resume() runs either from XEN_DOMCTL_VM_EVENT_OP_*, or
++     * EVTCHN_send from the intropsection consumer.  Both contexts are
++     * guarenteed not to be the subject of vm_event responses.
++     */
++    ASSERT(d != current->domain);
++
+     /* Pull all responses off the ring. */
+     while ( vm_event_get_response(d, ved, &rsp) )
+     {
+@@ -376,13 +383,6 @@ void vm_event_resume(struct domain *d, struct vm_event_domain *ved)
+         v = d->vcpu[rsp.vcpu_id];
+ 
+         /*
+-         * Make sure the vCPU state has been synchronized for the custom
+-         * handlers.
+-         */
+-        if ( atomic_read(&v->vm_event_pause_count) )
+-            sync_vcpu_execstate(v);
+-
+-        /*
+          * In some cases the response type needs extra handling, so here
+          * we call the appropriate handlers.
+          */
+diff --git a/xen/include/asm-x86/vm_event.h b/xen/include/asm-x86/vm_event.h
+index 1d56567..a4155ec 100644
+--- a/xen/include/asm-x86/vm_event.h
++++ b/xen/include/asm-x86/vm_event.h
+@@ -30,8 +30,10 @@ struct arch_vm_event {
+     uint32_t emulate_flags;
+     unsigned long gpa;
+     bool_t insn_fetch;
++    bool_t set_registers;
+     struct vm_event_emul_read_data emul_read_data;
+     struct monitor_write_data write_data;
++    struct vm_event_regs_x86 user_regs;
+ };
+ 
+ int vm_event_init_domain(struct domain *d);
