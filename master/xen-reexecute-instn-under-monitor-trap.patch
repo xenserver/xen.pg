@@ -39,28 +39,36 @@ index 32802fa..220cc3b 100644
  
      rc = mapcache_vcpu_init(v);
      if ( rc )
-diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index 371366c..f346081 100644
---- a/xen/arch/x86/hvm/hvm.c
-+++ b/xen/arch/x86/hvm/hvm.c
-@@ -500,8 +500,13 @@ void hvm_do_resume(struct vcpu *v)
-                       VM_EVENT_FLAG_EMULATE_NOWRITE )
-                 kind = EMUL_KIND_NOWRITE;
+diff --git a/xen/arch/x86/hvm/vm_event.c b/xen/arch/x86/hvm/vm_event.c
+index bd104e4..3a2c8f8 100644
+--- a/xen/arch/x86/hvm/vm_event.c
++++ b/xen/arch/x86/hvm/vm_event.c
+@@ -23,6 +23,7 @@
+ #include <xen/sched.h>
+ #include <xen/vm_event.h>
+ #include <asm/hvm/support.h>
++#include <asm/p2m.h>
+ #include <asm/vm_event.h>
  
--            hvm_mem_access_emulate_one(kind, TRAP_invalid_op,
--                                       HVM_DELIVER_NO_ERROR_CODE);
-+            if ( opt_introspection_extn &&
-+                 kind == EMUL_KIND_NORMAL && v->arch.vm_event->insn_fetch )
-+                vmx_start_reexecute_instruction(v, v->arch.vm_event->gpa,
-+                                                XENMEM_access_x);
-+            else
-+                hvm_mem_access_emulate_one(kind, TRAP_invalid_op,
-+                                           HVM_DELIVER_NO_ERROR_CODE);
+ static void hvm_vm_event_set_registers(const struct vcpu *v)
+@@ -79,8 +80,13 @@ void hvm_vm_event_do_resume(struct vcpu *v)
+                   VM_EVENT_FLAG_EMULATE_NOWRITE )
+             kind = EMUL_KIND_NOWRITE;
  
-             v->arch.vm_event->emulate_flags = 0;
-         }
+-        hvm_mem_access_emulate_one(kind, TRAP_invalid_op,
+-                                   HVM_DELIVER_NO_ERROR_CODE);
++        if ( opt_introspection_extn &&
++             kind == EMUL_KIND_NORMAL && v->arch.vm_event->insn_fetch )
++            vmx_start_reexecute_instruction(v, v->arch.vm_event->gpa,
++                                            XENMEM_access_x);
++        else
++            hvm_mem_access_emulate_one(kind, TRAP_invalid_op,
++                                       HVM_DELIVER_NO_ERROR_CODE);
+ 
+         v->arch.vm_event->emulate_flags = 0;
+     }
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index 7c479ef..cab7c91 100644
+index 3de8267..1256938 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
 @@ -2104,6 +2104,21 @@ static bool_t vmx_vcpu_emulate_ve(struct vcpu *v)
@@ -85,7 +93,7 @@ index 7c479ef..cab7c91 100644
  static int vmx_set_mode(struct vcpu *v, int mode)
  {
      unsigned long attr;
-@@ -2187,6 +2202,7 @@ static struct hvm_function_table __initdata vmx_function_table = {
+@@ -2207,6 +2222,7 @@ static struct hvm_function_table __initdata vmx_function_table = {
      .altp2m_vcpu_update_vmfunc_ve = vmx_vcpu_update_vmfunc_ve,
      .altp2m_vcpu_emulate_ve = vmx_vcpu_emulate_ve,
      .altp2m_vcpu_emulate_vmfunc = vmx_vcpu_emulate_vmfunc,
@@ -93,7 +101,7 @@ index 7c479ef..cab7c91 100644
      .tsc_scaling = {
          .max_ratio = VMX_TSC_MULTIPLIER_MAX,
          .setup     = vmx_setup_tsc_scaling,
-@@ -3308,12 +3324,62 @@ static int vmx_handle_apic_write(void)
+@@ -3328,12 +3344,62 @@ static int vmx_handle_apic_write(void)
      return vlapic_apicv_write(current, exit_qualification & 0xfff);
  }
  
@@ -156,7 +164,7 @@ index 7c479ef..cab7c91 100644
      __vmread(GUEST_RIP,    &regs->rip);
      __vmread(GUEST_RSP,    &regs->rsp);
      __vmread(GUEST_RFLAGS, &regs->rflags);
-@@ -3844,6 +3910,8 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+@@ -3864,6 +3930,8 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
      case EXIT_REASON_MONITOR_TRAP_FLAG:
          v->arch.hvm_vmx.exec_control &= ~CPU_BASED_MONITOR_TRAP_FLAG;
          vmx_update_cpu_exec_control(v);
@@ -165,7 +173,7 @@ index 7c479ef..cab7c91 100644
          if ( v->arch.hvm_vcpu.single_step )
          {
              hvm_event_breakpoint(regs->eip, HVM_EVENT_SINGLESTEP_BREAKPOINT);
-@@ -4023,6 +4091,8 @@ void vmx_vmenter_helper(const struct cpu_user_regs *regs)
+@@ -4043,6 +4111,8 @@ void vmx_vmenter_helper(const struct cpu_user_regs *regs)
      if ( unlikely(curr->arch.hvm_vmx.lbr_tsx_fixup_enabled) )
          lbr_tsx_fixup();
  
@@ -439,18 +447,9 @@ index a734e8c..cf9ccd1 100644
  
      if ( (err = xsm_alloc_security_domain(d)) != 0 )
 diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
-index d0cee85..6620204 100644
+index 1c12901..468fca0 100644
 --- a/xen/include/asm-x86/domain.h
 +++ b/xen/include/asm-x86/domain.h
-@@ -236,7 +236,7 @@ struct paging_vcpu {
- #define MAX_CPUID_INPUT 40
- typedef xen_domctl_cpuid_t cpuid_input_t;
- 
--#define MAX_NESTEDP2M 10
-+#define MAX_NESTEDP2M 8
- 
- #define MAX_ALTP2M      10 /* arbitrary */
- #define INVALID_ALTP2M  0xffff
 @@ -412,6 +412,8 @@ struct arch_domain
  
      /* Emulated devices enabled bitmap. */
@@ -484,13 +483,13 @@ index d0cee85..6620204 100644
 +    bool_t in_host;
 +
      struct arch_vm_event *vm_event;
- };
  
+     struct {
 diff --git a/xen/include/asm-x86/hvm/hvm.h b/xen/include/asm-x86/hvm/hvm.h
-index 03b9bb8..e07866f 100644
+index 983ccc5..7f46129 100644
 --- a/xen/include/asm-x86/hvm/hvm.h
 +++ b/xen/include/asm-x86/hvm/hvm.h
-@@ -221,6 +221,8 @@ struct hvm_function_table {
+@@ -222,6 +222,8 @@ struct hvm_function_table {
      bool_t (*altp2m_vcpu_emulate_ve)(struct vcpu *v);
      int (*altp2m_vcpu_emulate_vmfunc)(struct cpu_user_regs *regs);
  
@@ -515,7 +514,7 @@ index bb18ad3..522ea74 100644
  
  /*
 diff --git a/xen/include/asm-x86/vm_event.h b/xen/include/asm-x86/vm_event.h
-index 0470240..413e354 100644
+index 11833a7..5618b7c 100644
 --- a/xen/include/asm-x86/vm_event.h
 +++ b/xen/include/asm-x86/vm_event.h
 @@ -28,6 +28,8 @@
@@ -526,4 +525,4 @@ index 0470240..413e354 100644
 +    bool_t insn_fetch;
      struct vm_event_emul_read_data emul_read_data;
      struct monitor_write_data write_data;
- };
+     struct vm_event_regs_x86 gprs;
