@@ -1,0 +1,129 @@
+From ed719d7ca6e8df6384a2ecbe9a78977e32586478 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 4 May 2017 15:05:26 +0200
+Subject: [PATCH] hvm: fix hypervisor crash in hvm_save_one()
+
+hvm_save_cpu_ctxt() returns success without writing any data into
+hvm_domain_context_t when all VCPUs are offline. This can then crash
+the hypervisor (with FATAL PAGE FAULT) in hvm_save_one() via the
+"off < (ctxt.cur - sizeof(*desc))" for() test, where ctxt.cur remains 0,
+causing an underflow which leads the hypervisor to go off the end of the
+ctxt buffer.
+
+This has been broken since Xen 4.4 (c/s e019c606f59).
+It has happened in practice with an HVM Linux VM (Debian 8) queried around
+shutdown:
+
+(XEN) hvm.c:1595:d3v0 All CPUs offline -- powering off.
+(XEN) ----[ Xen-4.9-rc  x86_64  debug=y   Not tainted ]----
+(XEN) CPU:    5
+(XEN) RIP:    e008:[<ffff82d0802496d2>] hvm_save_one+0x145/0x1fd
+(XEN) RFLAGS: 0000000000010286   CONTEXT: hypervisor (d0v2)
+(XEN) rax: ffff830492cbb445   rbx: 0000000000000000   rcx: ffff83039343b400
+(XEN) rdx: 00000000ff88004d   rsi: fffffffffffffff8   rdi: 0000000000000000
+(XEN) rbp: ffff8304103e7c88   rsp: ffff8304103e7c48   r8:  0000000000000001
+(XEN) r9:  deadbeefdeadf00d   r10: 0000000000000000   r11: 0000000000000282
+(XEN) r12: 00007f43a3b14004   r13: 00000000fffffffe   r14: 0000000000000000
+(XEN) r15: ffff830400c41000   cr0: 0000000080050033   cr4: 00000000001526e0
+(XEN) cr3: 0000000402e13000   cr2: ffff830492cbb447
+(XEN) ds: 0000   es: 0000   fs: 0000   gs: 0000   ss: e010   cs: e008
+(XEN) Xen code around <ffff82d0802496d2> (hvm_save_one+0x145/0x1fd):
+(XEN)  00 00 48 01 c8 83 c2 08 <66> 39 58 02 75 64 eb 08 48 89 c8 ba 08 00 00 00
+(XEN) Xen stack trace from rsp=ffff8304103e7c48:
+(XEN)    0000041000000000 ffff83039343b400 ffff8304103e7c70 ffff8304103e7da8
+(XEN)    ffff830400c41000 00007f43a3b13004 ffff8304103b7000 ffffffffffffffea
+(XEN)    ffff8304103e7d48 ffff82d0802683d4 ffff8300d19fd000 ffff82d0802320d8
+(XEN)    ffff830400c41000 0000000000000000 ffff8304103e7cd8 ffff82d08026ff3d
+(XEN)    0000000000000000 ffff8300d19fd000 ffff8304103e7cf8 ffff82d080232142
+(XEN)    0000000000000000 ffff8300d19fd000 ffff8304103e7d28 ffff82d080207051
+(XEN)    ffff8304103e7d18 ffff830400c41000 0000000000000202 ffff830400c41000
+(XEN)    0000000000000000 00007f43a3b13004 0000000000000000 deadbeefdeadf00d
+(XEN)    ffff8304103e7e68 ffff82d080206c47 0700000000000000 ffff830410375bd0
+(XEN)    0000000000000296 ffff830410375c78 ffff830410375c80 0000000000000003
+(XEN)    ffff8304103e7e68 ffff8304103b67c0 ffff8304103b7000 ffff8304103b67c0
+(XEN)    0000000d00000037 0000000000000003 0000000000000002 00007f43a3b14004
+(XEN)    00007ffd5d925590 0000000000000000 0000000100000000 0000000000000000
+(XEN)    00000000ea8f8000 0000000000000000 00007ffd00000000 0000000000000000
+(XEN)    00007f43a276f557 0000000000000000 00000000ea8f8000 0000000000000000
+(XEN)    00007ffd5d9255e0 00007f43a23280b2 00007ffd5d926058 ffff8304103e7f18
+(XEN)    ffff8300d19fe000 0000000000000024 ffff82d0802053e5 deadbeefdeadf00d
+(XEN)    ffff8304103e7f08 ffff82d080351565 010000003fffffff 00007f43a3b13004
+(XEN)    deadbeefdeadf00d deadbeefdeadf00d deadbeefdeadf00d deadbeefdeadf00d
+(XEN)    ffff8800781425c0 ffff88007ce94300 ffff8304103e7ed8 ffff82d0802719ec
+(XEN) Xen call trace:
+(XEN)    [<ffff82d0802496d2>] hvm_save_one+0x145/0x1fd
+(XEN)    [<ffff82d0802683d4>] arch_do_domctl+0xa7a/0x259f
+(XEN)    [<ffff82d080206c47>] do_domctl+0x1862/0x1b7b
+(XEN)    [<ffff82d080351565>] pv_hypercall+0x1ef/0x42c
+(XEN)    [<ffff82d080355106>] entry.o#test_all_events+0/0x30
+(XEN)
+(XEN) Pagetable walk from ffff830492cbb447:
+(XEN)  L4[0x106] = 00000000dbc36063 ffffffffffffffff
+(XEN)  L3[0x012] = 0000000000000000 ffffffffffffffff
+(XEN)
+(XEN) ****************************************
+(XEN) Panic on CPU 5:
+(XEN) FATAL PAGE FAULT
+(XEN) [error_code=0000]
+(XEN) Faulting linear address: ffff830492cbb447
+(XEN) ****************************************
+
+At the same time pave the way for having zero-length records.
+
+Inspired by an earlier patch from Andrew and Razvan.
+
+Reported-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Diagnosed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Tim Deegan <tim@xen.org>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Tested-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Release-Acked-by: Julien Grall <julien.grall@arm.com>
+diff --git a/xen/common/hvm/save.c b/xen/common/hvm/save.c
+index dd2c547..e54e247 100644
+--- a/xen/common/hvm/save.c
++++ b/xen/common/hvm/save.c
+@@ -80,14 +80,15 @@ size_t hvm_save_size(struct domain *d)
+ int hvm_save_one(struct domain *d, uint16_t typecode, uint16_t instance, 
+                  XEN_GUEST_HANDLE_64(uint8) handle)
+ {
+-    int rv = 0;
++    int rv = -ENOENT;
+     size_t sz = 0;
+     struct vcpu *v;
+     hvm_domain_context_t ctxt = { 0, };
++    const struct hvm_save_descriptor *desc;
+ 
+     if ( d->is_dying 
+          || typecode > HVM_SAVE_CODE_MAX 
+-         || hvm_sr_handlers[typecode].size < sizeof(struct hvm_save_descriptor)
++         || hvm_sr_handlers[typecode].size < sizeof(*desc)
+          || hvm_sr_handlers[typecode].save == NULL )
+         return -EINVAL;
+ 
+@@ -108,13 +109,11 @@ int hvm_save_one(struct domain *d, uint16_t typecode, uint16_t instance,
+                d->domain_id, typecode);
+         rv = -EFAULT;
+     }
+-    else
++    else if ( ctxt.cur >= sizeof(*desc) )
+     {
+         uint32_t off;
+-        const struct hvm_save_descriptor *desc;
+ 
+-        rv = -ENOENT;
+-        for ( off = 0; off < (ctxt.cur - sizeof(*desc)); off += desc->length )
++        for ( off = 0; off <= (ctxt.cur - sizeof(*desc)); off += desc->length )
+         {
+             desc = (void *)(ctxt.data + off);
+             /* Move past header */
+@@ -123,7 +122,8 @@ int hvm_save_one(struct domain *d, uint16_t typecode, uint16_t instance,
+             {
+                 uint32_t copy_length = desc->length;
+ 
+-                if ( off + copy_length > ctxt.cur )
++                if ( ctxt.cur < copy_length ||
++                     off > ctxt.cur - copy_length )
+                     copy_length = ctxt.cur - off;
+                 rv = 0;
+                 if ( copy_to_guest(handle, ctxt.data + off, copy_length) )
