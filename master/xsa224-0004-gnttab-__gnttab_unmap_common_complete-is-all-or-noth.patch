@@ -1,8 +1,5 @@
-From c231837fd997458dcda6e6eb227c3bcb7d0354bc Mon Sep 17 00:00:00 2001
 From: Jan Beulich <jbeulich@suse.com>
-Date: Fri, 2 Jun 2017 15:45:56 +0100
-Subject: [PATCH 4/4] gnttab: __gnttab_unmap_common_complete() is
- all-or-nothing
+Subject: gnttab: __gnttab_unmap_common_complete() is all-or-nothing
 
 All failures have to be detected in __gnttab_unmap_common(), the
 completion function must not skip part of its processing. In particular
@@ -24,8 +21,9 @@ BUG_ON() or ASSERT()), but for the moment also move it.
 This is part of XSA-224.
 
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
+
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index c1de4ad..2d2bd15 100644
+index 4400c79..d06e408 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
 @@ -97,7 +97,7 @@ struct gnttab_unmap_common {
@@ -55,7 +53,7 @@ index c1de4ad..2d2bd15 100644
      bool_t put_handle = 0;
  
      ld = current->domain;
-@@ -1149,6 +1151,20 @@ __gnttab_unmap_common(
+@@ -1148,6 +1150,20 @@ __gnttab_unmap_common(
  
      grant_read_lock(rgt);
  
@@ -75,19 +73,28 @@ index c1de4ad..2d2bd15 100644
 +
      op->rd = rd;
      op->ref = map->ref;
-     act = active_entry_acquire(rgt, op->ref);
-@@ -1161,8 +1177,8 @@ __gnttab_unmap_common(
+ 
+@@ -1163,6 +1179,7 @@ __gnttab_unmap_common(
+     {
+         gdprintk(XENLOG_WARNING, "Unstable handle %#x\n", op->handle);
+         rc = GNTST_bad_handle;
++        flags = 0;
+         goto unlock_out;
+     }
+ 
+@@ -1176,9 +1193,9 @@ __gnttab_unmap_common(
       * hold anyway; see docs/misc/grant-tables.txt's "Locking" section.
       */
  
 -    op->flags = read_atomic(&map->flags);
--    if ( unlikely(!op->flags) || unlikely(map->domid != dom) )
 +    flags = read_atomic(&map->flags);
-+    if ( unlikely(!flags) || unlikely(map->domid != dom) )
+     smp_rmb();
+-    if ( unlikely(!op->flags) || unlikely(map->domid != dom) ||
++    if ( unlikely(!flags) || unlikely(map->domid != dom) ||
+          unlikely(map->ref != op->ref) )
      {
          gdprintk(XENLOG_WARNING, "Unstable handle %u\n", op->handle);
-         rc = GNTST_bad_handle;
-@@ -1171,24 +1187,27 @@ __gnttab_unmap_common(
+@@ -1188,24 +1205,27 @@ __gnttab_unmap_common(
  
      op->frame = act->frame;
  
@@ -126,15 +133,7 @@ index c1de4ad..2d2bd15 100644
      }
  
      if ( !(map->flags & (GNTMAP_device_map|GNTMAP_host_map)) )
-@@ -1199,6 +1218,7 @@ __gnttab_unmap_common(
- 
-  act_release_out:
-     active_entry_release(act);
-+ unlock_out:
-     grant_read_unlock(rgt);
- 
-     if ( put_handle )
-@@ -1224,7 +1244,7 @@ __gnttab_unmap_common(
+@@ -1242,7 +1262,7 @@ __gnttab_unmap_common(
      }
  
      /* If just unmapped a writable mapping, mark as dirtied */
@@ -143,7 +142,7 @@ index c1de4ad..2d2bd15 100644
           gnttab_mark_dirty(rd, op->frame);
  
      op->status = rc;
-@@ -1241,13 +1261,9 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1259,13 +1279,9 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
      struct page_info *pg;
      uint16_t *status;
  
@@ -159,7 +158,7 @@ index c1de4ad..2d2bd15 100644
          return;
      }
  
-@@ -1257,8 +1273,6 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1275,8 +1291,6 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
      rgt = rd->grant_table;
  
      grant_read_lock(rgt);
@@ -168,7 +167,7 @@ index c1de4ad..2d2bd15 100644
  
      act = active_entry_acquire(rgt, op->ref);
      sha = shared_entry_header(rgt, op->ref);
-@@ -1268,72 +1282,50 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1286,72 +1300,50 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
      else
          status = &status_entry(rgt, op->ref);
  
@@ -250,7 +249,7 @@ index c1de4ad..2d2bd15 100644
      grant_read_unlock(rgt);
  
      rcu_unlock_domain(rd);
-@@ -1349,6 +1341,7 @@ __gnttab_unmap_grant_ref(
+@@ -1367,6 +1359,7 @@ __gnttab_unmap_grant_ref(
      common->handle = op->handle;
  
      /* Intialise these in case common contains old state */
@@ -258,7 +257,7 @@ index c1de4ad..2d2bd15 100644
      common->new_addr = 0;
      common->rd = NULL;
      common->frame = 0;
-@@ -1428,6 +1421,7 @@ __gnttab_unmap_and_replace(
+@@ -1446,6 +1439,7 @@ __gnttab_unmap_and_replace(
      common->handle = op->handle;
      
      /* Intialise these in case common contains old state */
@@ -266,7 +265,7 @@ index c1de4ad..2d2bd15 100644
      common->dev_bus_addr = 0;
      common->rd = NULL;
      common->frame = 0;
-@@ -3394,7 +3388,9 @@ gnttab_release_mappings(
+@@ -3412,7 +3406,9 @@ gnttab_release_mappings(
                  if ( gnttab_release_host_mappings(d) &&
                       !is_iomem_page(act->frame) )
                  {
