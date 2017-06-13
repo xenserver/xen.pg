@@ -1,0 +1,52 @@
+From: Jan Beulich <jbeulich@suse.com>
+Subject: gnttab: correct maptrack table read side locking
+
+In order to observe a consistent (limit,pointer-table) pair, the reader
+needs to either hold the grant table lock (in line with documentation)
+or both sides would need to order their accesses suitably (the writer
+side barrier was removed by commit dff515dfea ["gnttab: use per-VCPU
+maptrack free lists"], and a read side barrier has never been there).
+Otoh holding the lock while accessing the maptrack entry fields is
+pointless, as these entries are protected by their associated active
+entry lock (which is being acquired later, before re-validating the
+fields read without holding the lock).
+
+This is part of XSA-218.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: George Dunlap <george.dunlap@citrix.com>
+
+diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
+index 4288e7a..00d7bcc 100644
+--- a/xen/common/grant_table.c
++++ b/xen/common/grant_table.c
+@@ -1095,6 +1095,8 @@ __gnttab_unmap_common(
+     op->page_accessed = 1;
+     op->frame = (unsigned long)(op->dev_bus_addr >> PAGE_SHIFT);
+ 
++    grant_read_lock(lgt);
++
+     if ( unlikely(op->handle >= lgt->maptrack_limit) )
+     {
+         gdprintk(XENLOG_INFO, "Bad handle (%d).\n", op->handle);
+@@ -1104,19 +1106,16 @@ __gnttab_unmap_common(
+ 
+     map = &maptrack_entry(lgt, op->handle);
+ 
+-    grant_read_lock(lgt);
++    grant_read_unlock(lgt);
+ 
+     if ( unlikely(!read_atomic(&map->flags)) )
+     {
+-        grant_read_unlock(lgt);
+         gdprintk(XENLOG_INFO, "Zero flags for handle (%d).\n", op->handle);
+         op->status = GNTST_bad_handle;
+         return;
+     }
+ 
+     dom = map->domid;
+-    grant_read_unlock(lgt);
+-
+     if ( unlikely((rd = rcu_lock_domain_by_id(dom)) == NULL) )
+     {
+         /* This can happen when a grant is implicitly unmapped. */

@@ -1,7 +1,5 @@
-From 6650b6f54d93bd45ec56f2a88c89294978ccfd1a Mon Sep 17 00:00:00 2001
 From: George Dunlap <george.dunlap@citrix.com>
-Date: Fri, 2 Jun 2017 12:29:59 +0100
-Subject: [PATCH 3/3] gnttab: Avoid potential double-put of maptrack entry
+Subject: gnttab: Avoid potential double-put of maptrack entry
 
 Each grant mapping for a particular domain is tracked by an in-Xen
 "maptrack" entry.  This entry is is referenced by a "handle", which is
@@ -44,8 +42,9 @@ This is part of XSA-218.
 
 Signed-off-by: George Dunlap <george.dunlap@citrix.com>
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
+
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index f870b27..ea93dd7 100644
+index f870b27..4288e7a 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
 @@ -99,8 +99,8 @@ struct gnttab_unmap_common {
@@ -90,7 +89,7 @@ index f870b27..ea93dd7 100644
      grant_read_unlock(lgt);
  
      if ( unlikely((rd = rcu_lock_domain_by_id(dom)) == NULL) )
-@@ -1137,17 +1139,26 @@ __gnttab_unmap_common(
+@@ -1137,16 +1139,43 @@ __gnttab_unmap_common(
  
      grant_read_lock(rgt);
  
@@ -98,6 +97,26 @@ index f870b27..ea93dd7 100644
 -    if ( unlikely(!op->flags) || unlikely(op->map->domid != dom) )
 +    op->rd = rd;
 +    op->ref = map->ref;
++
++    /*
++     * We can't assume there was no racing unmap for this maptrack entry,
++     * and hence we can't assume map->ref is valid for rd. While the checks
++     * below (with the active entry lock held) will reject any such racing
++     * requests, we still need to make sure we don't attempt to acquire an
++     * invalid lock.
++     */
++    smp_rmb();
++    if ( unlikely(op->ref >= nr_grant_entries(rgt)) )
+     {
+-        gdprintk(XENLOG_WARNING, "Unstable handle %u\n", op->handle);
++        gdprintk(XENLOG_WARNING, "Unstable handle %#x\n", op->handle);
+         rc = GNTST_bad_handle;
+-        goto unmap_out;
++        goto unlock_out;
+     }
+ 
+-    op->rd = rd;
+-    act = active_entry_acquire(rgt, op->map->ref);
 +    act = active_entry_acquire(rgt, op->ref);
 +
 +    /*
@@ -109,21 +128,18 @@ index f870b27..ea93dd7 100644
 +     */
 +
 +    op->flags = read_atomic(&map->flags);
-+    if ( unlikely(!op->flags) || unlikely(map->domid != dom) )
-     {
-         gdprintk(XENLOG_WARNING, "Unstable handle %u\n", op->handle);
-         rc = GNTST_bad_handle;
--        goto unmap_out;
++    smp_rmb();
++    if ( unlikely(!op->flags) || unlikely(map->domid != dom) ||
++         unlikely(map->ref != op->ref) )
++    {
++        gdprintk(XENLOG_WARNING, "Unstable handle %u\n", op->handle);
++        rc = GNTST_bad_handle;
 +        goto act_release_out;
-     }
++    }
  
--    op->rd = rd;
--    act = active_entry_acquire(rgt, op->map->ref);
--
      if ( op->frame == 0 )
      {
-         op->frame = act->frame;
-@@ -1159,7 +1170,7 @@ __gnttab_unmap_common(
+@@ -1159,7 +1188,7 @@ __gnttab_unmap_common(
                       "Bad frame number doesn't match gntref. (%lx != %lx)\n",
                       op->frame, act->frame);
  
@@ -132,7 +148,7 @@ index f870b27..ea93dd7 100644
      }
  
      if ( (op->host_addr != 0) && (op->flags & GNTMAP_host_map) )
-@@ -1169,14 +1180,22 @@ __gnttab_unmap_common(
+@@ -1169,14 +1198,23 @@ __gnttab_unmap_common(
                                                op->flags, &op->page_accessed)) < 0 )
              goto act_release_out;
  
@@ -149,6 +165,7 @@ index f870b27..ea93dd7 100644
   act_release_out:
      active_entry_release(act);
 - unmap_out:
++ unlock_out:
      grant_read_unlock(rgt);
  
 +    if ( put_handle )
@@ -157,7 +174,7 @@ index f870b27..ea93dd7 100644
      if ( rc == GNTST_okay && gnttab_need_iommu_mapping(ld) )
      {
          unsigned int kind;
-@@ -1213,7 +1232,6 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1213,7 +1251,6 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
      grant_entry_header_t *sha;
      struct page_info *pg;
      uint16_t *status;
@@ -165,7 +182,7 @@ index f870b27..ea93dd7 100644
  
      if ( rd == NULL )
      { 
-@@ -1234,13 +1252,13 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1234,13 +1271,13 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
      if ( rgt->gt_version == 0 )
          goto unlock_out;
  
@@ -182,7 +199,7 @@ index f870b27..ea93dd7 100644
  
      if ( unlikely(op->frame != act->frame) ) 
      {
-@@ -1297,9 +1315,6 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1297,9 +1334,6 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
              act->pin -= GNTPIN_hstw_inc;
      }
  
@@ -192,7 +209,7 @@ index f870b27..ea93dd7 100644
      if ( ((act->pin & (GNTPIN_devw_mask|GNTPIN_hstw_mask)) == 0) &&
           !(op->flags & GNTMAP_readonly) )
          gnttab_clear_flag(_GTF_writing, status);
-@@ -1312,11 +1327,6 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1312,11 +1346,6 @@ __gnttab_unmap_common_complete(struct gnttab_unmap_common *op)
   unlock_out:
      grant_read_unlock(rgt);
  
