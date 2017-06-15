@@ -1,55 +1,74 @@
 From: Jan Beulich <jbeulich@suse.com>
-Subject: gnttab: correct maptrack table read side locking
+Subject: gnttab: correct maptrack table accesses
 
 In order to observe a consistent (limit,pointer-table) pair, the reader
-needs to either hold the grant table lock (in line with documentation)
-or both sides would need to order their accesses suitably (the writer
-side barrier was removed by commit dff515dfea ["gnttab: use per-VCPU
+needs to either hold the maptrack lock (in line with documentation) or
+both sides need to order their accesses suitably (the writer side
+barrier was removed by commit dff515dfea ["gnttab: use per-VCPU
 maptrack free lists"], and a read side barrier has never been there).
-Otoh holding the lock while accessing the maptrack entry fields is
-pointless, as these entries are protected by their associated active
-entry lock (which is being acquired later, before re-validating the
-fields read without holding the lock).
+
+Make the writer publish a new table page before limit (for bounds
+checks to work), and new list head only after having published those
+(for racing maptrack_entry() invocations to work). At the same time add
+read barriers to lockless readers.
+
+Additionally get_maptrack_handle() must not assume ->maptrack_head to
+not change behind its back: Another handle may be put (updating only
+->maptrack_tail) and then got or stolen (updating ->maptrack_head).
 
 This is part of XSA-218.
 
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
-Reviewed-by: George Dunlap <george.dunlap@citrix.com>
-
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index 4288e7a..80023ce 100644
+index 4288e7a..6e9517f 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
-@@ -1095,8 +1095,11 @@ __gnttab_unmap_common(
-     op->page_accessed = 1;
-     op->frame = (unsigned long)(op->dev_bus_addr >> PAGE_SHIFT);
+@@ -402,7 +402,7 @@ get_maptrack_handle(
+     struct grant_table *lgt)
+ {
+     struct vcpu          *curr = current;
+-    int                   i;
++    unsigned int          i, head;
+     grant_handle_t        handle;
+     struct grant_mapping *new_mt;
  
-+    grant_read_lock(lgt);
+@@ -458,17 +458,20 @@ get_maptrack_handle(
+         new_mt[i].ref = handle + i + 1;
+         new_mt[i].vcpu = curr->vcpu_id;
+     }
+-    new_mt[i - 1].ref = curr->maptrack_head;
+ 
+     /* Set tail directly if this is the first page for this VCPU. */
+     if ( curr->maptrack_tail == MAPTRACK_TAIL )
+         curr->maptrack_tail = handle + MAPTRACK_PER_PAGE - 1;
+ 
+-    write_atomic(&curr->maptrack_head, handle + 1);
+-
+     lgt->maptrack[nr_maptrack_frames(lgt)] = new_mt;
++    smp_wmb();
+     lgt->maptrack_limit += MAPTRACK_PER_PAGE;
+ 
++    do {
++        new_mt[i - 1].ref = read_atomic(&curr->maptrack_head);
++        head = cmpxchg(&curr->maptrack_head, new_mt[i - 1].ref, handle + 1);
++    } while ( head != new_mt[i - 1].ref );
 +
-     if ( unlikely(op->handle >= lgt->maptrack_limit) )
+     spin_unlock(&lgt->maptrack_lock);
+ 
+     return handle;
+@@ -734,6 +737,7 @@ static unsigned int mapkind(
+     for ( handle = 0; !(kind & MAPKIND_WRITE) &&
+                       handle < lgt->maptrack_limit; handle++ )
      {
-+        grant_read_unlock(lgt);
-         gdprintk(XENLOG_INFO, "Bad handle (%d).\n", op->handle);
-         op->status = GNTST_bad_handle;
-         return;
-@@ -1104,19 +1107,16 @@ __gnttab_unmap_common(
- 
-     map = &maptrack_entry(lgt, op->handle);
- 
--    grant_read_lock(lgt);
-+    grant_read_unlock(lgt);
- 
-     if ( unlikely(!read_atomic(&map->flags)) )
-     {
--        grant_read_unlock(lgt);
-         gdprintk(XENLOG_INFO, "Zero flags for handle (%d).\n", op->handle);
-         op->status = GNTST_bad_handle;
++        smp_rmb();
+         map = &maptrack_entry(lgt, handle);
+         if ( !(map->flags & (GNTMAP_device_map|GNTMAP_host_map)) ||
+              map->domid != rd->domain_id )
+@@ -1102,6 +1106,7 @@ __gnttab_unmap_common(
          return;
      }
  
-     dom = map->domid;
--    grant_read_unlock(lgt);
--
-     if ( unlikely((rd = rcu_lock_domain_by_id(dom)) == NULL) )
-     {
-         /* This can happen when a grant is implicitly unmapped. */
++    smp_rmb();
+     map = &maptrack_entry(lgt, op->handle);
+ 
+     grant_read_lock(lgt);
