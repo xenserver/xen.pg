@@ -1,0 +1,990 @@
+diff --git a/config/Docs.mk b/config/Docs.mk
+index b1a32cb..a52db5c 100644
+--- a/config/Docs.mk
++++ b/config/Docs.mk
+@@ -5,6 +5,6 @@ FIG2DEV             :=
+ POD2MAN             := /usr/bin/pod2man
+ POD2HTML            := /usr/bin/pod2html
+ POD2TEXT            := /usr/bin/pod2text
+-MARKDOWN            := 
+-PANDOC              := 
++MARKDOWN            := /usr/bin/markdown_py
++PANDOC              := /usr/bin/pandoc
+ PERL                := /usr/bin/perl
+diff --git a/config/Tools.mk b/config/Tools.mk
+index 130672b..07828bb 100644
+--- a/config/Tools.mk
++++ b/config/Tools.mk
+@@ -21,7 +21,7 @@ LD86                := /usr/bin/ld86
+ BCC                 := /usr/bin/bcc
+ IASL                := /usr/bin/iasl
+ AWK                 := /usr/bin/awk
+-FETCHER             := /bin/false -c -O
++FETCHER             := /usr/bin/wget -c -O
+ SEABIOS_PATH        := 
+ OVMF_PATH           := 
+ 
+@@ -49,7 +49,7 @@ GIT_HTTP            := n
+ 
+ # Optional components
+ XENSTAT_XENTOP      := y
+-OCAML_TOOLS         := y
++OCAML_TOOLS         := n
+ FLASK_POLICY        := n
+ CONFIG_OVMF         := n
+ CONFIG_ROMBIOS      := y
+@@ -69,10 +69,10 @@ XEN_SYSTEMD_MODULES_LOAD := $(prefix)/lib/modules-load.d/
+ LINUX_BACKEND_MODULES := xen-evtchn xen-gntdev xen-gntalloc xen-blkback xen-netback xen-pciback evtchn gntdev netbk blkbk xen-scsibk usbbk pciback xen-acpi-processor blktap2
+ 
+ #System options
+-ZLIB                :=  -DHAVE_BZLIB -lbz2 -DHAVE_LZMA -llzma -DHAVE_LZO1X -llzo2
++ZLIB                :=  -DHAVE_LZMA -llzma
+ CONFIG_LIBICONV     := n
+-CONFIG_GCRYPT       := y
+-EXTFS_LIBS          := -lext2fs
++CONFIG_GCRYPT       := n
++EXTFS_LIBS          := 
+ CURSES_LIBS         := -lncurses
+ TINFO_LIBS          := -ltinfo
+ ARGP_LDFLAGS        := 
+diff --git a/tools/config.h b/tools/config.h
+index 4da4f18..affce82 100644
+--- a/tools/config.h
++++ b/tools/config.h
+@@ -92,7 +92,7 @@
+ #define INCLUDE_CURSES_H <ncurses.h>
+ 
+ /* Define extfs header to use */
+-#define INCLUDE_EXTFS_H <ext2fs/ext2fs.h>
++/* #undef INCLUDE_EXTFS_H */
+ 
+ /* libutil header file name */
+ /* #undef INCLUDE_LIBUTIL_H */
+diff --git a/tools/libxc/include/xenguest.h b/tools/libxc/include/xenguest.h
+index 40902ee..8a47ff0 100644
+--- a/tools/libxc/include/xenguest.h
++++ b/tools/libxc/include/xenguest.h
+@@ -30,7 +30,7 @@
+ #define XCFLAGS_STDVGA    (1 << 3)
+ #define XCFLAGS_CHECKPOINT_COMPRESS    (1 << 4)
+ 
+-#define X86_64_B_SIZE   64 
++#define X86_64_B_SIZE   64
+ #define X86_32_B_SIZE   32
+ 
+ /*
+diff --git a/tools/xenguest/Makefile b/tools/xenguest/Makefile
+index daaa3ba..74d78ef 100644
+--- a/tools/xenguest/Makefile
++++ b/tools/xenguest/Makefile
+@@ -14,9 +14,9 @@ all: build
+ .PHONY: build
+ build: $(PROGRAMS)
+ 
+-xenguest: xenguest.o xenguest_stubs.o
++xenguest: xenguest.o xenguest_stubs.o control.o
+ 	$(CC) $(CFLAGS) -o $@ $(LDFLAGS) $^ \
+-		$(LDLIBS_libxentoollog) $(LDLIBS_libxenctrl) $(LDLIBS_libxenguest) $(LDLIBS_libxenstore)
++		$(LDLIBS_libxentoollog) $(LDLIBS_libxenctrl) $(LDLIBS_libxenguest) $(LDLIBS_libxenstore) -ljson-c -pthread
+ 
+ .PHONY: install
+ install: build
+diff --git a/tools/xenguest/control.c b/tools/xenguest/control.c
+new file mode 100644
+index 0000000..a982483
+--- /dev/null
++++ b/tools/xenguest/control.c
+@@ -0,0 +1,506 @@
++#include <stdio.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <string.h>
++  
++#include <string.h>   //strlen
++#include <stdlib.h>
++#include <errno.h>
++#include <arpa/inet.h>    //close
++#include <netinet/in.h>
++#include <sys/time.h> //FD_SET, FD_ISSET, FD_ZERO macros
++#include <pthread.h>
++#include <time.h>
++#include <inttypes.h>
++#include <json/json.h>
++
++#include "control.h"
++
++#define UNIX_PATH_MAX 128
++
++#define ERR(...) {printf(__VA_ARGS__); printf("\n"); }
++#define INFO(...) {printf(__VA_ARGS__); printf("\n"); }
++#define ERRN(str1) printf("%s: %s failed with err %s", __func__, str1, strerror(errno));
++
++EMP_COMMANDS(commands);
++/*
++struct command_actions myactions[] = {
++    {cmd_migrate_abort,    &not_supported, 0 }, 
++    {cmd_migrate_init,     &not_supported, 0 },
++    {cmd_migrate_live,     &not_supported, 0 },
++    {cmd_migrate_pause,    &not_supported, 0 },
++    {cmd_migrate_paused,   &not_supported, 0 },
++    {cmd_migrate_progress, &not_supported, 0 },
++};
++*/
++#define max_clients 4
++static int client_socket[max_clients];
++static int chk[max_clients];
++
++static struct {
++   pthread_mutex_t lock;
++   struct command_actions *actions;
++} runstate;
++
++int reply(struct demu_client cli, char* msg)
++{
++    int num = cli.num;
++    int remaining;
++    int r = 0;
++    INFO("relpying to (%d,%d): %s",num, cli.chk, msg);
++    if ( chk[num] != cli.chk) {
++        ERR("Waring: client (%d,%d) disconnected\n", num, cli.chk);
++        errno=EPIPE;
++        return -1;
++    }
++    remaining = strlen(msg);
++    while (remaining > 0) {
++       r = send(client_socket[num] , &msg[remaining-strlen(msg)] , remaining , MSG_NOSIGNAL );
++       if (r < 0)
++       {
++          ERR("write to client (%d,%d) failed with %s", num, cli.chk, strerror(errno));
++         return r;
++       }
++       remaining-=r;
++    }
++    return r;
++}
++
++int send_return(struct demu_client cli, char* ret)
++{
++   char msg[256];
++   sprintf(msg, "{ \"return\" : %s }\n", (ret)?ret:"{}");
++   return reply(cli, msg);
++}
++
++/*
++
++Example:
++
++{"timestamp": {"seconds": 1432121972, "microseconds": 744001},
++ "event": "MIGRATION", "data": {"status": "completed"}}
++
++
++*/
++int sent_event_migrate_completed(struct demu_client cli)
++{
++   char msg[256];
++   INFO("Sending event");
++   sprintf(msg, "{ \"event\" : \"MIGRATION\", \"data\": {\"status\":\"completed\"}}}\n");
++   return reply(cli, msg);
++}
++
++int send_event(struct demu_client cli, char* ret)
++{
++   char msg[256];
++   sprintf(msg, "{ \"event\" : %s }\n", (ret)?ret:"{}");
++   return reply(cli, msg);
++}
++
++
++
++
++
++int send_error(struct demu_client cli, char* ret)
++{
++   char msg[256];
++   sprintf(msg, "{ \"error\" : \"%s\" }\n", ret);
++   return reply(cli, msg);
++}
++
++
++int run_in_thread(void *(*func) (struct threadargs *), struct threadargs *args)
++{
++   struct threadargs *targs;
++   pthread_t thread;
++   int rc;
++   void *(*vfunc) (void *);
++   vfunc = (void *(*) (void *)) func;
++
++   targs = malloc(sizeof(struct threadargs));
++   targs->cli = args->cli;
++   targs->fd = args->fd;
++   targs->lock = &runstate.lock;
++
++   pthread_mutex_lock(targs->lock);
++
++   rc = pthread_create(&thread, NULL, vfunc, targs);
++   if (rc == 0)
++       pthread_detach(thread);
++   else {
++      pthread_mutex_unlock(&runstate.lock);
++      if (args->fd != -1)
++          close(args->fd);
++      send_error(args->cli, "thread fail");
++   }
++   return rc;
++}
++
++int json_get_command(json_object * jobj, const char **cmd, json_object **params)
++{
++ *params=NULL;
++ *cmd=NULL;
++
++ json_object_object_foreach(jobj, key, val) {
++
++ if ((strcmp(key, "execute") == 0) && (json_object_get_type(val) == json_type_string)) {
++      if (*cmd)
++          return -1;
++      else
++          *cmd = json_object_get_string(val);
++ } else if ((strcmp(key, "arguments") == 0) && (json_object_get_type(val) == json_type_object)) {
++      if (*params) {
++          return -1;
++      }
++      else
++          *params= val;
++ } else
++     return -1;
++
++ }
++ if (*cmd == NULL)
++    return -1;
++
++ return 0;
++}
++
++int get_string(char *in_string, char **out_string, int *len) {
++   int i;
++   *out_string = in_string;
++   for (i = 0; in_string[i] > 0x20; i++);
++   *len = i;
++   return (i == 0);
++}
++
++
++static void process_message(struct demu_client cli, char* msg, int sent_fd)
++{
++   int rc=1;
++   int i;
++   int need_fd;
++   enum command_num cmd;
++   struct threadargs targs;
++   const char *cmd_str;
++   json_object *jobj;
++   json_object *params;
++
++   INFO("On (%d,%d) got message '%s'", cli.num, cli.chk,  msg);
++
++   jobj = json_tokener_parse(msg);
++
++   if (jobj==NULL) {
++       printf("Bad json!\n");
++       return;
++   }
++   if (json_get_command(jobj, &cmd_str, &params)) {
++       send_error(cli, "Invalid EMP");
++     return;
++   }
++
++   for (i=0; i < cmd_number; i++) {
++     rc = strcmp(cmd_str, commands[i].name);
++     if (rc <= 0)
++        break;
++   }
++   if (rc != 0 ) {
++      send_error(cli, "Invalid command.");
++      return;
++   }
++   need_fd = commands[i].fd;
++   cmd = commands[i].number;
++
++   targs.cli = cli;
++   targs.fd = sent_fd;
++   targs.lock = NULL;
++
++   for (i=0; i < cmd_number; i++) {
++       struct command_actions *action = &runstate.actions[i];
++     //  printf ("command %d == %d?\n", action->cmd , cmd);
++       if (action->cmd == cmd) {
++
++           if (need_fd)
++           {
++              if (sent_fd == -1) {
++                 send_error(cli, "Expected FD");
++                 return;
++              }
++              /* pack fd */
++           } else {
++              if (sent_fd != -1) {
++                 close(sent_fd);
++                 send_error(cli, "Unexpected FD");
++                 return;
++              }
++           }
++
++           if (action->in_thread)
++                 run_in_thread(action->func, &targs);
++              else 
++                  action->func(&targs);
++           return;
++       }
++   }
++   send_error(cli, "Not Implemented.");
++   json_object_put (jobj);
++
++}
++
++static int recv_fd(int socket, char *message_buffer, size_t count, int* sent_fd)
++{
++   struct msghdr socket_message;
++   struct iovec io_vector[1];
++   struct cmsghdr *control_message = NULL;
++   char ancillary_element_buffer[CMSG_SPACE(sizeof(int))];
++   int bytes;
++   *sent_fd = -1;
++
++   /* start clean */
++   memset(&socket_message, 0, sizeof(struct msghdr));
++   memset(ancillary_element_buffer, 0, CMSG_SPACE(sizeof(int)));
++
++   /* setup a place to fill in message contents */
++   io_vector[0].iov_base = message_buffer;
++   io_vector[0].iov_len = count;
++   socket_message.msg_iov = io_vector;
++   socket_message.msg_iovlen = 1;
++
++   /* provide space for the ancillary data */
++   socket_message.msg_control = ancillary_element_buffer;
++   socket_message.msg_controllen = CMSG_SPACE(sizeof(int));
++   bytes = recvmsg(socket, &socket_message, MSG_CMSG_CLOEXEC);
++   if (bytes <= 0) {
++      return bytes;
++   }
++
++   if((socket_message.msg_flags & MSG_CTRUNC) == MSG_CTRUNC)
++   {
++      /* we did not provide enough space for the ancillary element array */
++      errno=EMSGSIZE;
++      return -1;
++   }
++
++   /* iterate ancillary elements */
++   for(control_message = CMSG_FIRSTHDR(&socket_message);
++       control_message != NULL;
++       control_message = CMSG_NXTHDR(&socket_message, control_message))
++   {
++      if( (control_message->cmsg_level == SOL_SOCKET) &&
++          (control_message->cmsg_type == SCM_RIGHTS) )
++      {
++         *sent_fd = *((int *) CMSG_DATA(control_message));
++         return bytes;
++      }
++   }
++   return bytes;
++}
++
++
++/* start here */
++
++int control_sock_init(char* socket_name, struct control_sock_inf *inf, struct command_actions actions[])
++{
++   int i;
++   int opt = TRUE;
++   int r;
++
++   runstate.actions = actions;
++
++   if (( r = pthread_mutex_init(&runstate.lock, NULL))) {
++        ERR("mutex init failed - %s \n", strerror(r));
++        return 1;
++   }
++
++   //initialise all client_socket[] to 0 so not checked
++   for (i = 0; i < max_clients; i++)
++   {
++       client_socket[i] = 0;
++       chk[i] = 0;
++   }
++
++   inf->master_socket = socket(PF_UNIX, SOCK_STREAM, 0);
++   if(inf->master_socket < 0)
++   {
++        ERRN("socket()");
++        return -1;
++   }
++
++   unlink(socket_name);
++
++   if( setsockopt(inf->master_socket, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt)) < 0 )
++   {
++        ERRN("setsockopt()");
++        return -1;
++   }
++
++   /* start with a clean address structure */
++   memset(&inf->address, 0, sizeof(struct sockaddr_un));
++
++   inf->address.sun_family = AF_UNIX;
++   snprintf(inf->address.sun_path, UNIX_PATH_MAX, "%s", socket_name);
++
++   if(bind(inf->master_socket,
++           (struct sockaddr *) &inf->address,
++           sizeof(struct sockaddr_un)) != 0)
++   {
++         ERR("bind() to %s failed with %s", socket_name, strerror(errno));
++         return -1;
++   }
++
++   //try to specify maximum of 3 pending connections for the master socket
++   if (listen(inf->master_socket, 3) < 0)
++   {
++        ERRN("listen()");
++        exit(EXIT_FAILURE);
++   }
++
++   inf->next_chk=1;
++   return 0;
++}
++
++int control_fdset(struct control_sock_inf *inf, fd_set *fds)
++{
++    int max_fd;
++    int client;
++    int fd;
++
++    //add master socket to set
++    FD_SET(inf->master_socket, fds);
++    max_fd = inf->master_socket;
++
++
++    //add child sockets to set
++    for ( client = 0 ; client < max_clients ; client++)
++        {
++            //socket descriptor
++            fd = client_socket[client];
++
++            //if valid socket descriptor then add to read list
++            if(fd > 0)
++                FD_SET( fd , fds);
++
++            //highest file descriptor number, need it for the select function
++            if(fd > max_fd)
++                max_fd = fd;
++        }
++
++    return max_fd;
++
++}
++
++int control_fdread(struct control_sock_inf *inf, fd_set *fds, int activity)
++{
++    int  new_socket;
++    int i;
++    int addrlen = sizeof(inf->address);
++
++        if (FD_ISSET(inf->master_socket, fds)) 
++        {
++         //If something happened on the master socket , then its an incoming connection
++            int added = 0;
++            if ((new_socket = accept(inf->master_socket, (struct sockaddr *)&inf->address, (socklen_t*)&addrlen)) < 0)
++            {
++              ERRN("accept()");
++            } else {
++
++               //add new socket to array of sockets
++               for (i = 0; i < max_clients; i++) 
++               {
++                  //if position is empty
++                  if( client_socket[i] == 0 )
++                  {
++                    int nchk= inf->next_chk;
++                    client_socket[i] = new_socket;
++
++                    chk[i]= nchk++;
++                    inf->next_chk = (nchk) ? nchk : 1;
++                    ERR("Adding client on fd %d as (%d,%d)" , new_socket, i, chk[i]);
++                    added=1;
++                    break;
++                  }
++               }
++               if (!added) {
++                   ERR("WARNING: Failed to find slot for client on fd %d", new_socket);
++               }
++            }
++            activity--;
++        }
++
++        // Look for input from existing clients
++        for (i = 0; (activity >= 0) && (i < max_clients); i++) 
++        {
++            int fd = client_socket[i];
++
++            if (FD_ISSET( fd , fds)) 
++            {
++                int sent_fd = -1;
++                int valread;
++                char buffer[128];
++
++                valread = recv_fd(fd, buffer, 128, &sent_fd);
++
++                // If valread ==0, client disconnected
++                if (valread == 0)
++                {
++                    INFO("Host disconnected fd %d  (%d,%d)" , fd, i, chk[i]);
++
++                    //Close the socket and mark as 0 in list for reuse
++                    close( fd );
++                    client_socket[i] = 0;
++                    chk[i]=0;
++                }
++                else if (valread <0)
++                {
++                    ERR("Reading value on %d (%d,%d): %d failed with %s", fd,i, chk[i], valread, strerror(errno));
++                }
++                else
++                {
++                    //Prepare message, and send for processing.
++                    struct demu_client dc = { .num = i, .chk= chk[i] };
++                    buffer[valread] = '\0';
++                    process_message(dc, buffer, sent_fd);
++                }
++            activity--;
++            }
++        }
++    return activity;
++}
++
++#if 0
++int main()
++{
++   struct control_sock_inf cs_inf;
++   int rc;
++
++   if (control_sock_init("./control",&cs_inf, myactions))
++       return 1;
++
++   for (;;) {
++
++        fd_set          rfds;
++        fd_set          wfds;
++        fd_set          xfds;
++        int             nfds;
++//        struct timeval  tv;
++
++        FD_ZERO(&rfds);
++        FD_ZERO(&wfds);
++        FD_ZERO(&xfds);
++//        tv.tv_sec = 10;
++//        tv.tv_usec = 0;
++
++        nfds = control_fdset(&cs_inf, &rfds);
++        nfds++;
++        rc = select(nfds, &rfds, &wfds, &xfds, NULL);
++
++        if (rc < 0 && errno != EINTR)
++            break;
++
++        if ( rc > 0)
++               rc = control_fdread(&cs_inf, &rfds, rc);
++
++    }
++    return 1;
++}
++#endif
+diff --git a/tools/xenguest/control.h b/tools/xenguest/control.h
+new file mode 100644
+index 0000000..304f4d1
+--- /dev/null
++++ b/tools/xenguest/control.h
+@@ -0,0 +1,57 @@
++#include <sys/un.h>
++#include "emp.h"
++#include <json/json.h>
++struct demu_client {
++  int num;
++  int chk;
++};
++/*
++enum command_num {
++    cmd_migrate_abort,
++    cmd_migrate_init,
++    cmd_migrate_live,
++    cmd_migrate_pause,
++    cmd_migrate_paused,
++    cmd_migrate_progress,
++    cmd_quit,
++    cmd_number
++};
++#define EMP_COMMANDS(_cmd_name)                     \
++struct command_names _cmd_name[] = {                \
++    {"migrate_abort",0, cmd_migrate_abort},         \
++    {"migrate_init",1, cmd_migrate_init},           \
++    {"migrate_live",0, cmd_migrate_live},           \
++    {"migrate_pause",0, cmd_migrate_pause},         \
++    {"migrate_paused",0, cmd_migrate_paused},       \
++    {"migrate_progress",0, cmd_migrate_progress},   \
++    {"quit", 0, cmd_quit}                           \
++}
++*/
++struct threadargs {
++    struct demu_client cli;
++    int fd;
++    pthread_mutex_t *lock;
++};
++
++struct command_actions {
++   enum command_num cmd;
++   void* (*func)(struct threadargs *);
++   int in_thread;
++};
++
++
++struct control_sock_inf {
++
++   int master_socket;
++   struct sockaddr_un address;
++   int next_chk;
++};
++
++
++int control_sock_init(char *name, struct control_sock_inf *inf, struct command_actions actions[]);
++int control_fdset(struct control_sock_inf *inf, fd_set *fds);
++int control_fdread(struct control_sock_inf *inf, fd_set *fds, int activity);
++
++int sent_event_migrate_completed(struct demu_client cli);
++int send_return(struct demu_client cli, char* ret);
++int send_error(struct demu_client cli, char* ret);
+diff --git a/tools/xenguest/emp.h b/tools/xenguest/emp.h
+new file mode 100644
+index 0000000..a7f5630
+--- /dev/null
++++ b/tools/xenguest/emp.h
+@@ -0,0 +1,28 @@
++enum command_num {
++    cmd_migrate_abort,
++    cmd_migrate_init,
++    cmd_migrate_live,
++    cmd_migrate_pause,
++    cmd_migrate_paused,
++    cmd_migrate_progress,
++    cmd_quit,
++    cmd_number
++};
++
++struct command_names {
++   char *name;
++   char fd;
++   enum command_num number;
++};
++
++#define EMP_COMMANDS(_cmd_name)                     \
++struct command_names _cmd_name[] = {                \
++    {"migrate_abort",0, cmd_migrate_abort},         \
++    {"migrate_init",1, cmd_migrate_init},           \
++    {"migrate_live",0, cmd_migrate_live},           \
++    {"migrate_pause",0, cmd_migrate_pause},         \
++    {"migrate_paused",0, cmd_migrate_paused},       \
++    {"migrate_progress",0, cmd_migrate_progress},   \
++    {"quit", 0, cmd_quit}                           \
++}
++
+diff --git a/tools/xenguest/xenguest.c b/tools/xenguest/xenguest.c
+index 8998dd1..6abb6a4 100644
+--- a/tools/xenguest/xenguest.c
++++ b/tools/xenguest/xenguest.c
+@@ -14,8 +14,11 @@
+ #include <xenctrl.h>
+ #include <xenguest.h>
+ #include <xenstore.h>
+-
++#include <libgen.h>
++#include <sys/stat.h>
++#include <semaphore.h>
+ #include "xg_internal.h"
++#include "control.h"
+ 
+ /*
+  * Xapi uses a strange protocol to communicate which xenguest, which seems to
+@@ -89,6 +92,7 @@ static const char *xg_mode_names[] = {
+     [XG_MODE_LINUX_BUILD] = "linux_build",
+     [XG_MODE_HVM_BUILD] = "hvm_build",
+     [XG_MODE_TEST] = "test",
++    [XG_MODE_LISTEN] = "listen"
+ };
+ 
+ xc_interface *xch = NULL;
+@@ -537,6 +541,173 @@ static void do_test(void)
+     exit(1);
+ }
+ 
++static sem_t sem_stopped;
++//static sem_t sem_done;
++
++struct demu_client progress_cli;
++
++void* do_cmd_progress(struct threadargs *args)
++{
++/*    report_report = true; */
++//    sem_wait(&sem_done);
++    progress_cli = args->cli;
++    xg_info("setting progress_cli to %d", progress_cli.num);
++    send_return(args->cli, NULL);
++    return NULL;
++}
++
++static int running=1;
++
++void* do_cmd_quit(struct threadargs *args)
++{
++   send_return(args->cli, NULL);
++   running = 0;
++   return NULL;
++}
++
++
++void* not_supported(struct threadargs *args)  {
++   xg_err("Not supported");
++   send_error(args->cli, "Not supported");
++   return NULL;
++}
++
++
++void* do_migrate_init(struct threadargs *args)
++{
++
++   opt_fd = args->fd;
++   send_return(args->cli, NULL);
++   sem_init(&sem_stopped,0,0);
++//    sem_init(&sem_done,0,0);
++   progress_cli.num = -1;
++   return NULL;
++}
++
++int emu_suspend_callback(void *data)
++{
++  int r;
++  r=sem_wait(&sem_stopped);
++
++   return 1;
++}
++
++void* do_migrate_live(struct threadargs *args)
++{
++   send_return(args->cli, NULL);
++
++   emu_stub_xc_domain_save(opt_fd, 0, 0, opt_flags, true);
++//   sem_post(&sem_done);
++  if (progress_cli.num >= 0)
++       sent_event_migrate_completed(progress_cli);
++  else
++      xg_info("No cli watching");
++
++
++   return NULL;
++}
++
++void* do_migrate_paused(struct threadargs *args)
++{
++   send_return(args->cli, NULL);
++   sem_post(&sem_stopped);
++   return NULL;
++}
++struct command_actions actions[] = {
++    {cmd_migrate_abort,    &not_supported, 0 },
++    {cmd_migrate_init,     &do_migrate_init, 0 },
++    {cmd_migrate_live,     &do_migrate_live, 1 },
++    {cmd_migrate_pause,    &not_supported, 0 },
++    {cmd_migrate_paused,   &do_migrate_paused, 0 },
++    {cmd_migrate_progress, &do_cmd_progress,  0 },
++    {cmd_quit,             &do_cmd_quit,      0 }
++};
++
++
++static void do_listen(void)
++{
++/*
++"migrate_init"-> stash.
++"Migrte_live" -> do_migrate
++"migrate_pause" -> maby stop living, and wait.
++"migrate_paused" -> stop and copy migrate. (stop waiting)
++"migate_progress" -> set bool, tranmit progess
++*/
++#define CONTROL_PATH "/var/xen/%s/%d/control"
++
++struct control_sock_inf cs_inf;
++   int rc;
++   char* fname;
++   char* path;
++   int r;
++
++
++   r = mkdir("/var/xen/xenguest", S_IRWXU | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
++
++   if (r!=0 && errno != EEXIST) {
++      xg_err("Couldn't create directory, %d", errno);
++      return;
++   }
++
++   r = asprintf(&fname, CONTROL_PATH, "xenguest", domid);
++
++   if (r<0) {
++        xg_err("no memory (fname)");
++        return;
++   }
++   path = strdup(fname);
++
++   if (path==NULL) {
++       xg_err("no memory (path)");
++       free(fname);
++       return;
++   }
++
++   r = mkdir(dirname(path), S_IRWXU | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
++   free(path);
++
++   if ((r!=0 && errno!= EEXIST)){
++        xg_err("could not make directory, %d", errno);
++        free(fname);
++        return;
++   }
++
++   r = control_sock_init(fname, &cs_inf, actions);
++   free(fname);
++
++   if (r) {
++       xg_err("control socket failed");
++       return;
++   }
++//write(opt_controloutfd,"Greetings!\n", 12);
++   printf("Ready\n");
++   for (;running;) {
++        fd_set          rfds;
++        fd_set          wfds;
++        fd_set          xfds;
++        int             nfds;
++/*        struct timeval  tv; */
++
++        FD_ZERO(&rfds);
++        FD_ZERO(&wfds);
++        FD_ZERO(&xfds);
++/*        tv.tv_sec = 10;
++        tv.tv_usec = 0; */
++
++        nfds = control_fdset(&cs_inf, &rfds);
++        nfds++;
++        rc = select(nfds, &rfds, &wfds, &xfds, NULL);
++
++        if (rc < 0 && errno != EINTR)
++            break;
++
++        if ( rc > 0)
++               rc = control_fdread(&cs_inf, &rfds, rc);
++
++    }
++
++}
++
+ int main(int argc, char * const argv[])
+ {
+     static char ident[32];
+@@ -586,6 +757,9 @@ int main(int argc, char * const argv[])
+         case XG_MODE_HVM_SAVE:
+             suffix = "-save";
+             break;
++        case XG_MODE_LISTEN:
++            suffix = "-esave";
++            break;
+ 
+         case XG_MODE_RESTORE:
+         case XG_MODE_HVM_RESTORE:
+@@ -672,6 +846,9 @@ int main(int argc, char * const argv[])
+     case XG_MODE_TEST:
+         do_test();
+         break;
++    case XG_MODE_LISTEN:
++        do_listen();
++        break;
+     }
+ 
+     free(xs_domain_path);
+diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
+index e3a14eb..66201e5 100644
+--- a/tools/xenguest/xenguest_stubs.c
++++ b/tools/xenguest/xenguest_stubs.c
+@@ -1068,6 +1068,31 @@ void migration_safety_checks(void)
+ 
+ #define GENERATION_ID_ADDRESS "hvmloader/generation-id-address"
+ 
++
++
++int emu_stub_xc_domain_save(int fd, int max_iters, int max_factors,
++                        int flags, int hvm)
++{
++    int r;
++    struct save_callbacks callbacks =
++        {
++            .suspend = emu_suspend_callback,
++            .switch_qemu_logdirty = switch_qemu_logdirty,
++            .data = NULL,
++        };
++
++    migration_safety_checks();
++
++    r = xc_domain_save(xch, fd, domid,
++                       max_iters, max_factors,
++                       flags, &callbacks, hvm, 0, -1);
++    if (r)
++        failwith_oss_xc("xc_domain_save");
++
++    return 0;
++}
++
++
+ int stub_xc_domain_save(int fd, int max_iters, int max_factors,
+                         int flags, int hvm)
+ {
+diff --git a/tools/xenguest/xg_internal.h b/tools/xenguest/xg_internal.h
+index c2cb248..0f7e5a5 100644
+--- a/tools/xenguest/xg_internal.h
++++ b/tools/xenguest/xg_internal.h
+@@ -15,6 +15,7 @@ enum xenguest_mode {
+     XG_MODE_LINUX_BUILD,
+     XG_MODE_HVM_BUILD,
+     XG_MODE_TEST,
++    XG_MODE_LISTEN,
+     XG_MODE__END__,
+ };
+ 
+@@ -47,6 +48,12 @@ int stub_xc_hvm_build(int mem_max_mib, int mem_start_mib, const char *image_name
+                       int console_domid, unsigned long *store_mfn, unsigned long *console_mfn);
+ int stub_xc_domain_save(int fd, int max_iters, int max_factors,
+                         int flags, int hvm);
++
++
++int emu_stub_xc_domain_save(int fd, int max_iters, int max_factors,
++                        int flags, int hvm);
++
++
+ int stub_xc_domain_restore(int fd, int store_evtchn, int console_evtchn,
+                            int hvm,
+                            unsigned long *store_mfn, unsigned long *console_mfn);
+@@ -54,6 +61,9 @@ int stub_xc_domain_resume_slow(void);
+ 
+ int suspend_callback(void *data);
+ 
++int emu_suspend_callback(void *data);
++
++
+ void setup_legacy_conversion(int opt_fd, enum xenguest_mode mode);
+ void cleanup_legacy_conversion(void);
+ 

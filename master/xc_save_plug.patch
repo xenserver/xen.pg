@@ -1,0 +1,225 @@
+diff --git a/tools/libxc/include/xenguest.h b/tools/libxc/include/xenguest.h
+index 1641dff..20d73dd 100644
+--- a/tools/libxc/include/xenguest.h
++++ b/tools/libxc/include/xenguest.h
+@@ -39,6 +39,14 @@
+  */
+ struct xenevtchn_handle;
+ 
++/* For save's precopy_policy(). */
++struct precopy_stats
++{
++    unsigned iteration;
++    unsigned total_written;
++    long dirty_count; /* -1 if unknown */
++};
++
+ /* callbacks provided by xc_domain_save */
+ struct save_callbacks {
+     /* Called after expiration of checkpoint interval,
+@@ -46,6 +54,17 @@ struct save_callbacks {
+      */
+     int (*suspend)(void* data);
+ 
++    /* Called after every batch of page data sent during the precopy phase of a
++     * live migration to ask the caller what to do next based on the current
++     * state of the precopy migration.
++     */
++#define XGS_POLICY_ABORT          (-1) /* Abandon the migration entirely and
++                                        * tidy up. */
++#define XGS_POLICY_CONTINUE_PRECOPY 0  /* Remain in the precopy phase. */
++#define XGS_POLICY_STOP_AND_COPY    1  /* Immediately suspend and transmit the
++                                        * remaining dirty pages. */
++    int (*precopy_policy)(struct precopy_stats stats, void *data);
++
+     /* Called after the guest's dirty pages have been
+      *  copied into an output buffer.
+      * Callback function resumes the guest & the device model,
+diff --git a/tools/libxc/xc_sr_common.h b/tools/libxc/xc_sr_common.h
+index a83f22a..2bc261b 100644
+--- a/tools/libxc/xc_sr_common.h
++++ b/tools/libxc/xc_sr_common.h
+@@ -198,12 +198,11 @@ struct xc_sr_context
+             /* Further debugging information in the stream. */
+             bool debug;
+ 
+-            /* Parameters for tweaking live migration. */
+-            unsigned max_iterations;
+-            unsigned dirty_threshold;
+-
+             unsigned long p2m_size;
+ 
++            struct precopy_stats stats;
++            int policy_decision;
++
+             xen_pfn_t *batch_pfns;
+             unsigned nr_batch_pfns;
+             unsigned long *deferred_pages;
+diff --git a/tools/libxc/xc_sr_save.c b/tools/libxc/xc_sr_save.c
+index acf2059..08f72e3 100644
+--- a/tools/libxc/xc_sr_save.c
++++ b/tools/libxc/xc_sr_save.c
+@@ -452,8 +452,7 @@ static int update_progress_string(struct xc_sr_context *ctx,
+     xc_interface *xch = ctx->xch;
+     char *new_str = NULL;
+ 
+-    if ( asprintf(&new_str, "Frames iteration %u of %u",
+-                  iter, ctx->save.max_iterations) == -1 )
++    if ( asprintf(&new_str, "Frames iteration %u", iter) == -1 )
+     {
+         PERROR("Unable to allocate new progress string");
+         return -1;
+@@ -467,6 +466,25 @@ static int update_progress_string(struct xc_sr_context *ctx,
+ }
+ 
+ /*
++ * This is the live migration precopy policy - it's called periodically during
++ * the precopy phase of live migrations, and is responsible for deciding when
++ * the precopy phase should terminate and what should be done next.
++ *
++ * The policy implemented here behaves identically to the policy previously
++ * hard-coded into xc_domain_save() - it proceeds to the stop-and-copy phase of
++ * the live migration when there are either fewer than 50 dirty pages, or more
++ * than 5 precopy rounds have completed.
++ */
++static int simple_precopy_policy(
++    struct precopy_stats stats, void *user)
++{
++    return ((stats.dirty_count >= 0 && stats.dirty_count < 50) ||
++            stats.iteration >= 5)
++        ? XGS_POLICY_STOP_AND_COPY
++        : XGS_POLICY_CONTINUE_PRECOPY;
++}
++
++/*
+  * Send memory while guest is running.
+  */
+ static int send_memory_live(struct xc_sr_context *ctx)
+@@ -474,21 +492,62 @@ static int send_memory_live(struct xc_sr_context *ctx)
+     xc_interface *xch = ctx->xch;
+     xc_shadow_op_stats_t stats = { 0, ctx->save.p2m_size };
+     char *progress_str = NULL;
+-    unsigned x;
++    unsigned x=0;
+     int rc;
++    int policy_decision;
++
++    DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
++                                    &ctx->save.dirty_bitmap_hbuf);
++
++    int (*precopy_policy)(struct precopy_stats, void *) =
++        ctx->save.callbacks->precopy_policy;
++    void *data = ctx->save.callbacks->data;
++
++    struct precopy_stats *policy_stats;
+ 
+     rc = update_progress_string(ctx, &progress_str, 0);
+     if ( rc )
+         goto out;
+ 
+-    rc = send_all_pages(ctx);
+-    if ( rc )
+-        goto out;
++    ctx->save.stats = (struct precopy_stats)
++        {
++            .iteration     = x,
++            .total_written = 0,
++            .dirty_count   =ctx->save.p2m_size
++        };
++    policy_stats = &ctx->save.stats;
++
++    if (precopy_policy==NULL)
++         precopy_policy = simple_precopy_policy;
++
++    bitmap_set(dirty_bitmap, ctx->save.p2m_size);
++
++    do {
++        policy_decision = precopy_policy(*policy_stats, data);
++        x++;
++
++        if ( stats.dirty_count > 0 && policy_decision != XGS_POLICY_ABORT ) {
++            rc = update_progress_string(ctx, &progress_str, x);
++            if ( rc )
++                goto out;
++
++            rc = send_dirty_pages(ctx, stats.dirty_count);
++            if ( rc )
++                goto out;
++        }
++
++        if (policy_decision!=XGS_POLICY_CONTINUE_PRECOPY)
++            break;
++
++        policy_stats->iteration     = x;
++        policy_stats->total_written += policy_stats->dirty_count;
++        policy_stats->dirty_count   = -1;
++
++        policy_decision = precopy_policy(*policy_stats, data);
++
++        if (policy_decision!=XGS_POLICY_CONTINUE_PRECOPY)
++           break;
+ 
+-    for ( x = 1;
+-          ((x < ctx->save.max_iterations) &&
+-           (stats.dirty_count > ctx->save.dirty_threshold)); ++x )
+-    {
+         if ( xc_shadow_control(
+                  xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
+                  &ctx->save.dirty_bitmap_hbuf, ctx->save.p2m_size,
+@@ -499,17 +558,9 @@ static int send_memory_live(struct xc_sr_context *ctx)
+             goto out;
+         }
+ 
+-        if ( stats.dirty_count == 0 )
+-            break;
+-
+-        rc = update_progress_string(ctx, &progress_str, x);
+-        if ( rc )
+-            goto out;
++        policy_stats->dirty_count   = stats.dirty_count;
+ 
+-        rc = send_dirty_pages(ctx, stats.dirty_count);
+-        if ( rc )
+-            goto out;
+-    }
++    } while (true);
+ 
+  out:
+     xc_set_progress_prefix(xch, NULL);
+@@ -601,7 +652,7 @@ static int suspend_and_send_dirty(struct xc_sr_context *ctx)
+     if ( ctx->save.live )
+     {
+         rc = update_progress_string(ctx, &progress_str,
+-                                    ctx->save.max_iterations);
++                                    ctx->save.stats.iteration);
+         if ( rc )
+             goto out;
+     }
+@@ -937,15 +988,6 @@ int xc_domain_save(xc_interface *xch, int io_fd, uint32_t dom,
+            stream_type == XC_MIG_STREAM_REMUS ||
+            stream_type == XC_MIG_STREAM_COLO);
+ 
+-    /*
+-     * TODO: Find some time to better tweak the live migration algorithm.
+-     *
+-     * These parameters are better than the legacy algorithm especially for
+-     * busy guests.
+-     */
+-    ctx.save.max_iterations = 5;
+-    ctx.save.dirty_threshold = 50;
+-
+     /* Sanity checks for callbacks. */
+     if ( hvm )
+         assert(callbacks->switch_qemu_logdirty);
+diff --git a/tools/libxl/libxl_dom_save.c b/tools/libxl/libxl_dom_save.c
+index 579039f..bb6a1e4 100644
+--- a/tools/libxl/libxl_dom_save.c
++++ b/tools/libxl/libxl_dom_save.c
+@@ -400,6 +400,7 @@ void libxl__domain_save(libxl__egc *egc, libxl__domain_save_state *dss)
+     if (dss->checkpointed_stream == LIBXL_CHECKPOINTED_STREAM_NONE)
+         callbacks->suspend = libxl__domain_suspend_callback;
+ 
++    callbacks->precopy_policy = NULL;
+     callbacks->switch_qemu_logdirty = libxl__domain_suspend_common_switch_qemu_logdirty;
+ 
+     dss->sws.ao  = dss->ao;
