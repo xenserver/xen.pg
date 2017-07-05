@@ -73,14 +73,13 @@ BuildRequires: figlet
 BuildRequires: e2fsprogs-devel
 %if 0%{?centos}%{!?centos:5} < 6 && 0%{?rhel}%{!?rhel:5} < 6
 
-# For xenguest
-
-BuildRequires: json-c-devel
-
 #libext4fs
 BuildRequires: e4fsprogs-devel
 %endif
 BuildRequires: lzo-devel
+
+# For xenguest
+BuildRequires: json-c-devel
 
 # Misc
 BuildRequires: libtool
