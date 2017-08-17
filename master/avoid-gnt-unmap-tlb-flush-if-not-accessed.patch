@@ -3,10 +3,18 @@ xen/gnttab: Avoid TLB flush if grant mapped page was not accessed
 Implement an optimisation to avoid a TLB flush if the grant mapped page was
 not accessed whilst it was mapped.
 
+According to "AMD64 Architecture Programmer’s Manual Volume 2: System
+Programming" (2017 Mar) Chapter "5.4.2 Notes on Accessed and Dirty Bits",
+"The processor does not order Accessed bit updates with respect to loads
+done by other instructions". This means Xen cannot rely on Accessed bit
+value int a PTE. Skip TLB flush optimization if running on AMD CPU by
+unconditionally setting page_accessed to 1.
+
 Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
 
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 0426b6e..12cd1fa 100644
+index 0426b6e00d..0001ee8b16 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
 @@ -4132,7 +4132,8 @@ static int create_grant_va_mapping(
@@ -19,7 +27,7 @@ index 0426b6e..12cd1fa 100644
  {
      l1_pgentry_t *pl1e, ol1e;
      unsigned long gl1mfn;
-@@ -4178,12 +4179,13 @@ static int replace_grant_va_mapping(
+@@ -4178,13 +4179,18 @@ static int replace_grant_va_mapping(
      }
  
      /* Delete pagetable entry. */
@@ -30,11 +38,16 @@ index 0426b6e..12cd1fa 100644
          rc = GNTST_general_error;
          goto unlock_and_out;
      }
-+    *page_accessed = !!(l1e_get_flags(*pl1e) & _PAGE_ACCESSED);
  
++    if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
++        *page_accessed = 1;
++    else
++        *page_accessed = !!(l1e_get_flags(*pl1e) & _PAGE_ACCESSED);
++
   unlock_and_out:
      page_unlock(l1pg);
-@@ -4194,9 +4196,9 @@ static int replace_grant_va_mapping(
+     put_page(l1pg);
+@@ -4194,9 +4200,9 @@ static int replace_grant_va_mapping(
  }
  
  static int destroy_grant_va_mapping(
@@ -46,7 +59,7 @@ index 0426b6e..12cd1fa 100644
  }
  
  static int create_grant_p2m_mapping(uint64_t addr, unsigned long frame,
-@@ -4231,7 +4233,7 @@ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
+@@ -4231,7 +4237,7 @@ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
          return create_grant_p2m_mapping(addr, frame, flags, cache_flags);
  
      grant_pte_flags =
@@ -55,7 +68,7 @@ index 0426b6e..12cd1fa 100644
      if ( cpu_has_nx )
          grant_pte_flags |= _PAGE_NX_BIT;
  
-@@ -4282,7 +4284,8 @@ static int replace_grant_p2m_mapping(
+@@ -4282,7 +4288,8 @@ static int replace_grant_p2m_mapping(
  }
  
  int replace_grant_host_mapping(
@@ -65,7 +78,7 @@ index 0426b6e..12cd1fa 100644
  {
      struct vcpu *curr = current;
      l1_pgentry_t *pl1e, ol1e;
-@@ -4303,7 +4306,7 @@ int replace_grant_host_mapping(
+@@ -4303,7 +4310,7 @@ int replace_grant_host_mapping(
      }
  
      if ( !new_addr )
@@ -74,7 +87,7 @@ index 0426b6e..12cd1fa 100644
  
      pl1e = guest_map_l1e(new_addr, &gl1mfn);
      if ( !pl1e )
-@@ -4351,7 +4354,7 @@ int replace_grant_host_mapping(
+@@ -4351,7 +4358,7 @@ int replace_grant_host_mapping(
      put_page(l1pg);
      guest_unmap_l1e(pl1e);
  
@@ -84,7 +97,7 @@ index 0426b6e..12cd1fa 100644
          put_page_from_l1e(ol1e, curr->domain);
  
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index f06b664..c4dc975 100644
+index f06b664d58..c4dc975936 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
 @@ -94,6 +94,7 @@ struct gnttab_unmap_common {
@@ -186,7 +199,7 @@ index f06b664..c4dc975 100644
  
  static int __init gnttab_usage_init(void)
 diff --git a/xen/include/asm-x86/grant_table.h b/xen/include/asm-x86/grant_table.h
-index 9ca631c..34fd833 100644
+index 9ca631c4e3..34fd833257 100644
 --- a/xen/include/asm-x86/grant_table.h
 +++ b/xen/include/asm-x86/grant_table.h
 @@ -16,7 +16,8 @@
