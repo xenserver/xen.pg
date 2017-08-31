@@ -91,77 +91,22 @@ index 37dd15f..16750e9 100644
  
  int osdep_hypercall(xencall_handle *xcall, privcmd_hypercall_t *hypercall);
  
-diff --git a/tools/libs/foreignmemory/core.c b/tools/libs/foreignmemory/core.c
-index a872b95..2150956 100644
---- a/tools/libs/foreignmemory/core.c
-+++ b/tools/libs/foreignmemory/core.c
-@@ -63,6 +63,11 @@ int xenforeignmemory_close(xenforeignmemory_handle *fmem)
-     return rc;
- }
- 
-+int xenforeignmemory_restrict(xenforeignmemory_handle *fmem, uint32_t dom)
-+{
-+    return osdep_xenforeignmemory_restrict(fmem, dom);
-+}
-+
- void *xenforeignmemory_map(xenforeignmemory_handle *fmem,
-                            uint32_t dom, int prot,
-                            size_t num,
-diff --git a/tools/libs/foreignmemory/include/xenforeignmemory.h b/tools/libs/foreignmemory/include/xenforeignmemory.h
-index 92b9277..5b202c9 100644
---- a/tools/libs/foreignmemory/include/xenforeignmemory.h
-+++ b/tools/libs/foreignmemory/include/xenforeignmemory.h
-@@ -73,6 +73,8 @@ xenforeignmemory_handle *xenforeignmemory_open(struct xentoollog_logger *logger,
-  */
- int xenforeignmemory_close(xenforeignmemory_handle *fmem);
- 
-+int xenforeignmemory_restrict(xenforeignmemory_handle *fmem, uint32_t domid);
-+
- /*
-  * Maps a range within one domain to a local address range.  Mappings
-  * must be unmapped with xenforeignmemory_unmap and should follow the
-diff --git a/tools/libs/foreignmemory/libxenforeignmemory.map b/tools/libs/foreignmemory/libxenforeignmemory.map
-index df206b3..fee3c6f 100644
---- a/tools/libs/foreignmemory/libxenforeignmemory.map
-+++ b/tools/libs/foreignmemory/libxenforeignmemory.map
-@@ -2,6 +2,7 @@ VERS_1.0 {
- 	global:
- 		xenforeignmemory_open;
- 		xenforeignmemory_close;
-+		xenforeignmemory_restrict;
- 		xenforeignmemory_map;
- 		xenforeignmemory_unmap;
- 	local: *; /* Do not expose anything by default */
 diff --git a/tools/libs/foreignmemory/linux.c b/tools/libs/foreignmemory/linux.c
-index 423c744..2b61e04 100644
+index 374e45a..484f9dc 100644
 --- a/tools/libs/foreignmemory/linux.c
 +++ b/tools/libs/foreignmemory/linux.c
-@@ -65,6 +65,11 @@ int osdep_xenforeignmemory_close(xenforeignmemory_handle *fmem)
-     return close(fd);
+@@ -274,7 +274,8 @@ int osdep_xenforeignmemory_unmap(xenforeignmemory_handle *fmem,
+ int osdep_xenforeignmemory_restrict(xenforeignmemory_handle *fmem,
+                                     domid_t domid)
+ {
+-    return ioctl(fmem->fd, IOCTL_PRIVCMD_RESTRICT, &domid);
++    struct privcmd_restrict_domid restrict_domid = { domid };
++    return ioctl(fmem->fd, IOCTL_PRIVCMD_RESTRICT_DOMID, &restrict_domid);
  }
  
-+int osdep_xenforeignmemory_restrict(xenforeignmemory_handle *fmem, uint32_t dom)
-+{
-+    struct privcmd_restrict_domid restrict_domid = { dom };
-+    return ioctl(fmem->fd, IOCTL_PRIVCMD_RESTRICT_DOMID, &restrict_domid);
-+}
- static int map_foreign_batch_single(int fd, uint32_t dom,
-                                     xen_pfn_t *mfn, unsigned long addr)
- {
-diff --git a/tools/libs/foreignmemory/private.h b/tools/libs/foreignmemory/private.h
-index 9cc7814..f8fcf67 100644
---- a/tools/libs/foreignmemory/private.h
-+++ b/tools/libs/foreignmemory/private.h
-@@ -24,6 +24,7 @@ struct xenforeignmemory_handle {
- 
- int osdep_xenforeignmemory_open(xenforeignmemory_handle *fmem);
- int osdep_xenforeignmemory_close(xenforeignmemory_handle *fmem);
-+int osdep_xenforeignmemory_restrict(xenforeignmemory_handle *fmem, uint32_t dom);
- 
- void *osdep_xenforeignmemory_map(xenforeignmemory_handle *fmem,
-                                  uint32_t dom, int prot,
+ /*
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index 7f68658..9696a69 100644
+index 9d62480..742110a 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
 @@ -182,6 +182,11 @@ enum xc_open_flags {
@@ -177,10 +122,10 @@ index 7f68658..9696a69 100644
   * HYPERCALL SAFE MEMORY BUFFER
   *
 diff --git a/tools/libxc/xc_private.c b/tools/libxc/xc_private.c
-index d57c39a..492097e 100644
+index 7bea1c5..97f1f80 100644
 --- a/tools/libxc/xc_private.c
 +++ b/tools/libxc/xc_private.c
-@@ -97,6 +97,12 @@ int xc_interface_close(xc_interface *xch)
+@@ -96,6 +96,12 @@ int xc_interface_close(xc_interface *xch)
      return rc;
  }
  
