@@ -4,12 +4,11 @@ Date: Thu, 17 Aug 2017 15:57:13 +0100
 Subject: [PATCH] hvmloader, libxl: use the correct ACPI settings depending on
  device model
 
-We need to choose ACPI tables and ACPI IO port location
-properly depending on the device model version we are running.
-Previously, this decision was made by BIOS type specific
-code in hvmloader, e.g. always load QEMU traditional specific
-tables if it's ROMBIOS and always load QEMU Xen specific
-tables if it's SeaBIOS.
+We need to choose ACPI tables properly depending on the device
+model version we are running. Previously, this decision was
+made by BIOS type specific code in hvmloader, e.g. always load
+QEMU traditional specific tables if it's ROMBIOS and always
+load QEMU Xen specific tables if it's SeaBIOS.
 
 This change saves this behavior (for compatibility) but adds
 an additional way (xenstore key) to specify the correct
@@ -39,10 +38,10 @@ index 78eb43d..9e95be0 100644
  
  #endif /* _ACPI_2_0_H_ */
 diff --git a/tools/firmware/hvmloader/acpi/build.c b/tools/firmware/hvmloader/acpi/build.c
-index faa3dd5..c98f753 100644
+index faa3dd5..5426e52 100644
 --- a/tools/firmware/hvmloader/acpi/build.c
 +++ b/tools/firmware/hvmloader/acpi/build.c
-@@ -517,6 +517,27 @@ void acpi_build_tables(struct acpi_config *config, unsigned int physical)
+@@ -517,6 +517,23 @@ void acpi_build_tables(struct acpi_config *config, unsigned int physical)
      unsigned long        secondary_tables[ACPI_MAX_SECONDARY_TABLES];
      int                  nr_secondaries, i;
  
@@ -54,8 +53,6 @@ index faa3dd5..c98f753 100644
 +        config->dsdt_anycpu_len = dsdt_anycpu_len;
 +        config->dsdt_15cpu = dsdt_15cpu;
 +        config->dsdt_15cpu_len = dsdt_15cpu_len;
-+
-+        hvm_param_set(HVM_PARAM_ACPI_IOPORTS_LOCATION, 0);
 +    }
 +    else if ( !strncmp(s, "qemu_xen", 9) )
 +    {
@@ -63,28 +60,13 @@ index faa3dd5..c98f753 100644
 +        config->dsdt_anycpu_len = dsdt_anycpu_qemu_xen_len;
 +        config->dsdt_15cpu = NULL;
 +        config->dsdt_15cpu_len = 0;
-+
-+        hvm_param_set(HVM_PARAM_ACPI_IOPORTS_LOCATION, 1);
 +    }
 +
      /* Allocate and initialise the acpi info area. */
      mem_hole_populate_ram(ACPI_INFO_PHYSICAL_ADDRESS >> PAGE_SHIFT, 1);
      acpi_info = (struct acpi_info *)ACPI_INFO_PHYSICAL_ADDRESS;
-diff --git a/tools/firmware/hvmloader/hvmloader.c b/tools/firmware/hvmloader/hvmloader.c
-index 716d03c..3b5f02e 100644
---- a/tools/firmware/hvmloader/hvmloader.c
-+++ b/tools/firmware/hvmloader/hvmloader.c
-@@ -321,8 +321,6 @@ int main(void)
-         }
- 
-         acpi_enable_sci();
--
--        hvm_param_set(HVM_PARAM_ACPI_IOPORTS_LOCATION, 1);
-     }
- 
-     init_vm86_tss();
 diff --git a/tools/firmware/hvmloader/ovmf.c b/tools/firmware/hvmloader/ovmf.c
-index db9fa7a..cdfb5c9 100644
+index db9fa7a..1e21939 100644
 --- a/tools/firmware/hvmloader/ovmf.c
 +++ b/tools/firmware/hvmloader/ovmf.c
 @@ -47,9 +47,6 @@
@@ -97,22 +79,13 @@ index db9fa7a..cdfb5c9 100644
  #define OVMF_INFO_MAX_TABLES 4
  struct ovmf_info {
      char signature[14]; /* XenHVMOVMF\0\0\0\0 */
-@@ -125,6 +122,8 @@ static void ovmf_acpi_build_tables(void)
-         .dsdt_15cpu_len = 0
-     };
- 
-+    hvm_param_set(HVM_PARAM_ACPI_IOPORTS_LOCATION, 1);
-+
-     acpi_build_tables(&config, ACPI_PHYSICAL_ADDRESS);
- }
- 
 diff --git a/tools/firmware/hvmloader/rombios.c b/tools/firmware/hvmloader/rombios.c
-index 1f15b94..722f931 100644
+index cc9cec1..fbdc461 100644
 --- a/tools/firmware/hvmloader/rombios.c
 +++ b/tools/firmware/hvmloader/rombios.c
-@@ -42,9 +42,6 @@
- #define ROMBIOS_MAXOFFSET      0x0000FFFF
- #define ROMBIOS_END            (ROMBIOS_BEGIN + ROMBIOS_SIZE)
+@@ -45,9 +45,6 @@
+ #define IGD_VBT_SIZE 0x1200
+ #define IGD_VBIOS_VBT_OFFSET 0x1A
  
 -extern unsigned char dsdt_anycpu[], dsdt_15cpu[];
 -extern int dsdt_anycpu_len, dsdt_15cpu_len;
@@ -120,17 +93,8 @@ index 1f15b94..722f931 100644
  static void rombios_setup_e820(void)
  {
      /*
-@@ -180,6 +177,8 @@ static void rombios_acpi_build_tables(void)
-         .dsdt_15cpu_len = dsdt_15cpu_len,
-     };
- 
-+    hvm_param_set(HVM_PARAM_ACPI_IOPORTS_LOCATION, 0);
-+
-     acpi_build_tables(&config, ACPI_PHYSICAL_ADDRESS);
- }
- 
 diff --git a/tools/firmware/hvmloader/seabios.c b/tools/firmware/hvmloader/seabios.c
-index c6b3d9f..436d44d 100644
+index c6b3d9f..b8679ff 100644
 --- a/tools/firmware/hvmloader/seabios.c
 +++ b/tools/firmware/hvmloader/seabios.c
 @@ -30,9 +30,6 @@
@@ -143,15 +107,6 @@ index c6b3d9f..436d44d 100644
  struct seabios_info {
      char signature[14]; /* XenHVMSeaBIOS\0 */
      uint8_t length;     /* Length of this struct */
-@@ -100,6 +97,8 @@ static void seabios_acpi_build_tables(void)
-         .dsdt_15cpu_len = 0,
-     };
- 
-+    hvm_param_set(HVM_PARAM_ACPI_IOPORTS_LOCATION, 1);
-+
-     acpi_build_tables(&config, rsdp);
-     add_table(rsdp);
- }
 diff --git a/tools/libxl/libxl_create.c b/tools/libxl/libxl_create.c
 index 7608f6a..13e1f82 100644
 --- a/tools/libxl/libxl_create.c
