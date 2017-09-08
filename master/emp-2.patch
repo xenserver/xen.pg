@@ -1,8 +1,32 @@
 diff --git a/tools/xenguest/control.c b/tools/xenguest/control.c
-index a982483..68e96a6 100644
+index a982483..4bd9475 100644
 --- a/tools/xenguest/control.c
 +++ b/tools/xenguest/control.c
-@@ -84,11 +84,26 @@ Example:
+@@ -18,11 +18,20 @@
+ 
+ #include "control.h"
+ 
++
++#include <xenctrl.h>
++#include <xenguest.h>
++#include <xenstore.h>
++
++#include "xg_internal.h"
++
++
+ #define UNIX_PATH_MAX 128
+ 
+-#define ERR(...) {printf(__VA_ARGS__); printf("\n"); }
+-#define INFO(...) {printf(__VA_ARGS__); printf("\n"); }
+-#define ERRN(str1) printf("%s: %s failed with err %s", __func__, str1, strerror(errno));
++#define ERR(...) {xg_err(__VA_ARGS__); }
++// #define INFO(...) {xg_info(__VA_ARGS__); }
++#define INFO(...)
++#define ERRN(str1) xg_err("%s: %s failed with err %s", __func__, str1, strerror(errno));
+ 
+ EMP_COMMANDS(commands);
+ /*
+@@ -84,11 +93,26 @@ Example:
  
  
  */
@@ -31,7 +55,7 @@ index a982483..68e96a6 100644
     return reply(cli, msg);
  }
  
-@@ -111,26 +126,53 @@ int send_error(struct demu_client cli, char* ret)
+@@ -111,26 +135,53 @@ int send_error(struct demu_client cli, char* ret)
  }
  
  
@@ -139,18 +163,67 @@ index a7f5630..c0f2b6b 100644
      {"migrate_paused",0, cmd_migrate_paused},       \
      {"migrate_progress",0, cmd_migrate_progress},   \
 diff --git a/tools/xenguest/xenguest.c b/tools/xenguest/xenguest.c
-index 6abb6a4..9bb4cef 100644
+index 6abb6a4..71293b6 100644
 --- a/tools/xenguest/xenguest.c
 +++ b/tools/xenguest/xenguest.c
-@@ -542,38 +542,36 @@ static void do_test(void)
+@@ -100,6 +100,16 @@ xs_handle *xsh = NULL;
+ int domid = -1;
+ bool force = false;
+ 
++static sem_t sem_stopped;
++static int live_stop = 0;
++//static sem_t sem_done;
++
++struct demu_client progress_cli;
++
++
++static uint64_t last_sent = 0;
++static int last_iter = 0;
++
+ void xg_err(const char *msg, ...)
+ {
+     char *buf = NULL;
+@@ -172,12 +182,29 @@ static void progressfn(struct xentoollog_logger *logger,
+                        int percent, unsigned long done, unsigned long total)
+ {
+     static struct timeval lasttime = { 0 };
++    static struct timeval lastprog = { 0 };
+     struct timeval curtime;
++    uint64_t time_delta;
+ 
+     gettimeofday(&curtime, NULL);
++    time_delta = tv_delta_us(&curtime, &lasttime);
++ 
++
++    if (progress_cli.num >= 0) {
++
++        if ( done == 0 || done == total ) {
++            lastprog = curtime;
++        } else if (tv_delta_us(&curtime, &lastprog) > 1UL * 500 * 1000){
++             /* Don't send dirty_conut, is out of date */
++//             xg_info("Sending stats data");
++             send_event_migrate_progress(progress_cli,  last_sent + done, -1 , last_iter);
++//             xg_info("finishd sending stats data");
++             lastprog = curtime;
++        }
++    }
+ 
+-    if ( (done == 0) || (done == total) ||
+-         (tv_delta_us(&curtime, &lasttime) > (5UL * 1000 * 1000)) )
++    if ( (( done == 0 || done == total ) && (time_delta > 1UL * 500 * 1000 ))
++         || (time_delta > 5UL * 1000 * 1000) )
+     {
+         if ( done == 0 && total == 0 )
+             xg_info("progress: %s\n", doing_what);
+@@ -541,39 +568,31 @@ static void do_test(void)
+     exit(1);
  }
  
- static sem_t sem_stopped;
-+static int live_stop = 0;
- //static sem_t sem_done;
- 
- struct demu_client progress_cli;
- 
+-static sem_t sem_stopped;
+-//static sem_t sem_done;
+-
+-struct demu_client progress_cli;
+-
 -void* do_cmd_progress(struct threadargs *args)
 +void do_cmd_progress(struct threadargs *args)
  {
@@ -186,7 +259,7 @@ index 6abb6a4..9bb4cef 100644
  {
  
     opt_fd = args->fd;
-@@ -581,45 +579,93 @@ void* do_migrate_init(struct threadargs *args)
+@@ -581,45 +600,96 @@ void* do_migrate_init(struct threadargs *args)
     sem_init(&sem_stopped,0,0);
  //    sem_init(&sem_done,0,0);
     progress_cli.num = -1;
@@ -214,6 +287,9 @@ index 6abb6a4..9bb4cef 100644
 +
 +    if (stats.dirty_count >= 0) {
 +        struct demu_client *cli = (struct demu_client *)user;
++        last_sent = stats.total_written;
++        last_iter = stats.iteration;
++
 +        xg_info("Checking live policy.  %ld / %d for %d", stats.dirty_count, stats.total_written ,stats.iteration);
 +        send_event_migrate_progress(*cli, stats.total_written, stats.dirty_count, stats.iteration);
 +    }
@@ -248,7 +324,7 @@ index 6abb6a4..9bb4cef 100644
 +       send_event_migrate_completed(progress_cli);
 +   else
 +       xg_info("No cli watching");
- 
++
 +}
 +
 +void do_migrate_nonlive(struct threadargs *args)
@@ -256,7 +332,7 @@ index 6abb6a4..9bb4cef 100644
 +   opt_flags &= ~XCFLAGS_LIVE;
 +
 +   send_return(args->cli, NULL);
-+
+ 
 +   emu_stub_xc_domain_save(opt_fd, (void*) &args->cli, opt_flags, true);
 +   xg_info(" Finished, send compleate");
 +   if (progress_cli.num >= 0)
