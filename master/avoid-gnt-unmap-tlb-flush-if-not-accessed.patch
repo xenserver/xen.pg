@@ -14,27 +14,41 @@ Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
 Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
 
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 0426b6e00d..0001ee8b16 100644
+index e97eccc..8224f43 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -4132,7 +4132,8 @@ static int create_grant_va_mapping(
- }
+@@ -4077,7 +4077,7 @@ static int destroy_grant_pte_mapping(
+     }
+ 
+     if ( unlikely((l1e_get_flags(ol1e) ^ grant_pte_flags) &
+-                  ~(_PAGE_AVAIL | PAGE_CACHE_ATTRS)) )
++                  ~(_PAGE_AVAIL | PAGE_CACHE_ATTRS | _PAGE_ACCESSED | _PAGE_DIRTY)) )
+         MEM_LOG("PTE flags %x at %"PRIx64" don't match grant (%x)\n",
+                 l1e_get_flags(ol1e), addr, grant_pte_flags);
+ 
+@@ -4158,7 +4158,7 @@ static int create_grant_va_mapping(
  
  static int replace_grant_va_mapping(
--    unsigned long addr, unsigned long frame, l1_pgentry_t nl1e, struct vcpu *v)
-+    unsigned long addr, unsigned long frame, l1_pgentry_t nl1e, struct vcpu *v,
-+    int *page_accessed)
+     unsigned long addr, unsigned long frame, unsigned int grant_pte_flags,
+-    l1_pgentry_t nl1e, struct vcpu *v)
++    l1_pgentry_t nl1e, struct vcpu *v, int *page_accessed)
  {
      l1_pgentry_t *pl1e, ol1e;
      unsigned long gl1mfn;
-@@ -4178,13 +4179,18 @@ static int replace_grant_va_mapping(
+@@ -4210,18 +4210,23 @@ static int replace_grant_va_mapping(
      }
+ 
+     if ( unlikely((l1e_get_flags(ol1e) ^ grant_pte_flags) &
+-                  ~(_PAGE_AVAIL | PAGE_CACHE_ATTRS)) )
++                  ~(_PAGE_AVAIL | PAGE_CACHE_ATTRS | _PAGE_ACCESSED | _PAGE_DIRTY)) )
+         MEM_LOG("PTE flags %x for %"PRIx64" don't match grant (%x)",
+                 l1e_get_flags(ol1e), addr, grant_pte_flags);
  
      /* Delete pagetable entry. */
 -    if ( unlikely(!UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, v, 0)) )
 +    if ( unlikely(!UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, v, 1)) )
      {
-         MEM_LOG("Cannot delete PTE entry at %p", (unsigned long *)pl1e);
+         MEM_LOG("Cannot delete PTE entry for %"PRIx64, addr);
          rc = GNTST_general_error;
          goto unlock_and_out;
      }
@@ -47,19 +61,20 @@ index 0426b6e00d..0001ee8b16 100644
   unlock_and_out:
      page_unlock(l1pg);
      put_page(l1pg);
-@@ -4194,9 +4200,9 @@ static int replace_grant_va_mapping(
- }
+@@ -4232,10 +4237,10 @@ static int replace_grant_va_mapping(
  
  static int destroy_grant_va_mapping(
--    unsigned long addr, unsigned long frame, struct vcpu *v)
-+    unsigned long addr, unsigned long frame, struct vcpu *v, int *page_accessed)
+     unsigned long addr, unsigned long frame, unsigned int grant_pte_flags,
+-    struct vcpu *v)
++    struct vcpu *v, int *page_accessed)
  {
--    return replace_grant_va_mapping(addr, frame, l1e_empty(), v);
-+    return replace_grant_va_mapping(addr, frame, l1e_empty(), v, page_accessed);
+     return replace_grant_va_mapping(addr, frame, grant_pte_flags,
+-                                    l1e_empty(), v);
++                                    l1e_empty(), v, page_accessed);
  }
  
  static int create_grant_p2m_mapping(uint64_t addr, unsigned long frame,
-@@ -4231,7 +4237,7 @@ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
+@@ -4270,7 +4275,7 @@ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
          return create_grant_p2m_mapping(addr, frame, flags, cache_flags);
  
      grant_pte_flags =
@@ -68,7 +83,7 @@ index 0426b6e00d..0001ee8b16 100644
      if ( cpu_has_nx )
          grant_pte_flags |= _PAGE_NX_BIT;
  
-@@ -4282,7 +4288,8 @@ static int replace_grant_p2m_mapping(
+@@ -4321,7 +4326,8 @@ static int replace_grant_p2m_mapping(
  }
  
  int replace_grant_host_mapping(
@@ -78,26 +93,28 @@ index 0426b6e00d..0001ee8b16 100644
  {
      struct vcpu *curr = current;
      l1_pgentry_t *pl1e, ol1e;
-@@ -4303,7 +4310,7 @@ int replace_grant_host_mapping(
+@@ -4361,7 +4367,8 @@ int replace_grant_host_mapping(
      }
  
      if ( !new_addr )
--        return destroy_grant_va_mapping(addr, frame, curr);
-+        return destroy_grant_va_mapping(addr, frame, curr, page_accessed);
+-        return destroy_grant_va_mapping(addr, frame, grant_pte_flags, curr);
++        return destroy_grant_va_mapping(addr, frame, grant_pte_flags,
++                                        curr, page_accessed);
  
      pl1e = guest_map_l1e(new_addr, &gl1mfn);
      if ( !pl1e )
-@@ -4351,7 +4358,7 @@ int replace_grant_host_mapping(
+@@ -4409,7 +4416,8 @@ int replace_grant_host_mapping(
      put_page(l1pg);
      guest_unmap_l1e(pl1e);
  
--    rc = replace_grant_va_mapping(addr, frame, ol1e, curr);
-+    rc = replace_grant_va_mapping(addr, frame, ol1e, curr, page_accessed);
+-    rc = replace_grant_va_mapping(addr, frame, grant_pte_flags, ol1e, curr);
++    rc = replace_grant_va_mapping(addr, frame, grant_pte_flags,
++                                  ol1e, curr, page_accessed);
      if ( rc && !paging_mode_refcounts(curr->domain) )
          put_page_from_l1e(ol1e, curr->domain);
  
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index f06b664d58..c4dc975936 100644
+index ab11bae..dd6f0f7 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
 @@ -94,6 +94,7 @@ struct gnttab_unmap_common {
@@ -121,7 +138,7 @@ index f06b664d58..c4dc975936 100644
  /* Number of unmap operations that are done between each tlb flush */
  #define GNTTAB_UNMAP_BATCH_SIZE 32
  
-@@ -1102,6 +1109,8 @@ __gnttab_unmap_common(
+@@ -1119,6 +1126,8 @@ __gnttab_unmap_common(
      ld = current->domain;
      lgt = ld->grant_table;
  
@@ -130,7 +147,7 @@ index f06b664d58..c4dc975936 100644
      if ( unlikely(op->handle >= lgt->maptrack_limit) )
      {
          gdprintk(XENLOG_INFO, "Bad handle (%d).\n", op->handle);
-@@ -1212,7 +1221,7 @@ __gnttab_unmap_common(
+@@ -1229,7 +1238,7 @@ __gnttab_unmap_common(
      {
          if ( (rc = replace_grant_host_mapping(op->host_addr,
                                                op->frame, op->new_addr, 
@@ -139,7 +156,7 @@ index f06b664d58..c4dc975936 100644
              goto act_release_out;
  
          map->flags &= ~GNTMAP_host_map;
-@@ -1370,28 +1379,42 @@ static long
+@@ -1387,28 +1396,42 @@ static long
  gnttab_unmap_grant_ref(
      XEN_GUEST_HANDLE_PARAM(gnttab_unmap_grant_ref_t) uop, unsigned int count)
  {
@@ -185,7 +202,7 @@ index f06b664d58..c4dc975936 100644
          for ( i = 0; i < partial_done; i++ )
              __gnttab_unmap_common_complete(&(common[i]));
  
-@@ -3542,7 +3565,12 @@ static void gnttab_usage_print_all(unsigned char key)
+@@ -3594,7 +3617,12 @@ static void gnttab_usage_print_all(unsigned char key)
      printk("%s [ key '%c' pressed\n", __FUNCTION__, key);
      for_each_domain ( d )
          gnttab_usage_print(d);
@@ -199,7 +216,7 @@ index f06b664d58..c4dc975936 100644
  
  static int __init gnttab_usage_init(void)
 diff --git a/xen/include/asm-x86/grant_table.h b/xen/include/asm-x86/grant_table.h
-index 9ca631c4e3..34fd833257 100644
+index 9ca631c..34fd833 100644
 --- a/xen/include/asm-x86/grant_table.h
 +++ b/xen/include/asm-x86/grant_table.h
 @@ -16,7 +16,8 @@
