@@ -1,0 +1,64 @@
+From 46c3acb308bf0cd044b114e637aacaf18b957618 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 28 Jun 2017 15:05:35 +0100
+Subject: [PATCH] x86/vvmx: Fix WRMSR interception of VMX MSRs
+
+FEATURE_CONTROL is already read with LOCK bit set (so is unmodifiable), and
+all VMX MSRs are read-only.  Also, fix the MSR_IA32_VMX_TRUE_ENTRY_CTLS bound
+to be MSR_IA32_VMX_VMFUNC, rather than having the intervening MSRs falling
+into the default case.
+
+Raise #GP faults if the guest tries to modify any of them.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index fc00f69d46..2663e685fc 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -3016,10 +3016,10 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
+             goto gp_fault;
+         break;
+     case IA32_FEATURE_CONTROL_MSR:
+-    case MSR_IA32_VMX_BASIC...MSR_IA32_VMX_TRUE_ENTRY_CTLS:
+-        if ( !nvmx_msr_write_intercept(msr, msr_content) )
+-            goto gp_fault;
+-        break;
++    case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
++        /* None of these MSRs are writeable. */
++        goto gp_fault;
++
+     case MSR_P6_PERFCTR(0)...MSR_P6_PERFCTR(7):
+     case MSR_P6_EVNTSEL(0)...MSR_P6_EVNTSEL(7):
+     case MSR_CORE_PERF_FIXED_CTR0...MSR_CORE_PERF_FIXED_CTR2:
+diff --git a/xen/arch/x86/hvm/vmx/vvmx.c b/xen/arch/x86/hvm/vmx/vvmx.c
+index b970e0cab0..7862531496 100644
+--- a/xen/arch/x86/hvm/vmx/vvmx.c
++++ b/xen/arch/x86/hvm/vmx/vvmx.c
+@@ -2159,12 +2159,6 @@ int nvmx_msr_read_intercept(unsigned int msr, u64 *msr_content)
+     return r;
+ }
+ 
+-int nvmx_msr_write_intercept(unsigned int msr, u64 msr_content)
+-{
+-    /* silently ignore for now */
+-    return 1;
+-}
+-
+ /* This function uses L2_gpa to walk the P2M page table in L1. If the
+  * walk is successful, the translated value is returned in
+  * L1_gpa. The result value tells what to do next.
+diff --git a/xen/include/asm-x86/hvm/vmx/vvmx.h b/xen/include/asm-x86/hvm/vmx/vvmx.h
+index 6c39f81ced..afd303564f 100644
+--- a/xen/include/asm-x86/hvm/vmx/vvmx.h
++++ b/xen/include/asm-x86/hvm/vmx/vvmx.h
+@@ -233,8 +233,6 @@ int nvmx_handle_invept(struct cpu_user_regs *regs);
+ int nvmx_handle_invvpid(struct cpu_user_regs *regs);
+ int nvmx_msr_read_intercept(unsigned int msr,
+                                 u64 *msr_content);
+-int nvmx_msr_write_intercept(unsigned int msr,
+-                                 u64 msr_content);
+ 
+ void nvmx_update_exec_control(struct vcpu *v, u32 value);
+ void nvmx_update_secondary_exec_control(struct vcpu *v,
