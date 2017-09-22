@@ -1,57 +1,25 @@
-diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
-index 7f02afd..29fbe38 100644
---- a/xen/arch/x86/x86_64/compat/entry.S
-+++ b/xen/arch/x86/x86_64/compat/entry.S
-@@ -474,6 +474,10 @@ ENTRY(compat_hypercall_table)
-         .endr
-         .quad do_mca                    /* 48 */
-         .quad paging_domctl_continuation
-+        .rept __HYPERVISOR_arch_7+1-((.-compat_hypercall_table)/8)
-+        .quad do_ni_hypercall
-+        .endr
-+        .quad do_iommu_op               /* 56 */
-         .rept NR_hypercalls-((.-compat_hypercall_table)/8)
-         .quad compat_ni_hypercall
-         .endr
-@@ -525,6 +529,10 @@ ENTRY(compat_hypercall_args_table)
-         .endr
-         .byte 1 /* do_mca                   */
-         .byte 1 /* paging_domctl_continuation      */
-+        .rept __HYPERVISOR_arch_7+1-(.-compat_hypercall_args_table)
-+        .byte 0 /* do_ni_hypercall      */
-+        .endr
-+        .byte 2 /* do_iommu_op              */  /* 56 */
-         .rept NR_hypercalls-(.-compat_hypercall_args_table)
-         .byte 0 /* compat_ni_hypercall      */
-         .endr
-diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
-index fe7b195..169f940 100644
---- a/xen/arch/x86/x86_64/entry.S
-+++ b/xen/arch/x86/x86_64/entry.S
-@@ -796,6 +796,10 @@ ENTRY(hypercall_table)
-         .endr
-         .quad do_mca                /* 48 */
-         .quad paging_domctl_continuation
-+        .rept __HYPERVISOR_arch_7+1-((.-hypercall_table)/8)
-+        .quad do_ni_hypercall
-+        .endr
-+        .quad do_iommu_op           /* 56 */
-         .rept NR_hypercalls-((.-hypercall_table)/8)
-         .quad do_ni_hypercall
-         .endr
-@@ -847,6 +851,10 @@ ENTRY(hypercall_args_table)
-         .endr
-         .byte 1 /* do_mca               */  /* 48 */
-         .byte 1 /* paging_domctl_continuation */
-+        .rept __HYPERVISOR_arch_7+1-(.-hypercall_args_table)
-+        .byte 0 /* do_ni_hypercall      */
-+        .endr
-+        .byte 2 /* do_iommu_op          */  /* 56 */
-         .rept NR_hypercalls-(.-hypercall_args_table)
-         .byte 0 /* do_ni_hypercall      */
-         .endr
+diff --git a/xen/arch/x86/hypercall.c b/xen/arch/x86/hypercall.c
+index ff7445f..481b888 100644
+--- a/xen/arch/x86/hypercall.c
++++ b/xen/arch/x86/hypercall.c
+@@ -68,6 +68,7 @@ const hypercall_args_t hypercall_args_table[NR_hypercalls] =
+     ARGS(xenpmu_op, 2),
+     ARGS(dm_op, 3),
+     ARGS(mca, 1),
++    ARGS(iommu_op, 2),
+     ARGS(arch_1, 1),
+ };
+ 
+@@ -131,6 +132,7 @@ static const hypercall_table_t pv_hypercall_table[] = {
+     HYPERCALL(xenpmu_op),
+     COMPAT_CALL(dm_op),
+     HYPERCALL(mca),
++    HYPERCALL(iommu_op),
+     HYPERCALL(arch_1),
+ };
+ 
 diff --git a/xen/common/Makefile b/xen/common/Makefile
-index e9893e2..1fa11f6 100644
+index 0fd5de9..aeb8e2b 100644
 --- a/xen/common/Makefile
 +++ b/xen/common/Makefile
 @@ -29,6 +29,7 @@ obj-y += page_alloc.o
@@ -106,11 +74,25 @@ index 0000000..304fccf
 + * End:
 + */
 +
+diff --git a/xen/include/asm-x86/hypercall.h b/xen/include/asm-x86/hypercall.h
+index c59aa69..8a318d1 100644
+--- a/xen/include/asm-x86/hypercall.h
++++ b/xen/include/asm-x86/hypercall.h
+@@ -128,6 +128,9 @@ do_set_segment_base(
+     unsigned int which,
+     unsigned long base);
+ 
++extern long do_iommu_op(
++    XEN_GUEST_HANDLE_PARAM(void) arg, unsigned int count);
++
+ #ifdef CONFIG_COMPAT
+ 
+ #include <compat/arch-x86/xen.h>
 diff --git a/xen/include/public/xen.h b/xen/include/public/xen.h
-index 37bbb22..153d282 100644
+index 6601e05..f9cfe03 100644
 --- a/xen/include/public/xen.h
 +++ b/xen/include/public/xen.h
-@@ -126,6 +126,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_ulong_t);
+@@ -127,6 +127,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_ulong_t);
  #define __HYPERVISOR_arch_6               54
  #define __HYPERVISOR_arch_7               55
  

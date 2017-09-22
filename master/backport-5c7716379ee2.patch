@@ -1,0 +1,94 @@
+From 5c7716379ee2a9711cc842f39de7d5a94ff6f765 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 26 Jan 2015 15:21:30 +0000
+Subject: [PATCH] x86/hypercall: Reduce the size of the hypercall tables
+
+The highest populated entry in each hypercall table is currently at index 49.
+There is no need to extend both to tables to 64 entries.
+
+Range check eax against the hypercall table array size, and use a
+BUILD_BUG_ON() to ensure that the hypercall tables don't grow larger than the
+args table.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+---
+ xen/arch/x86/hvm/hvm.c   |  8 ++++++--
+ xen/arch/x86/hypercall.c | 14 ++++++++++----
+ 2 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 23b0d17..ddb12cc 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -4133,7 +4133,7 @@ static long hvm_physdev_op_compat32(
+ #define compat_grant_table_op hvm_grant_table_op_compat32
+ #define do_arch_1             paging_domctl_continuation
+ 
+-static const hypercall_table_t hvm_hypercall_table[NR_hypercalls] = {
++static const hypercall_table_t hvm_hypercall_table[] = {
+     COMPAT_CALL(memory_op),
+     COMPAT_CALL(grant_table_op),
+     COMPAT_CALL(vcpu_op),
+@@ -4194,7 +4194,11 @@ int hvm_do_hypercall(struct cpu_user_regs *regs)
+     if ( (eax & 0x80000000) && is_viridian_domain(currd) )
+         return viridian_hypercall(regs);
+ 
+-    if ( (eax >= NR_hypercalls) || !hvm_hypercall_table[eax].native )
++    BUILD_BUG_ON(ARRAY_SIZE(hvm_hypercall_table) >
++                 ARRAY_SIZE(hypercall_args_table));
++
++    if ( (eax >= ARRAY_SIZE(hvm_hypercall_table)) ||
++         !hvm_hypercall_table[eax].native )
+     {
+         regs->eax = -ENOSYS;
+         return HVM_HCALL_completed;
+diff --git a/xen/arch/x86/hypercall.c b/xen/arch/x86/hypercall.c
+index 41be870..d2b5331 100644
+--- a/xen/arch/x86/hypercall.c
++++ b/xen/arch/x86/hypercall.c
+@@ -82,7 +82,7 @@ const hypercall_args_t hypercall_args_table[NR_hypercalls] =
+ 
+ #define do_arch_1             paging_domctl_continuation
+ 
+-static const hypercall_table_t pv_hypercall_table[NR_hypercalls] = {
++static const hypercall_table_t pv_hypercall_table[] = {
+     COMPAT_CALL(set_trap_table),
+     HYPERCALL(mmu_update),
+     COMPAT_CALL(set_gdt),
+@@ -148,7 +148,11 @@ void pv_hypercall(struct cpu_user_regs *regs)
+ 
+     eax = is_pv_32bit_vcpu(curr) ? regs->_eax : regs->eax;
+ 
+-    if ( (eax >= NR_hypercalls) || !pv_hypercall_table[eax].native )
++    BUILD_BUG_ON(ARRAY_SIZE(pv_hypercall_table) >
++                 ARRAY_SIZE(hypercall_args_table));
++
++    if ( (eax >= ARRAY_SIZE(pv_hypercall_table)) ||
++         !pv_hypercall_table[eax].native )
+     {
+         regs->eax = -ENOSYS;
+         return;
+@@ -257,7 +261,8 @@ void arch_do_multicall_call(struct mc_state *state)
+     {
+         struct multicall_entry *call = &state->call;
+ 
+-        if ( (call->op < NR_hypercalls) && pv_hypercall_table[call->op].native )
++        if ( (call->op < ARRAY_SIZE(pv_hypercall_table)) &&
++             pv_hypercall_table[call->op].native )
+             call->result = pv_hypercall_table[call->op].native(
+                 call->args[0], call->args[1], call->args[2],
+                 call->args[3], call->args[4], call->args[5]);
+@@ -269,7 +274,8 @@ void arch_do_multicall_call(struct mc_state *state)
+     {
+         struct compat_multicall_entry *call = &state->compat_call;
+ 
+-        if ( (call->op < NR_hypercalls) && pv_hypercall_table[call->op].compat )
++        if ( (call->op < ARRAY_SIZE(pv_hypercall_table)) &&
++             pv_hypercall_table[call->op].compat )
+             call->result = pv_hypercall_table[call->op].compat(
+                 call->args[0], call->args[1], call->args[2],
+                 call->args[3], call->args[4], call->args[5]);
+-- 
+2.7.4
+

@@ -1,0 +1,223 @@
+From e7745d8ef588a2da0f6cba0846fc168f0b76fc37 Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Wed, 15 Feb 2017 15:22:29 +0000
+Subject: [PATCH] tools/libxendevicemodel: introduce a Linux-specific
+ implementation
+
+My recent patch [1] to the Linux privcmd module introduced a dedicated
+mechanism for making dm_op hypercalls.
+
+This patch adds the necessary code to libxendevicemodel to take
+advantage of that mechanism if it is implemented in the tools domain
+kernel.
+
+[1] https://git.kernel.org/cgit/linux/kernel/git/ostr/linux.git/commit/?id=ab520be8
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+Acked-by: Ian Jackson <ian.jackson@eu.citrix.com>
+---
+ tools/include/xen-sys/Linux/privcmd.h |  13 ++++
+ tools/libs/devicemodel/Makefile       |   2 +-
+ tools/libs/devicemodel/linux.c        | 123 ++++++++++++++++++++++++++++++++++
+ tools/libs/devicemodel/private.h      |   4 ++
+ 4 files changed, 141 insertions(+), 1 deletion(-)
+ create mode 100644 tools/libs/devicemodel/linux.c
+
+diff --git a/tools/include/xen-sys/Linux/privcmd.h b/tools/include/xen-sys/Linux/privcmd.h
+index e4e666a..c80eb5e 100644
+--- a/tools/include/xen-sys/Linux/privcmd.h
++++ b/tools/include/xen-sys/Linux/privcmd.h
+@@ -75,6 +75,17 @@ typedef struct privcmd_mmapbatch_v2 {
+ 	int __user *err;  /* array of error codes */
+ } privcmd_mmapbatch_v2_t;
+ 
++typedef struct privcmd_dm_op_buf {
++	void __user *uptr;
++	size_t size;
++} privcmd_dm_op_buf_t;
++
++typedef struct privcmd_dm_op {
++	domid_t dom;
++	__u16 num;
++	const privcmd_dm_op_buf_t __user *ubufs;
++} privcmd_dm_op_t;
++
+ /*
+  * @cmd: IOCTL_PRIVCMD_HYPERCALL
+  * @arg: &privcmd_hypercall_t
+@@ -88,5 +99,7 @@ typedef struct privcmd_mmapbatch_v2 {
+ 	_IOC(_IOC_NONE, 'P', 3, sizeof(privcmd_mmapbatch_t))
+ #define IOCTL_PRIVCMD_MMAPBATCH_V2				\
+ 	_IOC(_IOC_NONE, 'P', 4, sizeof(privcmd_mmapbatch_v2_t))
++#define IOCTL_PRIVCMD_DM_OP					\
++	_IOC(_IOC_NONE, 'P', 5, sizeof(privcmd_dm_op_t))
+ 
+ #endif /* __LINUX_PUBLIC_PRIVCMD_H__ */
+diff --git a/tools/libs/devicemodel/Makefile b/tools/libs/devicemodel/Makefile
+index b87bf84..1803942 100644
+--- a/tools/libs/devicemodel/Makefile
++++ b/tools/libs/devicemodel/Makefile
+@@ -11,7 +11,7 @@ CFLAGS   += $(CFLAGS_libxentoollog)
+ CFLAGS   += $(CFLAGS_libxencall)
+ 
+ SRCS-y                 += core.c
+-SRCS-$(CONFIG_Linux)   += compat.c
++SRCS-$(CONFIG_Linux)   += linux.c
+ SRCS-$(CONFIG_FreeBSD) += compat.c
+ SRCS-$(CONFIG_SunOS)   += compat.c
+ SRCS-$(CONFIG_NetBSD)  += compat.c
+diff --git a/tools/libs/devicemodel/linux.c b/tools/libs/devicemodel/linux.c
+new file mode 100644
+index 0000000..7511ee7
+--- /dev/null
++++ b/tools/libs/devicemodel/linux.c
+@@ -0,0 +1,123 @@
++/*
++ * Copyright (c) 2017 Citrix Systems Inc.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation;
++ * version 2.1 of the License.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++#include <xen/xen.h>
++#include <xen/sys/privcmd.h>
++
++#include "private.h"
++
++int osdep_xendevicemodel_open(xendevicemodel_handle *dmod)
++{
++    int fd = open("/dev/xen/privcmd", O_RDWR | O_CLOEXEC);
++    privcmd_dm_op_t uop;
++    int rc;
++
++    if (fd < 0) {
++        /*
++         * If the 'new' privcmd interface doesn't exist then don't treat
++         * this as an error, but an old privcmd clearly won't implement
++         * IOCTL_PRIVCMD_DM_OP so don't bother trying to open it.
++         */
++        if (errno == ENOENT || errno == ENXIO || errno == ENODEV)
++            goto out;
++
++        PERROR("Could not obtain handle on privileged command interface");
++        return -1;
++    }
++
++    /*
++     * Check to see if IOCTL_PRIVCMD_DM_OP is implemented as we want to
++     * use that in preference to libxencall.
++     */
++    uop.dom = DOMID_INVALID;
++    uop.num = 0;
++    uop.ubufs = NULL;
++
++    rc = ioctl(fd, IOCTL_PRIVCMD_DM_OP, &uop);
++    if (rc < 0) {
++        close(fd);
++        fd = -1;
++    }
++
++out:
++    dmod->fd = fd;
++    return 0;
++}
++
++int osdep_xendevicemodel_close(xendevicemodel_handle *dmod)
++{
++    if (dmod->fd < 0)
++        return 0;
++
++    return close(dmod->fd);
++}
++
++int osdep_xendevicemodel_op(xendevicemodel_handle *dmod,
++                            domid_t domid, unsigned int nr_bufs,
++                            struct xendevicemodel_buf bufs[])
++{
++    privcmd_dm_op_buf_t *ubufs;
++    privcmd_dm_op_t uop;
++    unsigned int i;
++    int rc;
++
++    if (dmod->fd < 0)
++        return xendevicemodel_xcall(dmod, domid, nr_bufs, bufs);
++
++    ubufs = calloc(nr_bufs, sizeof (*ubufs));
++    if (!ubufs)
++        return -1;
++
++    for (i = 0; i < nr_bufs; i++) {
++        ubufs[i].uptr = bufs[i].ptr;
++        ubufs[i].size = bufs[i].size;
++    }
++
++    uop.dom = domid;
++    uop.num = nr_bufs;
++    uop.ubufs = ubufs;
++
++    rc = ioctl(dmod->fd, IOCTL_PRIVCMD_DM_OP, &uop);
++
++    free(ubufs);
++
++    if (rc < 0)
++        return -1;
++
++    return 0;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/tools/libs/devicemodel/private.h b/tools/libs/devicemodel/private.h
+index 7c7acf2..5ce3b45 100644
+--- a/tools/libs/devicemodel/private.h
++++ b/tools/libs/devicemodel/private.h
+@@ -11,6 +11,7 @@ struct xendevicemodel_handle {
+     xentoollog_logger *logger, *logger_tofree;
+     unsigned int flags;
+     xencall_handle *xcall;
++    int fd;
+ };
+ 
+ struct xendevicemodel_buf {
+@@ -28,6 +29,9 @@ int osdep_xendevicemodel_op(xendevicemodel_handle *dmod,
+                             domid_t domid, unsigned int nr_bufs,
+                             struct xendevicemodel_buf bufs[]);
+ 
++#define PERROR(_f...) \
++    xtl_log(dmod->logger, XTL_ERROR, errno, "xendevicemodel", _f)
++
+ #endif
+ 
+ /*
+-- 
+2.7.4
+

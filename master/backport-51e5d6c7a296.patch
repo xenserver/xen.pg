@@ -1,4 +1,4 @@
-From 79a10d00b0ca740f8383521e9c9f46ae31f925c8 Mon Sep 17 00:00:00 2001
+From 51e5d6c7a29640490eeab4e4c3d60b9c2d3d3054 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Mon, 26 Jan 2015 12:01:00 +0000
 Subject: [PATCH] x86/pv: Implement pv_hypercall() in C
@@ -20,57 +20,27 @@ Finally, pv_hypercall() will treat a NULL hypercall function pointer as
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
-diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
-index ad16037954..c3ab6f2e20 100644
---- a/xen/arch/x86/Makefile
-+++ b/xen/arch/x86/Makefile
-@@ -28,6 +28,7 @@ obj-y += e820.o
- obj-y += extable.o
- obj-y += flushtlb.o
- obj-$(CONFIG_CRASH_DEBUG) += gdbstub.o
-+obj-y += hypercall.o
- obj-y += i387.o
- obj-y += i8259.o
- obj-y += io_apic.o
 diff --git a/xen/arch/x86/hypercall.c b/xen/arch/x86/hypercall.c
-new file mode 100644
-index 0000000000..6535f401df
---- /dev/null
+index 4b42f86..13a89a0 100644
+--- a/xen/arch/x86/hypercall.c
 +++ b/xen/arch/x86/hypercall.c
-@@ -0,0 +1,157 @@
-+/******************************************************************************
-+ * arch/x86/hypercall.c
-+ *
-+ * This program is free software; you can redistribute it and/or modify
-+ * it under the terms of the GNU General Public License as published by
-+ * the Free Software Foundation; either version 2 of the License, or
-+ * (at your option) any later version.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program; If not, see <http://www.gnu.org/licenses/>.
-+ *
-+ * Copyright (c) 2015,2016 Citrix Systems Ltd.
-+ */
-+
+@@ -17,7 +17,12 @@
+  * Copyright (c) 2015,2016 Citrix Systems Ltd.
+  */
+ 
 +#include <xen/compiler.h>
-+#include <xen/hypercall.h>
+ #include <xen/hypercall.h>
 +#include <xen/trace.h>
-+
-+typedef unsigned long hypercall_fn_t(
-+    unsigned long, unsigned long, unsigned long,
-+    unsigned long, unsigned long, unsigned long);
 +
 +extern hypercall_fn_t *const hypercall_table[NR_hypercalls],
 +    *const compat_hypercall_table[NR_hypercalls];
-+
-+extern const uint8_t hypercall_args_table[NR_hypercalls],
-+    compat_hypercall_args_table[NR_hypercalls];
-+
+ 
+ #define ARGS(x, n)                              \
+     [ __HYPERVISOR_ ## x ] = (n)
+@@ -111,6 +116,121 @@ const uint8_t compat_hypercall_args_table[NR_hypercalls] =
+ 
+ #undef ARGS
+ 
 +void pv_hypercall(struct cpu_user_regs *regs)
 +{
 +    struct vcpu *curr = current;
@@ -186,17 +156,11 @@ index 0000000000..6535f401df
 +    perfc_incr(hypercalls);
 +}
 +
-+/*
-+ * Local variables:
-+ * mode: C
-+ * c-file-style: "BSD"
-+ * c-basic-offset: 4
-+ * tab-width: 4
-+ * indent-tabs-mode: nil
-+ * End:
-+ */
+ /*
+  * Local variables:
+  * mode: C
 diff --git a/xen/arch/x86/trace.c b/xen/arch/x86/trace.c
-index bd8596c5aa..f11b30903f 100644
+index bd8596c..f11b309 100644
 --- a/xen/arch/x86/trace.c
 +++ b/xen/arch/x86/trace.c
 @@ -6,33 +6,6 @@
@@ -233,8 +197,20 @@ index bd8596c5aa..f11b30903f 100644
  void __trace_pv_trap(int trapnr, unsigned long eip,
                       int use_error_code, unsigned error_code)
  {
+diff --git a/xen/arch/x86/x86_64/asm-offsets.c b/xen/arch/x86/x86_64/asm-offsets.c
+index a0621ea..fe69a68 100644
+--- a/xen/arch/x86/x86_64/asm-offsets.c
++++ b/xen/arch/x86/x86_64/asm-offsets.c
+@@ -159,7 +159,6 @@ void __dummy__(void)
+     BLANK();
+ 
+ #ifdef CONFIG_PERF_COUNTERS
+-    DEFINE(ASM_PERFC_hypercalls, PERFC_hypercalls);
+     DEFINE(ASM_PERFC_exceptions, PERFC_exceptions);
+     BLANK();
+ #endif
 diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
-index 21a5b1b680..06527931ba 100644
+index 18168ea..3939486 100644
 --- a/xen/arch/x86/x86_64/compat/entry.S
 +++ b/xen/arch/x86/x86_64/compat/entry.S
 @@ -34,68 +34,8 @@ UNLIKELY_END(msi_check)
@@ -320,7 +296,7 @@ index 21a5b1b680..06527931ba 100644
  ENTRY(compat_restore_all_guest)
          ASSERT_INTERRUPTS_DISABLED
 diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
-index 2a50560c33..32bb46eb59 100644
+index 880a454..9d2d4eb 100644
 --- a/xen/arch/x86/x86_64/entry.S
 +++ b/xen/arch/x86/x86_64/entry.S
 @@ -186,62 +186,8 @@ ENTRY(lstar_enter)

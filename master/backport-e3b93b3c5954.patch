@@ -1,0 +1,293 @@
+From e3b93b3c595447db34d0b55f45cbd85aa636f31a Mon Sep 17 00:00:00 2001
+From: Jennifer Herbert <Jennifer.Herbert@citrix.com>
+Date: Wed, 26 Apr 2017 09:47:30 +0200
+Subject: [PATCH] dmop: add xendevicemodel_modified_memory_bulk()
+
+This new lib devicemodel call allows multiple extents of pages to be
+marked as modified in a single call.  This is something needed for a
+usecase I'm working on.
+
+The xen side of the modified_memory call has been modified to accept
+an array of extents.  The devicemodel library either provides an array
+of length 1, to support the original library function, or a second
+function allows an array to be provided.
+
+Signed-off-by: Jennifer Herbert <Jennifer.Herbert@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+Release-acked-by: Julien Grall <julien.grall@arm.com>
+diff --git a/tools/libs/devicemodel/core.c b/tools/libs/devicemodel/core.c
+index 19ebef6..49dbeb7 100644
+--- a/tools/libs/devicemodel/core.c
++++ b/tools/libs/devicemodel/core.c
+@@ -433,22 +433,36 @@ int xendevicemodel_track_dirty_vram(
+                              dirty_bitmap, (size_t)(nr + 7) / 8);
+ }
+ 
+-int xendevicemodel_modified_memory(
+-    xendevicemodel_handle *dmod, domid_t domid, uint64_t first_pfn,
+-    uint32_t nr)
++int xendevicemodel_modified_memory_bulk(
++    xendevicemodel_handle *dmod, domid_t domid,
++    struct xen_dm_op_modified_memory_extent *extents, uint32_t nr)
+ {
+     struct xen_dm_op op;
+-    struct xen_dm_op_modified_memory *data;
++    struct xen_dm_op_modified_memory *header;
++    size_t extents_size = nr * sizeof(struct xen_dm_op_modified_memory_extent);
+ 
+     memset(&op, 0, sizeof(op));
+ 
+     op.op = XEN_DMOP_modified_memory;
+-    data = &op.u.modified_memory;
++    header = &op.u.modified_memory;
+ 
+-    data->first_pfn = first_pfn;
+-    data->nr = nr;
++    header->nr_extents = nr;
++    header->opaque = 0;
+ 
+-    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++    return xendevicemodel_op(dmod, domid, 2, &op, sizeof(op),
++                             extents, extents_size);
++}
++
++int xendevicemodel_modified_memory(
++    xendevicemodel_handle *dmod, domid_t domid, uint64_t first_pfn,
++    uint32_t nr)
++{
++    struct xen_dm_op_modified_memory_extent extent;
++
++    extent.first_pfn = first_pfn;
++    extent.nr = nr;
++
++    return xendevicemodel_modified_memory_bulk(dmod, domid, &extent, 1);
+ }
+ 
+ int xendevicemodel_set_mem_type(
+diff --git a/tools/libs/devicemodel/include/xendevicemodel.h b/tools/libs/devicemodel/include/xendevicemodel.h
+index b3f600e..9c62bf9 100644
+--- a/tools/libs/devicemodel/include/xendevicemodel.h
++++ b/tools/libs/devicemodel/include/xendevicemodel.h
+@@ -236,8 +236,8 @@ int xendevicemodel_track_dirty_vram(
+     uint32_t nr, unsigned long *dirty_bitmap);
+ 
+ /**
+- * This function notifies the hypervisor that a set of domain pages
+- * have been modified.
++ * This function notifies the hypervisor that a set of contiguous
++ * domain pages have been modified.
+  *
+  * @parm dmod a handle to an open devicemodel interface.
+  * @parm domid the domain id to be serviced
+@@ -250,6 +250,21 @@ int xendevicemodel_modified_memory(
+     uint32_t nr);
+ 
+ /**
++ * This function notifies the hypervisor that a set of discontiguous
++ * domain pages have been modified.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm extents an array of extent structs, which each hold
++                 a start_pfn and nr (number of pfns).
++ * @parm nr the number of extents in the array
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_modified_memory_bulk(
++    xendevicemodel_handle *dmod, domid_t domid,
++    struct xen_dm_op_modified_memory_extent extents[], uint32_t nr);
++
++/**
+  * This function notifies the hypervisor that a set of domain pages
+  * are to be treated in a specific way. (See the definition of
+  * hvmmem_type_t).
+diff --git a/xen/arch/x86/hvm/dm.c b/xen/arch/x86/hvm/dm.c
+index bc0b56f..0133ee7 100644
+--- a/xen/arch/x86/hvm/dm.c
++++ b/xen/arch/x86/hvm/dm.c
+@@ -154,56 +154,102 @@ static int set_isa_irq_level(struct domain *d, uint8_t isa_irq,
+ }
+ 
+ static int modified_memory(struct domain *d,
+-                           struct xen_dm_op_modified_memory *data)
++                           const struct dmop_args *bufs,
++                           struct xen_dm_op_modified_memory *header)
+ {
+-    xen_pfn_t last_pfn = data->first_pfn + data->nr - 1;
+-    unsigned int iter = 0;
+-    int rc = 0;
++#define EXTENTS_BUFFER 1
+ 
+-    if ( (data->first_pfn > last_pfn) ||
+-         (last_pfn > domain_get_maximum_gpfn(d)) )
+-        return -EINVAL;
++    /* Process maximum of 256 pfns before checking for continuation. */
++    const unsigned int cont_check_interval = 0x100;
++    unsigned int *rem_extents =  &header->nr_extents;
++    unsigned int batch_rem_pfns = cont_check_interval;
++    /* Used for continuation. */
++    unsigned int *pfns_done = &header->opaque;
+ 
+     if ( !paging_mode_log_dirty(d) )
+         return 0;
+ 
+-    while ( iter < data->nr )
++    if ( (bufs->buf[EXTENTS_BUFFER].size /
++          sizeof(struct xen_dm_op_modified_memory_extent)) <
++         *rem_extents )
++        return -EINVAL;
++
++    while ( *rem_extents > 0 )
+     {
+-        unsigned long pfn = data->first_pfn + iter;
+-        struct page_info *page;
++        struct xen_dm_op_modified_memory_extent extent;
++        unsigned int batch_nr;
++        xen_pfn_t pfn, end_pfn;
++        int rc;
+ 
+-        page = get_page_from_gfn(d, pfn, NULL, P2M_UNSHARE);
+-        if ( page )
++        rc = COPY_FROM_GUEST_BUF_OFFSET(extent,
++            bufs, EXTENTS_BUFFER, (*rem_extents - 1) * sizeof(extent));
++        if ( rc )
++            return -EFAULT;
++
++        if ( extent.pad )
++            return -EINVAL;
++
++        end_pfn = extent.first_pfn + extent.nr;
++
++        if ( end_pfn <= extent.first_pfn ||
++             end_pfn > domain_get_maximum_gpfn(d) )
++            return -EINVAL;
++
++        if ( *pfns_done >= extent.nr )
++            return -EINVAL;
++
++        pfn = extent.first_pfn + *pfns_done;
++        batch_nr = extent.nr - *pfns_done;
++
++        if ( batch_nr > batch_rem_pfns )
++        {
++            batch_nr = batch_rem_pfns;
++            *pfns_done += batch_nr;
++            end_pfn = pfn + batch_nr;
++        }
++        else
+         {
+-            mfn_t gmfn = _mfn(page_to_mfn(page));
+-
+-            paging_mark_dirty(d, mfn_x(gmfn));
+-            /*
+-             * These are most probably not page tables any more
+-             * don't take a long time and don't die either.
+-             */
+-            sh_remove_shadows(d, gmfn, 1, 0);
+-            put_page(page);
++            (*rem_extents)--;
++            *pfns_done = 0;
+         }
+ 
+-        iter++;
++        batch_rem_pfns -= batch_nr;
++
++        for ( ; pfn < end_pfn; pfn++ )
++        {
++            struct page_info *page;
++
++            page = get_page_from_gfn(d, pfn, NULL, P2M_UNSHARE);
++            if ( page )
++            {
++                mfn_t gmfn = _mfn(page_to_mfn(page));
++
++                paging_mark_dirty(d, mfn_x(gmfn));
++                /*
++                 * These are most probably not page tables any more
++                 * don't take a long time and don't die either.
++                 */
++                sh_remove_shadows(d, gmfn, 1, 0);
++                put_page(page);
++            }
++        }
+ 
+         /*
+-         * Check for continuation every 256th iteration and if the
+-         * iteration is not the last.
++         * After a full batch of cont_check_interval pfns
++         * have been processed, and there are still extents
++         * remaining to process, check for continuation.
+          */
+-        if ( (iter < data->nr) && ((iter & 0xff) == 0) &&
+-             hypercall_preempt_check() )
++        if ( (batch_rem_pfns == 0) && (*rem_extents > 0) )
+         {
+-            data->first_pfn += iter;
+-            data->nr -= iter;
++            if ( hypercall_preempt_check() )
++                return -ERESTART;
+ 
+-            rc = -ERESTART;
+-            break;
++            batch_rem_pfns = cont_check_interval;
+         }
+     }
++    return 0;
+ 
+-    return rc;
++#undef EXTENTS_BUFFER
+ }
+ 
+ static bool allow_p2m_type_change(p2m_type_t old, p2m_type_t new)
+@@ -472,13 +518,8 @@ static int dm_op(const struct dmop_args *op_args)
+         struct xen_dm_op_modified_memory *data =
+             &op.u.modified_memory;
+ 
+-        const_op = false;
+-
+-        rc = -EINVAL;
+-        if ( data->pad )
+-            break;
+-
+-        rc = modified_memory(d, data);
++        rc = modified_memory(d, op_args, data);
++        const_op = !rc;
+         break;
+     }
+ 
+diff --git a/xen/include/public/hvm/dm_op.h b/xen/include/public/hvm/dm_op.h
+index f54cece..a296d6a 100644
+--- a/xen/include/public/hvm/dm_op.h
++++ b/xen/include/public/hvm/dm_op.h
+@@ -237,13 +237,26 @@ struct xen_dm_op_set_pci_link_route {
+  * XEN_DMOP_modified_memory: Notify that a set of pages were modified by
+  *                           an emulator.
+  *
+- * NOTE: In the event of a continuation, the @first_pfn is set to the
+- *       value of the pfn of the remaining set of pages and @nr reduced
+- *       to the size of the remaining set.
++ * DMOP buf 1 contains an array of xen_dm_op_modified_memory_extent with
++ * @nr_extents entries.
++ *
++ * On error, @nr_extents will contain the index+1 of the extent that
++ * had the error.  It is not defined if or which pages may have been
++ * marked as dirty, in this event.
+  */
+ #define XEN_DMOP_modified_memory 11
+ 
+ struct xen_dm_op_modified_memory {
++    /*
++     * IN - Number of extents to be processed
++     * OUT -returns n+1 for failing extent
++     */
++    uint32_t nr_extents;
++    /* IN/OUT - Must be set to 0 */
++    uint32_t opaque;
++};
++
++struct xen_dm_op_modified_memory_extent {
+     /* IN - number of contiguous pages modified */
+     uint32_t nr;
+     uint32_t pad;

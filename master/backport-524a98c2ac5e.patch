@@ -1,0 +1,744 @@
+From 524a98c2ac5e60b824033af32243bd4c8dd8e265 Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Wed, 25 Jan 2017 10:40:51 +0100
+Subject: [PATCH] public / x86: introduce __HYPERCALL_dm_op...
+
+...as a set of hypercalls to be used by a device model.
+
+As stated in the new docs/designs/dm_op.markdown:
+
+"The aim of DMOP is to prevent a compromised device model from
+compromising domains other then the one it is associated with. (And is
+therefore likely already compromised)."
+
+See that file for further information.
+
+This patch simply adds the boilerplate for the hypercall.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Suggested-by: Ian Jackson <ian.jackson@citrix.com>
+Suggested-by: Jennifer Herbert <jennifer.herbert@citrix.com>
+Acked-by: Daniel De Graaf <dgdegra@tycho.nsa.gov>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/docs/designs/dmop.markdown b/docs/designs/dmop.markdown
+new file mode 100644
+index 0000000..a6cf6eb
+--- /dev/null
++++ b/docs/designs/dmop.markdown
+@@ -0,0 +1,175 @@
++DMOP
++====
++
++Introduction
++------------
++
++The aim of DMOP is to prevent a compromised device model from compromising
++domains other than the one it is providing emulation for (which is therefore
++likely already compromised).
++
++The problem occurs when you a device model issues an hypercall that
++includes references to user memory other than the operation structure
++itself, such as with Track dirty VRAM (as used in VGA emulation).
++Is this case, the address of this other user memory needs to be vetted,
++to ensure it is not within restricted address ranges, such as kernel
++memory. The real problem comes down to how you would vet this address -
++the idea place to do this is within the privcmd driver, without privcmd
++having to have specific knowledge of the hypercall's semantics.
++
++The Design
++----------
++
++The privcmd driver implements a new restriction ioctl, which takes a domid
++parameter.  After that restriction ioctl is issued, all unaudited operations
++on the privcmd driver will cease to function, including regular hypercalls.
++DMOP hypercalls will continue to function as they can be audited.
++
++A DMOP hypercall consists of a domid (which is audited to verify that it
++matches any restriction in place) and an array of buffers and lengths,
++with the first one containing the specific DMOP parameters. These can
++then reference further buffers from within in the array. Since the only
++user buffers passed are that found with that array, they can all can be
++audited by privcmd.
++
++The following code illustrates this idea:
++
++struct xen_dm_op {
++    uint32_t op;
++};
++
++struct xen_dm_op_buf {
++    XEN_GUEST_HANDLE(void) h;
++    unsigned long size;
++};
++typedef struct xen_dm_op_buf xen_dm_op_buf_t;
++
++enum neg_errnoval
++HYPERVISOR_dm_op(domid_t domid,
++                 xen_dm_op_buf_t bufs[],
++                 unsigned int nr_bufs)
++
++@domid is the domain the hypercall operates on.
++@bufs points to an array of buffers where @bufs[0] contains a struct
++dm_op, describing the specific device model operation and its parameters.
++@bufs[1..] may be referenced in the parameters for the purposes of
++passing extra information to or from the domain.
++@nr_bufs is the number of buffers in the @bufs array.
++
++It is forbidden for the above struct (xen_dm_op) to contain any guest
++handles. If they are needed, they should instead be in
++HYPERVISOR_dm_op->bufs.
++
++Validation by privcmd driver
++----------------------------
++
++If the privcmd driver has been restricted to specific domain (using a
++ new ioctl), when it received an op, it will:
++
++1. Check hypercall is DMOP.
++
++2. Check domid == restricted domid.
++
++3. For each @nr_bufs in @bufs: Check @h and @size give a buffer
++   wholly in the user space part of the virtual address space. (e.g.
++   Linux will use access_ok()).
++
++
++Xen Implementation
++------------------
++
++Since a DMOP buffers need to be copied from or to the guest, functions for
++doing this would be written as below.  Note that care is taken to prevent
++damage from buffer under- or over-run situations.  If the DMOP is called
++with incorrectly sized buffers, zeros will be read, while extra is ignored.
++
++static bool copy_buf_from_guest(xen_dm_op_buf_t bufs[],
++                                unsigned int nr_bufs, void *dst,
++                                unsigned int idx, size_t dst_size)
++{
++    size_t size;
++
++    if ( idx >= nr_bufs )
++        return false;
++
++    memset(dst, 0, dst_size);
++
++    size = min_t(size_t, dst_size, bufs[idx].size);
++
++    return !copy_from_guest(dst, bufs[idx].h, size);
++}
++
++static bool copy_buf_to_guest(xen_dm_op_buf_t bufs[],
++                              unsigned int nr_bufs, unsigned int idx,
++                              void *src, size_t src_size)
++{
++    size_t size;
++
++    if ( idx >= nr_bufs )
++        return false;
++
++    size = min_t(size_t, bufs[idx].size, src_size);
++
++    return !copy_to_guest(bufs[idx].h, src, size);
++}
++
++This leaves do_dm_op easy to implement as below:
++
++static int dm_op(domid_t domid,
++                 unsigned int nr_bufs,
++                 xen_dm_op_buf_t bufs[])
++{
++    struct domain *d;
++    struct xen_dm_op op;
++    bool const_op = true;
++    long rc;
++
++    rc = rcu_lock_remote_domain_by_id(domid, &d);
++    if ( rc )
++        return rc;
++
++    if ( !has_hvm_container_domain(d) )
++        goto out;
++
++    rc = xsm_dm_op(XSM_DM_PRIV, d);
++    if ( rc )
++        goto out;
++
++    if ( !copy_buf_from_guest(bufs, nr_bufs, &op, 0, sizeof(op)) )
++    {
++        rc = -EFAULT;
++        goto out;
++    }
++
++    switch ( op.op )
++    {
++    default:
++        rc = -EOPNOTSUPP;
++        break;
++    }
++
++    if ( !rc &&
++         !const_op &&
++         !copy_buf_to_guest(bufs, nr_bufs, 0, &op, sizeof(op)) )
++        rc = -EFAULT;
++
++ out:
++    rcu_unlock_domain(d);
++
++    return rc;
++}
++
++long do_dm_op(domid_t domid,
++              unsigned int nr_bufs,
++              XEN_GUEST_HANDLE_PARAM(xen_dm_op_buf_t) bufs)
++{
++    struct xen_dm_op_buf nat[MAX_NR_BUFS];
++
++    if ( nr_bufs > MAX_NR_BUFS )
++        return -EINVAL;
++
++    if ( copy_from_guest_offset(nat, bufs, 0, nr_bufs) )
++        return -EFAULT;
++
++    return dm_op(domid, nr_bufs, nat);
++}
+diff --git a/tools/flask/policy/modules/xen.if b/tools/flask/policy/modules/xen.if
+index dbefa1e..7f1b29c 100644
+--- a/tools/flask/policy/modules/xen.if
++++ b/tools/flask/policy/modules/xen.if
+@@ -151,7 +151,7 @@ define(`device_model', `
+ 
+ 	allow $1 $2_target:domain shutdown;
+ 	allow $1 $2_target:mmu { map_read map_write adjust physmap target_hack };
+-	allow $1 $2_target:hvm { getparam setparam trackdirtyvram hvmctl irqlevel pciroute pcilevel cacheattr send_irq };
++	allow $1 $2_target:hvm { getparam setparam trackdirtyvram hvmctl irqlevel pciroute pcilevel cacheattr send_irq dm };
+ ')
+ 
+ # make_device_model(priv, dm_dom, hvm_dom)
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 0a31295..88d9a4a 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -41,6 +41,7 @@
+ #include <xen/sched.h>
+ #include <xen/memory.h>
+ #include <xen/grant_table.h>
++#include <xen/hvm/dm_op.h>
+ #include <xen/hvm/params.h>
+ #include <xen/xsm/flask_op.h>
+ #include <xen/tmem.h>
+diff --git a/tools/libxc/xc_private.c b/tools/libxc/xc_private.c
+index 7bea1c5..4ee0d1f 100644
+--- a/tools/libxc/xc_private.c
++++ b/tools/libxc/xc_private.c
+@@ -775,6 +775,76 @@ int xc_ffs64(uint64_t x)
+     return l ? xc_ffs32(l) : h ? xc_ffs32(h) + 32 : 0;
+ }
+ 
++int do_dm_op(xc_interface *xch, domid_t domid, unsigned int nr_bufs, ...)
++{
++    int ret = -1;
++    struct  {
++        void *u;
++        void *h;
++    } *bounce;
++    DECLARE_HYPERCALL_BUFFER(xen_dm_op_buf_t, bufs);
++    va_list args;
++    unsigned int idx;
++
++    bounce = calloc(nr_bufs, sizeof(*bounce));
++    if ( bounce == NULL )
++        goto fail1;
++
++    bufs = xc_hypercall_buffer_alloc(xch, bufs, sizeof(*bufs) * nr_bufs);
++    if ( bufs == NULL )
++        goto fail2;
++
++    va_start(args, nr_bufs);
++    for ( idx = 0; idx < nr_bufs; idx++ )
++    {
++        void *u = va_arg(args, void *);
++        size_t size = va_arg(args, size_t);
++
++        bounce[idx].h = xencall_alloc_buffer(xch->xcall, size);
++        if ( bounce[idx].h == NULL )
++            goto fail3;
++
++        memcpy(bounce[idx].h, u, size);
++        bounce[idx].u = u;
++
++        set_xen_guest_handle_raw(bufs[idx].h, bounce[idx].h);
++        bufs[idx].size = size;
++    }
++    va_end(args);
++
++    ret = xencall3(xch->xcall, __HYPERVISOR_dm_op,
++                   domid, nr_bufs, HYPERCALL_BUFFER_AS_ARG(bufs));
++    if ( ret < 0 )
++        goto fail4;
++
++    while ( idx-- != 0 )
++    {
++        memcpy(bounce[idx].u, bounce[idx].h, bufs[idx].size);
++        xencall_free_buffer(xch->xcall, bounce[idx].h);
++    }
++
++    xc_hypercall_buffer_free(xch, bufs);
++
++    free(bounce);
++
++    return 0;
++
++ fail4:
++    idx = nr_bufs;
++
++ fail3:
++    while ( idx-- != 0 )
++        xencall_free_buffer(xch->xcall, bounce[idx].h);
++
++    xc_hypercall_buffer_free(xch, bufs);
++
++ fail2:
++    free(bounce);
++
++ fail1:
++    return ret;
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/tools/libxc/xc_private.h b/tools/libxc/xc_private.h
+index 0239e44..eeec92c 100644
+--- a/tools/libxc/xc_private.h
++++ b/tools/libxc/xc_private.h
+@@ -426,6 +426,8 @@ int xc_vm_event_control(xc_interface *xch, domid_t domain_id, unsigned int op,
+ void *xc_vm_event_enable(xc_interface *xch, domid_t domain_id, int param,
+                          uint32_t *port);
+ 
++int do_dm_op(xc_interface *xch, domid_t domid, unsigned int nr_bufs, ...);
++
+ #endif /* __XC_PRIVATE_H__ */
+ 
+ /*
+diff --git a/xen/arch/x86/hvm/Makefile b/xen/arch/x86/hvm/Makefile
+index 8bc55a9..5b1045c 100644
+--- a/xen/arch/x86/hvm/Makefile
++++ b/xen/arch/x86/hvm/Makefile
+@@ -2,6 +2,7 @@ subdir-y += svm
+ subdir-y += vmx
+ 
+ obj-y += asid.o
++obj-y += dm.o
+ obj-y += emulate.o
+ obj-y += event.o
+ obj-y += hpet.o
+diff --git a/xen/arch/x86/hvm/dm.c b/xen/arch/x86/hvm/dm.c
+new file mode 100644
+index 0000000..ad7a82a
+--- /dev/null
++++ b/xen/arch/x86/hvm/dm.c
+@@ -0,0 +1,153 @@
++/*
++ * Copyright (c) 2016 Citrix Systems Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <xen/guest_access.h>
++#include <xen/hypercall.h>
++#include <xen/sched.h>
++#include <xen/stdbool.h>
++
++#include <asm/hvm/ioreq.h>
++
++#include <xsm/xsm.h>
++
++static bool copy_buf_from_guest(const xen_dm_op_buf_t bufs[],
++                                unsigned int nr_bufs, void *dst,
++                                unsigned int idx, size_t dst_size)
++{
++    size_t size;
++
++    if ( idx >= nr_bufs )
++        return false;
++
++    memset(dst, 0, dst_size);
++
++    size = min_t(size_t, dst_size, bufs[idx].size);
++
++    return !copy_from_guest(dst, bufs[idx].h, size);
++}
++
++static bool copy_buf_to_guest(const xen_dm_op_buf_t bufs[],
++                              unsigned int nr_bufs, unsigned int idx,
++                              const void *src, size_t src_size)
++{
++    size_t size;
++
++    if ( idx >= nr_bufs )
++        return false;
++
++    size = min_t(size_t, bufs[idx].size, src_size);
++
++    return !copy_to_guest(bufs[idx].h, src, size);
++}
++
++static int dm_op(domid_t domid,
++                 unsigned int nr_bufs,
++                 xen_dm_op_buf_t bufs[])
++{
++    struct domain *d;
++    struct xen_dm_op op;
++    bool const_op = true;
++    long rc;
++
++    rc = rcu_lock_remote_domain_by_id(domid, &d);
++    if ( rc )
++        return rc;
++
++    if ( !has_hvm_container_domain(d) )
++        goto out;
++
++    rc = xsm_dm_op(XSM_DM_PRIV, d);
++    if ( rc )
++        goto out;
++
++    if ( !copy_buf_from_guest(bufs, nr_bufs, &op, 0, sizeof(op)) )
++    {
++        rc = -EFAULT;
++        goto out;
++    }
++
++    switch ( op.op )
++    {
++    default:
++        rc = -EOPNOTSUPP;
++        break;
++    }
++
++    if ( !rc &&
++         !const_op &&
++         !copy_buf_to_guest(bufs, nr_bufs, 0, &op, sizeof(op)) )
++        rc = -EFAULT;
++
++ out:
++    rcu_unlock_domain(d);
++
++    return rc;
++}
++
++#define MAX_NR_BUFS 1
++
++int compat_dm_op(domid_t domid,
++                 unsigned int nr_bufs,
++                 COMPAT_HANDLE_PARAM(compat_dm_op_buf_t) bufs)
++{
++    struct xen_dm_op_buf nat[MAX_NR_BUFS];
++    unsigned int i;
++
++    if ( nr_bufs > MAX_NR_BUFS )
++        return -E2BIG;
++
++    for ( i = 0; i < nr_bufs; i++ )
++    {
++        struct compat_dm_op_buf cmp;
++
++        if ( copy_from_compat_offset(&cmp, bufs, i, 1) )
++            return -EFAULT;
++
++#define XLAT_dm_op_buf_HNDL_h(_d_, _s_) \
++        guest_from_compat_handle((_d_)->h, (_s_)->h)
++
++        XLAT_dm_op_buf(&nat[i], &cmp);
++
++#undef XLAT_dm_op_buf_HNDL_h
++    }
++
++    return dm_op(domid, nr_bufs, nat);
++}
++
++long do_dm_op(domid_t domid,
++              unsigned int nr_bufs,
++              XEN_GUEST_HANDLE_PARAM(xen_dm_op_buf_t) bufs)
++{
++    struct xen_dm_op_buf nat[MAX_NR_BUFS];
++
++    if ( nr_bufs > MAX_NR_BUFS )
++        return -E2BIG;
++
++    if ( copy_from_guest_offset(nat, bufs, 0, nr_bufs) )
++        return -EFAULT;
++
++    return dm_op(domid, nr_bufs, nat);
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 0d1dae1..474c835 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -4220,6 +4220,7 @@ static const hypercall_table_t hvm_hypercall_table[] = {
+     COMPAT_CALL(platform_op),
+     COMPAT_CALL(mmuext_op),
+     HYPERCALL(xenpmu_op),
++    COMPAT_CALL(dm_op),
+     HYPERCALL(arch_1)
+ };
+ 
+diff --git a/xen/arch/x86/hypercall.c b/xen/arch/x86/hypercall.c
+index 33ffcbb..ff7445f 100644
+--- a/xen/arch/x86/hypercall.c
++++ b/xen/arch/x86/hypercall.c
+@@ -66,6 +66,7 @@ const hypercall_args_t hypercall_args_table[NR_hypercalls] =
+     ARGS(kexec_op, 2),
+     ARGS(tmem_op, 1),
+     ARGS(xenpmu_op, 2),
++    ARGS(dm_op, 3),
+     ARGS(mca, 1),
+     ARGS(arch_1, 1),
+ };
+@@ -128,6 +129,7 @@ static const hypercall_table_t pv_hypercall_table[] = {
+     HYPERCALL(tmem_op),
+ #endif
+     HYPERCALL(xenpmu_op),
++    COMPAT_CALL(dm_op),
+     HYPERCALL(mca),
+     HYPERCALL(arch_1),
+ };
+diff --git a/xen/include/Makefile b/xen/include/Makefile
+index 268bc9d..e753062 100644
+--- a/xen/include/Makefile
++++ b/xen/include/Makefile
+@@ -27,6 +27,7 @@ headers-$(CONFIG_X86)     += compat/arch-x86/xen-mca.h
+ headers-$(CONFIG_X86)     += compat/arch-x86/xen.h
+ headers-$(CONFIG_X86)     += compat/arch-x86/xen-$(compat-arch-y).h
+ headers-$(CONFIG_X86)     += compat/hvm/hvm_vcpu.h
++headers-$(CONFIG_X86)     += compat/hvm/dm_op.h
+ headers-y                 += compat/arch-$(compat-arch-y).h compat/pmu.h compat/xlat.h
+ headers-$(CONFIG_FLASK)   += compat/xsm/flask_op.h
+ 
+diff --git a/xen/include/public/hvm/dm_op.h b/xen/include/public/hvm/dm_op.h
+new file mode 100644
+index 0000000..8627a64
+--- /dev/null
++++ b/xen/include/public/hvm/dm_op.h
+@@ -0,0 +1,69 @@
++/*
++ * Copyright (c) 2016, Citrix Systems Inc
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef __XEN_PUBLIC_HVM_DM_OP_H__
++#define __XEN_PUBLIC_HVM_DM_OP_H__
++
++#include "../xen.h"
++
++#if defined(__XEN__) || defined(__XEN_TOOLS__)
++
++struct xen_dm_op {
++    uint32_t op;
++};
++
++#endif /* __XEN__ || __XEN_TOOLS__ */
++
++struct xen_dm_op_buf {
++    XEN_GUEST_HANDLE(void) h;
++    xen_ulong_t size;
++};
++typedef struct xen_dm_op_buf xen_dm_op_buf_t;
++DEFINE_XEN_GUEST_HANDLE(xen_dm_op_buf_t);
++
++/* ` enum neg_errnoval
++ * ` HYPERVISOR_dm_op(domid_t domid,
++ * `                  xen_dm_op_buf_t bufs[],
++ * `                  unsigned int nr_bufs)
++ * `
++ *
++ * @domid is the domain the hypercall operates on.
++ * @bufs points to an array of buffers where @bufs[0] contains a struct
++ * xen_dm_op, describing the specific device model operation and its
++ * parameters.
++ * @bufs[1..] may be referenced in the parameters for the purposes of
++ * passing extra information to or from the domain.
++ * @nr_bufs is the number of buffers in the @bufs array.
++ */
++
++#endif /* __XEN_PUBLIC_HVM_DM_OP_H__ */
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/xen/include/public/xen.h b/xen/include/public/xen.h
+index 37bbb22..6601e05 100644
+--- a/xen/include/public/xen.h
++++ b/xen/include/public/xen.h
+@@ -115,6 +115,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_ulong_t);
+ #define __HYPERVISOR_tmem_op              38
+ #define __HYPERVISOR_xc_reserved_op       39 /* reserved for XenClient */
+ #define __HYPERVISOR_xenpmu_op            40
++#define __HYPERVISOR_dm_op                41
+ 
+ /* Architecture-specific hypercall definitions. */
+ #define __HYPERVISOR_arch_0               48
+diff --git a/xen/include/xen/hypercall.h b/xen/include/xen/hypercall.h
+index 207a0e8..8d4824f 100644
+--- a/xen/include/xen/hypercall.h
++++ b/xen/include/xen/hypercall.h
+@@ -15,6 +15,7 @@
+ #include <public/tmem.h>
+ #include <public/version.h>
+ #include <public/pmu.h>
++#include <public/hvm/dm_op.h>
+ #include <asm/hypercall.h>
+ #include <xsm/xsm.h>
+ 
+@@ -141,6 +142,12 @@ do_xenoprof_op(int op, XEN_GUEST_HANDLE_PARAM(void) arg);
+ extern long
+ do_xenpmu_op(unsigned int op, XEN_GUEST_HANDLE_PARAM(xen_pmu_params_t) arg);
+ 
++extern long
++do_dm_op(
++    domid_t domid,
++    unsigned int nr_bufs,
++    XEN_GUEST_HANDLE_PARAM(xen_dm_op_buf_t) bufs);
++
+ #ifdef CONFIG_COMPAT
+ 
+ extern int
+@@ -190,6 +197,14 @@ extern int compat_multicall(
+     XEN_GUEST_HANDLE_PARAM(multicall_entry_compat_t) call_list,
+     uint32_t nr_calls);
+ 
++#include <compat/hvm/dm_op.h>
++
++extern int
++compat_dm_op(
++    domid_t domid,
++    unsigned int nr_bufs,
++    COMPAT_HANDLE_PARAM(compat_dm_op_buf_t) bufs);
++
+ #endif
+ 
+ void arch_get_xen_caps(xen_capabilities_info_t *info);
+diff --git a/xen/include/xlat.lst b/xen/include/xlat.lst
+index bdf1d05..039a39c 100644
+--- a/xen/include/xlat.lst
++++ b/xen/include/xlat.lst
+@@ -56,6 +56,7 @@
+ ?       grant_entry_header              grant_table.h
+ ?	grant_entry_v2			grant_table.h
+ ?	gnttab_swap_grant_ref		grant_table.h
++!	dm_op_buf			hvm/dm_op.h
+ ?	vcpu_hvm_context		hvm/hvm_vcpu.h
+ ?	vcpu_hvm_x86_32			hvm/hvm_vcpu.h
+ ?	vcpu_hvm_x86_64			hvm/hvm_vcpu.h
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index 9fc1a24..c36076e 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -721,6 +721,12 @@ static XSM_INLINE int xsm_pmu_op (XSM_DEFAULT_ARG struct domain *d, unsigned int
+     }
+ }
+ 
++static XSM_INLINE int xsm_dm_op(XSM_DEFAULT_ARG struct domain *d)
++{
++    XSM_ASSERT_ACTION(XSM_DM_PRIV);
++    return xsm_default_action(action, current->domain, d);
++}
++
+ #endif /* CONFIG_X86 */
+ 
+ #include <public/version.h>
+diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
+index 5dc59dd..e2d336f 100644
+--- a/xen/include/xsm/xsm.h
++++ b/xen/include/xsm/xsm.h
+@@ -184,6 +184,7 @@ struct xsm_operations {
+     int (*ioport_permission) (struct domain *d, uint32_t s, uint32_t e, uint8_t allow);
+     int (*ioport_mapping) (struct domain *d, uint32_t s, uint32_t e, uint8_t allow);
+     int (*pmu_op) (struct domain *d, unsigned int op);
++    int (*dm_op) (struct domain *d);
+ #endif
+     int (*xen_version) (uint32_t cmd);
+ };
+@@ -722,6 +723,11 @@ static inline int xsm_pmu_op (xsm_default_t def, struct domain *d, unsigned int
+     return xsm_ops->pmu_op(d, op);
+ }
+ 
++static inline int xsm_dm_op(xsm_default_t def, struct domain *d)
++{
++    return xsm_ops->dm_op(d);
++}
++
+ #endif /* CONFIG_X86 */
+ 
+ static inline int xsm_xen_version (xsm_default_t def, uint32_t op)
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index ec6f5b4..27d77e6 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -1632,6 +1632,12 @@ static int flask_pmu_op (struct domain *d, unsigned int op)
+         return -EPERM;
+     }
+ }
++
++static int flask_dm_op(struct domain *d)
++{
++    return current_has_perm(d, SECCLASS_HVM, HVM__DM);
++}
++
+ #endif /* CONFIG_X86 */
+ 
+ static int flask_xen_version (uint32_t op)
+@@ -1811,6 +1817,7 @@ static struct xsm_operations flask_ops = {
+     .ioport_permission = flask_ioport_permission,
+     .ioport_mapping = flask_ioport_mapping,
+     .pmu_op = flask_pmu_op,
++    .dm_op = flask_dm_op,
+ #endif
+     .xen_version = flask_xen_version,
+ };

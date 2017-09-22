@@ -1,0 +1,1846 @@
+From 6902cb00e03122811089bec0b089c5a21e2849ae Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Wed, 15 Feb 2017 14:44:16 +0000
+Subject: [PATCH] tools/libxendevicemodel: extract functions and add a compat
+ layer
+
+This patch extracts all functions resulting in a dm_op hypercall from
+libxenctrl and moves them into libxendevicemodel. It also adds a compat
+layer into libxenctrl, which can be selected by defining
+XC_WANT_COMPAT_DEVICEMODEL_API to 1 before including xenctrl.h.
+
+With this patch the core of libxendevicemodel still uses libxencall to
+issue the dm_op hypercalls, but this is done by calling through code that
+can be modified on a per-OS basis. A subsequent patch will add a Linux-
+specific variant.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Acked-by: Ian Jackson <ian.jackson@eu.citrix.com>
+Cc: Wei Liu <wei.liu2@citrix.com>
+---
+ tools/Makefile                                  |   1 +
+ tools/Rules.mk                                  |   2 +-
+ tools/libs/devicemodel/Makefile                 |  10 +-
+ tools/libs/devicemodel/compat.c                 |  45 +++
+ tools/libs/devicemodel/core.c                   | 435 ++++++++++++++++++++++++
+ tools/libs/devicemodel/include/xendevicemodel.h | 258 ++++++++++++++
+ tools/libs/devicemodel/libxendevicemodel.map    |  16 +
+ tools/libs/devicemodel/private.h                |  19 ++
+ tools/libxc/Makefile                            |   1 +
+ tools/libxc/include/xenctrl.h                   | 197 -----------
+ tools/libxc/include/xenctrl_compat.h            |  47 +++
+ tools/libxc/xc_devicemodel_compat.c             | 139 ++++++++
+ tools/libxc/xc_domain.c                         | 201 -----------
+ tools/libxc/xc_misc.c                           | 154 ---------
+ tools/libxc/xc_private.c                        |  73 ----
+ 15 files changed, 970 insertions(+), 628 deletions(-)
+ create mode 100644 tools/libs/devicemodel/compat.c
+ create mode 100644 tools/libxc/xc_devicemodel_compat.c
+
+diff --git a/tools/Makefile b/tools/Makefile
+index 0890cc9..e6c0cc5 100644
+--- a/tools/Makefile
++++ b/tools/Makefile
+@@ -262,6 +262,7 @@ subdir-all-qemu-xen-dir: qemu-xen-dir-find
+ 		--extra-cflags="-DXC_WANT_COMPAT_EVTCHN_API=1 \
+ 		-DXC_WANT_COMPAT_GNTTAB_API=1 \
+ 		-DXC_WANT_COMPAT_MAP_FOREIGN_API=1 \
++		-DXC_WANT_COMPAT_DEVICEMODEL_API=1 \
+ 		-I$(XEN_ROOT)/tools/include \
+ 		-I$(XEN_ROOT)/tools/libs/toollog/include \
+ 		-I$(XEN_ROOT)/tools/libs/evtchn/include \
+diff --git a/tools/Rules.mk b/tools/Rules.mk
+index e3415f0..8ea3901 100644
+--- a/tools/Rules.mk
++++ b/tools/Rules.mk
+@@ -119,7 +119,7 @@ LDLIBS_libxenforeignmemory = $(XEN_LIBXENFOREIGNMEMORY)/libxenforeignmemory$(lib
+ SHLIB_libxenforeignmemory  = -Wl,-rpath-link=$(XEN_LIBXENFOREIGNMEMORY)
+ 
+ CFLAGS_libxendevicemodel = -I$(XEN_LIBXENDEVICEMODEL)/include $(CFLAGS_xeninclude)
+-SHDEPS_libxendevicemodel = $(SHLIB_libxentoollog)
++SHDEPS_libxendevicemodel = $(SHLIB_libxentoollog) $(SHLIB_xencall)
+ LDLIBS_libxendevicemodel = $(XEN_LIBXENDEVICEMODEL)/libxendevicemodel$(libextension)
+ SHLIB_libxendevicemodel  = -Wl,-rpath-link=$(XEN_LIBXENDEVICEMODEL)
+ 
+diff --git a/tools/libs/devicemodel/Makefile b/tools/libs/devicemodel/Makefile
+index 4f1e616..b87bf84 100644
+--- a/tools/libs/devicemodel/Makefile
++++ b/tools/libs/devicemodel/Makefile
+@@ -8,8 +8,14 @@ SHLIB_LDFLAGS += -Wl,--version-script=libxendevicemodel.map
+ CFLAGS   += -Werror -Wmissing-prototypes
+ CFLAGS   += -I./include $(CFLAGS_xeninclude)
+ CFLAGS   += $(CFLAGS_libxentoollog)
+-
+-SRCS-y   += core.c
++CFLAGS   += $(CFLAGS_libxencall)
++
++SRCS-y                 += core.c
++SRCS-$(CONFIG_Linux)   += compat.c
++SRCS-$(CONFIG_FreeBSD) += compat.c
++SRCS-$(CONFIG_SunOS)   += compat.c
++SRCS-$(CONFIG_NetBSD)  += compat.c
++SRCS-$(CONFIG_MiniOS)  += compat.c
+ 
+ LIB_OBJS := $(patsubst %.c,%.o,$(SRCS-y))
+ PIC_OBJS := $(patsubst %.c,%.opic,$(SRCS-y))
+diff --git a/tools/libs/devicemodel/compat.c b/tools/libs/devicemodel/compat.c
+new file mode 100644
+index 0000000..245e907
+--- /dev/null
++++ b/tools/libs/devicemodel/compat.c
+@@ -0,0 +1,45 @@
++/*
++ * Copyright (c) 2017 Citrix Systems Inc.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation;
++ * version 2.1 of the License.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "private.h"
++
++int osdep_xendevicemodel_open(xendevicemodel_handle *dmod)
++{
++    return 0;
++}
++
++int osdep_xendevicemodel_close(xendevicemodel_handle *dmod)
++{
++    return 0;
++}
++
++int osdep_xendevicemodel_op(xendevicemodel_handle *dmod,
++                            domid_t domid, unsigned int nr_bufs,
++                            struct xendevicemodel_buf bufs[])
++{
++    return xendevicemodel_xcall(dmod, domid, nr_bufs, bufs);
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/tools/libs/devicemodel/core.c b/tools/libs/devicemodel/core.c
+index ec18142..33ee157 100644
+--- a/tools/libs/devicemodel/core.c
++++ b/tools/libs/devicemodel/core.c
+@@ -16,6 +16,8 @@
+  */
+ 
+ #include <stdlib.h>
++#include <string.h>
++#include <errno.h>
+ 
+ #include "private.h"
+ 
+@@ -23,6 +25,7 @@ xendevicemodel_handle *xendevicemodel_open(xentoollog_logger *logger,
+                                            unsigned open_flags)
+ {
+     xendevicemodel_handle *dmod = malloc(sizeof(*dmod));
++    int rc;
+ 
+     if (!dmod)
+         return NULL;
+@@ -39,6 +42,14 @@ xendevicemodel_handle *xendevicemodel_open(xentoollog_logger *logger,
+             goto err;
+     }
+ 
++    dmod->xcall = xencall_open(dmod->logger, 0);
++    if (!dmod->xcall)
++        goto err;
++
++    rc = osdep_xendevicemodel_open(dmod);
++    if (rc)
++        goto err;
++
+     return dmod;
+ 
+ err:
+@@ -49,14 +60,438 @@ err:
+ 
+ int xendevicemodel_close(xendevicemodel_handle *dmod)
+ {
++    int rc;
++
+     if (!dmod)
+         return 0;
+ 
++    rc = osdep_xendevicemodel_close(dmod);
++
++    xencall_close(dmod->xcall);
+     xtl_logger_destroy(dmod->logger_tofree);
+     free(dmod);
++    return rc;
++}
++
++int xendevicemodel_xcall(xendevicemodel_handle *dmod,
++                         domid_t domid, unsigned int nr_bufs,
++                         struct xendevicemodel_buf bufs[])
++{
++    int ret = -1;
++    void **xcall_bufs;
++    xen_dm_op_buf_t *op_bufs;
++    unsigned int i;
++
++    xcall_bufs = calloc(nr_bufs, sizeof(*xcall_bufs));
++    if (xcall_bufs == NULL)
++        goto out;
++
++    op_bufs = xencall_alloc_buffer(dmod->xcall, sizeof(xen_dm_op_buf_t) *
++                                   nr_bufs);
++    if (op_bufs == NULL)
++        goto out;
++
++    for (i = 0; i < nr_bufs; i++)  {
++        xcall_bufs[i] = xencall_alloc_buffer(dmod->xcall, bufs[i].size);
++        if ( xcall_bufs[i] == NULL )
++            goto out;
++
++        memcpy(xcall_bufs[i], bufs[i].ptr, bufs[i].size);
++        set_xen_guest_handle_raw(op_bufs[i].h, xcall_bufs[i]);
++
++        op_bufs[i].size = bufs[i].size;
++    }
++
++    ret = xencall3(dmod->xcall, __HYPERVISOR_dm_op,
++                   domid, nr_bufs, (unsigned long)op_bufs);
++    if (ret < 0)
++        goto out;
++
++    for (i = 0; i < nr_bufs; i++)
++        memcpy(bufs[i].ptr, xcall_bufs[i], bufs[i].size);
++
++out:
++    if (xcall_bufs)
++        for (i = 0; i < nr_bufs; i++)
++            xencall_free_buffer(dmod->xcall, xcall_bufs[i]);
++
++    xencall_free_buffer(dmod->xcall, op_bufs);
++    free(xcall_bufs);
++
++    return ret;
++}
++
++static int xendevicemodel_op(
++    xendevicemodel_handle *dmod, domid_t domid,  unsigned int nr_bufs, ...)
++{
++    struct xendevicemodel_buf *bufs;
++    va_list args;
++    unsigned int i;
++    int ret;
++
++    bufs = calloc(nr_bufs, sizeof(*bufs));
++    if (!bufs)
++        return -1;
++
++    va_start(args, nr_bufs);
++    for (i = 0; i < nr_bufs; i++) {
++        bufs[i].ptr = va_arg(args, void *);
++        bufs[i].size = va_arg(args, size_t);
++    }
++    va_end(args);
++
++    ret = osdep_xendevicemodel_op(dmod, domid, nr_bufs, bufs);
++
++    free(bufs);
++
++    return ret;
++}
++
++int xendevicemodel_create_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, int handle_bufioreq,
++    ioservid_t *id)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_create_ioreq_server *data;
++    int rc;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_create_ioreq_server;
++    data = &op.u.create_ioreq_server;
++
++    data->handle_bufioreq = handle_bufioreq;
++
++    rc = xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++    if (rc)
++        return rc;
++
++    *id = data->id;
++
++    return 0;
++}
++
++int xendevicemodel_get_ioreq_server_info(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id,
++    xen_pfn_t *ioreq_pfn, xen_pfn_t *bufioreq_pfn,
++    evtchn_port_t *bufioreq_port)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_get_ioreq_server_info *data;
++    int rc;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_get_ioreq_server_info;
++    data = &op.u.get_ioreq_server_info;
++
++    data->id = id;
++
++    rc = xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++    if (rc)
++        return rc;
++
++    if (ioreq_pfn)
++        *ioreq_pfn = data->ioreq_pfn;
++
++    if (bufioreq_pfn)
++        *bufioreq_pfn = data->bufioreq_pfn;
++
++    if (bufioreq_port)
++        *bufioreq_port = data->bufioreq_port;
++
+     return 0;
+ }
+ 
++int xendevicemodel_map_io_range_to_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id, int is_mmio,
++    uint64_t start, uint64_t end)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_ioreq_server_range *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_map_io_range_to_ioreq_server;
++    data = &op.u.map_io_range_to_ioreq_server;
++
++    data->id = id;
++    data->type = is_mmio ? XEN_DMOP_IO_RANGE_MEMORY : XEN_DMOP_IO_RANGE_PORT;
++    data->start = start;
++    data->end = end;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_unmap_io_range_from_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id, int is_mmio,
++    uint64_t start, uint64_t end)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_ioreq_server_range *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_unmap_io_range_from_ioreq_server;
++    data = &op.u.unmap_io_range_from_ioreq_server;
++
++    data->id = id;
++    data->type = is_mmio ? XEN_DMOP_IO_RANGE_MEMORY : XEN_DMOP_IO_RANGE_PORT;
++    data->start = start;
++    data->end = end;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_map_pcidev_to_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id,
++    uint16_t segment, uint8_t bus, uint8_t device, uint8_t function)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_ioreq_server_range *data;
++
++    if (device > 0x1f || function > 0x7) {
++        errno = EINVAL;
++        return -1;
++    }
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_map_io_range_to_ioreq_server;
++    data = &op.u.map_io_range_to_ioreq_server;
++
++    data->id = id;
++    data->type = XEN_DMOP_IO_RANGE_PCI;
++
++    /*
++     * The underlying hypercall will deal with ranges of PCI SBDF
++     * but, for simplicity, the API only uses singletons.
++     */
++    data->start = data->end = XEN_DMOP_PCI_SBDF((uint64_t)segment,
++                                                (uint64_t)bus,
++                                                (uint64_t)device,
++                                                (uint64_t)function);
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_unmap_pcidev_from_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id,
++    uint16_t segment, uint8_t bus, uint8_t device, uint8_t function)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_ioreq_server_range *data;
++
++    if (device > 0x1f || function > 0x7) {
++        errno = EINVAL;
++        return -1;
++    }
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_unmap_io_range_from_ioreq_server;
++    data = &op.u.unmap_io_range_from_ioreq_server;
++
++    data->id = id;
++    data->type = XEN_DMOP_IO_RANGE_PCI;
++
++    /*
++     * The underlying hypercall will deal with ranges of PCI SBDF
++     * but, for simplicity, the API only uses singletons.
++     */
++    data->start = data->end = XEN_DMOP_PCI_SBDF((uint64_t)segment,
++                                                (uint64_t)bus,
++                                                (uint64_t)device,
++                                                (uint64_t)function);
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_destroy_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_destroy_ioreq_server *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_destroy_ioreq_server;
++    data = &op.u.destroy_ioreq_server;
++
++    data->id = id;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_set_ioreq_server_state(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id, int enabled)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_set_ioreq_server_state *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_set_ioreq_server_state;
++    data = &op.u.set_ioreq_server_state;
++
++    data->id = id;
++    data->enabled = !!enabled;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_set_pci_intx_level(
++    xendevicemodel_handle *dmod, domid_t domid, uint16_t segment,
++    uint8_t bus, uint8_t device, uint8_t intx, unsigned int level)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_set_pci_intx_level *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_set_pci_intx_level;
++    data = &op.u.set_pci_intx_level;
++
++    data->domain = segment;
++    data->bus = bus;
++    data->device = device;
++    data->intx = intx;
++    data->level = level;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_set_isa_irq_level(
++    xendevicemodel_handle *dmod, domid_t domid, uint8_t irq,
++    unsigned int level)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_set_isa_irq_level *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_set_isa_irq_level;
++    data = &op.u.set_isa_irq_level;
++
++    data->isa_irq = irq;
++    data->level = level;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_set_pci_link_route(
++    xendevicemodel_handle *dmod, domid_t domid, uint8_t link, uint8_t irq)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_set_pci_link_route *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_set_pci_link_route;
++    data = &op.u.set_pci_link_route;
++
++    data->link = link;
++    data->isa_irq = irq;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_inject_msi(
++    xendevicemodel_handle *dmod, domid_t domid, uint64_t msi_addr,
++    uint32_t msi_data)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_inject_msi *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_inject_msi;
++    data = &op.u.inject_msi;
++
++    data->addr = msi_addr;
++    data->data = msi_data;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_track_dirty_vram(
++    xendevicemodel_handle *dmod, domid_t domid, uint64_t first_pfn,
++    uint32_t nr, unsigned long *dirty_bitmap)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_track_dirty_vram *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_track_dirty_vram;
++    data = &op.u.track_dirty_vram;
++
++    data->first_pfn = first_pfn;
++    data->nr = nr;
++
++    return xendevicemodel_op(dmod, domid, 2, &op, sizeof(op),
++                             dirty_bitmap, (size_t)(nr + 7) / 8);
++}
++
++int xendevicemodel_modified_memory(
++    xendevicemodel_handle *dmod, domid_t domid, uint64_t first_pfn,
++    uint32_t nr)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_modified_memory *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_modified_memory;
++    data = &op.u.modified_memory;
++
++    data->first_pfn = first_pfn;
++    data->nr = nr;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_set_mem_type(
++    xendevicemodel_handle *dmod, domid_t domid, hvmmem_type_t mem_type,
++    uint64_t first_pfn, uint32_t nr)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_set_mem_type *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_set_mem_type;
++    data = &op.u.set_mem_type;
++
++    data->mem_type = mem_type;
++    data->first_pfn = first_pfn;
++    data->nr = nr;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
++int xendevicemodel_inject_event(
++    xendevicemodel_handle *dmod, domid_t domid, int vcpu, uint8_t vector,
++    uint8_t type, uint32_t error_code, uint8_t insn_len, uint64_t cr2)
++{
++    struct xen_dm_op op;
++    struct xen_dm_op_inject_event *data;
++
++    memset(&op, 0, sizeof(op));
++
++    op.op = XEN_DMOP_inject_event;
++    data = &op.u.inject_event;
++
++    data->vcpuid = vcpu;
++    data->vector = vector;
++    data->type = type;
++    data->error_code = error_code;
++    data->insn_len = insn_len;
++    data->cr2 = cr2;
++
++    return xendevicemodel_op(dmod, domid, 1, &op, sizeof(op));
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/tools/libs/devicemodel/include/xendevicemodel.h b/tools/libs/devicemodel/include/xendevicemodel.h
+index f977b0e..e00f8da 100644
+--- a/tools/libs/devicemodel/include/xendevicemodel.h
++++ b/tools/libs/devicemodel/include/xendevicemodel.h
+@@ -17,6 +17,14 @@
+ #ifndef XENDEVICEMODEL_H
+ #define XENDEVICEMODEL_H
+ 
++#ifdef __XEN_TOOLS__
++
++#include <stdint.h>
++
++#include <xen/xen.h>
++#include <xen/hvm/dm_op.h>
++#include <xen/hvm/hvm_op.h>
++
+ /* Callers who don't care don't need to #include <xentoollog.h> */
+ struct xentoollog_logger;
+ 
+@@ -27,6 +35,256 @@ xendevicemodel_handle *xendevicemodel_open(struct xentoollog_logger *logger,
+ 
+ int xendevicemodel_close(xendevicemodel_handle *dmod);
+ 
++/*
++ * IOREQ Server API. (See section on IOREQ Servers in public/hvm_op.h).
++ */
++
++/**
++ * This function instantiates an IOREQ Server.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm handle_bufioreq how should the IOREQ Server handle buffered
++ *                       requests (HVM_IOREQSRV_BUFIOREQ_*)?
++ * @parm id pointer to an ioservid_t to receive the IOREQ Server id.
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_create_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, int handle_bufioreq,
++    ioservid_t *id);
++
++/**
++ * This function retrieves the necessary information to allow an
++ * emulator to use an IOREQ Server.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm id the IOREQ Server id.
++ * @parm ioreq_pfn pointer to a xen_pfn_t to receive the synchronous ioreq
++ *                  gmfn
++ * @parm bufioreq_pfn pointer to a xen_pfn_t to receive the buffered ioreq
++ *                    gmfn
++ * @parm bufioreq_port pointer to a evtchn_port_t to receive the buffered
++ *                     ioreq event channel
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_get_ioreq_server_info(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id,
++    xen_pfn_t *ioreq_pfn, xen_pfn_t *bufioreq_pfn,
++    evtchn_port_t *bufioreq_port);
++
++/**
++ * This function registers a range of memory or I/O ports for emulation.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm id the IOREQ Server id.
++ * @parm is_mmio is this a range of ports or memory
++ * @parm start start of range
++ * @parm end end of range (inclusive).
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_map_io_range_to_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id, int is_mmio,
++    uint64_t start, uint64_t end);
++
++/**
++ * This function deregisters a range of memory or I/O ports for emulation.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm id the IOREQ Server id.
++ * @parm is_mmio is this a range of ports or memory
++ * @parm start start of range
++ * @parm end end of range (inclusive).
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_unmap_io_range_from_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id, int is_mmio,
++    uint64_t start, uint64_t end);
++
++/**
++ * This function registers a PCI device for config space emulation.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm id the IOREQ Server id.
++ * @parm segment the PCI segment of the device
++ * @parm bus the PCI bus of the device
++ * @parm device the 'slot' number of the device
++ * @parm function the function number of the device
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_map_pcidev_to_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id,
++    uint16_t segment, uint8_t bus, uint8_t device, uint8_t function);
++
++/**
++ * This function deregisters a PCI device for config space emulation.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm id the IOREQ Server id.
++ * @parm segment the PCI segment of the device
++ * @parm bus the PCI bus of the device
++ * @parm device the 'slot' number of the device
++ * @parm function the function number of the device
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_unmap_pcidev_from_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id,
++    uint16_t segment, uint8_t bus, uint8_t device, uint8_t function);
++
++/**
++ * This function destroys an IOREQ Server.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm id the IOREQ Server id.
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_destroy_ioreq_server(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id);
++
++/**
++ * This function sets IOREQ Server state. An IOREQ Server
++ * will not be passed emulation requests until it is in
++ * the enabled state.
++ * Note that the contents of the ioreq_pfn and bufioreq_pfn are
++ * not meaningful until the IOREQ Server is in the enabled state.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm id the IOREQ Server id.
++ * @parm enabled the state.
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_set_ioreq_server_state(
++    xendevicemodel_handle *dmod, domid_t domid, ioservid_t id, int enabled);
++
++/**
++ * This function sets the level of INTx pin of an emulated PCI device.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm segment the PCI segment number of the emulated device
++ * @parm bus the PCI bus number of the emulated device
++ * @parm device the PCI device number of the emulated device
++ * @parm intx the INTx pin to modify (0 => A .. 3 => D)
++ * @parm level the level (1 for asserted, 0 for de-asserted)
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_set_pci_intx_level(
++    xendevicemodel_handle *dmod, domid_t domid, uint16_t segment,
++    uint8_t bus, uint8_t device, uint8_t intx, unsigned int level);
++
++/**
++ * This function sets the level of an ISA IRQ line.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm irq the IRQ number (0 - 15)
++ * @parm level the level (1 for asserted, 0 for de-asserted)
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_set_isa_irq_level(
++    xendevicemodel_handle *dmod, domid_t domid, uint8_t irq,
++    unsigned int level);
++
++/**
++ * This function maps a PCI INTx line to a an IRQ line.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm line the INTx line (0 => A .. 3 => B)
++ * @parm irq the IRQ number (0 - 15)
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_set_pci_link_route(
++    xendevicemodel_handle *dmod, domid_t domid, uint8_t link, uint8_t irq);
++
++/**
++ * This function injects an MSI into a guest.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm msi_addr the MSI address (0xfeexxxxx)
++ * @parm msi_data the MSI data
++ * @return 0 on success, -1 on failure.
++*/
++int xendevicemodel_inject_msi(
++    xendevicemodel_handle *dmod, domid_t domid, uint64_t msi_addr,
++    uint32_t msi_data);
++
++/**
++ * This function enables tracking of changes in the VRAM area.
++ *
++ * The following is done atomically:
++ * - get the dirty bitmap since the last call.
++ * - set up dirty tracking area for period up to the next call.
++ * - clear the dirty tracking area.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm first_pfn the start of the area to track
++ * @parm nr the number of pages to track
++ * @parm dirty_bitmal a pointer to the bitmap to be updated
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_track_dirty_vram(
++    xendevicemodel_handle *dmod, domid_t domid, uint64_t first_pfn,
++    uint32_t nr, unsigned long *dirty_bitmap);
++
++/**
++ * This function notifies the hypervisor that a set of domain pages
++ * have been modified.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm first_pfn the start of the modified area
++ * @parm nr the number of pages modified
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_modified_memory(
++    xendevicemodel_handle *dmod, domid_t domid, uint64_t first_pfn,
++    uint32_t nr);
++
++/**
++ * This function notifies the hypervisor that a set of domain pages
++ * are to be treated in a specific way. (See the definition of
++ * hvmmem_type_t).
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm mem_type determines how the set is to be treated
++ * @parm first_pfn the start of the set
++ * @parm nr the number of pages in the set
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_set_mem_type(
++    xendevicemodel_handle *dmod, domid_t domid, hvmmem_type_t mem_type,
++    uint64_t first_pfn, uint32_t nr);
++
++/**
++ * This function injects an event into a vCPU to take effect the next
++ * time it resumes.
++ *
++ * @parm dmod a handle to an open devicemodel interface.
++ * @parm domid the domain id to be serviced
++ * @parm vcpu the vcpu id
++ * @parm vector the interrupt vector
++ * @parm type the event type (see the definition of enum x86_event_type)
++ * @parm error_code the error code or ~0 to skip
++ * @parm insn_len the instruction length
++ * @parm cr2 the value of CR2 for page faults
++ * @return 0 on success, -1 on failure.
++ */
++int xendevicemodel_inject_event(
++    xendevicemodel_handle *dmod, domid_t domid, int vcpu, uint8_t vector,
++    uint8_t type, uint32_t error_code, uint8_t insn_len, uint64_t cr2);
++
++#endif /* __XEN_TOOLS__ */
++
+ #endif /* XENDEVICEMODEL_H */
+ 
+ /*
+diff --git a/tools/libs/devicemodel/libxendevicemodel.map b/tools/libs/devicemodel/libxendevicemodel.map
+index 980c429..abc6d06 100644
+--- a/tools/libs/devicemodel/libxendevicemodel.map
++++ b/tools/libs/devicemodel/libxendevicemodel.map
+@@ -1,6 +1,22 @@
+ VERS_1.0 {
+ 	global:
+ 		xendevicemodel_open;
++		xendevicemodel_create_ioreq_server;
++		xendevicemodel_get_ioreq_server_info;
++		xendevicemodel_map_io_range_to_ioreq_server;
++		xendevicemodel_unmap_io_range_from_ioreq_server;
++		xendevicemodel_map_pcidev_to_ioreq_server;
++		xendevicemodel_unmap_pcidev_from_ioreq_server;
++		xendevicemodel_destroy_ioreq_server;
++		xendevicemodel_set_ioreq_server_state;
++		xendevicemodel_set_pci_intx_level;
++		xendevicemodel_set_isa_irq_level;
++		xendevicemodel_set_pci_link_route;
++		xendevicemodel_inject_msi;
++		xendevicemodel_track_dirty_vram;
++		xendevicemodel_modified_memory;
++		xendevicemodel_set_mem_type;
++		xendevicemodel_inject_event;
+ 		xendevicemodel_close;
+ 	local: *; /* Do not expose anything by default */
+ };
+diff --git a/tools/libs/devicemodel/private.h b/tools/libs/devicemodel/private.h
+index cf1e4b0..7c7acf2 100644
+--- a/tools/libs/devicemodel/private.h
++++ b/tools/libs/devicemodel/private.h
+@@ -1,14 +1,33 @@
+ #ifndef XENDEVICEMODEL_PRIVATE_H
+ #define XENDEVICEMODEL_PRIVATE_H
+ 
++#define __XEN_TOOLS__ 1
++
+ #include <xentoollog.h>
+ #include <xendevicemodel.h>
++#include <xencall.h>
+ 
+ struct xendevicemodel_handle {
+     xentoollog_logger *logger, *logger_tofree;
+     unsigned int flags;
++    xencall_handle *xcall;
++};
++
++struct xendevicemodel_buf {
++    void *ptr;
++    size_t size;
+ };
+ 
++int xendevicemodel_xcall(xendevicemodel_handle *dmod,
++                         domid_t domid, unsigned int nr_bufs,
++                         struct xendevicemodel_buf bufs[]);
++
++int osdep_xendevicemodel_open(xendevicemodel_handle *dmod);
++int osdep_xendevicemodel_close(xendevicemodel_handle *dmod);
++int osdep_xendevicemodel_op(xendevicemodel_handle *dmod,
++                            domid_t domid, unsigned int nr_bufs,
++                            struct xendevicemodel_buf bufs[]);
++
+ #endif
+ 
+ /*
+diff --git a/tools/libxc/Makefile b/tools/libxc/Makefile
+index af5e49c..da689c4 100644
+--- a/tools/libxc/Makefile
++++ b/tools/libxc/Makefile
+@@ -50,6 +50,7 @@ CTRL_SRCS-$(CONFIG_NetBSDRump) += xc_netbsd.c
+ CTRL_SRCS-$(CONFIG_MiniOS) += xc_minios.c
+ CTRL_SRCS-y       += xc_evtchn_compat.c
+ CTRL_SRCS-y       += xc_gnttab_compat.c
++CTRL_SRCS-y       += xc_devicemodel_compat.c
+ 
+ GUEST_SRCS-y :=
+ GUEST_SRCS-y += xg_private.c xc_suspend.c
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 927e373..a48981a 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1594,59 +1594,6 @@ int xc_physdev_unmap_pirq(xc_interface *xch,
+                           int domid,
+                           int pirq);
+ 
+-int xc_hvm_set_pci_intx_level(
+-    xc_interface *xch, domid_t dom,
+-    uint16_t domain, uint8_t bus, uint8_t device, uint8_t intx,
+-    unsigned int level);
+-int xc_hvm_set_isa_irq_level(
+-    xc_interface *xch, domid_t dom,
+-    uint8_t isa_irq,
+-    unsigned int level);
+-
+-int xc_hvm_set_pci_link_route(
+-    xc_interface *xch, domid_t dom, uint8_t link, uint8_t isa_irq);
+-
+-int xc_hvm_inject_msi(
+-    xc_interface *xch, domid_t dom, uint64_t addr, uint32_t data);
+-
+-/*
+- * Track dirty bit changes in the VRAM area
+- *
+- * All of this is done atomically:
+- * - get the dirty bitmap since the last call
+- * - set up dirty tracking area for period up to the next call
+- * - clear the dirty tracking area.
+- *
+- * Returns -ENODATA and does not fill bitmap if the area has changed since the
+- * last call.
+- */
+-int xc_hvm_track_dirty_vram(
+-    xc_interface *xch, domid_t dom,
+-    uint64_t first_pfn, uint32_t nr,
+-    unsigned long *bitmap);
+-
+-/*
+- * Notify that some pages got modified by the Device Model
+- */
+-int xc_hvm_modified_memory(
+-    xc_interface *xch, domid_t dom, uint64_t first_pfn, uint32_t nr);
+-
+-/*
+- * Set a range of memory to a specific type.
+- * Allowed types are HVMMEM_ram_rw, HVMMEM_ram_ro, HVMMEM_mmio_dm
+- */
+-int xc_hvm_set_mem_type(
+-    xc_interface *xch, domid_t dom, hvmmem_type_t memtype, uint64_t first_pfn, uint32_t nr);
+-
+-/*
+- * Injects a hardware/software CPU trap, to take effect the next time the HVM 
+- * resumes. 
+- */
+-int xc_hvm_inject_trap(
+-    xc_interface *xch, domid_t dom, int vcpu, uint8_t vector,
+-    uint8_t type, uint32_t error_code, uint8_t insn_len,
+-    uint64_t cr2);
+-
+ /*
+  *  LOGGING AND ERROR REPORTING
+  */
+@@ -1691,150 +1638,6 @@ int xc_hvm_param_get(xc_interface *handle, domid_t dom, uint32_t param, uint64_t
+ int xc_set_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long value);
+ int xc_get_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long *value);
+ 
+-/*
+- * IOREQ Server API. (See section on IOREQ Servers in public/hvm_op.h).
+- */
+-
+-/**
+- * This function instantiates an IOREQ Server.
+- *
+- * @parm xch a handle to an open hypervisor interface.
+- * @parm domid the domain id to be serviced
+- * @parm handle_bufioreq how should the IOREQ Server handle buffered requests
+- *                       (HVM_IOREQSRV_BUFIOREQ_*)?
+- * @parm id pointer to an ioservid_t to receive the IOREQ Server id.
+- * @return 0 on success, -1 on failure.
+- */
+-int xc_hvm_create_ioreq_server(xc_interface *xch,
+-                               domid_t domid,
+-                               int handle_bufioreq,
+-                               ioservid_t *id);
+-
+-/**
+- * This function retrieves the necessary information to allow an
+- * emulator to use an IOREQ Server.
+- *
+- * @parm xch a handle to an open hypervisor interface.
+- * @parm domid the domain id to be serviced
+- * @parm id the IOREQ Server id.
+- * @parm ioreq_pfn pointer to a xen_pfn_t to receive the synchronous ioreq gmfn
+- * @parm bufioreq_pfn pointer to a xen_pfn_t to receive the buffered ioreq gmfn
+- * @parm bufioreq_port pointer to a evtchn_port_t to receive the buffered ioreq event channel
+- * @return 0 on success, -1 on failure.
+- */
+-int xc_hvm_get_ioreq_server_info(xc_interface *xch,
+-                                 domid_t domid,
+-                                 ioservid_t id,
+-                                 xen_pfn_t *ioreq_pfn,
+-                                 xen_pfn_t *bufioreq_pfn,
+-                                 evtchn_port_t *bufioreq_port);
+-
+-/**
+- * This function sets IOREQ Server state. An IOREQ Server
+- * will not be passed emulation requests until it is in
+- * the enabled state.
+- * Note that the contents of the ioreq_pfn and bufioreq_pfn are
+- * not meaningful until the IOREQ Server is in the enabled state.
+- *
+- * @parm xch a handle to an open hypervisor interface.
+- * @parm domid the domain id to be serviced
+- * @parm id the IOREQ Server id.
+- * @parm enabled the state.
+- * @return 0 on success, -1 on failure.
+- */
+-int xc_hvm_set_ioreq_server_state(xc_interface *xch,
+-                                  domid_t domid,
+-                                  ioservid_t id,
+-                                  int enabled);
+-
+-/**
+- * This function registers a range of memory or I/O ports for emulation.
+- *
+- * @parm xch a handle to an open hypervisor interface.
+- * @parm domid the domain id to be serviced
+- * @parm id the IOREQ Server id.
+- * @parm is_mmio is this a range of ports or memory
+- * @parm start start of range
+- * @parm end end of range (inclusive).
+- * @return 0 on success, -1 on failure.
+- */
+-int xc_hvm_map_io_range_to_ioreq_server(xc_interface *xch,
+-                                        domid_t domid,
+-                                        ioservid_t id,
+-                                        int is_mmio,
+-                                        uint64_t start,
+-                                        uint64_t end);
+-
+-/**
+- * This function deregisters a range of memory or I/O ports for emulation.
+- *
+- * @parm xch a handle to an open hypervisor interface.
+- * @parm domid the domain id to be serviced
+- * @parm id the IOREQ Server id.
+- * @parm is_mmio is this a range of ports or memory
+- * @parm start start of range
+- * @parm end end of range (inclusive).
+- * @return 0 on success, -1 on failure.
+- */
+-int xc_hvm_unmap_io_range_from_ioreq_server(xc_interface *xch,
+-                                            domid_t domid,
+-                                            ioservid_t id,
+-                                            int is_mmio,
+-                                            uint64_t start,
+-                                            uint64_t end);
+-
+-/**
+- * This function registers a PCI device for config space emulation.
+- *
+- * @parm xch a handle to an open hypervisor interface.
+- * @parm domid the domain id to be serviced
+- * @parm id the IOREQ Server id.
+- * @parm segment the PCI segment of the device
+- * @parm bus the PCI bus of the device
+- * @parm device the 'slot' number of the device
+- * @parm function the function number of the device
+- * @return 0 on success, -1 on failure.
+- */
+-int xc_hvm_map_pcidev_to_ioreq_server(xc_interface *xch,
+-                                      domid_t domid,
+-                                      ioservid_t id,
+-                                      uint16_t segment,
+-                                      uint8_t bus,
+-                                      uint8_t device,
+-                                      uint8_t function);
+-
+-/**
+- * This function deregisters a PCI device for config space emulation.
+- *
+- * @parm xch a handle to an open hypervisor interface.
+- * @parm domid the domain id to be serviced
+- * @parm id the IOREQ Server id.
+- * @parm segment the PCI segment of the device
+- * @parm bus the PCI bus of the device
+- * @parm device the 'slot' number of the device
+- * @parm function the function number of the device
+- * @return 0 on success, -1 on failure.
+- */
+-int xc_hvm_unmap_pcidev_from_ioreq_server(xc_interface *xch,
+-                                          domid_t domid,
+-                                          ioservid_t id,
+-                                          uint16_t segment,
+-                                          uint8_t bus,
+-                                          uint8_t device,
+-                                          uint8_t function);
+-
+-/**
+- * This function destroys an IOREQ Server.
+- *
+- * @parm xch a handle to an open hypervisor interface.
+- * @parm domid the domain id to be serviced
+- * @parm id the IOREQ Server id.
+- * @return 0 on success, -1 on failure.
+- */
+-int xc_hvm_destroy_ioreq_server(xc_interface *xch,
+-                                domid_t domid,
+-                                ioservid_t id);
+-
+ /* HVM guest pass-through */
+ int xc_assign_device(xc_interface *xch,
+                      uint32_t domid,
+diff --git a/tools/libxc/include/xenctrl_compat.h b/tools/libxc/include/xenctrl_compat.h
+index 93ccadb..040e7b2 100644
+--- a/tools/libxc/include/xenctrl_compat.h
++++ b/tools/libxc/include/xenctrl_compat.h
+@@ -120,6 +120,53 @@ int xc_gntshr_munmap(xc_gntshr *xcg, void *start_address, uint32_t count);
+ 
+ #endif /* XC_WANT_COMPAT_GNTTAB_API */
+ 
++#ifdef XC_WANT_COMPAT_DEVICEMODEL_API
++
++int xc_hvm_create_ioreq_server(
++    xc_interface *xch, domid_t domid, int handle_bufioreq,
++    ioservid_t *id);
++int xc_hvm_get_ioreq_server_info(
++    xc_interface *xch, domid_t domid, ioservid_t id, xen_pfn_t *ioreq_pfn,
++    xen_pfn_t *bufioreq_pfn, evtchn_port_t *bufioreq_port);
++int xc_hvm_map_io_range_to_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id, int is_mmio,
++    uint64_t start, uint64_t end);
++int xc_hvm_unmap_io_range_from_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id, int is_mmio,
++    uint64_t start, uint64_t end);
++int xc_hvm_map_pcidev_to_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id, uint16_t segment,
++    uint8_t bus, uint8_t device, uint8_t function);
++int xc_hvm_unmap_pcidev_from_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id, uint16_t segment,
++    uint8_t bus, uint8_t device, uint8_t function);
++int xc_hvm_destroy_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id);
++int xc_hvm_set_ioreq_server_state(
++    xc_interface *xch, domid_t domid, ioservid_t id, int enabled);
++int xc_hvm_set_pci_intx_level(
++    xc_interface *xch, domid_t domid, uint16_t segment, uint8_t bus,
++    uint8_t device, uint8_t intx, unsigned int level);
++int xc_hvm_set_isa_irq_level(
++    xc_interface *xch, domid_t domid, uint8_t irq, unsigned int level);
++int xc_hvm_set_pci_link_route(
++    xc_interface *xch, domid_t domid, uint8_t link, uint8_t irq);
++int xc_hvm_inject_msi(
++    xc_interface *xch, domid_t domid, uint64_t msi_addr, uint32_t msi_data);
++int xc_hvm_track_dirty_vram(
++    xc_interface *xch, domid_t domid, uint64_t first_pfn, uint32_t nr,
++    unsigned long *dirty_bitmap);
++int xc_hvm_modified_memory(
++    xc_interface *xch, domid_t domid, uint64_t first_pfn, uint32_t nr);
++int xc_hvm_set_mem_type(
++    xc_interface *xch, domid_t domid, hvmmem_type_t type,
++    uint64_t first_pfn, uint32_t nr);
++int xc_hvm_inject_trap(
++    xc_interface *xch, domid_t domid, int vcpu, uint8_t vector,
++    uint8_t type, uint32_t error_code, uint8_t insn_len, uint64_t cr2);
++
++#endif /* XC_WANT_COMPAT_DEVICEMODEL_API */
++
+ #endif
+ 
+ /*
+diff --git a/tools/libxc/xc_devicemodel_compat.c b/tools/libxc/xc_devicemodel_compat.c
+new file mode 100644
+index 0000000..e4edeea
+--- /dev/null
++++ b/tools/libxc/xc_devicemodel_compat.c
+@@ -0,0 +1,139 @@
++/*
++ * Compat shims for use of 3rd party consumers of libxenctrl device model
++ * functionality which has been split into separate libraries.
++ */
++
++#define XC_WANT_COMPAT_DEVICEMODEL_API
++#include "xc_private.h"
++
++int xc_hvm_create_ioreq_server(
++    xc_interface *xch, domid_t domid, int handle_bufioreq,
++    ioservid_t *id)
++{
++    return xendevicemodel_create_ioreq_server(xch->dmod, domid,
++                                              handle_bufioreq, id);
++}
++
++int xc_hvm_get_ioreq_server_info(
++    xc_interface *xch, domid_t domid, ioservid_t id, xen_pfn_t *ioreq_pfn,
++    xen_pfn_t *bufioreq_pfn, evtchn_port_t *bufioreq_port)
++{
++    return xendevicemodel_get_ioreq_server_info(xch->dmod, domid, id,
++                                                ioreq_pfn, bufioreq_pfn,
++                                                bufioreq_port);
++}
++
++int xc_hvm_map_io_range_to_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id, int is_mmio,
++    uint64_t start, uint64_t end)
++{
++    return xendevicemodel_map_io_range_to_ioreq_server(xch->dmod, domid,
++                                                       id, is_mmio, start,
++                                                       end);
++}
++
++int xc_hvm_unmap_io_range_from_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id, int is_mmio,
++    uint64_t start, uint64_t end)
++{
++    return xendevicemodel_unmap_io_range_from_ioreq_server(xch->dmod, domid,
++                                                           id, is_mmio,
++                                                           start, end);
++}
++
++int xc_hvm_map_pcidev_to_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id, uint16_t segment,
++    uint8_t bus, uint8_t device, uint8_t function)
++{
++    return xendevicemodel_map_pcidev_to_ioreq_server(xch->dmod, domid, id,
++                                                     segment, bus, device,
++                                                     function);
++}
++
++int xc_hvm_unmap_pcidev_from_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id, uint16_t segment,
++    uint8_t bus, uint8_t device, uint8_t function)
++{
++    return xendevicemodel_unmap_pcidev_from_ioreq_server(xch->dmod, domid,
++                                                         id, segment, bus,
++                                                         device, function);
++}
++
++int xc_hvm_destroy_ioreq_server(
++    xc_interface *xch, domid_t domid, ioservid_t id)
++{
++    return xendevicemodel_destroy_ioreq_server(xch->dmod, domid, id);
++}
++
++int xc_hvm_set_ioreq_server_state(
++    xc_interface *xch, domid_t domid, ioservid_t id, int enabled)
++{
++    return xendevicemodel_set_ioreq_server_state(xch->dmod, domid, id,
++                                                 enabled);
++}
++
++int xc_hvm_set_pci_intx_level(
++    xc_interface *xch, domid_t domid, uint16_t segment, uint8_t bus,
++    uint8_t device, uint8_t intx, unsigned int level)
++{
++    return xendevicemodel_set_pci_intx_level(xch->dmod, domid, segment,
++                                             bus, device, intx, level);
++}
++
++int xc_hvm_set_isa_irq_level(
++    xc_interface *xch, domid_t domid, uint8_t irq, unsigned int level)
++{
++    return xendevicemodel_set_isa_irq_level(xch->dmod, domid, irq, level);
++}
++
++int xc_hvm_set_pci_link_route(
++    xc_interface *xch, domid_t domid, uint8_t link, uint8_t irq)
++{
++    return xendevicemodel_set_pci_link_route(xch->dmod, domid, link, irq);
++}
++
++int xc_hvm_inject_msi(
++    xc_interface *xch, domid_t domid, uint64_t msi_addr, uint32_t msi_data)
++{
++    return xendevicemodel_inject_msi(xch->dmod, domid, msi_addr, msi_data);
++}
++
++int xc_hvm_track_dirty_vram(
++    xc_interface *xch, domid_t domid, uint64_t first_pfn, uint32_t nr,
++    unsigned long *dirty_bitmap)
++{
++    return xendevicemodel_track_dirty_vram(xch->dmod, domid, first_pfn,
++                                           nr, dirty_bitmap);
++}
++
++int xc_hvm_modified_memory(
++    xc_interface *xch, domid_t domid, uint64_t first_pfn, uint32_t nr)
++{
++    return xendevicemodel_modified_memory(xch->dmod, domid, first_pfn, nr);
++}
++
++int xc_hvm_set_mem_type(
++    xc_interface *xch, domid_t domid, hvmmem_type_t type,
++    uint64_t first_pfn, uint32_t nr)
++{
++    return xendevicemodel_set_mem_type(xch->dmod, domid, type, first_pfn,
++                                       nr);
++}
++
++int xc_hvm_inject_trap(
++    xc_interface *xch, domid_t domid, int vcpu, uint8_t vector,
++    uint8_t type, uint32_t error_code, uint8_t insn_len, uint64_t cr2)
++{
++    return xendevicemodel_inject_event(xch->dmod, domid, vcpu, vector,
++                                       type, error_code, insn_len, cr2);
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
+index fa1daeb..d862e53 100644
+--- a/tools/libxc/xc_domain.c
++++ b/tools/libxc/xc_domain.c
+@@ -1412,207 +1412,6 @@ int xc_get_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long
+     return 0;
+ }
+ 
+-int xc_hvm_create_ioreq_server(xc_interface *xch,
+-                               domid_t domid,
+-                               int handle_bufioreq,
+-                               ioservid_t *id)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_create_ioreq_server *data;
+-    int rc;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_create_ioreq_server;
+-    data = &op.u.create_ioreq_server;
+-
+-    data->handle_bufioreq = handle_bufioreq;
+-
+-    rc = do_dm_op(xch, domid, 1, &op, sizeof(op));
+-    if ( rc )
+-        return rc;
+-
+-    *id = data->id;
+-
+-    return 0;
+-}
+-
+-int xc_hvm_get_ioreq_server_info(xc_interface *xch,
+-                                 domid_t domid,
+-                                 ioservid_t id,
+-                                 xen_pfn_t *ioreq_pfn,
+-                                 xen_pfn_t *bufioreq_pfn,
+-                                 evtchn_port_t *bufioreq_port)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_get_ioreq_server_info *data;
+-    int rc;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_get_ioreq_server_info;
+-    data = &op.u.get_ioreq_server_info;
+-
+-    data->id = id;
+-
+-    rc = do_dm_op(xch, domid, 1, &op, sizeof(op));
+-    if ( rc )
+-        return rc;
+-
+-    if ( ioreq_pfn )
+-        *ioreq_pfn = data->ioreq_pfn;
+-
+-    if ( bufioreq_pfn )
+-        *bufioreq_pfn = data->bufioreq_pfn;
+-
+-    if ( bufioreq_port )
+-        *bufioreq_port = data->bufioreq_port;
+-
+-    return 0;
+-}
+-
+-int xc_hvm_map_io_range_to_ioreq_server(xc_interface *xch, domid_t domid,
+-                                        ioservid_t id, int is_mmio,
+-                                        uint64_t start, uint64_t end)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_ioreq_server_range *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_map_io_range_to_ioreq_server;
+-    data = &op.u.map_io_range_to_ioreq_server;
+-
+-    data->id = id;
+-    data->type = is_mmio ? XEN_DMOP_IO_RANGE_MEMORY : XEN_DMOP_IO_RANGE_PORT;
+-    data->start = start;
+-    data->end = end;
+-
+-    return do_dm_op(xch, domid, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_unmap_io_range_from_ioreq_server(xc_interface *xch, domid_t domid,
+-                                            ioservid_t id, int is_mmio,
+-                                            uint64_t start, uint64_t end)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_ioreq_server_range *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_unmap_io_range_from_ioreq_server;
+-    data = &op.u.unmap_io_range_from_ioreq_server;
+-
+-    data->id = id;
+-    data->type = is_mmio ? XEN_DMOP_IO_RANGE_MEMORY : XEN_DMOP_IO_RANGE_PORT;
+-    data->start = start;
+-    data->end = end;
+-
+-    return do_dm_op(xch, domid, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_map_pcidev_to_ioreq_server(xc_interface *xch, domid_t domid,
+-                                      ioservid_t id, uint16_t segment,
+-                                      uint8_t bus, uint8_t device,
+-                                      uint8_t function)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_ioreq_server_range *data;
+-
+-    if (device > 0x1f || function > 0x7) {
+-        errno = EINVAL;
+-        return -1;
+-    }
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_map_io_range_to_ioreq_server;
+-    data = &op.u.map_io_range_to_ioreq_server;
+-
+-    data->id = id;
+-    data->type = XEN_DMOP_IO_RANGE_PCI;
+-
+-    /*
+-     * The underlying hypercall will deal with ranges of PCI SBDF
+-     * but, for simplicity, the API only uses singletons.
+-     */
+-    data->start = data->end = XEN_DMOP_PCI_SBDF((uint64_t)segment,
+-                                                (uint64_t)bus,
+-                                                (uint64_t)device,
+-                                                (uint64_t)function);
+-
+-    return do_dm_op(xch, domid, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_unmap_pcidev_from_ioreq_server(xc_interface *xch, domid_t domid,
+-                                          ioservid_t id, uint16_t segment,
+-                                          uint8_t bus, uint8_t device,
+-                                          uint8_t function)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_ioreq_server_range *data;
+-
+-    if (device > 0x1f || function > 0x7) {
+-        errno = EINVAL;
+-        return -1;
+-    }
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_unmap_io_range_from_ioreq_server;
+-    data = &op.u.unmap_io_range_from_ioreq_server;
+-
+-    data->id = id;
+-    data->type = XEN_DMOP_IO_RANGE_PCI;
+-
+-    /*
+-     * The underlying hypercall will deal with ranges of PCI SBDF
+-     * but, for simplicity, the API only uses singletons.
+-     */
+-    data->start = data->end = XEN_DMOP_PCI_SBDF((uint64_t)segment,
+-                                                (uint64_t)bus,
+-                                                (uint64_t)device,
+-                                                (uint64_t)function);
+-
+-    return do_dm_op(xch, domid, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_destroy_ioreq_server(xc_interface *xch,
+-                                domid_t domid,
+-                                ioservid_t id)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_destroy_ioreq_server *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_destroy_ioreq_server;
+-    data = &op.u.destroy_ioreq_server;
+-
+-    data->id = id;
+-
+-    return do_dm_op(xch, domid, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_set_ioreq_server_state(xc_interface *xch,
+-                                  domid_t domid,
+-                                  ioservid_t id,
+-                                  int enabled)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_set_ioreq_server_state *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_set_ioreq_server_state;
+-    data = &op.u.set_ioreq_server_state;
+-
+-    data->id = id;
+-    data->enabled = !!enabled;
+-
+-    return do_dm_op(xch, domid, 1, &op, sizeof(op));
+-}
+-
+ int xc_domain_setdebugging(xc_interface *xch,
+                            uint32_t domid,
+                            unsigned int enable)
+diff --git a/tools/libxc/xc_misc.c b/tools/libxc/xc_misc.c
+index 5159475..88084fd 100644
+--- a/tools/libxc/xc_misc.c
++++ b/tools/libxc/xc_misc.c
+@@ -467,160 +467,6 @@ int xc_getcpuinfo(xc_interface *xch, int max_cpus,
+     return rc;
+ }
+ 
+-
+-int xc_hvm_set_pci_intx_level(
+-    xc_interface *xch, domid_t dom,
+-    uint16_t domain, uint8_t bus, uint8_t device, uint8_t intx,
+-    unsigned int level)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_set_pci_intx_level *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_set_pci_intx_level;
+-    data = &op.u.set_pci_intx_level;
+-
+-    data->domain = domain;
+-    data->bus = bus;
+-    data->device = device;
+-    data->intx = intx;
+-    data->level = level;
+-
+-    return do_dm_op(xch, dom, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_set_isa_irq_level(
+-    xc_interface *xch, domid_t dom,
+-    uint8_t isa_irq,
+-    unsigned int level)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_set_isa_irq_level *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_set_isa_irq_level;
+-    data = &op.u.set_isa_irq_level;
+-
+-    data->isa_irq = isa_irq;
+-    data->level = level;
+-
+-    return do_dm_op(xch, dom, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_set_pci_link_route(
+-    xc_interface *xch, domid_t dom, uint8_t link, uint8_t isa_irq)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_set_pci_link_route *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_set_pci_link_route;
+-    data = &op.u.set_pci_link_route;
+-
+-    data->link = link;
+-    data->isa_irq = isa_irq;
+-
+-    return do_dm_op(xch, dom, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_inject_msi(
+-    xc_interface *xch, domid_t dom, uint64_t msi_addr, uint32_t msi_data)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_inject_msi *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_inject_msi;
+-    data = &op.u.inject_msi;
+-
+-    data->addr = msi_addr;
+-    data->data = msi_data;
+-
+-    return do_dm_op(xch, dom, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_track_dirty_vram(
+-    xc_interface *xch, domid_t dom,
+-    uint64_t first_pfn, uint32_t nr,
+-    unsigned long *dirty_bitmap)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_track_dirty_vram *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_track_dirty_vram;
+-    data = &op.u.track_dirty_vram;
+-
+-    data->first_pfn = first_pfn;
+-    data->nr = nr;
+-
+-    return do_dm_op(xch, dom, 2, &op, sizeof(op),
+-                    dirty_bitmap, (size_t)((nr + 7) / 8));
+-}
+-
+-int xc_hvm_modified_memory(
+-    xc_interface *xch, domid_t dom, uint64_t first_pfn, uint32_t nr)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_modified_memory *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_modified_memory;
+-    data = &op.u.modified_memory;
+-
+-    data->first_pfn = first_pfn;
+-    data->nr = nr;
+-
+-    return do_dm_op(xch, dom, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_set_mem_type(
+-    xc_interface *xch, domid_t dom, hvmmem_type_t mem_type, uint64_t first_pfn, uint32_t nr)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_set_mem_type *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_set_mem_type;
+-    data = &op.u.set_mem_type;
+-
+-    data->mem_type = mem_type;
+-    data->first_pfn = first_pfn;
+-    data->nr = nr;
+-
+-    return do_dm_op(xch, dom, 1, &op, sizeof(op));
+-}
+-
+-int xc_hvm_inject_trap(
+-    xc_interface *xch, domid_t dom, int vcpu, uint8_t vector,
+-    uint8_t type, uint32_t error_code, uint8_t insn_len,
+-    uint64_t cr2)
+-{
+-    struct xen_dm_op op;
+-    struct xen_dm_op_inject_event *data;
+-
+-    memset(&op, 0, sizeof(op));
+-
+-    op.op = XEN_DMOP_inject_event;
+-    data = &op.u.inject_event;
+-
+-    data->vcpuid = vcpu;
+-    data->vector = vector;
+-    data->type = type;
+-    data->error_code = error_code;
+-    data->insn_len = insn_len;
+-    data->cr2 = cr2;
+-
+-    return do_dm_op(xch, dom, 1, &op, sizeof(op));
+-}
+-
+ int xc_livepatch_upload(xc_interface *xch,
+                         char *name,
+                         unsigned char *payload,
+diff --git a/tools/libxc/xc_private.c b/tools/libxc/xc_private.c
+index bce7797..72e6242 100644
+--- a/tools/libxc/xc_private.c
++++ b/tools/libxc/xc_private.c
+@@ -783,79 +783,6 @@ int xc_ffs64(uint64_t x)
+     return l ? xc_ffs32(l) : h ? xc_ffs32(h) + 32 : 0;
+ }
+ 
+-int do_dm_op(xc_interface *xch, domid_t domid, unsigned int nr_bufs, ...)
+-{
+-    int ret = -1;
+-    struct  {
+-        void *u;
+-        void *h;
+-    } *bounce;
+-    DECLARE_HYPERCALL_BUFFER(xen_dm_op_buf_t, bufs);
+-    va_list args;
+-    unsigned int idx;
+-
+-    bounce = calloc(nr_bufs, sizeof(*bounce));
+-    if ( bounce == NULL )
+-        goto fail1;
+-
+-    bufs = xc_hypercall_buffer_alloc(xch, bufs, sizeof(*bufs) * nr_bufs);
+-    if ( bufs == NULL )
+-        goto fail2;
+-
+-    va_start(args, nr_bufs);
+-    for ( idx = 0; idx < nr_bufs; idx++ )
+-    {
+-        void *u = va_arg(args, void *);
+-        size_t size = va_arg(args, size_t);
+-
+-        bounce[idx].h = xencall_alloc_buffer(xch->xcall, size);
+-        if ( bounce[idx].h == NULL )
+-            break; /* Error path handled after va_end(). */
+-
+-        memcpy(bounce[idx].h, u, size);
+-        bounce[idx].u = u;
+-
+-        set_xen_guest_handle_raw(bufs[idx].h, bounce[idx].h);
+-        bufs[idx].size = size;
+-    }
+-    va_end(args);
+-
+-    if ( idx != nr_bufs )
+-        goto fail3;
+-
+-    ret = xencall3(xch->xcall, __HYPERVISOR_dm_op,
+-                   domid, nr_bufs, HYPERCALL_BUFFER_AS_ARG(bufs));
+-    if ( ret < 0 )
+-        goto fail4;
+-
+-    while ( idx-- != 0 )
+-    {
+-        memcpy(bounce[idx].u, bounce[idx].h, bufs[idx].size);
+-        xencall_free_buffer(xch->xcall, bounce[idx].h);
+-    }
+-
+-    xc_hypercall_buffer_free(xch, bufs);
+-
+-    free(bounce);
+-
+-    return 0;
+-
+- fail4:
+-    idx = nr_bufs;
+-
+- fail3:
+-    while ( idx-- != 0 )
+-        xencall_free_buffer(xch->xcall, bounce[idx].h);
+-
+-    xc_hypercall_buffer_free(xch, bufs);
+-
+- fail2:
+-    free(bounce);
+-
+- fail1:
+-    return ret;
+-}
+-
+ /*
+  * Local variables:
+  * mode: C
+-- 
+2.7.4
+

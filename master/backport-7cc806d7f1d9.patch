@@ -1,0 +1,65 @@
+From 7cc806d7f1d91dd4c4656f11226f043c749eb0ed Mon Sep 17 00:00:00 2001
+From: George Dunlap <george.dunlap@citrix.com>
+Date: Mon, 22 May 2017 11:38:31 +0100
+Subject: [PATCH] Restore HVM_OP hypercall continuation (partial revert of
+ ae20ccf)
+
+Commit ae20ccf removed the hypercall continuation logic from the end
+of do_hvm_op(), claiming:
+
+"This patch removes the need for handling HVMOP restarts, so that
+infrastructure is removed."
+
+That turns out to be false.  The removal of HVMOP_set_mem_type removed
+the need to store a start iteration value in the hypercall
+continuation, but a grep through hvm.c for ERESTART turns up at least
+two places where do_hvm_op() may still need a hypercall continuation:
+
+ * HVMOP_set_hvm_param can return -ERESTART when setting
+HVM_PARAM_IDENT_PT in the event that it fails to acquire the domctl
+lock
+
+ * HVMOP_flush_tlbs can return -ERESTART if several vcpus call it at
+   the same time
+
+In both cases, a simple restart (with no stored iteration information)
+is necessary.
+
+Add a check for -ERESTART again, along with a comment at the top of
+the function regarding the lack of decoding any information from the
+op value.
+
+Reported-by: Xudong Hao <xudong.hao@intel.com>
+Signed-off-by: George Dunlap <george.dunlap@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-acked-by: Julien Grall <julien.grall@arm.com>
+Tested-by: Xudong Hao <xudong.hao@intel.com>
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index ebbfd14..66980ed 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -5085,6 +5085,13 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+ {
+     long rc = 0;
+ 
++    /*
++     * NB: hvm_op can be part of a restarted hypercall; but at the
++     * moment the only hypercalls which do continuations don't need to
++     * store any iteration information (since they're just re-trying
++     * the acquisition of a lock).
++     */
++
+     switch ( op )
+     {
+     case HVMOP_set_evtchn_upcall_vector:
+@@ -5216,6 +5223,10 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+     }
+     }
+ 
++    if ( rc == -ERESTART )
++        rc = hypercall_create_continuation(__HYPERVISOR_hvm_op, "lh",
++                                           op, arg);
++
+     return rc;
+ }
+ 

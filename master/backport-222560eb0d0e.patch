@@ -1,0 +1,496 @@
+From 222560eb0d0e03437a337f221e3cbf771bc32a0d Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 26 Jan 2015 14:15:23 +0000
+Subject: [PATCH] x86/hypercall: Move the hypercall tables into C
+
+Editing (and indeed, finding) the hypercall tables can be tricky, especially
+towards the end where .rept's are used to maintain the correct layout.
+
+Move this all into C, and let the compiler do the hard work.
+
+To do this, xen/hypercall.h and asm-x86/hypercall.h need to contain prototypes
+for all the hypercalls; some were previously missing.  This in turn requires
+some shuffling of definitions and includes.
+
+One difference is that NULL function pointers are used instead of
+{,compat_}do_ni_hypercall(), which pv_hypercall() handles correctly.  All
+ni_hypercall() infrastructure is therefore dropped.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 913c9a8..0e6510c 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -4268,7 +4268,9 @@ static const hypercall_table_t hvm_hypercall_table[NR_hypercalls] = {
+     HYPERCALL(hvm_op),
+     HYPERCALL(sysctl),
+     HYPERCALL(domctl),
++#ifdef CONFIG_TMEM
+     HYPERCALL(tmem_op),
++#endif
+     COMPAT_CALL(platform_op),
+     COMPAT_CALL(mmuext_op),
+     HYPERCALL(xenpmu_op),
+diff --git a/xen/arch/x86/hypercall.c b/xen/arch/x86/hypercall.c
+index 13a89a0..faff260 100644
+--- a/xen/arch/x86/hypercall.c
++++ b/xen/arch/x86/hypercall.c
+@@ -21,9 +21,6 @@
+ #include <xen/hypercall.h>
+ #include <xen/trace.h>
+ 
+-extern hypercall_fn_t *const hypercall_table[NR_hypercalls],
+-    *const compat_hypercall_table[NR_hypercalls];
+-
+ #define ARGS(x, n)                              \
+     [ __HYPERVISOR_ ## x ] = (n)
+ 
+@@ -116,6 +113,118 @@ const uint8_t compat_hypercall_args_table[NR_hypercalls] =
+ 
+ #undef ARGS
+ 
++#define HYPERCALL(x)                                                \
++    [ __HYPERVISOR_ ## x ] = (hypercall_fn_t *) do_ ## x
++
++#define do_arch_1             paging_domctl_continuation
++
++hypercall_fn_t *const hypercall_table[NR_hypercalls] = {
++    HYPERCALL(set_trap_table),
++    HYPERCALL(mmu_update),
++    HYPERCALL(set_gdt),
++    HYPERCALL(stack_switch),
++    HYPERCALL(set_callbacks),
++    HYPERCALL(fpu_taskswitch),
++    HYPERCALL(sched_op_compat),
++    HYPERCALL(platform_op),
++    HYPERCALL(set_debugreg),
++    HYPERCALL(get_debugreg),
++    HYPERCALL(update_descriptor),
++    HYPERCALL(memory_op),
++    HYPERCALL(multicall),
++    HYPERCALL(update_va_mapping),
++    HYPERCALL(set_timer_op),
++    HYPERCALL(event_channel_op_compat),
++    HYPERCALL(xen_version),
++    HYPERCALL(console_io),
++    HYPERCALL(physdev_op_compat),
++    HYPERCALL(grant_table_op),
++    HYPERCALL(vm_assist),
++    HYPERCALL(update_va_mapping_otherdomain),
++    HYPERCALL(iret),
++    HYPERCALL(vcpu_op),
++    HYPERCALL(set_segment_base),
++    HYPERCALL(mmuext_op),
++    HYPERCALL(xsm_op),
++    HYPERCALL(nmi_op),
++    HYPERCALL(sched_op),
++    HYPERCALL(callback_op),
++#ifdef CONFIG_XENOPROF
++    HYPERCALL(xenoprof_op),
++#endif
++    HYPERCALL(event_channel_op),
++    HYPERCALL(physdev_op),
++    HYPERCALL(hvm_op),
++    HYPERCALL(sysctl),
++    HYPERCALL(domctl),
++#ifdef CONFIG_KEXEC
++    HYPERCALL(kexec_op),
++#endif
++#ifdef CONFIG_TMEM
++    HYPERCALL(tmem_op),
++#endif
++    HYPERCALL(xenpmu_op),
++    HYPERCALL(mca),
++    HYPERCALL(arch_1),
++};
++
++#define COMPAT_CALL(x)                                              \
++    [ __HYPERVISOR_ ## x ] = (hypercall_fn_t *) compat_ ## x
++
++hypercall_fn_t *const compat_hypercall_table[NR_hypercalls] = {
++    COMPAT_CALL(set_trap_table),
++    HYPERCALL(mmu_update),
++    COMPAT_CALL(set_gdt),
++    HYPERCALL(stack_switch),
++    COMPAT_CALL(set_callbacks),
++    HYPERCALL(fpu_taskswitch),
++    HYPERCALL(sched_op_compat),
++    COMPAT_CALL(platform_op),
++    HYPERCALL(set_debugreg),
++    HYPERCALL(get_debugreg),
++    COMPAT_CALL(update_descriptor),
++    COMPAT_CALL(memory_op),
++    COMPAT_CALL(multicall),
++    COMPAT_CALL(update_va_mapping),
++    COMPAT_CALL(set_timer_op),
++    HYPERCALL(event_channel_op_compat),
++    COMPAT_CALL(xen_version),
++    HYPERCALL(console_io),
++    COMPAT_CALL(physdev_op_compat),
++    COMPAT_CALL(grant_table_op),
++    COMPAT_CALL(vm_assist),
++    COMPAT_CALL(update_va_mapping_otherdomain),
++    COMPAT_CALL(iret),
++    COMPAT_CALL(vcpu_op),
++    HYPERCALL(set_segment_base),
++    COMPAT_CALL(mmuext_op),
++    COMPAT_CALL(xsm_op),
++    COMPAT_CALL(nmi_op),
++    COMPAT_CALL(sched_op),
++    COMPAT_CALL(callback_op),
++#ifdef CONFIG_XENOPROF
++    COMPAT_CALL(xenoprof_op),
++#endif
++    HYPERCALL(event_channel_op),
++    COMPAT_CALL(physdev_op),
++    HYPERCALL(hvm_op),
++    HYPERCALL(sysctl),
++    HYPERCALL(domctl),
++#ifdef CONFIG_KEXEC
++    COMPAT_CALL(kexec_op),
++#endif
++#ifdef CONFIG_TMEM
++    HYPERCALL(tmem_op),
++#endif
++    HYPERCALL(xenpmu_op),
++    HYPERCALL(mca),
++    HYPERCALL(arch_1),
++};
++
++#undef do_arch_1
++#undef COMPAT_CALL
++#undef HYPERCALL
++
+ void pv_hypercall(struct cpu_user_regs *regs)
+ {
+     struct vcpu *curr = current;
+diff --git a/xen/arch/x86/x86_64/compat.c b/xen/arch/x86/x86_64/compat.c
+index f8f633b..edc3115 100644
+--- a/xen/arch/x86/x86_64/compat.c
++++ b/xen/arch/x86/x86_64/compat.c
+@@ -8,7 +8,6 @@ asm(".file \"" __FILE__ "\"");
+ #include <compat/xen.h>
+ #include <compat/physdev.h>
+ 
+-DEFINE_XEN_GUEST_HANDLE(physdev_op_compat_t);
+ #define physdev_op                    compat_physdev_op
+ #define physdev_op_t                  physdev_op_compat_t
+ #define do_physdev_op                 compat_physdev_op
+diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
+index 22897f1..1b4eaba 100644
+--- a/xen/arch/x86/x86_64/compat/entry.S
++++ b/xen/arch/x86/x86_64/compat/entry.S
+@@ -385,68 +385,3 @@ compat_crash_page_fault:
+         jmp   .Lft14
+ .previous
+         _ASM_EXTABLE(.Lft14, .Lfx14)
+-
+-.section .rodata, "a", @progbits
+-
+-#ifndef CONFIG_KEXEC
+-#define compat_kexec_op do_ni_hypercall
+-#endif
+-
+-#ifndef CONFIG_TMEM
+-#define do_tmem_op do_ni_hypercall
+-#endif
+-
+-#ifndef CONFIG_XENOPROF
+-#define compat_xenoprof_op do_ni_hypercall
+-#endif
+-
+-ENTRY(compat_hypercall_table)
+-        .quad compat_set_trap_table     /*  0 */
+-        .quad do_mmu_update
+-        .quad compat_set_gdt
+-        .quad do_stack_switch
+-        .quad compat_set_callbacks
+-        .quad do_fpu_taskswitch         /*  5 */
+-        .quad do_sched_op_compat
+-        .quad compat_platform_op
+-        .quad do_set_debugreg
+-        .quad do_get_debugreg
+-        .quad compat_update_descriptor  /* 10 */
+-        .quad compat_ni_hypercall
+-        .quad compat_memory_op
+-        .quad compat_multicall
+-        .quad compat_update_va_mapping
+-        .quad compat_set_timer_op       /* 15 */
+-        .quad do_event_channel_op_compat
+-        .quad compat_xen_version
+-        .quad do_console_io
+-        .quad compat_physdev_op_compat
+-        .quad compat_grant_table_op     /* 20 */
+-        .quad compat_vm_assist
+-        .quad compat_update_va_mapping_otherdomain
+-        .quad compat_iret
+-        .quad compat_vcpu_op
+-        .quad do_set_segment_base       /* 25 */
+-        .quad compat_mmuext_op
+-        .quad compat_xsm_op
+-        .quad compat_nmi_op
+-        .quad compat_sched_op
+-        .quad compat_callback_op        /* 30 */
+-        .quad compat_xenoprof_op
+-        .quad do_event_channel_op
+-        .quad compat_physdev_op
+-        .quad do_hvm_op
+-        .quad do_sysctl                 /* 35 */
+-        .quad do_domctl
+-        .quad compat_kexec_op
+-        .quad do_tmem_op
+-        .quad do_ni_hypercall           /* reserved for XenClient */
+-        .quad do_xenpmu_op              /* 40 */
+-        .rept __HYPERVISOR_arch_0-((.-compat_hypercall_table)/8)
+-        .quad compat_ni_hypercall
+-        .endr
+-        .quad do_mca                    /* 48 */
+-        .quad paging_domctl_continuation
+-        .rept NR_hypercalls-((.-compat_hypercall_table)/8)
+-        .quad compat_ni_hypercall
+-        .endr
+diff --git a/xen/arch/x86/x86_64/compat/traps.c b/xen/arch/x86/x86_64/compat/traps.c
+index 69c2d62..2cf61a1 100644
+--- a/xen/arch/x86/x86_64/compat/traps.c
++++ b/xen/arch/x86/x86_64/compat/traps.c
+@@ -329,8 +329,6 @@ long compat_set_callbacks(unsigned long event_selector,
+     return 0;
+ }
+ 
+-DEFINE_XEN_GUEST_HANDLE(trap_info_compat_t);
+-
+ int compat_set_trap_table(XEN_GUEST_HANDLE(trap_info_compat_t) traps)
+ {
+     struct compat_trap_info cur;
+diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
+index ebb0707..ad8a957 100644
+--- a/xen/arch/x86/x86_64/entry.S
++++ b/xen/arch/x86/x86_64/entry.S
+@@ -885,69 +885,6 @@ ENTRY(exception_table)
+         .quad do_reserved_trap /* Architecturally reserved exceptions. */
+         .endr
+         .size exception_table, . - exception_table
+-
+-#ifndef CONFIG_KEXEC
+-#define do_kexec_op do_ni_hypercall
+-#endif
+-
+-#ifndef CONFIG_TMEM
+-#define do_tmem_op do_ni_hypercall
+-#endif
+-
+-#ifndef CONFIG_XENOPROF
+-#define do_xenoprof_op do_ni_hypercall
+-#endif
+-
+-ENTRY(hypercall_table)
+-        .quad do_set_trap_table     /*  0 */
+-        .quad do_mmu_update
+-        .quad do_set_gdt
+-        .quad do_stack_switch
+-        .quad do_set_callbacks
+-        .quad do_fpu_taskswitch     /*  5 */
+-        .quad do_sched_op_compat
+-        .quad do_platform_op
+-        .quad do_set_debugreg
+-        .quad do_get_debugreg
+-        .quad do_update_descriptor  /* 10 */
+-        .quad do_ni_hypercall
+-        .quad do_memory_op
+-        .quad do_multicall
+-        .quad do_update_va_mapping
+-        .quad do_set_timer_op       /* 15 */
+-        .quad do_event_channel_op_compat
+-        .quad do_xen_version
+-        .quad do_console_io
+-        .quad do_physdev_op_compat
+-        .quad do_grant_table_op     /* 20 */
+-        .quad do_vm_assist
+-        .quad do_update_va_mapping_otherdomain
+-        .quad do_iret
+-        .quad do_vcpu_op
+-        .quad do_set_segment_base   /* 25 */
+-        .quad do_mmuext_op
+-        .quad do_xsm_op
+-        .quad do_nmi_op
+-        .quad do_sched_op
+-        .quad do_callback_op        /* 30 */
+-        .quad do_xenoprof_op
+-        .quad do_event_channel_op
+-        .quad do_physdev_op
+-        .quad do_hvm_op
+-        .quad do_sysctl             /* 35 */
+-        .quad do_domctl
+-        .quad do_kexec_op
+-        .quad do_tmem_op
+-        .quad do_ni_hypercall       /* reserved for XenClient */
+-        .quad do_xenpmu_op          /* 40 */
+-        .rept __HYPERVISOR_arch_0-((.-hypercall_table)/8)
+-        .quad do_ni_hypercall
+-        .endr
+-        .quad do_mca                /* 48 */
+-        .quad paging_domctl_continuation
+-        .rept NR_hypercalls-((.-hypercall_table)/8)
+-        .quad do_ni_hypercall
+-        .endr
+         .popsection
+ 
+ /* Table of automatically generated entry points.  One per vector. */
+diff --git a/xen/arch/x86/x86_64/traps.c b/xen/arch/x86/x86_64/traps.c
+index bf8dfcb..85b9ef3 100644
+--- a/xen/arch/x86/x86_64/traps.c
++++ b/xen/arch/x86/x86_64/traps.c
+@@ -14,6 +14,7 @@
+ #include <xen/nmi.h>
+ #include <xen/guest_access.h>
+ #include <xen/watchdog.h>
++#include <xen/hypercall.h>
+ #include <asm/current.h>
+ #include <asm/flushtlb.h>
+ #include <asm/traps.h>
+diff --git a/xen/common/kernel.c b/xen/common/kernel.c
+index 9dba17e..7d98585 100644
+--- a/xen/common/kernel.c
++++ b/xen/common/kernel.c
+@@ -486,12 +486,6 @@ DO(vm_assist)(unsigned int cmd, unsigned int type)
+ }
+ #endif
+ 
+-DO(ni_hypercall)(void)
+-{
+-    /* No-op hypercall. */
+-    return -ENOSYS;
+-}
+-
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/include/asm-x86/hypercall.h b/xen/include/asm-x86/hypercall.h
+index 731f3a8..c00de2b 100644
+--- a/xen/include/asm-x86/hypercall.h
++++ b/xen/include/asm-x86/hypercall.h
+@@ -9,6 +9,7 @@
+ #include <public/physdev.h>
+ #include <public/event_channel.h>
+ #include <public/arch-x86/xen-mca.h> /* for do_mca */
++#include <asm/paging.h>
+ 
+ typedef unsigned long hypercall_fn_t(
+     unsigned long, unsigned long, unsigned long,
+@@ -32,6 +33,14 @@ extern long
+ do_event_channel_op_compat(
+     XEN_GUEST_HANDLE_PARAM(evtchn_op_t) uop);
+ 
++/* Legacy hypercall (as of 0x00030202). */
++extern long do_physdev_op_compat(
++    XEN_GUEST_HANDLE(physdev_op_t) uop);
++
++/* Legacy hypercall (as of 0x00030101). */
++extern long do_sched_op_compat(
++    int cmd, unsigned long arg);
++
+ extern long
+ do_set_trap_table(
+     XEN_GUEST_HANDLE_PARAM(const_trap_info_t) traps);
+@@ -98,6 +107,9 @@ do_mmuext_op(
+     XEN_GUEST_HANDLE_PARAM(uint) pdone,
+     unsigned int foreigndom);
+ 
++extern long do_callback_op(
++    int cmd, XEN_GUEST_HANDLE_PARAM(const_void) arg);
++
+ extern unsigned long
+ do_iret(
+     void);
+@@ -113,6 +125,11 @@ do_set_segment_base(
+     unsigned int which,
+     unsigned long base);
+ 
++#ifdef CONFIG_COMPAT
++
++#include <compat/arch-x86/xen.h>
++#include <compat/physdev.h>
++
+ extern int
+ compat_physdev_op(
+     int cmd,
+@@ -131,4 +148,35 @@ extern int compat_mmuext_op(
+ extern int compat_platform_op(
+     XEN_GUEST_HANDLE_PARAM(void) u_xenpf_op);
+ 
++extern long compat_callback_op(
++    int cmd, XEN_GUEST_HANDLE(void) arg);
++
++extern int compat_update_va_mapping(
++    unsigned int va, u32 lo, u32 hi, unsigned int flags);
++
++extern int compat_update_va_mapping_otherdomain(
++    unsigned long va, u32 lo, u32 hi, unsigned long flags, domid_t domid);
++
++DEFINE_XEN_GUEST_HANDLE(trap_info_compat_t);
++extern int compat_set_trap_table(XEN_GUEST_HANDLE(trap_info_compat_t) traps);
++
++extern int compat_set_gdt(
++    XEN_GUEST_HANDLE_PARAM(uint) frame_list, unsigned int entries);
++
++extern int compat_update_descriptor(
++    u32 pa_lo, u32 pa_hi, u32 desc_lo, u32 desc_hi);
++
++extern unsigned int compat_iret(void);
++
++extern int compat_nmi_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) arg);
++
++extern long compat_set_callbacks(
++    unsigned long event_selector, unsigned long event_address,
++    unsigned long failsafe_selector, unsigned long failsafe_address);
++
++DEFINE_XEN_GUEST_HANDLE(physdev_op_compat_t);
++extern int compat_physdev_op_compat(XEN_GUEST_HANDLE(physdev_op_compat_t) uop);
++
++#endif /* CONFIG_COMPAT */
++
+ #endif /* __ASM_X86_HYPERCALL_H__ */
+diff --git a/xen/include/xen/hypercall.h b/xen/include/xen/hypercall.h
+index 0c8ae0e..207a0e8 100644
+--- a/xen/include/xen/hypercall.h
++++ b/xen/include/xen/hypercall.h
+@@ -19,10 +19,6 @@
+ #include <xsm/xsm.h>
+ 
+ extern long
+-do_ni_hypercall(
+-    void);
+-
+-extern long
+ do_sched_op(
+     int cmd,
+     XEN_GUEST_HANDLE_PARAM(void) arg);
+@@ -137,8 +133,6 @@ do_xsm_op(
+ extern long
+ do_tmem_op(
+     XEN_GUEST_HANDLE_PARAM(tmem_op_t) uops);
+-#else
+-#define do_tmem_op do_ni_hypercall
+ #endif
+ 
+ extern long
+@@ -184,6 +178,18 @@ compat_set_timer_op(
+     u32 lo,
+     s32 hi);
+ 
++extern int compat_xsm_op(
++    XEN_GUEST_HANDLE_PARAM(xsm_op_t) op);
++
++extern int compat_kexec_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) uarg);
++
++extern int compat_vm_assist(unsigned int cmd, unsigned int type);
++
++DEFINE_XEN_GUEST_HANDLE(multicall_entry_compat_t);
++extern int compat_multicall(
++    XEN_GUEST_HANDLE_PARAM(multicall_entry_compat_t) call_list,
++    uint32_t nr_calls);
++
+ #endif
+ 
+ void arch_get_xen_caps(xen_capabilities_info_t *info);

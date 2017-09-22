@@ -1,0 +1,89 @@
+From 9b7c0ce58396a20f01e8db4494e967ca4cb55ed4 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Wed, 25 Jan 2017 10:51:10 +0100
+Subject: [PATCH] x86/hvm: serialize trap injecting producer and consumer
+
+Since injection works on a remote vCPU, and since there's no
+enforcement of the subject vCPU being paused, there's a potential race
+between the producing and consuming sides. Fix this by leveraging the
+vector field as synchronization variable.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+[re-based]
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/hvm/dm.c b/xen/arch/x86/hvm/dm.c
+index c0b9bed..ec4a674 100644
+--- a/xen/arch/x86/hvm/dm.c
++++ b/xen/arch/x86/hvm/dm.c
+@@ -146,7 +146,7 @@ static int modified_memory(struct domain *d,
+         {
+             mfn_t gmfn = _mfn(page_to_mfn(page));
+ 
+-            paging_mark_dirty(d, gmfn);
++            paging_mark_dirty(d, mfn_x(gmfn));
+             /*
+              * These are most probably not page tables any more
+              * don't take a long time and don't die either.
+@@ -257,13 +257,16 @@ static int inject_event(struct domain *d,
+     if ( data->vcpuid >= d->max_vcpus || !(v = d->vcpu[data->vcpuid]) )
+         return -EINVAL;
+ 
+-    if ( v->arch.hvm_vcpu.inject_event.vector != -1 )
++    if ( cmpxchg(&v->arch.hvm_vcpu.inject_event.vector,
++                 HVM_EVENT_VECTOR_UNSET, HVM_EVENT_VECTOR_UPDATING) !=
++         HVM_EVENT_VECTOR_UNSET )
+         return -EBUSY;
+ 
+     v->arch.hvm_vcpu.inject_event.type = data->type;
+     v->arch.hvm_vcpu.inject_event.insn_len = data->insn_len;
+     v->arch.hvm_vcpu.inject_event.error_code = data->error_code;
+     v->arch.hvm_vcpu.inject_event.cr2 = data->cr2;
++    smp_wmb();
+     v->arch.hvm_vcpu.inject_event.vector = data->vector;
+ 
+     return 0;
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index feb602b..38df249 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -532,12 +532,14 @@ void hvm_do_resume(struct vcpu *v)
+     }
+ 
+     /* Inject pending hw/sw trap */
+-    if ( v->arch.hvm_vcpu.inject_event.vector != -1 )
++    if ( v->arch.hvm_vcpu.inject_event.vector >= 0 )
+     {
++        smp_rmb();
++
+         if ( !hvm_event_pending(v) )
+             hvm_inject_trap(&v->arch.hvm_vcpu.inject_event);
+ 
+-        v->arch.hvm_vcpu.inject_event.vector = -1;
++        v->arch.hvm_vcpu.inject_event.vector = HVM_EVENT_VECTOR_UNSET;
+     }
+ 
+     if ( unlikely(v->arch.vm_event) && v->arch.monitor.next_interrupt_enabled )
+@@ -1563,7 +1565,7 @@ int hvm_vcpu_initialise(struct vcpu *v)
+         (void(*)(unsigned long))hvm_assert_evtchn_irq,
+         (unsigned long)v);
+ 
+-    v->arch.hvm_vcpu.inject_event.vector = -1;
++    v->arch.hvm_vcpu.inject_event.vector = HVM_EVENT_VECTOR_UNSET;
+ 
+     if ( is_pvh_domain(d) )
+     {
+diff --git a/xen/include/asm-x86/hvm/hvm.h b/xen/include/asm-x86/hvm/hvm.h
+index cc256b6..04a5661 100644
+--- a/xen/include/asm-x86/hvm/hvm.h
++++ b/xen/include/asm-x86/hvm/hvm.h
+@@ -69,6 +69,9 @@ enum hvm_intblk {
+ #define HVM_INTR_SHADOW_SMI    0x00000004
+ #define HVM_INTR_SHADOW_NMI    0x00000008
+ 
++#define HVM_EVENT_VECTOR_UNSET    (-1)
++#define HVM_EVENT_VECTOR_UPDATING (-2)
++
+ /*
+  * HAP super page capabilities:
+  * bit0: if 2MB super page is allowed?
