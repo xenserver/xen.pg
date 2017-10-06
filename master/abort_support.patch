@@ -1,0 +1,263 @@
+diff --git a/tools/xenguest/control.c b/tools/xenguest/control.c
+index cc4d2d2..0394ae8 100644
+--- a/tools/xenguest/control.c
++++ b/tools/xenguest/control.c
+@@ -211,6 +211,18 @@ int emp_unlock(struct threadargs *args)
+    }
+ }
+ 
++
++int control_lock() {
++
++    pthread_mutex_lock(&runstate.lock);
++    return 0;
++}
++
++int control_unlock() {
++    pthread_mutex_unlock(&runstate.lock);
++    return 0;
++}
++
+ int run_in_thread(void (*func) (struct threadargs *), struct threadargs *args)
+ {
+    struct threadargs *targs;
+@@ -465,12 +477,13 @@ int control_sock_init(char* socket_name, struct control_sock_inf *inf, struct co
+    return 0;
+ }
+ 
+-int control_fdset(struct control_sock_inf *inf, fd_set *fds)
++int control_fdset(struct control_sock_inf *inf, fd_set *fds, int* num_clients)
+ {
+     int max_fd;
+     int client;
+     int fd;
+-
++    if (num_clients)
++       *num_clients = 0;
+     //add master socket to set
+     FD_SET(inf->master_socket, fds);
+     max_fd = inf->master_socket;
+@@ -483,9 +496,11 @@ int control_fdset(struct control_sock_inf *inf, fd_set *fds)
+             fd = client_socket[client];
+ 
+             //if valid socket descriptor then add to read list
+-            if(fd > 0)
++            if(fd > 0) {
+                 FD_SET( fd , fds);
+-
++                if (num_clients)
++                    (*num_clients)++;
++            }
+             //highest file descriptor number, need it for the select function
+             if(fd > max_fd)
+                 max_fd = fd;
+diff --git a/tools/xenguest/control.h b/tools/xenguest/control.h
+index 2c3fc52..b3b11c3 100644
+--- a/tools/xenguest/control.h
++++ b/tools/xenguest/control.h
+@@ -61,8 +61,10 @@ struct control_sock_inf {
+ 
+ 
+ int control_sock_init(char *name, struct control_sock_inf *inf, struct command_actions actions[]);
+-int control_fdset(struct control_sock_inf *inf, fd_set *fds);
++int control_fdset(struct control_sock_inf *inf, fd_set *fds, int* num_clients);
+ int control_fdread(struct control_sock_inf *inf, fd_set *fds, int activity);
++int control_lock(void);
++int control_unlock(void);
+ 
+ int send_event_migrate_completed(struct demu_client cli);
+ int send_event_migrate_completed_result(struct demu_client cli, char* result);
+diff --git a/tools/xenguest/emp.h b/tools/xenguest/emp.h
+index 4a0fe67..dd46d68 100644
+--- a/tools/xenguest/emp.h
++++ b/tools/xenguest/emp.h
+@@ -1,4 +1,5 @@
+ enum command_num {
++    cmd_track_dirty,
+     cmd_migrate_abort,
+     cmd_migrate_init,
+     cmd_migrate_live,
+@@ -29,6 +30,7 @@ struct command_names _cmd_name[] = {                \
+     {"migrate_progress",0, cmd_migrate_progress},   \
+     {"quit", 0, cmd_quit},                          \
+     {"restore", 0, cmd_restore},                    \
+-    {"set_args", 0, cmd_set_args}                   \
++    {"set_args", 0, cmd_set_args},                  \
++    {"track_dirty", 0, cmd_track_dirty}             \
+ }
+ 
+diff --git a/tools/xenguest/xenguest.c b/tools/xenguest/xenguest.c
+index 609eea9..ae9fef5 100644
+--- a/tools/xenguest/xenguest.c
++++ b/tools/xenguest/xenguest.c
+@@ -38,6 +38,8 @@
+  * successfully reads a line from controlinfd.
+  */
+ 
++#define COMMAND_TIMOUT (60*2)
++
+ enum xenguest_opts {
+     XG_OPT_MODE, /* choice */
+     XG_OPT_CONTROLINFD, /* int */
+@@ -102,7 +104,7 @@ int domid = -1;
+ bool force = false;
+ 
+ static sem_t sem_stopped;
+-static int live_stop = 0;
++static int live_stage = XGS_POLICY_CONTINUE_PRECOPY;
+ //static sem_t sem_done;
+ 
+ struct demu_client progress_cli = { .num = -1 };
+@@ -586,6 +588,24 @@ void do_cmd_quit(struct threadargs *args)
+    running = 0;
+ }
+ 
++void abort_all(void)
++{
++   live_stage = XGS_POLICY_ABORT;
++   /* post to sem, incase we are waiting */
++   sem_post(&sem_stopped);
++}
++
++void do_abort(struct threadargs *args)  {
++   xg_err("Recived abort command!");
++   abort_all();
++   send_return(args->cli, NULL);
++}
++
++
++void do_ignore(struct threadargs *args)  {
++   send_return(args->cli, NULL);
++}
++
+ 
+ void not_supported(struct threadargs *args)  {
+    xg_err("Not supported");
+@@ -607,6 +627,11 @@ int emu_suspend_callback(void *data)
+    int r;
+    xg_info("waiting for suspend");
+    r=sem_wait(&sem_stopped);
++   if (live_stage == XGS_POLICY_ABORT) {
++       xg_info("Ignoring libxc suspend reqest do to abort");
++       return 0;
++   }
++
+    xg_info("suspend was recived");
+    return 1;
+ }
+@@ -615,7 +640,8 @@ int emu_suspend_callback(void *data)
+ int xenguest_precopy_policy(
+     struct precopy_stats stats, void *user)
+ {
+-    int stop = live_stop;
++    int stop_decision = live_stage;
++    int r = 0;
+ 
+     if (stats.dirty_count >= 0) {
+         struct demu_client *cli = (struct demu_client *)user;
+@@ -623,17 +649,17 @@ int xenguest_precopy_policy(
+         last_iter = stats.iteration;
+ 
+         xg_info("Checking live policy.  %ld / %d for %d", stats.dirty_count, stats.total_written ,stats.iteration);
+-        send_event_migrate_progress(*cli, stats.total_written, stats.dirty_count, stats.iteration);
++        r = send_event_migrate_progress(*cli, stats.total_written, stats.dirty_count, stats.iteration);
+     }
+ 
+-    if (stop)
++    if (stop_decision)
+          xg_info("passing down stop message");
+     else if (stats.dirty_count == 0) {
+          xg_info("No dirty pages, finishing migration");
+-         stop = 1;
++         stop_decision = XGS_POLICY_STOP_AND_COPY;
+     }
+ 
+-   return (stop)?XGS_POLICY_STOP_AND_COPY:XGS_POLICY_CONTINUE_PRECOPY;
++   return stop_decision;
+ }
+ 
+ 
+@@ -679,7 +705,7 @@ void do_migrate_paused(struct threadargs *args)
+ void do_migrate_pause(struct threadargs *args)
+ {
+    send_return(args->cli, NULL);
+-   live_stop=1;
++   live_stage=XGS_POLICY_STOP_AND_COPY;
+ }
+ 
+ void do_cmd_restore(struct threadargs *args) 
+@@ -789,7 +815,8 @@ void do_cmd_set_args(struct threadargs *args)
+ }
+ 
+ struct command_actions actions[] = {
+-    {cmd_migrate_abort,    &not_supported, 0 },
++    {cmd_track_dirty,      &do_ignore, 0 },
++    {cmd_migrate_abort,    &do_abort, 0 },
+     {cmd_migrate_init,     &do_migrate_init, 0 },
+     {cmd_migrate_live,     &do_migrate_live, 1 },
+     {cmd_migrate_pause,    &do_migrate_pause, 0 },
+@@ -818,7 +845,7 @@ struct control_sock_inf cs_inf;
+    char* fname;
+    char* path;
+    int r;
+-
++   time_t act_time;
+ 
+    r = mkdir("/var/xen/xenguest", S_IRWXU | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+ 
+@@ -857,24 +884,39 @@ struct control_sock_inf cs_inf;
+        xg_err("control socket failed");
+        return;
+    }
+-//write(opt_controloutfd,"Greetings!\n", 12);
++
++   act_time = time(0);
++
+    printf("Ready\n");
++
+    for (;running;) {
+         fd_set          rfds;
+         fd_set          wfds;
+         fd_set          xfds;
+         int             nfds;
+-/*        struct timeval  tv; */
++        int             num_clients;
++        struct timeval  tv;
+ 
+         FD_ZERO(&rfds);
+         FD_ZERO(&wfds);
+         FD_ZERO(&xfds);
+-/*        tv.tv_sec = 10;
+-        tv.tv_usec = 0; */
++        tv.tv_sec = 30;
++        tv.tv_usec = 0;
+ 
+-        nfds = control_fdset(&cs_inf, &rfds);
++        nfds = control_fdset(&cs_inf, &rfds, &num_clients);
+         nfds++;
+-        rc = select(nfds, &rfds, &wfds, &xfds, NULL);
++        rc = select(nfds, &rfds, &wfds, &xfds, &tv);
++
++        if (rc == 0 && num_clients == 0) {
++           int timediff = time(0) - act_time;
++           if (timediff > COMMAND_TIMOUT) {
++               xg_err("Control timeout");
++               abort_all();
++               break;
++           }
++        }
++        else
++           act_time = time(0);
+ 
+         if (rc < 0 && errno != EINTR)
+             break;
+@@ -883,6 +925,9 @@ struct control_sock_inf cs_inf;
+                rc = control_fdread(&cs_inf, &rfds, rc);
+ 
+     }
++    /* wait for any threads to finish */
++    control_lock();
++    control_unlock();
+ 
+ }
+ 
