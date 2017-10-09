@@ -3,7 +3,7 @@ From: Jan Beulich <jbeulich@suse.com>
 Date: Thu, 28 Sep 2017 15:17:27 +0100
 Subject: [PATCH 1/2] x86: limit linear page table use to a single level
 
-That's the only way what they're meant to be used. Without such a
+That's the only way that they're meant to be used. Without such a
 restriction arbitrarily long chains of same-level page tables can be
 built, tearing down of which may then cause arbitrarily deep recursion,
 causing a stack overflow. To facilitate this restriction, a counter is
@@ -268,7 +268,7 @@ index e97ecccd93..e81a461b91 100644
                      current->arch.old_guest_table = page;
                  }
              }
-@@ -2369,8 +2467,8 @@ int free_page_type(struct page_info *page, unsigned long type,
+@@ -2369,14 +2467,20 @@ int free_page_type(struct page_info *pag
  }
  
  
@@ -279,19 +279,18 @@ index e97ecccd93..e81a461b91 100644
  {
      int rc = free_page_type(page, type, preemptible);
  
-@@ -2387,6 +2485,12 @@ static int __put_final_page_type(
-         if ( !(shadow_mode_enabled(page_get_owner(page)) &&
-                (page->count_info & PGC_page_table)) )
-             page->tlbflush_timestamp = tlbflush_current_time();
+     /* No need for atomic update of type_info here: noone else updates it. */
+     if ( rc == 0 )
+     {
 +        if ( ptpg && PGT_type_equal(type, ptpg->u.inuse.type_info) )
 +        {
 +            dec_linear_uses(page);
 +            dec_linear_entries(ptpg);
 +        }
 +        ASSERT(!page->linear_pt_count || page_get_owner(page)->is_dying);
-         wmb();
-         page->u.inuse.type_info--;
-     }
+         /*
+          * Record TLB information for flush later. We do not stamp page tables
+          * when running in shadow mode:
 @@ -2412,8 +2516,8 @@ static int __put_final_page_type(
  }
  
