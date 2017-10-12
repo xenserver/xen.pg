@@ -3,21 +3,81 @@ xen/gnttab: Avoid TLB flush if grant mapped page was not accessed
 Implement an optimisation to avoid a TLB flush if the grant mapped page was
 not accessed whilst it was mapped.
 
-According to "AMD64 Architecture Programmer’s Manual Volume 2: System
-Programming" (2017 Mar) Chapter "5.4.2 Notes on Accessed and Dirty Bits",
-"The processor does not order Accessed bit updates with respect to loads
-done by other instructions". This means Xen cannot rely on Accessed bit
-value int a PTE. Skip TLB flush optimization if running on AMD CPU by
-unconditionally setting page_accessed to 1.
-
 Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
 Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
 
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index e97eccc..8224f43 100644
+index e97eccc..9d0221b 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -4077,7 +4077,7 @@ static int destroy_grant_pte_mapping(
+@@ -1804,49 +1804,53 @@ void page_unlock(struct page_info *page)
+ 
+ /* How to write an entry to the guest pagetables.
+  * Returns 0 for failure (pointer not valid), 1 for success. */
+-static inline int update_intpte(intpte_t *p, 
+-                                intpte_t old, 
+-                                intpte_t new,
+-                                unsigned long mfn,
+-                                struct vcpu *v,
+-                                int preserve_ad)
++static inline int _update_intpte(
++    intpte_t *p, intpte_t *old, intpte_t new,
++    unsigned long mfn, struct vcpu *v, int preserve_ad, int use_cmpxchg)
+ {
+     int rv = 1;
+ #ifndef PTE_UPDATE_WITH_CMPXCHG
+-    if ( !preserve_ad )
++    if ( !preserve_ad && !use_cmpxchg )
+     {
+         rv = paging_write_guest_entry(v, p, new, _mfn(mfn));
+     }
+     else
+ #endif
+     {
+-        intpte_t t = old;
++        intpte_t t = *old;
+         for ( ; ; )
+         {
+             intpte_t _new = new;
+             if ( preserve_ad )
+-                _new |= old & (_PAGE_ACCESSED | _PAGE_DIRTY);
++                _new |= *old & (_PAGE_ACCESSED | _PAGE_DIRTY);
+ 
+             rv = paging_cmpxchg_guest_entry(v, p, &t, _new, _mfn(mfn));
+             if ( unlikely(rv == 0) )
+             {
+                 MEM_LOG("Failed to update %" PRIpte " -> %" PRIpte
+-                        ": saw %" PRIpte, old, _new, t);
++                        ": saw %" PRIpte, *old, _new, t);
+                 break;
+             }
+ 
+-            if ( t == old )
++            if ( t == *old )
+                 break;
+ 
+             /* Allowed to change in Accessed/Dirty flags only. */
+-            BUG_ON((t ^ old) & ~(intpte_t)(_PAGE_ACCESSED|_PAGE_DIRTY));
++            BUG_ON((t ^ *old) & ~(intpte_t)(_PAGE_ACCESSED|_PAGE_DIRTY));
+ 
+-            old = t;
++            *old = t;
+         }
+     }
+     return rv;
+ }
+ 
++static inline int update_intpte(
++    intpte_t *p, intpte_t old, intpte_t new,
++    unsigned long mfn, struct vcpu *v, int preserve_ad)
++{
++    return _update_intpte(p, &old, new, mfn, v, preserve_ad, 0);
++}
++
+ /* Macro that wraps the appropriate type-changes around update_intpte().
+  * Arguments are: type, ptr, old, new, mfn, vcpu */
+ #define UPDATE_ENTRY(_t,_p,_o,_n,_m,_v,_ad)                         \
+@@ -4077,7 +4081,7 @@ static int destroy_grant_pte_mapping(
      }
  
      if ( unlikely((l1e_get_flags(ol1e) ^ grant_pte_flags) &
@@ -26,7 +86,7 @@ index e97eccc..8224f43 100644
          MEM_LOG("PTE flags %x at %"PRIx64" don't match grant (%x)\n",
                  l1e_get_flags(ol1e), addr, grant_pte_flags);
  
-@@ -4158,7 +4158,7 @@ static int create_grant_va_mapping(
+@@ -4158,7 +4162,7 @@ static int create_grant_va_mapping(
  
  static int replace_grant_va_mapping(
      unsigned long addr, unsigned long frame, unsigned int grant_pte_flags,
@@ -35,7 +95,7 @@ index e97eccc..8224f43 100644
  {
      l1_pgentry_t *pl1e, ol1e;
      unsigned long gl1mfn;
-@@ -4210,18 +4210,23 @@ static int replace_grant_va_mapping(
+@@ -4210,18 +4214,28 @@ static int replace_grant_va_mapping(
      }
  
      if ( unlikely((l1e_get_flags(ol1e) ^ grant_pte_flags) &
@@ -46,22 +106,27 @@ index e97eccc..8224f43 100644
  
      /* Delete pagetable entry. */
 -    if ( unlikely(!UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, v, 0)) )
-+    if ( unlikely(!UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, v, 1)) )
++    if ( unlikely(!_update_intpte(&pl1e->l1, &ol1e.l1, nl1e.l1, gl1mfn, v, 0, 1)) )
      {
          MEM_LOG("Cannot delete PTE entry for %"PRIx64, addr);
          rc = GNTST_general_error;
          goto unlock_and_out;
      }
  
-+    if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
-+        *page_accessed = 1;
-+    else
-+        *page_accessed = !!(l1e_get_flags(*pl1e) & _PAGE_ACCESSED);
++    /*
++     * Calculate a synthetic _PAGE_ACCESSED bit, which controls whether the
++     * TLB flush is performed or skipped for grant unmap.
++     *
++     * Note: The use of a locked cmpxchg makes this is safe on AMD processors,
++     * as locked accesses are ordered WRT the pagewalk, unlike normal
++     * accesses.
++     */
++    *page_accessed = !!(l1e_get_flags(ol1e) & _PAGE_ACCESSED);
 +
   unlock_and_out:
      page_unlock(l1pg);
      put_page(l1pg);
-@@ -4232,10 +4237,10 @@ static int replace_grant_va_mapping(
+@@ -4232,10 +4246,10 @@ static int replace_grant_va_mapping(
  
  static int destroy_grant_va_mapping(
      unsigned long addr, unsigned long frame, unsigned int grant_pte_flags,
@@ -74,7 +139,7 @@ index e97eccc..8224f43 100644
  }
  
  static int create_grant_p2m_mapping(uint64_t addr, unsigned long frame,
-@@ -4270,7 +4275,7 @@ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
+@@ -4270,7 +4284,7 @@ int create_grant_host_mapping(uint64_t addr, unsigned long frame,
          return create_grant_p2m_mapping(addr, frame, flags, cache_flags);
  
      grant_pte_flags =
@@ -83,7 +148,7 @@ index e97eccc..8224f43 100644
      if ( cpu_has_nx )
          grant_pte_flags |= _PAGE_NX_BIT;
  
-@@ -4321,7 +4326,8 @@ static int replace_grant_p2m_mapping(
+@@ -4321,7 +4335,8 @@ static int replace_grant_p2m_mapping(
  }
  
  int replace_grant_host_mapping(
@@ -93,7 +158,7 @@ index e97eccc..8224f43 100644
  {
      struct vcpu *curr = current;
      l1_pgentry_t *pl1e, ol1e;
-@@ -4361,7 +4367,8 @@ int replace_grant_host_mapping(
+@@ -4361,7 +4376,8 @@ int replace_grant_host_mapping(
      }
  
      if ( !new_addr )
@@ -103,7 +168,7 @@ index e97eccc..8224f43 100644
  
      pl1e = guest_map_l1e(new_addr, &gl1mfn);
      if ( !pl1e )
-@@ -4409,7 +4416,8 @@ int replace_grant_host_mapping(
+@@ -4409,7 +4425,8 @@ int replace_grant_host_mapping(
      put_page(l1pg);
      guest_unmap_l1e(pl1e);
  
@@ -114,7 +179,7 @@ index e97eccc..8224f43 100644
          put_page_from_l1e(ol1e, curr->domain);
  
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index ab11bae..dd6f0f7 100644
+index ab11bae..750882a 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
 @@ -94,6 +94,7 @@ struct gnttab_unmap_common {
@@ -202,7 +267,7 @@ index ab11bae..dd6f0f7 100644
          for ( i = 0; i < partial_done; i++ )
              __gnttab_unmap_common_complete(&(common[i]));
  
-@@ -3594,7 +3617,12 @@ static void gnttab_usage_print_all(unsigned char key)
+@@ -3594,6 +3617,11 @@ static void gnttab_usage_print_all(unsigned char key)
      printk("%s [ key '%c' pressed\n", __FUNCTION__, key);
      for_each_domain ( d )
          gnttab_usage_print(d);
@@ -210,11 +275,10 @@ index ab11bae..dd6f0f7 100644
 +    printk("Grant unmap tlb flush performed %i\n", atomic_read(&grant_unmap_tlb_flush_done));
 +    printk("Grant unmap tlb flush avoided %i\n", atomic_read(&grant_unmap_tlb_flush_avoided));
 +    printk("Grant unmap operations %i\n", atomic_read(&grant_unmap_operations));
-     printk("%s ] done\n", __FUNCTION__);
 +#endif
+     printk("%s ] done\n", __FUNCTION__);
  }
  
- static int __init gnttab_usage_init(void)
 diff --git a/xen/include/asm-x86/grant_table.h b/xen/include/asm-x86/grant_table.h
 index 9ca631c..34fd833 100644
 --- a/xen/include/asm-x86/grant_table.h
