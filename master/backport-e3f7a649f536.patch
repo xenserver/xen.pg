@@ -1,0 +1,44 @@
+From e3f7a649f536490c86baf0448387303b22fd14b5 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 12 Oct 2017 15:25:57 +0200
+Subject: [PATCH] x86/FLASK: fix unmap-domain-IRQ XSM hook
+
+The caller and the FLASK implementation of xsm_unmap_domain_irq()
+disagreed about what the "data" argument points to in the MSI case:
+Change both sides to pass/take a PCI device.
+
+This is part of XSA-237.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 6f17f5c43a3bd28d27ed8133b2bf513e2eab7d59
+master date: 2017-10-12 14:37:56 +0200
+diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
+index ab477b8..1b1fc23 100644
+--- a/xen/arch/x86/irq.c
++++ b/xen/arch/x86/irq.c
+@@ -2146,7 +2146,8 @@ int unmap_domain_pirq(struct domain *d, int pirq)
+         nr = msi_desc->msi.nvec;
+     }
+ 
+-    ret = xsm_unmap_domain_irq(XSM_HOOK, d, irq, msi_desc);
++    ret = xsm_unmap_domain_irq(XSM_HOOK, d, irq,
++                               msi_desc ? msi_desc->dev : NULL);
+     if ( ret )
+         goto done;
+ 
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 20d46c8..bc32a89 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -911,8 +911,8 @@ static int flask_unmap_domain_msi (struct domain *d, int irq, void *data,
+                                    u32 *sid, struct avc_audit_data *ad)
+ {
+ #ifdef CONFIG_HAS_PCI
+-    struct msi_info *msi = data;
+-    u32 machine_bdf = (msi->seg << 16) | (msi->bus << 8) | msi->devfn;
++    const struct pci_dev *pdev = data;
++    u32 machine_bdf = (pdev->seg << 16) | (pdev->bus << 8) | pdev->devfn;
+ 
+     AVC_AUDIT_DATA_INIT(ad, DEV);
+     ad->device = machine_bdf;
