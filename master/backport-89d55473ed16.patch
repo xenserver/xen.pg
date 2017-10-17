@@ -1,0 +1,106 @@
+From 89d55473ed16543044a31d1e0d4660cf5a3f49df Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Wed, 18 Oct 2017 14:42:33 +0100
+Subject: [PATCH] xentoolcore_restrict_all: Implement for libxenevtchn
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Acked-by: Ian Jackson <ian.jackson@eu.citrix.com>
+Release-acked-by: Julien Grall <julien.grall@linaro.org>
+diff --git a/tools/Rules.mk b/tools/Rules.mk
+index 7bf535d..b785707 100644
+--- a/tools/Rules.mk
++++ b/tools/Rules.mk
+@@ -94,7 +94,7 @@ LDLIBS_libxentoolcore = $(SHDEPS_libxentoolcore) $(XEN_LIBXENTOOLCORE)/libxentoo
+ SHLIB_libxentoolcore  = $(SHDEPS_libxentoolcore) -Wl,-rpath-link=$(XEN_LIBXENTOOLCORE)
+ 
+ CFLAGS_libxenevtchn = -I$(XEN_LIBXENEVTCHN)/include $(CFLAGS_xeninclude)
+-SHDEPS_libxenevtchn =
++SHDEPS_libxenevtchn = $(SHLIB_libxentoolcore)
+ LDLIBS_libxenevtchn = $(XEN_LIBXENEVTCHN)/libxenevtchn$(libextension)
+ SHLIB_libxenevtchn  = -Wl,-rpath-link=$(XEN_LIBXENEVTCHN)
+ 
+diff --git a/tools/libs/evtchn/Makefile b/tools/libs/evtchn/Makefile
+index 151e96f..e6a93c6 100644
+--- a/tools/libs/evtchn/Makefile
++++ b/tools/libs/evtchn/Makefile
+@@ -7,7 +7,7 @@ SHLIB_LDFLAGS += -Wl,--version-script=libxenevtchn.map
+ 
+ CFLAGS   += -Werror -Wmissing-prototypes
+ CFLAGS   += -I./include $(CFLAGS_xeninclude)
+-CFLAGS   += $(CFLAGS_libxentoollog)
++CFLAGS   += $(CFLAGS_libxentoollog) $(CFLAGS_libxentoolcore)
+ 
+ SRCS-y                 += core.c
+ SRCS-$(CONFIG_Linux)   += linux.c
+@@ -45,7 +45,7 @@ libxenevtchn.so.$(MAJOR): libxenevtchn.so.$(MAJOR).$(MINOR)
+ 	$(SYMLINK_SHLIB) $< $@
+ 
+ libxenevtchn.so.$(MAJOR).$(MINOR): $(PIC_OBJS) libxenevtchn.map
+-	$(CC) $(LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxenevtchn.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $(PIC_OBJS) $(LDLIBS_libxentoollog) $(APPEND_LDFLAGS)
++	$(CC) $(LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxenevtchn.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $(PIC_OBJS) $(LDLIBS_libxentoollog) $(LDLIBS_libxentoolcore) $(APPEND_LDFLAGS)
+ 
+ .PHONY: install
+ install: build
+diff --git a/tools/libs/evtchn/core.c b/tools/libs/evtchn/core.c
+index 41621ff..14b7549 100644
+--- a/tools/libs/evtchn/core.c
++++ b/tools/libs/evtchn/core.c
+@@ -18,6 +18,16 @@
+ 
+ #include "private.h"
+ 
++static int all_restrict_cb(Xentoolcore__Active_Handle *ah, domid_t domid) {
++    xenevtchn_handle *xce = CONTAINER_OF(ah, *xce, tc_ah);
++
++    if (xce->fd < 0)
++        /* just in case */
++        return 0;
++
++    return xenevtchn_restrict(xce, domid);
++}
++
+ xenevtchn_handle *xenevtchn_open(xentoollog_logger *logger, unsigned open_flags)
+ {
+     xenevtchn_handle *xce = malloc(sizeof(*xce));
+@@ -29,6 +39,9 @@ xenevtchn_handle *xenevtchn_open(xentoollog_logger *logger, unsigned open_flags)
+     xce->logger = logger;
+     xce->logger_tofree  = NULL;
+ 
++    xce->tc_ah.restrict_callback = all_restrict_cb;
++    xentoolcore__register_active_handle(&xce->tc_ah);
++
+     if (!xce->logger) {
+         xce->logger = xce->logger_tofree =
+             (xentoollog_logger*)
+diff --git a/tools/libs/evtchn/private.h b/tools/libs/evtchn/private.h
+index 3d34862..31e595b 100644
+--- a/tools/libs/evtchn/private.h
++++ b/tools/libs/evtchn/private.h
+@@ -4,11 +4,14 @@
+ #include <xentoollog.h>
+ #include <xenevtchn.h>
+ 
++#include <xentoolcore_internal.h>
++
+ #include <xen/xen.h>
+ 
+ struct xenevtchn_handle {
+     xentoollog_logger *logger, *logger_tofree;
+     int fd;
++    Xentoolcore__Active_Handle tc_ah;
+ };
+ 
+ int osdep_evtchn_open(xenevtchn_handle *xce);
+diff --git a/tools/libs/toolcore/include/xentoolcore.h b/tools/libs/toolcore/include/xentoolcore.h
+index be6c570..8d28c2d 100644
+--- a/tools/libs/toolcore/include/xentoolcore.h
++++ b/tools/libs/toolcore/include/xentoolcore.h
+@@ -33,8 +33,6 @@
+  *
+  * Does not prevent effects that amount only to
+  *   - denial of service, possibly host-wide, by resource exhaustion etc.
+- *   - leak of not-very-interesting metainformation about other domains
+- *     eg, specifically, event channel signals relating to other domains
+  *
+  * If this cannot be achieved, returns -1 and sets errno.
+  * If called again with the same domid, it may succeed, or it may
