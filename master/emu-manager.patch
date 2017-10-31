@@ -16,17 +16,17 @@ index daaa3ba..5c59e70 100644
  install: build
 diff --git a/tools/xenguest/control.c b/tools/xenguest/control.c
 new file mode 100644
-index 0000000..ce065cb
+index 0000000..db9dfc4
 --- /dev/null
 +++ b/tools/xenguest/control.c
-@@ -0,0 +1,578 @@
+@@ -0,0 +1,655 @@
 +#include <stdio.h>
 +#include <sys/socket.h>
 +#include <sys/un.h>
 +#include <sys/types.h>
 +#include <unistd.h>
 +#include <string.h>
-+  
++
 +#include <string.h>
 +#include <stdlib.h>
 +#include <errno.h>
@@ -51,8 +51,11 @@ index 0000000..ce065cb
 +#define UNIX_PATH_MAX 128
 +
 +#define ERR(...) {xg_err(__VA_ARGS__); }
-+// #define INFO(...) {xg_info(__VA_ARGS__); }
-+#define INFO(...)
++#ifdef DEBUG
++#define DBG(...) {xg_info(__VA_ARGS__); }
++#else
++#define DBG(...)
++#endif
 +#define ERRN(str1) xg_err("%s: %s failed with err %s", __func__, str1, strerror(errno));
 +
 +EMP_COMMANDS(commands);
@@ -62,16 +65,22 @@ index 0000000..ce065cb
 +static int chk[max_clients];
 +
 +static struct {
-+   sem_t sem;
-+   struct command_actions *actions;
++    /* 
++     * Master lock for EMP commands - each command started with this locked
++     * threaded cammands can unlock to run in parellel
++     */
++    sem_t sem;
++    struct command_actions *actions;
++    sem_t num_threads_check;
++    int num_threads;
 +} runstate;
 +
-+int reply(struct demu_client cli, char* msg)
++int reply(struct emu_client cli, char* msg)
 +{
 +    int num = cli.num;
 +    int remaining;
 +    int r = 0;
-+    INFO("relpying to (%d,%d): %s",num, cli.chk, msg);
++    DBG("relpying to (%d,%d): %s",num, cli.chk, msg);
 +    if ( chk[num] != cli.chk) {
 +        ERR("Waring: client (%d,%d) disconnected\n", num, cli.chk);
 +        errno=EPIPE;
@@ -79,7 +88,7 @@ index 0000000..ce065cb
 +    }
 +    remaining = strlen(msg);
 +    while (remaining > 0) {
-+       r = send(client_socket[num] , &msg[remaining-strlen(msg)] , remaining , MSG_NOSIGNAL );
++       r = send(client_socket[num] , &msg[strlen(msg) - remaining] , remaining , MSG_NOSIGNAL );
 +       if (r < 0)
 +       {
 +          ERR("write to client (%d,%d) failed with %s", num, cli.chk, strerror(errno));
@@ -90,11 +99,11 @@ index 0000000..ce065cb
 +    return r;
 +}
 +
-+int send_return(struct demu_client cli, char* ret)
++int send_return(struct emu_client cli, char* ret)
 +{
-+   char msg[256];
-+   sprintf(msg, "{ \"return\" : %s }\n", (ret)?ret:"{}");
-+   return reply(cli, msg);
++    char msg[256];
++    sprintf(msg, "{ \"return\" : %s }\n", (ret)?ret:"{}");
++    return reply(cli, msg);
 +}
 +
 +/*
@@ -108,319 +117,380 @@ index 0000000..ce065cb
 +
 +const char evt_mig_hdr[]= "{ \"event\" : \"MIGRATION\", \"data\": {";
 +const char evt_mig_cmp[]= "\"status\":\"completed\"";
-+const char evt_mig_res[]= "\"result\":\"";
 +const char evnt_mig_ftr[]= "}}\n";
 +
-+int send_event_migrate_completed_result(struct demu_client cli, char* result)
++int send_event_migrate_completed_result(struct emu_client cli, char* result)
 +{
-+   char msg[128];
-+   int r; 
++    char msg[128];
++    int r;
 +
-+   INFO("Sending event");
-+   r = snprintf(msg, sizeof(msg), "%s%s,\"result\":\"%s\"%s", 
++    DBG("Sending event");
++    r = snprintf(msg, sizeof(msg), "%s%s,\"result\":\"%s\"%s", 
 +               evt_mig_hdr, evt_mig_cmp, result, evnt_mig_ftr);
-+   if (r < 0 || r >= sizeof(msg)) {
++    if ( r < 0 || r >= sizeof(msg) )
++    {
 +        ERR("failed to sent compleat with result");
 +        return -1;
-+   }
-+   return reply(cli, msg);
++    }
++    return reply(cli, msg);
 +}
 +
 +
-+int send_event_migrate_completed(struct demu_client cli)
++int send_event_migrate_completed(struct emu_client cli)
 +{
-+   char msg[256];
-+   INFO("Sending event");
++    char msg[256];
++    DBG("Sending event");
 +
-+   snprintf(msg,sizeof(msg), "%s%s%s", evt_mig_hdr, evt_mig_cmp, evnt_mig_ftr);
-+   return reply(cli, msg);
++    snprintf(msg,sizeof(msg), "%s%s%s", evt_mig_hdr, evt_mig_cmp, evnt_mig_ftr);
++    return reply(cli, msg);
 +}
 +
-+
-+
-+int send_event_migrate_progress(struct demu_client cli, int sent, int remaining, int iter)
++int send_event_migrate_progress(struct emu_client cli, int sent, int remaining, int iter)
 +{
-+   char msg[256];
-+   char iters[60] = "";
++    char msg[256];
++    char iters[34] = "";
 +
-+   if (iter>=0)
-+     snprintf(iters, sizeof(iters), ",\"iteration\": %d", iter);
++    if ( iter >= 0 )
++        snprintf(iters, sizeof(iters), ",\"iteration\": %d", iter);
 +
-+   snprintf(msg, sizeof(msg), "%s\"sent\": %d,\"remaining\": %d%s%s",
++    snprintf(msg, sizeof(msg), "%s\"sent\": %d,\"remaining\": %d%s%s",
 +            evt_mig_hdr, sent, remaining, iters, evnt_mig_ftr);
 +
-+   return reply(cli, msg);
++    return reply(cli, msg);
 +}
 +
-+int send_event(struct demu_client cli, char* ret)
++int send_event(struct emu_client cli, char* ret)
 +{
-+   char msg[256];
-+   sprintf(msg, "{ \"event\" : %s }\n", (ret)?ret:"{}");
-+   return reply(cli, msg);
++    char msg[256];
++    sprintf(msg, "{ \"event\" : %s }\n", (ret)?ret:"{}");
++    return reply(cli, msg);
 +}
 +
-+int send_error(struct demu_client cli, char* ret)
++int send_error(struct emu_client cli, char* ret)
 +{
-+   char msg[256];
-+   snprintf(msg, sizeof(msg), "{ \"error\" : \"%s\" }\n", ret);
-+   return reply(cli, msg);
++    char msg[256];
++    snprintf(msg, sizeof(msg), "{ \"error\" : \"%s\" }\n", ret);
++    return reply(cli, msg);
 +}
 +
-+
-+void* run_thread(void *vargs) {
-+   struct threadargs* args = (struct threadargs*) vargs;
-+   int r;
-+
-+   args->func(args);
-+
-+   if (args->is_locked) {
-+       r = sem_wait(args->sem);
-+       if (r)
-+          ERR("Failed to unlock due to %s", strerror(r))
-+       else
-+          args->is_locked = 0;
-+   }
-+   json_object_put(args->cmd_args);
-+   free(args);
-+   return NULL;
-+}
++/* emp_lock & emp_unlock
++ * No two emp commands my hold the lock at once
++ * attempting to will result in the thread blocking.
++ *
++ * Atempting to lock or unlock from a emp command already
++ * in that state will result in an error (-1) being returned.
++ *
++ * Each thread is started with this lock held - when it is safe
++ * to run in parrelel with other command, the lock may be unlocked.
++ * No furher emp command will start until until this unlock occures.
++ * (Hence running a threaded command and not unlocking is pointless)
++ *
++ * The lock it auto-released on thread exit, such that it can be left
++ * in ether state.
++ */
 +
 +int emp_lock(struct threadargs *args)
 +{
-+   int r;
-+   if (!args->is_locked){
-+       r = sem_wait(args->sem);
-+       if (r) {
-+          ERR("Failed to lock due to %s", strerror(r));
-+          return -1;
-+       }
-+       args->is_locked = 1;
-+       return 0;
-+   } else {
-+       ERR("Error - locking locked lock");
-+       return -1;
-+   }
++    int r;
++    if ( !args->is_locked )
++    {
++        r = sem_wait(args->sem);
++        if ( r ) {
++            ERR("Failed to lock due to %s", strerror(r));
++            return -1;
++        }
++        args->is_locked = 1;
++        return 0;
++    }
++    else
++    {
++        ERR("Error - locking locked lock");
++        return -1;
++    }
 +}
 +
 +int emp_unlock(struct threadargs *args)
 +{
-+   int r;
-+   if (args->is_locked){
++    int r;
++    if ( args->is_locked )
++    {
 +        r = sem_post(args->sem);
-+       if (r) {
-+          ERR("Failed to unlock due to %s", strerror(r));
-+          return -1;
-+       }
-+       args->is_locked = 0;
-+       return 0;
-+   } else {
-+       ERR("Error - unlocking unlocked lock");
-+       return -1;
-+   }
++        if (r) {
++            ERR("Failed to unlock due to %s", strerror(r));
++            return -1;
++        }
++        args->is_locked = 0;
++        return 0;
++    }
++    else
++    {
++        ERR("Error - unlocking unlocked lock");
++        return -1;
++    }
 +}
 +
++static int increment_threads(struct threadargs *args)
++{
++    int semval;
 +
-+int control_lock() {
++    /* Check we are in a locked state */
++    if (args->is_locked == 0 || sem_getvalue(args->sem, &semval) != 0 ||  (semval > 0) ) {
++        ERR("Should not increment_threads without lock");
++        return -1;
++    }
 +
-+    sem_wait(&runstate.sem);
++    runstate.num_threads++;
 +    return 0;
 +}
 +
-+int control_unlock() {
-+    sem_post(&runstate.sem);
++static int decrement_threads(struct threadargs *args)
++{
++    int semval;
++
++    if (args->is_locked == 0 || sem_getvalue(args->sem, &semval) != 0 ||  (semval > 0) ) {
++        ERR("Should not decrement_threads without lock");
++        return -1;
++    }
++    runstate.num_threads--;
++    if (runstate.num_threads == 0 )
++        sem_post(&runstate.num_threads_check);
 +    return 0;
++}
++
++int wait_for_threads(void)
++{
++    int val;
++    do {
++        sem_wait(&runstate.num_threads_check);
++        val = runstate.num_threads;
++    } while (val > 0);
++
++    return 0;
++}
++
++void* run_thread(void *vargs)
++{
++    struct threadargs* args = (struct threadargs*) vargs;
++
++    increment_threads(args);
++
++    args->func(args);
++
++    if (args->is_locked == 0)
++         emp_lock(args);
++
++    decrement_threads(args);
++
++    json_object_put(args->cmd_args);
++    free(args);
++
++    emp_unlock(args);
++    return NULL;
 +}
 +
 +int run_in_thread(void (*func) (struct threadargs *), struct threadargs *args)
 +{
-+   struct threadargs *targs;
-+   pthread_t thread;
-+   int rc;
++    struct threadargs *targs;
++    pthread_t thread;
++    int rc;
 +
-+   targs = malloc(sizeof(struct threadargs));
-+   memcpy(targs, args, sizeof(*args));
-+   targs->func = func;
++    targs = malloc(sizeof(struct threadargs));
++    memcpy(targs, args, sizeof(*args));
++    targs->func = func;
 +
-+   rc = pthread_create(&thread, NULL, run_thread, targs);
-+   if (rc == 0)
-+       pthread_detach(thread);
-+   else {
-+      sem_post(targs->sem);
-+      if (args->fd != -1)
-+          close(args->fd);
-+      send_error(args->cli, "thread fail");
-+   }
-+   return rc;
++    rc = pthread_create(&thread, NULL, run_thread, targs);
++    if (rc == 0)
++        pthread_detach(thread);
++    else {
++        emp_unlock(targs);
++        if (args->fd != -1)
++            close(args->fd);
++        send_error(args->cli, "thread fail");
++    }
++    return rc;
 +}
 +
 +int json_get_command(json_object * jobj, const char **cmd, json_object **params)
 +{
-+ *params=NULL;
-+ *cmd=NULL;
++    *params = NULL;
++    *cmd = NULL;
 +
-+ json_object_object_foreach(jobj, key, val) {
++    json_object_object_foreach(jobj, key, val)
++    {
 +
-+ if ((strcmp(key, "execute") == 0) && (json_object_get_type(val) == json_type_string)) {
-+      if (*cmd)
-+          return -1;
-+      else
-+          *cmd = json_object_get_string(val);
-+ } else if ((strcmp(key, "arguments") == 0) && (json_object_get_type(val) == json_type_object)) {
-+      if (*params) {
-+          return -1;
-+      }
-+      else {
-+          *params= val;
-+      }
-+ } else
-+     return -1;
++        if ( (strcmp(key, "execute") == 0) && (json_object_get_type(val) == json_type_string) )
++        {
++            if (*cmd)
++                return -1;
++            else
++                *cmd = json_object_get_string(val);
++        }
++        else if ( (strcmp(key, "arguments") == 0) && (json_object_get_type(val) == json_type_object) )
++        {
++            if (*params)
++            {
++                return -1;
++            }
++            else
++            {
++                *params = val;
++            }
++        }
++        else
++           return -1;
 +
-+ }
-+ if (*cmd == NULL)
-+    return -1;
++    }
++    if ( *cmd == NULL )
++        return -1;
 +
-+ return 0;
++    return 0;
 +}
 +
-+int get_string(char *in_string, char **out_string, int *len) {
-+   int i;
-+   *out_string = in_string;
-+   for (i = 0; in_string[i] > 0x20; i++);
-+   *len = i;
-+   return (i == 0);
-+}
-+
-+
-+static void process_message(struct demu_client cli, char* msg, int sent_fd)
++static void process_message(struct emu_client cli, char* msg, int sent_fd)
 +{
-+   int rc=1;
-+   int i;
-+   int need_fd;
-+   enum command_num cmd;
-+   struct threadargs targs;
-+   const char *cmd_str;
-+   json_object *jobj;
-+   json_object *params;
++    int rc=1;
++    int i;
++    int need_fd;
++    enum command_num cmd;
++    struct threadargs targs;
++    const char *cmd_str;
++    json_object *jobj;
++    json_object *params;
 +
-+   INFO("On (%d,%d) got message '%s'", cli.num, cli.chk,  msg);
++    DBG("On (%d,%d) got message '%s'", cli.num, cli.chk,  msg);
 +
-+   jobj = json_tokener_parse(msg);
++    jobj = json_tokener_parse(msg);
 +
-+   if (jobj==NULL) {
-+       printf("Bad json!\n");
-+       return;
-+   }
-+   if (json_get_command(jobj, &cmd_str, &params)) {
-+       send_error(cli, "Invalid EMP");
-+     return;
-+   }
++    if (jobj==NULL) {
++        printf("Bad json!\n");
++        return;
++    }
++    if ( json_get_command(jobj, &cmd_str, &params) )
++    {
++        send_error(cli, "Invalid EMP");
++        return;
++    }
 +
-+   for (i=0; i < cmd_number; i++) {
-+     rc = strcmp(cmd_str, commands[i].name);
-+     if (rc <= 0)
-+        break;
-+   }
-+   if (rc != 0 ) {
-+      send_error(cli, "Invalid command.");
-+      return;
-+   }
-+   need_fd = commands[i].fd;
-+   cmd = commands[i].number;
++    for (i=0; i < cmd_number; i++) 
++    {
++        rc = strcmp(cmd_str, commands[i].name);
++        if (rc == 0)
++            break;
++    }
++    if (rc != 0 )
++    {
++        send_error(cli, "Invalid command.");
++        return;
++    }
++    need_fd = commands[i].fd;
++    cmd = commands[i].number;
 +
-+   targs.cli = cli;
-+   targs.fd = sent_fd;
-+   targs.sem = &runstate.sem;
-+   targs.is_locked = 1;
-+   targs.cmd_args = params;
++    targs.cli = cli;
++    targs.fd = sent_fd;
++    targs.sem = &runstate.sem;
++    targs.is_locked = 0;
++    targs.cmd_args = params;
 +
-+   for (i=0; i < cmd_number; i++) {
-+       struct command_actions *action = &runstate.actions[i];
++    for (i=0; i < cmd_number; i++)
++    {
++        struct command_actions *action = &runstate.actions[i];
 +
-+       if (action->cmd == cmd) {
++        if (action->cmd == cmd)
++        {
 +
-+           if (need_fd)
-+           {
-+              if (sent_fd == -1) {
-+                 send_error(cli, "Expected FD");
-+                 return;
-+              }
++            if (need_fd)
++            {
++                if (sent_fd == -1)
++                {
++                    send_error(cli, "Expected FD");
++                    return;
++                }
 +              /* pack fd */
-+           } else {
-+              if (sent_fd != -1) {
-+                 close(sent_fd);
-+                 send_error(cli, "Unexpected FD");
-+                 return;
-+              }
-+           }
-+           if (sem_wait(&runstate.sem))
-+           {
-+               send_error(cli, "internal error");
-+               ERR("Semephore failed to lock with %s", strerror(errno));
-+               return;
-+           }
++            }
++            else
++            {
++                if (sent_fd != -1)
++                {
++                    close(sent_fd);
++                    send_error(cli, "Unexpected FD");
++                    return;
++                }
++            }
++            /* Each emp command runs in exculsivly, until they explicitly
++             * unlock this.
++             */
++            if ( emp_lock(&targs) )
++            {
++                send_error(cli, "internal error");
++                ERR("Semephore failed to lock with %s", strerror(errno));
++                return;
++            }
 +
-+           if (action->in_thread) {
-+                 json_object_get(params);
-+                 run_in_thread(action->func, &targs);
-+           } else {
-+                  action->func(&targs);
-+                  emp_unlock(&targs);
-+           }
-+           return;
-+       }
-+   }
-+   send_error(cli, "Not Implemented.");
-+   json_object_put (jobj);
-+
++            if (action->in_thread)
++            {
++                json_object_get(params);
++                run_in_thread(action->func, &targs);
++                /* thread unlocks on error/compleation or when safe */
++            }
++            else
++            {
++                action->func(&targs);
++                emp_unlock(&targs);
++            }
++            return;
++        }
++    }
++    send_error(cli, "Not Implemented.");
++    json_object_put(jobj);
 +}
 +
 +static int recv_fd(int socket, char *message_buffer, size_t count, int* sent_fd)
 +{
-+   struct msghdr socket_message;
-+   struct iovec io_vector[1];
-+   struct cmsghdr *control_message = NULL;
-+   char ancillary_element_buffer[CMSG_SPACE(sizeof(int))];
-+   int bytes;
-+   *sent_fd = -1;
++    struct msghdr socket_message;
++    struct iovec io_vector[1];
++    struct cmsghdr *control_message = NULL;
++    char ancillary_element_buffer[CMSG_SPACE(sizeof(int))];
++    int bytes;
++    *sent_fd = -1;
 +
-+   /* start clean */
-+   memset(&socket_message, 0, sizeof(struct msghdr));
-+   memset(ancillary_element_buffer, 0, CMSG_SPACE(sizeof(int)));
++    /* start clean */
++    memset(&socket_message, 0, sizeof(struct msghdr));
++    memset(ancillary_element_buffer, 0, CMSG_SPACE(sizeof(int)));
 +
-+   /* setup a place to fill in message contents */
-+   io_vector[0].iov_base = message_buffer;
-+   io_vector[0].iov_len = count;
-+   socket_message.msg_iov = io_vector;
-+   socket_message.msg_iovlen = 1;
++    /* setup a place to fill in message contents */
++    io_vector[0].iov_base = message_buffer;
++    io_vector[0].iov_len = count;
++    socket_message.msg_iov = io_vector;
++    socket_message.msg_iovlen = 1;
 +
-+   /* provide space for the ancillary data */
-+   socket_message.msg_control = ancillary_element_buffer;
-+   socket_message.msg_controllen = CMSG_SPACE(sizeof(int));
-+   bytes = recvmsg(socket, &socket_message, MSG_CMSG_CLOEXEC);
-+   if (bytes <= 0) {
-+      return bytes;
-+   }
++    /* provide space for the ancillary data */
++    socket_message.msg_control = ancillary_element_buffer;
++    socket_message.msg_controllen = CMSG_SPACE(sizeof(int));
++    bytes = recvmsg(socket, &socket_message, MSG_CMSG_CLOEXEC);
++    if (bytes <= 0) {
++        return bytes;
++    }
 +
-+   if((socket_message.msg_flags & MSG_CTRUNC) == MSG_CTRUNC)
-+   {
-+      /* we did not provide enough space for the ancillary element array */
-+      errno=EMSGSIZE;
-+      return -1;
-+   }
++    if ( (socket_message.msg_flags & MSG_CTRUNC) == MSG_CTRUNC )
++    {
++       /* we did not provide enough space for the ancillary element array */
++       errno = EMSGSIZE;
++       return -1;
++    }
 +
-+   /* iterate ancillary elements */
-+   for(control_message = CMSG_FIRSTHDR(&socket_message);
-+       control_message != NULL;
-+       control_message = CMSG_NXTHDR(&socket_message, control_message))
-+   {
-+      if( (control_message->cmsg_level == SOL_SOCKET) &&
-+          (control_message->cmsg_type == SCM_RIGHTS) )
-+      {
-+         *sent_fd = *((int *) CMSG_DATA(control_message));
-+         return bytes;
-+      }
-+   }
-+   return bytes;
++    /* iterate ancillary elements */
++    for(control_message = CMSG_FIRSTHDR(&socket_message);
++        control_message != NULL;
++        control_message = CMSG_NXTHDR(&socket_message, control_message))
++    {
++        if( (control_message->cmsg_level == SOL_SOCKET) &&
++            (control_message->cmsg_type == SCM_RIGHTS) )
++        {
++           *sent_fd = *((int *) CMSG_DATA(control_message));
++           return bytes;
++        }
++    }
++    return bytes;
 +}
 +
 +
@@ -428,63 +498,68 @@ index 0000000..ce065cb
 +
 +int control_sock_init(char* socket_name, struct control_sock_inf *inf, struct command_actions actions[])
 +{
-+   int i;
-+   int opt = TRUE;
-+   int r;
++    int opt = TRUE;
++    int r;
 +
-+   r = sem_init(&runstate.sem, 0, 1);
++    r = sem_init(&runstate.sem, 0, 1);
 +
-+   if (r) {
++    if ( r ) {
 +        ERR("semaphore init failed - %s \n", strerror(r));
 +        return -1;
-+   }
++    }
 +
-+   runstate.actions = actions;
-+   //initialise all client_socket[] to 0 so not checked
-+   for (i = 0; i < max_clients; i++)
-+   {
-+       client_socket[i] = 0;
-+       chk[i] = 0;
-+   }
++    r = sem_init(&runstate.num_threads_check, 0, 0);
 +
-+   inf->master_socket = socket(PF_UNIX, SOCK_STREAM, 0);
-+   if(inf->master_socket < 0)
-+   {
++    if ( r ) {
++        ERR("semaphore init failed - %s \n", strerror(r));
++        return -1;
++    }
++
++
++
++    runstate.actions = actions;
++    //initialise all client_socket[] to 0 so not checked
++    memset(client_socket, 0, sizeof (client_socket));
++    memset(chk,           0, sizeof (chk));
++
++    inf->master_socket = socket(PF_UNIX, SOCK_STREAM, 0);
++    if ( inf->master_socket < 0 )
++    {
 +        ERRN("socket()");
 +        return -1;
-+   }
++    }
 +
-+   unlink(socket_name);
++    unlink(socket_name);
 +
-+   if( setsockopt(inf->master_socket, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt)) < 0 )
-+   {
++    if ( setsockopt(inf->master_socket, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt)) < 0 )
++    {
 +        ERRN("setsockopt()");
 +        return -1;
-+   }
++    }
 +
-+   /* start with a clean address structure */
-+   memset(&inf->address, 0, sizeof(struct sockaddr_un));
++    /* start with a clean address structure */
++    memset(&inf->address, 0, sizeof(struct sockaddr_un));
 +
-+   inf->address.sun_family = AF_UNIX;
-+   snprintf(inf->address.sun_path, UNIX_PATH_MAX, "%s", socket_name);
++    inf->address.sun_family = AF_UNIX;
++    snprintf(inf->address.sun_path, UNIX_PATH_MAX, "%s", socket_name);
 +
-+   if(bind(inf->master_socket,
++    if( bind(inf->master_socket,
 +           (struct sockaddr *) &inf->address,
-+           sizeof(struct sockaddr_un)) != 0)
-+   {
++           sizeof(struct sockaddr_un)) != 0 )
++    {
 +         ERR("bind() to %s failed with %s", socket_name, strerror(errno));
 +         return -1;
-+   }
++    }
 +
-+   //try to specify maximum of 3 pending connections for the master socket
-+   if (listen(inf->master_socket, 3) < 0)
-+   {
++    //try to specify maximum of 3 pending connections for the master socket
++    if ( listen(inf->master_socket, 3) < 0 )
++    {
 +        ERRN("listen()");
 +        exit(EXIT_FAILURE);
-+   }
++    }
 +
-+   inf->next_chk=1;
-+   return 0;
++    inf->next_chk = 1;
++    return 0;
 +}
 +
 +int control_fdset(struct control_sock_inf *inf, fd_set *fds, int* num_clients)
@@ -492,8 +567,8 @@ index 0000000..ce065cb
 +    int max_fd;
 +    int client;
 +    int fd;
-+    if (num_clients)
-+       *num_clients = 0;
++    if ( num_clients )
++        *num_clients = 0;
 +    //add master socket to set
 +    FD_SET(inf->master_socket, fds);
 +    max_fd = inf->master_socket;
@@ -501,46 +576,47 @@ index 0000000..ce065cb
 +
 +    //add child sockets to set
 +    for ( client = 0 ; client < max_clients ; client++)
-+        {
-+            //socket descriptor
-+            fd = client_socket[client];
++    {
++        //socket descriptor
++        fd = client_socket[client];
 +
-+            //if valid socket descriptor then add to read list
-+            if(fd > 0) {
-+                FD_SET( fd , fds);
-+                if (num_clients)
-+                    (*num_clients)++;
-+            }
-+            //highest file descriptor number, need it for the select function
-+            if(fd > max_fd)
-+                max_fd = fd;
++        //if valid socket descriptor then add to read list
++        if ( fd > 0 )
++        {
++            FD_SET( fd , fds);
++            if (num_clients)
++                (*num_clients)++;
 +        }
++        //highest file descriptor number, need it for the select function
++        if ( fd > max_fd )
++            max_fd = fd;
++    }
 +
 +    return max_fd;
-+
 +}
 +
 +int control_fdread(struct control_sock_inf *inf, fd_set *fds, int activity)
 +{
-+    int  new_socket;
++    int new_socket;
 +    int i;
 +    int addrlen = sizeof(inf->address);
 +
-+        if (FD_ISSET(inf->master_socket, fds)) 
++    if ( FD_ISSET(inf->master_socket, fds) )
++    {
++        //If something happened on the master socket , then its an incoming connection
++        int added = 0;
++        if ( (new_socket = accept(inf->master_socket, (struct sockaddr *)&inf->address, (socklen_t*)&addrlen)) < 0 )
 +        {
-+         //If something happened on the master socket , then its an incoming connection
-+            int added = 0;
-+            if ((new_socket = accept(inf->master_socket, (struct sockaddr *)&inf->address, (socklen_t*)&addrlen)) < 0)
++            ERRN("accept()");
++        }
++        else
++        {
++            //add new socket to array of sockets
++            for (i = 0; i < max_clients; i++)
 +            {
-+              ERRN("accept()");
-+            } else {
-+
-+               //add new socket to array of sockets
-+               for (i = 0; i < max_clients; i++) 
-+               {
-+                  //if position is empty
-+                  if( client_socket[i] == 0 )
-+                  {
++                //if position is empty
++                if( client_socket[i] == 0 )
++                {
 +                    int nchk= inf->next_chk;
 +                    client_socket[i] = new_socket;
 +
@@ -549,92 +625,71 @@ index 0000000..ce065cb
 +                    ERR("Adding client on fd %d as (%d,%d)" , new_socket, i, chk[i]);
 +                    added=1;
 +                    break;
-+                  }
-+               }
-+               if (!added) {
-+                   ERR("WARNING: Failed to find slot for client on fd %d", new_socket);
-+               }
++                }
 +            }
-+            activity--;
-+        }
-+
-+        // Look for input from existing clients
-+        for (i = 0; (activity >= 0) && (i < max_clients); i++) 
-+        {
-+            int fd = client_socket[i];
-+
-+            if (FD_ISSET( fd , fds)) 
++            if ( !added )
 +            {
-+                int sent_fd = -1;
-+                int valread;
-+                char buffer[128];
-+
-+                valread = recv_fd(fd, buffer, 128, &sent_fd);
-+
-+                // If valread ==0, client disconnected
-+                if (valread == 0)
-+                {
-+                    INFO("Host disconnected fd %d  (%d,%d)" , fd, i, chk[i]);
-+
-+                    //Close the socket and mark as 0 in list for reuse
-+                    close( fd );
-+                    client_socket[i] = 0;
-+                    chk[i]=0;
-+                }
-+                else if (valread <0)
-+                {
-+                    ERR("Reading value on %d (%d,%d): %d failed with %s", fd,i, chk[i], valread, strerror(errno));
-+                }
-+                else
-+                {
-+                    //Prepare message, and send for processing.
-+                    struct demu_client dc = { .num = i, .chk= chk[i] };
-+                    buffer[valread] = '\0';
-+                    process_message(dc, buffer, sent_fd);
-+                }
-+            activity--;
++                ERR("WARNING: Failed to find slot for client on fd %d", new_socket);
 +            }
 +        }
++        activity--;
++    }
++
++    // Look for input from existing clients
++    for (i = 0; (activity >= 0) && (i < max_clients); i++)
++    {
++        int fd = client_socket[i];
++
++        if ( fd != 0 && FD_ISSET( fd , fds) )
++        {
++            int sent_fd = -1;
++            int valread;
++            char buffer[128];
++
++            valread = recv_fd(fd, buffer, sizeof(buffer), &sent_fd);
++
++            // If valread ==0, client disconnected
++            if ( valread == 0 )
++            {
++                DBG("Host disconnected fd %d  (%d,%d)" , fd, i, chk[i]);
++
++                //Close the socket and mark as 0 in list for reuse
++                close( fd );
++                client_socket[i] = 0;
++                chk[i] = 0;
++            }
++            else if ( valread < 0 )
++            {
++                    ERR("Reading value on %d (%d,%d): %d failed with %s", fd,i, chk[i], valread, strerror(errno));
++            }
++            else
++            {
++                //Prepare message, and send for processing.
++                struct emu_client dc = { .num = i, .chk = chk[i] };
++                buffer[valread] = '\0';
++                process_message(dc, buffer, sent_fd);
++            }
++            activity--;
++        }
++    }
 +    return activity;
 +}
 +
 diff --git a/tools/xenguest/control.h b/tools/xenguest/control.h
 new file mode 100644
-index 0000000..76b4347
+index 0000000..5da8694
 --- /dev/null
 +++ b/tools/xenguest/control.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,51 @@
 +#include <semaphore.h>
 +#include <sys/un.h>
 +#include "emp.h"
 +#include <json/json.h>
-+struct demu_client {
++
++struct emu_client {
 +  int num;
 +  int chk;
 +};
-+/*
-+enum command_num {
-+    cmd_migrate_abort,
-+    cmd_migrate_init,
-+    cmd_migrate_live,
-+    cmd_migrate_pause,
-+    cmd_migrate_paused,
-+    cmd_migrate_progress,
-+    cmd_quit,
-+    cmd_number
-+};
-+#define EMP_COMMANDS(_cmd_name)                     \
-+struct command_names _cmd_name[] = {                \
-+    {"migrate_abort",0, cmd_migrate_abort},         \
-+    {"migrate_init",1, cmd_migrate_init},           \
-+    {"migrate_live",0, cmd_migrate_live},           \
-+    {"migrate_pause",0, cmd_migrate_pause},         \
-+    {"migrate_paused",0, cmd_migrate_paused},       \
-+    {"migrate_progress",0, cmd_migrate_progress},   \
-+    {"quit", 0, cmd_quit}                           \
-+}
-+*/
-+
 +
 +struct args_list {
 +    struct args_list* next;
@@ -642,9 +697,8 @@ index 0000000..76b4347
 +    char *value;
 +};
 +
-+
 +struct threadargs {
-+    struct demu_client cli;
++    struct emu_client cli;
 +    int fd;
 +    json_object *cmd_args;
 +    sem_t *sem;
@@ -653,39 +707,117 @@ index 0000000..76b4347
 +};
 +
 +struct command_actions {
-+   enum command_num cmd;
-+   void (*func)(struct threadargs *);
-+   int in_thread;
++    enum command_num cmd;
++    void (*func)(struct threadargs *);
++    int in_thread;
 +};
 +
 +
 +struct control_sock_inf {
-+
-+   int master_socket;
-+   struct sockaddr_un address;
-+   int next_chk;
++    int master_socket;
++    struct sockaddr_un address;
++    int next_chk;
 +};
 +
 +
 +int control_sock_init(char *name, struct control_sock_inf *inf, struct command_actions actions[]);
 +int control_fdset(struct control_sock_inf *inf, fd_set *fds, int* num_clients);
 +int control_fdread(struct control_sock_inf *inf, fd_set *fds, int activity);
-+int control_lock(void);
-+int control_unlock(void);
 +
-+int send_event_migrate_completed(struct demu_client cli);
-+int send_event_migrate_completed_result(struct demu_client cli, char* result);
-+int send_event_migrate_progress(struct demu_client cli, int sent, int remaining, int iter);
-+int send_return(struct demu_client cli, char* ret);
-+int send_error(struct demu_client cli, char* ret);
++int send_event_migrate_completed(struct emu_client cli);
++int send_event_migrate_completed_result(struct emu_client cli, char* result);
++int send_event_migrate_progress(struct emu_client cli, int sent, int remaining, int iter);
++int send_return(struct emu_client cli, char* ret);
++int send_error(struct emu_client cli, char* ret);
 +int emp_lock(struct threadargs *args);
 +int emp_unlock(struct threadargs *args);
++int wait_for_threads(void);
 diff --git a/tools/xenguest/emp.h b/tools/xenguest/emp.h
 new file mode 100644
-index 0000000..dd46d68
+index 0000000..215590f
 --- /dev/null
 +++ b/tools/xenguest/emp.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,116 @@
++
++/*
++
++EMP commands take the following format:
++
++    {“execute” : “<command>”, "arguments": { “arg1 : “val1:”} }
++
++and you should expect:
++
++    {“return” : {} }
++
++or
++
++    { “error” : “descriptive error” }
++
++-------------------------------------------------------------------------
++Command           Description
++----------------  -------------------------------------------------------
++migrate_init      And FD is sent via the auxiliary channel, which
++                  shoud be used later for migration.
++
++migrate_live      The emulator may start migrating, while the guest
++                  is still running.  This call should come after a
++                  migrate_init and track_dirty command.
++
++migrate_nonlive   The emulator should start migrating, the guest
++                  should not be running.  This must come after a migrate_init.
++
++migrate_pause     Following on from a migrate_live, the VM has been paused,
++                  and no further writes to its ram may be made.
++
++migrate_paused    After all emus have been asked to 'pause', this command
++                  this command indicates, the VM is paused, and you can 
++                  expect no furter writes to its ram from any emu.
++
++migrate_progress  The emulator should provide updates on
++                  migration progress.
++                  Arguments may include the triggers.
++                  “data-sent”: <minimum sent in bytes>
++
++migrate_abort     Due to some sort of error, migration should stop,
++                  and normal operation resume - if possible.
++
++quit              The emulator should terminate.
++
++restore           The emulator is to restore state, created using a
++                  migrate command above.  This must follow a migrate_init.
++
++set_args          Optional command, allows emu specific arguments 
++                  to be sent to an emu.
++
++track_dirty       This instructs the emulator to start dirty page tracking.
++-------------------------------------------------------------------------
++
++
++After an migrate_progress, repeated responses will be received as follows.  Note that
++the iterations field is optional.  Also not that if the bytes "remaining" in not known
++(perhaps becouse you are mid iteration), '-1' can be sent.
++
++{
++   "event" : "MIGRATION", "data":
++       {
++       "sent" : 500,
++       "remaning" : 300
++       "iteration": 3
++       }
++}
++
++After migation has compleated, a repsonse like below may be recived. (Not that a result is optional)
++
++{
++   "event" : "MIGRATION", "data":
++       {
++       "status": "completed",
++       "result": "0 0"
++       }
++}
++
++*/
++
 +enum command_num {
 +    cmd_track_dirty,
 +    cmd_migrate_abort,
@@ -702,9 +834,9 @@ index 0000000..dd46d68
 +};
 +
 +struct command_names {
-+   char *name;
-+   char fd;
-+   enum command_num number;
++    char *name;
++    char fd;
++    enum command_num number;
 +};
 +
 +#define EMP_COMMANDS(_cmd_name)                     \
@@ -723,7 +855,7 @@ index 0000000..dd46d68
 +}
 +
 diff --git a/tools/xenguest/xenguest.c b/tools/xenguest/xenguest.c
-index 8998dd1..2c631b7 100644
+index 8998dd1..b1ae9d2 100644
 --- a/tools/xenguest/xenguest.c
 +++ b/tools/xenguest/xenguest.c
 @@ -89,6 +89,7 @@ static const char *xg_mode_names[] = {
@@ -742,11 +874,11 @@ index 8998dd1..2c631b7 100644
  
      gettimeofday(&curtime, NULL);
 +    time_delta = tv_delta_us(&curtime, &lasttime);
-+ 
-+    send_emu_progress(done, total);
  
 -    if ( (done == 0) || (done == total) ||
 -         (tv_delta_us(&curtime, &lasttime) > (5UL * 1000 * 1000)) )
++    send_emu_progress(done, total);
++
 +    if ( (( done == 0 || done == total ) && (time_delta > 1UL * 500 * 1000 ))
 +         || (time_delta > 5UL * 1000 * 1000) )
      {
@@ -814,10 +946,10 @@ index 4ba6384..d8a2792 100644
  {
 diff --git a/tools/xenguest/xg_emu.c b/tools/xenguest/xg_emu.c
 new file mode 100644
-index 0000000..c4de820
+index 0000000..61bbd99
 --- /dev/null
 +++ b/tools/xenguest/xg_emu.c
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,454 @@
 +#include <xenctrl.h>
 +#include <xenguest.h>
 +#include <xenstore.h>
@@ -831,52 +963,55 @@ index 0000000..c4de820
 +
 +static sem_t sem_stopped;
 +static int live_stage = XGS_POLICY_CONTINUE_PRECOPY;
-+static int hvm_mode = true;
++static int pv_mode = false;
 +
-+struct demu_client progress_cli = { .num = -1 };
++struct emu_client progress_cli = { .num = -1 };
 +static int last_iter = 0;
 +static uint64_t last_sent = 0;
 +static int stream_fd = -1;
-+
 +
 +static int arg_store_port = -1;
 +static int arg_console_port = -1;
 +
 +static int xg_flags = 0;
 +
-+
++/* timeout in seconds */
 +#define COMMAND_TIMOUT (60*2)
 +
-+int str_lookup(const char* table[], char cmp[]) {
++int str_lookup(const char* table[], char cmp[])
++{
 +    int i;
 +    for (i=0; table[i]; i++) {
-+        if (strcmp(table[i], cmp)==0)
-+           return i;
++        if ( strcmp(table[i], cmp) == 0 )
++            return i;
 +    }
 +    return -1;
 +}
 +
 +/* Called for mid-iteration progress update */
-+void send_emu_progress(unsigned long done, unsigned long total) {
++void send_emu_progress(unsigned long done, unsigned long total)
++{
 +
-+    struct timeval curtime;
-+    static struct timeval lastprog = { 0 };
++    struct timespec curtime;
++    static struct timespec lastprog = { 0 };
 +
-+    gettimeofday(&curtime, NULL);
++    clock_gettime(CLOCK_MONOTONIC, &curtime);
 +
-+    if (progress_cli.num >= 0) {
++    if ( progress_cli.num >= 0 )
++    {
 +
-+        if ( done == 0 || done == total ) {
++        if ( done == 0 || done == total )
++        {
 +            lastprog = curtime;
-+        } else if (tv_delta_us(&curtime, &lastprog) > 1UL * 500 * 1000){
-+             /* Don't send dirty_conut, is out of date */
-+              send_event_migrate_progress(progress_cli,  last_sent + done, -1 , last_iter);
-+              lastprog = curtime;
++        }
++        else if ( ts_delta_us(&curtime, &lastprog) > 1UL * 500 * 1000 )
++        {
++            /* Don't send dirty_conut, is out of date */
++            send_event_migrate_progress(progress_cli,  last_sent + done, -1 , last_iter);
++            lastprog = curtime;
 +        }
 +    }
 +}
-+
-+
 +
 +static void do_cmd_progress(struct threadargs *args)
 +{
@@ -885,30 +1020,32 @@ index 0000000..c4de820
 +    send_return(args->cli, NULL);
 +}
 +
-+static int running=1;
++static int running = 1;
 +
 +static void do_cmd_quit(struct threadargs *args)
 +{
-+   send_return(args->cli, NULL);
-+   running = 0;
++    send_return(args->cli, NULL);
++    running = 0;
 +}
 +
 +static void abort_all(void)
 +{
-+   live_stage = XGS_POLICY_ABORT;
-+   /* post to sem, incase we are waiting */
-+   sem_post(&sem_stopped);
++    live_stage = XGS_POLICY_ABORT;
++    /* post to sem, incase we are waiting */
++    sem_post(&sem_stopped);
 +}
 +
-+static void do_abort(struct threadargs *args)  {
-+   xg_err("Recived abort command!");
-+   abort_all();
-+   send_return(args->cli, NULL);
++static void do_abort(struct threadargs *args)
++{
++    xg_err("Recived abort command!");
++    abort_all();
++    send_return(args->cli, NULL);
 +}
 +
 +
-+static void do_ignore(struct threadargs *args)  {
-+   send_return(args->cli, NULL);
++static void do_ignore(struct threadargs *args)
++{
++    send_return(args->cli, NULL);
 +}
 +
 +#if 0
@@ -921,24 +1058,24 @@ index 0000000..c4de820
 +static void do_migrate_init(struct threadargs *args)
 +{
 +
-+   stream_fd = args->fd;
-+   send_return(args->cli, NULL);
-+   sem_init(&sem_stopped,0,0);
-+//    sem_init(&sem_done,0,0);
++    stream_fd = args->fd;
++    send_return(args->cli, NULL);
++    sem_init(&sem_stopped, 0, 0);
 +}
 +
 +int emu_suspend_callback(void *data)
 +{
-+   int r;
-+   xg_info("waiting for suspend");
-+   r=sem_wait(&sem_stopped);
-+   if (live_stage == XGS_POLICY_ABORT) {
++    int r;
++    xg_info("waiting for suspend");
++    r = sem_wait(&sem_stopped);
++    if ( live_stage == XGS_POLICY_ABORT )
++    {
 +       xg_info("Ignoring libxc suspend reqest do to abort");
 +       return 0;
-+   }
++    }
 +
-+   xg_info("suspend was recived");
-+   return 1;
++    xg_info("suspend was recived");
++    return 1;
 +}
 +
 +/* Monitor process */
@@ -948,8 +1085,9 @@ index 0000000..c4de820
 +    int stop_decision = live_stage;
 +    int r = 0;
 +
-+    if (stats.dirty_count >= 0) {
-+        struct demu_client *cli = (struct demu_client *)user;
++    if ( stats.dirty_count >= 0 )
++    {
++        struct emu_client *cli = (struct emu_client *) user;
 +        last_sent = stats.total_written;
 +        last_iter = stats.iteration;
 +
@@ -957,9 +1095,9 @@ index 0000000..c4de820
 +        r = send_event_migrate_progress(*cli, stats.total_written, stats.dirty_count, stats.iteration);
 +    }
 +
-+    if (stop_decision)
++    if ( stop_decision )
 +         xg_info("passing down stop message");
-+    else if (stats.dirty_count == 0) {
++    else if ( stats.dirty_count == 0 ) {
 +         xg_info("No dirty pages, finishing migration");
 +         stop_decision = XGS_POLICY_STOP_AND_COPY;
 +    }
@@ -967,74 +1105,70 @@ index 0000000..c4de820
 +   return stop_decision;
 +}
 +
-+
-+
 +static void do_migrate_live(struct threadargs *args)
 +{
-+   xg_flags |= XCFLAGS_LIVE;
-+   emp_unlock(args);
++    xg_flags |= XCFLAGS_LIVE;
++    emp_unlock(args);
 +
-+   send_return(args->cli, NULL);
++    send_return(args->cli, NULL);
 +
-+   emu_stub_xc_domain_save(stream_fd, (void*) &args->cli, xg_flags, hvm_mode);
-+   xg_info(" Finished, send compleate");
-+   if (progress_cli.num >= 0)
-+       send_event_migrate_completed(progress_cli);
-+   else
-+       xg_info("No cli watching");
++    emu_stub_xc_domain_save(stream_fd, (void*) &args->cli, xg_flags, !pv_mode);
++    xg_info(" Finished, send compleate");
++    if ( progress_cli.num >= 0 )
++        send_event_migrate_completed(progress_cli);
++    else
++        xg_info("No cli watching");
 +
 +}
 +
 +static void do_migrate_nonlive(struct threadargs *args)
 +{
-+   xg_flags &= ~XCFLAGS_LIVE;
-+   emp_unlock(args);
++    xg_flags &= ~XCFLAGS_LIVE;
++    emp_unlock(args);
 +
-+   send_return(args->cli, NULL);
++    send_return(args->cli, NULL);
 +
-+   emu_stub_xc_domain_save(stream_fd, (void*) &args->cli, xg_flags, hvm_mode);
-+   xg_info(" Finished, send compleate");
-+   send_event_migrate_completed(args->cli);
++    emu_stub_xc_domain_save(stream_fd, (void*) &args->cli, xg_flags, !pv_mode);
++    xg_info(" Finished, send compleate");
++    send_event_migrate_completed(args->cli);
 +
-+   if (progress_cli.num >= 0)
-+       send_event_migrate_completed(progress_cli);
-+   else
-+       xg_info("No cli watching");
-+
++    if ( progress_cli.num >= 0 )
++        send_event_migrate_completed(progress_cli);
++    else
++        xg_info("No cli watching");
 +}
-+
-+
 +
 +static void do_migrate_paused(struct threadargs *args)
 +{
-+   xg_info("Recived paused message");
-+   send_return(args->cli, NULL);
-+   sem_post(&sem_stopped);
++    xg_info("Recived paused message");
++    send_return(args->cli, NULL);
++    sem_post(&sem_stopped);
 +}
 +
 +static void do_migrate_pause(struct threadargs *args)
 +{
-+   xg_info("Recived pause message");
-+   send_return(args->cli, NULL);
-+   live_stage=XGS_POLICY_STOP_AND_COPY;
++    xg_info("Recived pause message");
++    send_return(args->cli, NULL);
++    live_stage=XGS_POLICY_STOP_AND_COPY;
 +}
 +
-+static void do_cmd_restore(struct threadargs *args) 
++static void do_cmd_restore(struct threadargs *args)
 +{
 +    unsigned long store_mfn = 0, console_mfn = 0;
 +    char buf[64];
 +
-+    if (domid == -1 || stream_fd == -1
-+        || arg_store_port == -1 || arg_console_port == -1) {
++    if ( domid == -1 || stream_fd == -1
++        || arg_store_port == -1 || arg_console_port == -1)
++    {
 +        xg_err("xenguest: missing command line options\n");
-+        send_error(args->cli, "Missing options");
++        send_error(args->cli, "Missing options" );
 +        return;
 +    }
 +    emp_unlock(args);
 +
 +    send_return(args->cli, NULL);
 +
-+    stub_xc_domain_restore(stream_fd, arg_store_port, arg_console_port, hvm_mode,
++    stub_xc_domain_restore(stream_fd, arg_store_port, arg_console_port, !pv_mode,
 +                           &store_mfn, &console_mfn);
 +
 +    xg_info("Restore compleat, send result");
@@ -1044,79 +1178,116 @@ index 0000000..c4de820
 +       send_event_migrate_completed_result(progress_cli,buf);
 +    if (progress_cli.num != args->cli.num)
 +       send_event_migrate_completed_result(args->cli , buf);
-+   xg_info("All done");
++    xg_info("All done");
 +}
 +
-+
-+enum arg_keys {
-+     unknown    = -1,
-+     store_port = 0,
-+     console_port,
-+     mode_pv
++enum arg_type
++{
++    int_type,
++    str_type,
++    bool_type,
 +};
 +
-+const char* setable_args[] = {"store_port", "console_port","pv", NULL};
++struct arg_list
++{
++    char *name;
++    enum arg_type atype;
++    union
++    {
++       int *a_int;
++       char **a_str;
++    };
++};
++
++const static struct arg_list setable_args[] = {
++                              {"store_port",   int_type,  .a_int = &arg_store_port},
++                              {"console_port", int_type,  .a_int = &arg_console_port},
++                              {"pv",           bool_type, .a_int = &pv_mode},
++                              {NULL,           -1,        .a_int = NULL}
++                              };
 +
 +void do_cmd_set_args(struct threadargs *args)
 +{
-+   json_object *jobj = args->cmd_args;
-+   enum arg_keys key;
-+   char* str_end;
-+   const char* val;
-+   int bad = 0;
++    json_object *jobj = args->cmd_args;
++    int ival;
++    char* str_end;
++    const char* val;
++    int bad = 0;
++    int i;
 +
-+   if (jobj==NULL) {
-+      xg_err("set_args called without any args");
-+      send_error(args->cli, "No Args");
-+      return;
-+   }
++    if ( jobj==NULL )
++    {
++        xg_err("set_args called without any args");
++        send_error(args->cli, "No Args");
++        return;
++    }
 +
++    json_object_object_foreach(jobj, s_key, jval)
++    {
++        if ( json_object_get_type(jval) != json_type_string )
++        {
++            xg_err("expecting only string argemunts.  (%s)", s_key);
++            bad = 1;
++            continue;
++        }
++        val = json_object_get_string(jval);
 +
-+   json_object_object_foreach(jobj, s_key, jval) {
++        for (i = 0; setable_args[i].name != NULL; i++)
++        {
++            if ( strcmp(setable_args[i].name, s_key) == 0 )
++            {
++                xg_err("yes");
++                switch (setable_args[i].atype)
++                {
++                case int_type:
++                    ival = strtol(val, &str_end, 10);
++                    if ( *str_end != '\0' ) {
++                        xg_err("Bad arge %s = %s", s_key, val);
++                        bad = 1;
++                    }
++                    else
++                    {
++                        *(setable_args[i].a_int) = ival;
++                    }
++                break;
 +
-+      if (json_object_get_type(jval) != json_type_string) {
-+          xg_err("expecting only string argemunts.  (%s)", s_key);
-+          bad = 1;
-+          continue;
-+      }
-+      val = json_object_get_string(jval);
++                case str_type:
++                    *(setable_args[i].a_str) = strdup(val);
++                break;
 +
-+       key = str_lookup(setable_args, s_key);
-+       switch (key) {
-+       case store_port:
-+            arg_store_port = strtol(val, &str_end, 10);
-+            if (*str_end != '\0') {
-+                 arg_store_port =-1;
-+                 xg_err("Bad arge %s = %s", s_key, val);
-+                 bad = 1;
++                case bool_type:
++                    if (strcmp(val, "true") == 0)
++                    {
++                        *(setable_args[i].a_int) = 1;
++                    }
++                    else if (strcmp(val, "false") == 0)
++                    {
++                        *(setable_args[i].a_int) = 0;
++                    }
++                    else
++                    {
++                        xg_err("Bad arge %s = %s", s_key, val);
++                        bad = 1;
++                    }
++                break;
++                }
++            break;
 +            }
-+            xg_info("store port = %d", arg_store_port);
-+       break;
-+       case console_port:
-+
-+            arg_console_port = strtol(val, &str_end, 10);
-+            if (*str_end != '\0') {
-+                 arg_console_port =-1;
-+                 xg_err("Bad arge %s = %s", s_key, val);
-+                 bad = 1;
-+            }
-+            xg_info("console port = %d", arg_console_port);
-+       break;
-+       case mode_pv:
-+            hvm_mode = false;
-+       break;
-+       default:
-+           xg_err("Unknown arg: %s", s_key);
-+       }
-+   }
-+   if (bad) {
-+      send_error(args->cli, "Bad Args");
-+   } else {
-+      send_return(args->cli, NULL);
-+   }
++        }
++        if ( setable_args[i].name == NULL ) {
++            xg_err("Unknown arg: %s", s_key);
++            bad = 1;
++        }
++    }
++    if ( bad )
++    {
++        send_error(args->cli, "Bad Args");
++    }
++    else
++    {
++        send_return(args->cli, NULL);
++    }
 +}
-+
-+
 +
 +struct command_actions actions[] = {
 +    {cmd_track_dirty,      &do_ignore, 0 },
@@ -1135,65 +1306,59 @@ index 0000000..c4de820
 +
 +void emp_do_listen(void)
 +{
-+/*
-+"migrate_init"-> stash.
-+"Migrte_live" -> do_migrate
-+"migrate_pause" -> maby stop living, and wait.
-+"migrate_paused" -> stop and copy migrate. (stop waiting)
-+"migate_progress" -> set bool, tranmit progess
-+*/
-+#define CONTROL_PATH "/var/xen/%s/%d/control"
++#define EMU_HOME     "/var/xen/xenguest"
++#define CONTROL_PATH "%s/%d/control"
 +
-+struct control_sock_inf cs_inf;
-+   int rc;
-+   char* fname;
-+   char* path;
-+   int r;
-+   time_t act_time;
++    struct control_sock_inf cs_inf;
++    int rc;
++    char* fname;
++    char* path;
++    int r;
++    struct timespec act_time;
 +
-+   r = mkdir("/var/xen/xenguest", S_IRWXU | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
++    r = mkdir( EMU_HOME, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
 +
-+   if (r!=0 && errno != EEXIST) {
-+      xg_err("Couldn't create directory, %d", errno);
-+      return;
-+   }
++    if ( r !=0 && errno != EEXIST ) {
++        xg_err("Couldn't create directory, %d", errno);
++        return;
++    }
 +
-+   r = asprintf(&fname, CONTROL_PATH, "xenguest", domid);
++    r = asprintf(&fname, CONTROL_PATH, EMU_HOME, domid);
 +
-+   if (r<0) {
++    if ( r < 0 ) {
 +        xg_err("no memory (fname)");
 +        return;
-+   }
-+   path = strdup(fname);
++    }
++    path = strdup(fname);
 +
-+   if (path==NULL) {
-+       xg_err("no memory (path)");
-+       free(fname);
-+       return;
-+   }
++    if ( path == NULL ) {
++        xg_err("no memory (path)");
++        free(fname);
++        return;
++    }
 +
-+   r = mkdir(dirname(path), S_IRWXU | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-+   free(path);
++    r = mkdir(dirname(path), S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
++    free(path);
 +
-+   if ((r!=0 && errno!= EEXIST)){
++    if ( (r != 0 && errno != EEXIST) ){
 +        xg_err("could not make directory, %d", errno);
 +        free(fname);
 +        return;
-+   }
++    }
 +
-+   r = control_sock_init(fname, &cs_inf, actions);
-+   free(fname);
++    r = control_sock_init(fname, &cs_inf, actions);
++    free(fname);
 +
-+   if (r) {
-+       xg_err("control socket failed");
-+       return;
-+   }
++    if ( r ) {
++        xg_err("control socket failed");
++        return;
++    }
 +
-+   act_time = time(0);
++    clock_gettime(CLOCK_MONOTONIC, &act_time);
 +
-+   printf("Ready\n");
++    printf("Ready\n");
 +
-+   for (;running;) {
++    while (running) {
 +        fd_set          rfds;
 +        fd_set          wfds;
 +        fd_set          xfds;
@@ -1211,18 +1376,23 @@ index 0000000..c4de820
 +        nfds++;
 +        rc = select(nfds, &rfds, &wfds, &xfds, &tv);
 +
-+        if (rc == 0 && num_clients == 0) {
-+           int timediff = time(0) - act_time;
-+           if (timediff > COMMAND_TIMOUT) {
++        if ( rc == 0 && num_clients == 0 ) {
++           struct timespec cur_time;
++           uint64_t timediff;
++           clock_gettime(CLOCK_MONOTONIC, &cur_time);
++
++           timediff = ts_delta_us( &cur_time, &act_time);
++           if ( timediff > (COMMAND_TIMOUT * 1000000) )
++           {
 +               xg_err("Control timeout");
 +               abort_all();
 +               break;
 +           }
 +        }
 +        else
-+           act_time = time(0);
++           clock_gettime(CLOCK_MONOTONIC, &act_time);
 +
-+        if (rc < 0 && errno != EINTR)
++        if ( rc < 0 && errno != EINTR )
 +            break;
 +
 +        if ( rc > 0)
@@ -1230,14 +1400,12 @@ index 0000000..c4de820
 +
 +    }
 +    /* wait for any threads to finish */
-+    control_lock();
-+    control_unlock();
-+
++    wait_for_threads();
 +}
 +
 +
 diff --git a/tools/xenguest/xg_internal.h b/tools/xenguest/xg_internal.h
-index c2cb248..d236a7a 100644
+index c2cb248..78d83e9 100644
 --- a/tools/xenguest/xg_internal.h
 +++ b/tools/xenguest/xg_internal.h
 @@ -15,6 +15,7 @@ enum xenguest_mode {
@@ -1256,13 +1424,13 @@ index c2cb248..d236a7a 100644
  /* Read and write /local/domain/$domid/ relative paths. */
  char *xenstore_getsv(const char *fmt, va_list ap);
  char *xenstore_gets(const char *fmt, ...)  __printf(1, 2);
-@@ -45,8 +47,13 @@ int stub_xc_linux_build(int c_mem_max_mib, int mem_start_mib,
+@@ -45,8 +47,14 @@ int stub_xc_linux_build(int c_mem_max_mib, int mem_start_mib,
  int stub_xc_hvm_build(int mem_max_mib, int mem_start_mib, const char *image_name,
                        int store_evtchn, int store_domid, int console_evtchn,
                        int console_domid, unsigned long *store_mfn, unsigned long *console_mfn);
--int stub_xc_domain_save(int fd, int max_iters, int max_factors,
 +
-+int stub_xc_domain_save(int fd, int max_iters, int max_factors, int flags, int hvm);
+ int stub_xc_domain_save(int fd, int max_iters, int max_factors,
++                    int flags, int hvm);
 +
 +int emu_stub_xc_domain_save(int fd, void* data,
                          int flags, int hvm);
@@ -1271,7 +1439,7 @@ index c2cb248..d236a7a 100644
  int stub_xc_domain_restore(int fd, int store_evtchn, int console_evtchn,
                             int hvm,
                             unsigned long *store_mfn, unsigned long *console_mfn);
-@@ -54,6 +61,9 @@ int stub_xc_domain_resume_slow(void);
+@@ -54,6 +62,9 @@ int stub_xc_domain_resume_slow(void);
  
  int suspend_callback(void *data);
  
@@ -1281,10 +1449,20 @@ index c2cb248..d236a7a 100644
  void setup_legacy_conversion(int opt_fd, enum xenguest_mode mode);
  void cleanup_legacy_conversion(void);
  
-@@ -68,6 +78,10 @@ static inline uint64_t tv_delta_us(const struct timeval *new,
+@@ -68,6 +79,20 @@ static inline uint64_t tv_delta_us(const struct timeval *new,
              (new->tv_usec - old->tv_usec));
  }
  
++
++/* Calcluate the difference between two timevals, in microseconds. */
++static inline uint64_t ts_delta_us(const struct timespec *new,
++                                   const struct timespec *old)
++{
++    return (((new->tv_sec - old->tv_sec)*1000000) +
++            ((new->tv_nsec - old->tv_nsec)/1000));
++}
++
++
 +int xenguest_precopy_policy(struct precopy_stats stats, void *user);
 +void emp_do_listen(void);
 +void send_emu_progress(unsigned long done, unsigned long total);
