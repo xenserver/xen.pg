@@ -1,0 +1,235 @@
+From 7f76b3a06aefc1f201f6bfcb593b5d0b3dc68bff Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Thu, 25 Jan 2018 12:26:55 +0100
+Subject: [PATCH] x86/domctl: remove XEN_DOMCTL_pin_mem_cacheattr
+
+Remove the implementation of XEN_DOMCTL_pin_mem_cacheattr since it has
+been replaced by a dmop. Change xc_domain_pin_memory_cacheattr() so
+that it is only defined when XC_WANT_COMPAT_DEVICEMODEL_API is set and
+have it call the new dmop.  Leave the definitions of
+XEN_DOMCTL_MEM_CACHEATTR_* since they are still used by QEMU.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
+Acked-by: Daniel De Graaf <dgdegra@tycho.nsa.gov>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/tools/flask/policy/modules/xen.if b/tools/flask/policy/modules/xen.if
+index 7ca401b..f491c84 100644
+--- a/tools/flask/policy/modules/xen.if
++++ b/tools/flask/policy/modules/xen.if
+@@ -57,7 +57,7 @@ define(`create_domain_common', `
+ 	allow $1 $2:shadow enable;
+ 	allow $1 $2:mmu { map_read map_write adjust memorymap physmap pinpage mmuext_op updatemp };
+ 	allow $1 $2:grant setup;
+-	allow $1 $2:hvm { cacheattr getparam hvmctl sethvmc
++	allow $1 $2:hvm { getparam hvmctl sethvmc
+ 			setparam nested altp2mhvm altp2mhvm_op dm };
+ ')
+ 
+@@ -151,7 +151,7 @@ define(`device_model', `
+ 
+ 	allow $1 $2_target:domain shutdown;
+ 	allow $1 $2_target:mmu { map_read map_write adjust physmap target_hack };
+-	allow $1 $2_target:hvm { getparam setparam hvmctl cacheattr dm };
++	allow $1 $2_target:hvm { getparam setparam hvmctl dm };
+ ')
+ 
+ # make_device_model(priv, dm_dom, hvm_dom)
+diff --git a/tools/libs/devicemodel/include/xendevicemodel.h b/tools/libs/devicemodel/include/xendevicemodel.h
+index b9fc996..3a28298 100644
+--- a/tools/libs/devicemodel/include/xendevicemodel.h
++++ b/tools/libs/devicemodel/include/xendevicemodel.h
+@@ -328,7 +328,7 @@ int xendevicemodel_relocate_memory(
+  * @parm domid the domain id to be serviced
+  * @parm start Start gfn
+  * @parm end End gfn
+- * @parm type XEN_DOMCTL_MEM_CACHEATTR_*
++ * @parm type XEN_DMOP_MEM_CACHEATTR_*
+  * @return 0 on success, -1 on failure.
+  */
+ int xendevicemodel_pin_memory_cacheattr(
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 1e924f0..35e53c9 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1398,12 +1398,6 @@ int xc_domain_iomem_permission(xc_interface *xch,
+                                unsigned long nr_mfns,
+                                uint8_t allow_access);
+ 
+-int xc_domain_pin_memory_cacheattr(xc_interface *xch,
+-                                   uint32_t domid,
+-                                   uint64_t start,
+-                                   uint64_t end,
+-                                   uint32_t type);
+-
+ unsigned long xc_make_page_below_4G(xc_interface *xch, uint32_t domid,
+                                     unsigned long mfn);
+ 
+diff --git a/tools/libxc/include/xenctrl_compat.h b/tools/libxc/include/xenctrl_compat.h
+index 040e7b2..58b8870 100644
+--- a/tools/libxc/include/xenctrl_compat.h
++++ b/tools/libxc/include/xenctrl_compat.h
+@@ -164,6 +164,9 @@ int xc_hvm_set_mem_type(
+ int xc_hvm_inject_trap(
+     xc_interface *xch, domid_t domid, int vcpu, uint8_t vector,
+     uint8_t type, uint32_t error_code, uint8_t insn_len, uint64_t cr2);
++int xc_domain_pin_memory_cacheattr(
++    xc_interface *xch, uint32_t domid, uint64_t start, uint64_t end,
++    uint32_t type);
+ 
+ #endif /* XC_WANT_COMPAT_DEVICEMODEL_API */
+ 
+diff --git a/tools/libxc/xc_devicemodel_compat.c b/tools/libxc/xc_devicemodel_compat.c
+index e4edeea..3c1c5c8 100644
+--- a/tools/libxc/xc_devicemodel_compat.c
++++ b/tools/libxc/xc_devicemodel_compat.c
+@@ -128,6 +128,14 @@ int xc_hvm_inject_trap(
+                                        type, error_code, insn_len, cr2);
+ }
+ 
++int xc_domain_pin_memory_cacheattr(
++    xc_interface *xch, uint32_t domid, uint64_t start, uint64_t end,
++    uint32_t type)
++{
++    return xendevicemodel_pin_memory_cacheattr(xch->dmod, domid, start, end,
++                                               type);
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
+index d862e53..09ee9c0 100644
+--- a/tools/libxc/xc_domain.c
++++ b/tools/libxc/xc_domain.c
+@@ -631,21 +631,6 @@ int xc_domain_setmaxmem(xc_interface *xch,
+     return do_domctl(xch, &domctl);
+ }
+ 
+-int xc_domain_pin_memory_cacheattr(xc_interface *xch,
+-                                   uint32_t domid,
+-                                   uint64_t start,
+-                                   uint64_t end,
+-                                   uint32_t type)
+-{
+-    DECLARE_DOMCTL;
+-    domctl.cmd = XEN_DOMCTL_pin_mem_cacheattr;
+-    domctl.domain = (domid_t)domid;
+-    domctl.u.pin_mem_cacheattr.start = start;
+-    domctl.u.pin_mem_cacheattr.end = end;
+-    domctl.u.pin_mem_cacheattr.type = type;
+-    return do_domctl(xch, &domctl);
+-}
+-
+ #if defined(__i386__) || defined(__x86_64__)
+ int xc_domain_set_memory_map(xc_interface *xch,
+                                uint32_t domid,
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index fd0a9ce..74429f9 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -24,7 +24,6 @@
+ #include <asm/irq.h>
+ #include <asm/hvm/hvm.h>
+ #include <asm/hvm/support.h>
+-#include <asm/hvm/cacheattr.h>
+ #include <asm/processor.h>
+ #include <asm/acpi.h> /* for hvm_acpi_power_button */
+ #include <xen/hypercall.h> /* for arch_do_domctl */
+@@ -747,13 +746,6 @@ long arch_do_domctl(
+         break;
+     }
+ 
+-    case XEN_DOMCTL_pin_mem_cacheattr:
+-        ret = hvm_set_mem_pinned_cacheattr(
+-            d, domctl->u.pin_mem_cacheattr.start,
+-            domctl->u.pin_mem_cacheattr.end,
+-            domctl->u.pin_mem_cacheattr.type);
+-        break;
+-
+     case XEN_DOMCTL_set_ext_vcpucontext:
+     case XEN_DOMCTL_get_ext_vcpucontext:
+     {
+diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
+index d4c46e0..ccaa006 100644
+--- a/xen/include/public/domctl.h
++++ b/xen/include/public/domctl.h
+@@ -636,12 +636,6 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_ioport_mapping_t);
+ #define XEN_DOMCTL_MEM_CACHEATTR_WB  6
+ #define XEN_DOMCTL_MEM_CACHEATTR_UCM 7
+ #define XEN_DOMCTL_DELETE_MEM_CACHEATTR (~(uint32_t)0)
+-struct xen_domctl_pin_mem_cacheattr {
+-    uint64_aligned_t start, end;
+-    uint32_t type; /* XEN_DOMCTL_MEM_CACHEATTR_* */
+-};
+-typedef struct xen_domctl_pin_mem_cacheattr xen_domctl_pin_mem_cacheattr_t;
+-DEFINE_XEN_GUEST_HANDLE(xen_domctl_pin_mem_cacheattr_t);
+ 
+ 
+ /* XEN_DOMCTL_set_ext_vcpucontext */
+@@ -1176,7 +1170,7 @@ struct xen_domctl {
+ #define XEN_DOMCTL_bind_pt_irq                   38
+ #define XEN_DOMCTL_memory_mapping                39
+ #define XEN_DOMCTL_ioport_mapping                40
+-#define XEN_DOMCTL_pin_mem_cacheattr             41
++/* #define XEN_DOMCTL_pin_mem_cacheattr          41 Removed - use dmop */
+ #define XEN_DOMCTL_set_ext_vcpucontext           42
+ #define XEN_DOMCTL_get_ext_vcpucontext           43
+ #define XEN_DOMCTL_set_opt_feature               44 /* Obsolete IA64 only */
+@@ -1251,7 +1245,6 @@ struct xen_domctl {
+         struct xen_domctl_bind_pt_irq       bind_pt_irq;
+         struct xen_domctl_memory_mapping    memory_mapping;
+         struct xen_domctl_ioport_mapping    ioport_mapping;
+-        struct xen_domctl_pin_mem_cacheattr pin_mem_cacheattr;
+         struct xen_domctl_ext_vcpucontext   ext_vcpucontext;
+         struct xen_domctl_set_target        set_target;
+         struct xen_domctl_subscribe         subscribe;
+diff --git a/xen/include/public/hvm/dm_op.h b/xen/include/public/hvm/dm_op.h
+index f852d41..0e3fecb 100644
+--- a/xen/include/public/hvm/dm_op.h
++++ b/xen/include/public/hvm/dm_op.h
+@@ -369,7 +369,15 @@ struct xen_dm_op_relocate_memory {
+ struct xen_dm_op_pin_memory_cacheattr {
+     uint64_aligned_t start; /* Start gfn. */
+     uint64_aligned_t end;   /* End gfn. */
+-    uint32_t type;          /* XEN_DOMCTL_MEM_CACHEATTR_* */
++/* Caching types: these happen to be the same as x86 MTRR/PAT type codes. */
++#define XEN_DMOP_MEM_CACHEATTR_UC  0
++#define XEN_DMOP_MEM_CACHEATTR_WC  1
++#define XEN_DMOP_MEM_CACHEATTR_WT  4
++#define XEN_DMOP_MEM_CACHEATTR_WP  5
++#define XEN_DMOP_MEM_CACHEATTR_WB  6
++#define XEN_DMOP_MEM_CACHEATTR_UCM 7
++#define XEN_DMOP_DELETE_MEM_CACHEATTR (~(uint32_t)0)
++    uint32_t type;          /* XEN_DMOP_MEM_CACHEATTR_* */
+     uint32_t pad;
+ };
+ 
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 3096b70..b3d1e1d 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -692,9 +692,6 @@ static int flask_domctl(struct domain *d, int cmd)
+     case XEN_DOMCTL_mem_sharing_op:
+         return current_has_perm(d, SECCLASS_HVM, HVM__MEM_SHARING);
+ 
+-    case XEN_DOMCTL_pin_mem_cacheattr:
+-        return current_has_perm(d, SECCLASS_HVM, HVM__CACHEATTR);
+-
+     case XEN_DOMCTL_sendtrigger:
+         return current_has_perm(d, SECCLASS_DOMAIN, DOMAIN__TRIGGER);
+ 
+diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
+index 35f6cd0..719b6f9 100644
+--- a/xen/xsm/flask/policy/access_vectors
++++ b/xen/xsm/flask/policy/access_vectors
+@@ -258,8 +258,6 @@ class hvm
+ # HVMOP_get_param
+     getparam
+     bind_irq
+-# XEN_DOMCTL_pin_mem_cacheattr
+-    cacheattr
+ # HVMOP_get_mem_type,
+ # HVMOP_set_mem_access, HVMOP_get_mem_access, HVMOP_pagetable_dying
+     hvmctl

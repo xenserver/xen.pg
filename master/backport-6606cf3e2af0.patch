@@ -1,0 +1,112 @@
+From 6606cf3e2af0962b12a8802d9a5bf2cef6eaf005 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Thu, 25 Jan 2018 12:24:14 +0100
+Subject: [PATCH] x86/hvm: provide XEN_DMOP_relocate_memory
+
+Provide XEN_DMOP_relocate_memory, a limited version of
+XENMEM_add_to_physmap to allow a deprivileged QEMU to move VRAM when a
+guest programs its BAR. It is equivalent to XENMEM_add_to_physmap with
+space == XENMAPSPACE_gmfn_range.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/arch/x86/hvm/dm.c b/xen/arch/x86/hvm/dm.c
+index f132b3e..d0d6cd9 100644
+--- a/xen/arch/x86/hvm/dm.c
++++ b/xen/arch/x86/hvm/dm.c
+@@ -573,6 +573,37 @@ static int dm_op(const struct dmop_args *op_args)
+         break;
+     }
+ 
++    case XEN_DMOP_relocate_memory:
++    {
++        struct xen_dm_op_relocate_memory *data = &op.u.relocate_memory;
++        struct xen_add_to_physmap xatp = {
++            .domid = op_args->domid,
++            .size = data->size,
++            .space = XENMAPSPACE_gmfn_range,
++            .idx = data->src_gfn,
++            .gpfn = data->dst_gfn,
++        };
++
++        if ( data->pad )
++        {
++            rc = -EINVAL;
++            break;
++        }
++
++        rc = xenmem_add_to_physmap(d, &xatp, 0);
++        if ( rc == 0 && data->size != xatp.size )
++            rc = xatp.size;
++        if ( rc > 0 )
++        {
++            data->size -= rc;
++            data->src_gfn += rc;
++            data->dst_gfn += rc;
++            const_op = false;
++            rc = -ERESTART;
++        }
++        break;
++    }
++
+     default:
+         rc = -EOPNOTSUPP;
+         break;
+@@ -602,6 +633,7 @@ CHECK_dm_op_set_mem_type;
+ CHECK_dm_op_inject_event;
+ CHECK_dm_op_inject_msi;
+ CHECK_dm_op_remote_shutdown;
++CHECK_dm_op_relocate_memory;
+ 
+ int compat_dm_op(domid_t domid,
+                  unsigned int nr_bufs,
+diff --git a/xen/include/public/hvm/dm_op.h b/xen/include/public/hvm/dm_op.h
+index 4d2f15b..1746552 100644
+--- a/xen/include/public/hvm/dm_op.h
++++ b/xen/include/public/hvm/dm_op.h
+@@ -342,6 +342,24 @@ struct xen_dm_op_remote_shutdown {
+                            /* (Other reason values are not blocked) */
+ };
+ 
++/*
++ * XEN_DMOP_relocate_memory : Relocate GFNs for the specified guest.
++ *                            Identical to XENMEM_add_to_physmap with
++ *                            space == XENMAPSPACE_gmfn_range.
++ */
++#define XEN_DMOP_relocate_memory 17
++
++struct xen_dm_op_relocate_memory {
++    /* All fields are IN/OUT, with their OUT state undefined. */
++    /* Number of GFNs to process. */
++    uint32_t size;
++    uint32_t pad;
++    /* Starting GFN to relocate. */
++    uint64_aligned_t src_gfn;
++    /* Starting GFN where GFNs should be relocated. */
++    uint64_aligned_t dst_gfn;
++};
++
+ struct xen_dm_op {
+     uint32_t op;
+     uint32_t pad;
+@@ -361,6 +379,7 @@ struct xen_dm_op {
+         struct xen_dm_op_inject_event inject_event;
+         struct xen_dm_op_inject_msi inject_msi;
+         struct xen_dm_op_remote_shutdown remote_shutdown;
++        struct xen_dm_op_relocate_memory relocate_memory;
+     } u;
+ };
+ 
+diff --git a/xen/include/xlat.lst b/xen/include/xlat.lst
+index 4346cbe..b3d00b7 100644
+--- a/xen/include/xlat.lst
++++ b/xen/include/xlat.lst
+@@ -57,6 +57,7 @@
+ ?	grant_entry_v2			grant_table.h
+ ?	gnttab_swap_grant_ref		grant_table.h
+ !	dm_op_buf			hvm/dm_op.h
++?	dm_op_relocate_memory		hvm/dm_op.h
+ ?	dm_op_create_ioreq_server	hvm/dm_op.h
+ ?	dm_op_destroy_ioreq_server	hvm/dm_op.h
+ ?	dm_op_get_ioreq_server_info	hvm/dm_op.h
