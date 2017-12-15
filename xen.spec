@@ -39,6 +39,8 @@ ExclusiveArch: i686 x86_64
 BuildRequires: gcc-x86_64-linux-gnu binutils-x86_64-linux-gnu
 %endif
 
+BuildRequires: gcc-xs
+
 # For HVMLoader and 16/32bit firmware
 BuildRequires: /usr/include/gnu/stubs-32.h
 BuildRequires: dev86 iasl
@@ -210,11 +212,11 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 mkdir -p %{buildroot}/boot/
 
 # Regular build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
     KCONFIG_CONFIG=../buildconfigs/config-release olddefconfig
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
     KCONFIG_CONFIG=../buildconfigs/config-release build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
     KCONFIG_CONFIG=../buildconfigs/config-release MAP
 
 cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}.gz
@@ -223,12 +225,12 @@ cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{release}
 cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{release}.config
 
 # Debug build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen clean
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen clean
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug olddefconfig
-%{?cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+PATH=/opt/xensource/gcc/bin:$PATH %{?cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug MAP
 
 cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}-d.gz
