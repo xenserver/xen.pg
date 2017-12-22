@@ -2,7 +2,7 @@ Expose vcpus as multiple cores in a smaller number of sockets,
 by adjusting the cpuid responses appropriately.
 
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index 8b5c87b..51613b5 100644
+index 52df40e..aeb41a7 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
 @@ -1321,6 +1321,10 @@ int xc_domain_disable_migrate(xc_interface *xch, uint32_t domid);
@@ -17,7 +17,7 @@ index 8b5c87b..51613b5 100644
  
  int xc_domain_nr_gpfns(xc_interface *xch, domid_t domid, xen_pfn_t *gpfns);
 diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
-index 859e170..a9fbec2 100644
+index c21f7ab..e07da5e 100644
 --- a/tools/libxc/xc_domain.c
 +++ b/tools/libxc/xc_domain.c
 @@ -840,6 +840,20 @@ int xc_domain_get_tsc_info(xc_interface *xch,
@@ -42,10 +42,10 @@ index 859e170..a9fbec2 100644
  {
      long rc = do_memory_op(xch, XENMEM_maximum_gpfn, &domid, sizeof(domid));
 diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
-index 679e615..5e56045 100644
+index 5916838..1ac38bd 100644
 --- a/xen/arch/x86/hvm/svm/svm.c
 +++ b/xen/arch/x86/hvm/svm/svm.c
-@@ -1574,14 +1574,52 @@ static void svm_cpuid_intercept(
+@@ -1593,14 +1593,52 @@ static void svm_cpuid_intercept(
  {
      unsigned int input = *eax;
      struct vcpu *v = current;
@@ -99,12 +99,12 @@ index 679e615..5e56045 100644
      case 0x8000001c: 
      {
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index 670d7dc..5f45496 100644
+index d1f3223..1f42185 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -2377,11 +2377,32 @@ static void vmx_cpuid_intercept(
+@@ -2426,11 +2426,32 @@ static void vmx_cpuid_intercept(
+ {
      unsigned int input = *eax;
-     struct segment_register cs;
      struct vcpu *v = current;
 +    unsigned int cps = v->domain->cores_per_socket;
  
@@ -134,12 +134,12 @@ index 670d7dc..5f45496 100644
 +
          case 0x80000001:
              /* SYSCALL is visible iff running in long mode. */
-             vmx_get_segment_register(v, x86_seg_cs, &cs);
+             if ( hvm_long_mode_enabled(v) )
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index ccdebd9..a4e1326 100644
+index 844e227..596b19b 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -1204,6 +1204,32 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+@@ -1156,6 +1156,32 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
          copyback = 1;
          break;
  
@@ -173,10 +173,10 @@ index ccdebd9..a4e1326 100644
          ret = arch_do_domctl(op, d, u_domctl);
          break;
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index f2051a6..dc77b8f 100644
+index d1aebe8..e17c1e3 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1177,6 +1177,13 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
+@@ -1176,6 +1176,13 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
  /* Some vcpus are runnable, some are blocked */
  #define DOMAIN_RUNSTATE_partial_contention 5
  
@@ -190,7 +190,7 @@ index f2051a6..dc77b8f 100644
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1260,6 +1267,7 @@ struct xen_domctl {
+@@ -1259,6 +1266,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
  #define XEN_DOMCTL_gdbsx_domstatus             1003
@@ -198,7 +198,7 @@ index f2051a6..dc77b8f 100644
      uint32_t interface_version; /* XEN_DOMCTL_INTERFACE_VERSION */
      domid_t  domain;
      union {
-@@ -1310,6 +1318,7 @@ struct xen_domctl {
+@@ -1309,6 +1317,7 @@ struct xen_domctl {
          struct xen_domctl_set_virq_handler  set_virq_handler;
          struct xen_domctl_set_max_evtchn    set_max_evtchn;
          struct xen_domctl_runstate_info     domain_runstate;
@@ -207,10 +207,10 @@ index f2051a6..dc77b8f 100644
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index ad13069..5b748cc 100644
+index 4bd20c9..1a38286 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -480,6 +480,8 @@ struct domain
+@@ -481,6 +481,8 @@ struct domain
      spinlock_t runstate_lock;
      atomic_t runstate_missed_changes;
      domain_runstate_info_t runstate;
@@ -220,10 +220,10 @@ index ad13069..5b748cc 100644
  
  /* Protect updates/reads (resp.) of domain_list and domain_hash. */
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
-index 69dcb5d..525c5ec 100644
+index 55ec6c7..43583b8 100644
 --- a/xen/xsm/flask/hooks.c
 +++ b/xen/xsm/flask/hooks.c
-@@ -751,6 +751,9 @@ static int flask_domctl(struct domain *d, int cmd)
+@@ -754,6 +754,9 @@ static int flask_domctl(struct domain *d, int cmd)
      case XEN_DOMCTL_get_runstate_info:
          return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__GET_RUNSTATE_INFO);
  
@@ -234,10 +234,10 @@ index 69dcb5d..525c5ec 100644
          return avc_unknown_permission("domctl", cmd);
      }
 diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
-index 3cfe77c..680828d 100644
+index 7430b9f..6346baf 100644
 --- a/xen/xsm/flask/policy/access_vectors
 +++ b/xen/xsm/flask/policy/access_vectors
-@@ -246,6 +246,8 @@ class domain2
+@@ -248,6 +248,8 @@ class domain2
      psr_cat_op
  # XEN_DOMCTL_get_runstate_info
      get_runstate_info
