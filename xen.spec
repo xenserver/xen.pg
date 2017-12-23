@@ -24,7 +24,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.7.3
+Version: 4.7.4
 Release: 3.0.7
 License: GPL
 URL:     http://www.xen.org
