@@ -6,10 +6,10 @@ Subject: [PATCH] x86: Protect unaware domains from meddling hyperthreads
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 9fd110a..1191cc0 100644
+index 9fd110a..ca0a7c1 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -2671,6 +2671,19 @@ int domain_relinquish_resources(struct domain *d)
+@@ -2671,6 +2671,25 @@ int domain_relinquish_resources(struct domain *d)
   */
  void cpuid_policy_updated(struct vcpu *v)
  {
@@ -17,14 +17,20 @@ index 9fd110a..1191cc0 100644
 +    struct msr_vcpu_policy *vp = v->arch.msr;
 +
 +    /*
-+     * For guests which are not told about STIBP, running on hardware
-+     * supporting hyperthreading, the guest doesn't know to protect itself
-+     * fully.  (Such a guest won't be permitted direct access to the MSR.)
-+     * Have Xen fill in the gaps, so an unaware guest can't be interfered with
-+     * by a meddling guest on an adjacent hyperthread.
++     * For guests which know about IBRS but are not told about STIBP running
++     * on hardware supporting hyperthreading, the guest doesn't know to
++     * protect itself fully.  (Such a guest won't be permitted direct access
++     * to the MSR.)  Have Xen fill in the gaps, so an unaware guest can't be
++     * interfered with by a meddling guest on an adjacent hyperthread.
 +     */
-+    if ( !cp->feat.stibp && cpu_has_stibp )
-+        vp->spec_ctrl.host = SPEC_CTRL_STIBP;
++    if ( cp->feat.ibrsb )
++    {
++        if ( !cp->feat.stibp && cpu_has_stibp &&
++             !(vp->spec_ctrl.guest & (SPEC_CTRL_IBRS | SPEC_CTRL_STIBP)) )
++            vp->spec_ctrl.host = SPEC_CTRL_STIBP;
++        else
++            vp->spec_ctrl.host = vp->spec_ctrl.guest;
++    }
 +
      if ( is_hvm_vcpu(v) )
          hvm_cpuid_policy_changed(v);
