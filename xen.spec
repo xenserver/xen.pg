@@ -25,7 +25,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.7.4
-Release: 3.0.7
+Release: 3.0.18
 License: GPL
 URL:     http://www.xen.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -40,6 +40,8 @@ ExclusiveArch: i686 x86_64
 %ifarch %ix86
 BuildRequires: gcc-x86_64-linux-gnu binutils-x86_64-linux-gnu
 %endif
+
+BuildRequires: gcc-xs
 
 # For HVMLoader and 16/32bit firmware
 BuildRequires: /usr/include/gnu/stubs-32.h
@@ -215,11 +217,11 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 mkdir -p %{buildroot}/boot/
 
 # Regular build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
     KCONFIG_CONFIG=../buildconfigs/config-release olddefconfig
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
     KCONFIG_CONFIG=../buildconfigs/config-release build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
     KCONFIG_CONFIG=../buildconfigs/config-release MAP
 
 cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}.gz
@@ -228,12 +230,12 @@ cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{release}
 cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{release}.config
 
 # Debug build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen clean
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen clean
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug olddefconfig
-%{?cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+PATH=/opt/xensource/gcc/bin:$PATH %{?cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+PATH=/opt/xensource/gcc/bin:$PATH %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug MAP
 
 cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}-d.gz
@@ -557,7 +559,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxenctrl.so.4.7
 %{_libdir}/libxenctrl.so.4.7.0
 %{_libdir}/libxenforeignmemory.so.1
-%{_libdir}/libxenforeignmemory.so.1.0
+%{_libdir}/libxenforeignmemory.so.1.2
 %{_libdir}/libxenguest.so.4.7
 %{_libdir}/libxenguest.so.4.7.0
 %{_libdir}/libxenlight.so.4.7
@@ -700,8 +702,8 @@ ln -sf %{name}-%{version}-%{release}.gz /boot/xen-release.gz
 
 # Point /boot/xen.gz appropriately
 if [ ! -e /boot/xen.gz ]; then
-    # Use a debug hypervisor by default
-    ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen.gz
+    # Use a release hypervisor by default
+    ln -sf %{name}-%{version}-%{release}.gz /boot/xen.gz
 else
     # Else look at the current link, and whether it is debug
     path="`readlink -f /boot/xen.gz`"
