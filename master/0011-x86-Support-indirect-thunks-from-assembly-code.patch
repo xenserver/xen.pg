@@ -12,7 +12,7 @@ the compiled-in thunks at those points.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 diff --git a/xen/arch/x86/boot/trampoline.S b/xen/arch/x86/boot/trampoline.S
-index b013614..2a6ee4c 100644
+index b0136148bb..2a6ee4c3bb 100644
 --- a/xen/arch/x86/boot/trampoline.S
 +++ b/xen/arch/x86/boot/trampoline.S
 @@ -128,8 +128,28 @@ trampoline_protmode_entry:
@@ -47,7 +47,7 @@ index b013614..2a6ee4c 100644
          .code32
  trampoline_boot_cpu_entry:
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 5f8d939..9dc1fc2 100644
+index 5f8d939b22..1b0068a5c3 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
 @@ -2216,6 +2216,10 @@ static int is_cpufreq_controller(struct domain *d)
@@ -70,7 +70,7 @@ index 5f8d939..9dc1fc2 100644
      uint64_t val;
      bool_t vpmu_msr;
  
-@@ -2424,28 +2430,43 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -2424,31 +2430,46 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
       * context. This is needed for some systems which (ab)use IN/OUT
       * to communicate with BIOS code in system-management mode.
       */
@@ -122,12 +122,34 @@ index 5f8d939..9dc1fc2 100644
 +    io_emul = (void *)stub_va;
  
      if ( ioemul_handle_quirk )
-         ioemul_handle_quirk(opcode, &io_emul_stub[12], regs);
+-        ioemul_handle_quirk(opcode, &io_emul_stub[12], regs);
++        ioemul_handle_quirk(opcode, &io_emul_stub[15], regs);
+ 
+     /* I/O Port and Interrupt Flag instructions. */
+     switch ( opcode )
+@@ -2457,7 +2478,7 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+         op_bytes = 1;
+     case 0xe5: /* IN imm8,%eax */
+         port = insn_fetch(u8, code_base, eip, code_limit);
+-        io_emul_stub[14] = port; /* imm8 */
++        io_emul_stub[17] = port; /* imm8 */
+     exec_in:
+         if ( !guest_io_okay(port, op_bytes, v, regs) )
+             goto fail;
+@@ -2486,7 +2507,7 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+         op_bytes = 1;
+     case 0xe7: /* OUT %eax,imm8 */
+         port = insn_fetch(u8, code_base, eip, code_limit);
+-        io_emul_stub[14] = port; /* imm8 */
++        io_emul_stub[17] = port; /* imm8 */
+     exec_out:
+         if ( !guest_io_okay(port, op_bytes, v, regs) )
+             goto fail;
 diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
-index 6de55ba..25a9e7b 100644
+index c824d5b009..33c1155cbd 100644
 --- a/xen/arch/x86/x86_64/entry.S
 +++ b/xen/arch/x86/x86_64/entry.S
-@@ -467,7 +467,8 @@ handle_exception_saved:
+@@ -473,7 +473,8 @@ handle_exception_saved:
          movzbl UREGS_entry_vector(%rsp),%eax
          leaq  exception_table(%rip),%rdx
          PERFC_INCR(exceptions, %rax, %rbx)
@@ -137,7 +159,7 @@ index 6de55ba..25a9e7b 100644
          testb $3,UREGS_cs(%rsp)
          jz    restore_all_xen
          leaq  VCPU_trap_bounce(%rbx),%rdx
-@@ -607,7 +608,8 @@ handle_ist_exception:
+@@ -613,7 +614,8 @@ handle_ist_exception:
  1:      movq  %rsp,%rdi
          movzbl UREGS_entry_vector(%rsp),%eax
          leaq  exception_table(%rip),%rdx
@@ -148,7 +170,7 @@ index 6de55ba..25a9e7b 100644
          jne   ret_from_intr
  
 diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
-index cf6f4fe..f8f79d5 100644
+index cf6f4fe027..f8f79d501f 100644
 --- a/xen/arch/x86/x86_emulate/x86_emulate.c
 +++ b/xen/arch/x86/x86_emulate/x86_emulate.c
 @@ -4322,7 +4322,7 @@ x86_emulate(
@@ -170,7 +192,7 @@ index cf6f4fe..f8f79d5 100644
          }
          put_fpu(&fic);
 diff --git a/xen/common/wait.c b/xen/common/wait.c
-index 877ef19..34b4799 100644
+index 877ef19638..34b4799d8f 100644
 --- a/xen/common/wait.c
 +++ b/xen/common/wait.c
 @@ -204,12 +204,14 @@ void check_wakeup_from_wait(void)
@@ -192,7 +214,7 @@ index 877ef19..34b4799 100644
      unreachable();
  }
 diff --git a/xen/include/asm-x86/asm_defns.h b/xen/include/asm-x86/asm_defns.h
-index af49a64..1acef90 100644
+index af49a64870..1acef90bd0 100644
 --- a/xen/include/asm-x86/asm_defns.h
 +++ b/xen/include/asm-x86/asm_defns.h
 @@ -13,6 +13,19 @@
@@ -217,7 +239,7 @@ index af49a64..1acef90 100644
  #endif
 diff --git a/xen/include/asm-x86/indirect_thunk_asm.h b/xen/include/asm-x86/indirect_thunk_asm.h
 new file mode 100644
-index 0000000..554dd7e
+index 0000000000..554dd7e618
 --- /dev/null
 +++ b/xen/include/asm-x86/indirect_thunk_asm.h
 @@ -0,0 +1,41 @@
@@ -263,7 +285,7 @@ index 0000000..554dd7e
 +    IND_THUNK jmp, \arg
 +.endm
 diff --git a/xen/include/asm-x86/multicall.h b/xen/include/asm-x86/multicall.h
-index 3cb0b6d..0d6f1e4 100644
+index 3cb0b6d9a0..0d6f1e461f 100644
 --- a/xen/include/asm-x86/multicall.h
 +++ b/xen/include/asm-x86/multicall.h
 @@ -34,7 +34,7 @@ enum mc_disposition {
