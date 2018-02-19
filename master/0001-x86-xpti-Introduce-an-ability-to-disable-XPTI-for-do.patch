@@ -1,0 +1,104 @@
+From 05697789020a0bec95b3edaccadf192f4d78544d Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 5 Feb 2018 14:50:10 +0000
+Subject: [PATCH] x86/xpti: Introduce an ability to disable XPTI for dom0
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index f345f95062..532c2fdaf1 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -687,6 +687,10 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags,
+      */
+     d->arch.x87_fip_width = cpu_has_fpu_sel ? 0 : 8;
+ 
++    if ( is_pv_domain(d) )
++        d->arch.pv_domain.xpti = opt_xpti &&
++                                 (opt_xpti_dom0 || d->domain_id != 0);
++
+     return 0;
+ 
+  fail:
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 2da8d29442..2f73cd1237 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -4015,7 +4015,7 @@ long do_mmu_update(
+                      * to the page lock we hold, its pinned status, and uses on
+                      * this (v)CPU.
+                      */
+-                    if ( !rc && !!this_cpu(root_pgt) &&
++                    if ( !rc && pg_owner->arch.pv_domain.xpti &&
+                          ((page->u.inuse.type_info & PGT_count_mask) >
+                           (1 + !!(page->u.inuse.type_info & PGT_pinned) +
+                            (pagetable_get_pfn(curr->arch.guest_table) == mfn) +
+diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
+index 4b58df72ba..d0ebb0eecc 100644
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -748,8 +748,10 @@ static int clone_mapping(const void *ptr, root_pgentry_t *rpt)
+     return 0;
+ }
+ 
+-static __read_mostly int8_t opt_xpti = -1;
++__read_mostly int8_t opt_xpti = -1;
+ boolean_param("xpti", opt_xpti);
++__read_mostly bool opt_xpti_dom0 = true;
++boolean_param("xpti-dom0", opt_xpti_dom0);
+ DEFINE_PER_CPU(root_pgentry_t *, root_pgt);
+ 
+ extern const char _stextentry[], _etextentry[];
+diff --git a/xen/arch/x86/x86_64/asm-offsets.c b/xen/arch/x86/x86_64/asm-offsets.c
+index 8ef11dc8f1..54729c2656 100644
+--- a/xen/arch/x86/x86_64/asm-offsets.c
++++ b/xen/arch/x86/x86_64/asm-offsets.c
+@@ -118,6 +118,7 @@ void __dummy__(void)
+     BLANK();
+ 
+     OFFSET(DOMAIN_is_32bit_pv, struct domain, arch.is_32bit_pv);
++    OFFSET(DOMAIN_arch_pv_xpti, struct domain, arch.pv_domain.xpti);
+     BLANK();
+ 
+     OFFSET(VMCB_rax, struct vmcb_struct, rax);
+diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
+index f6683b2217..795c12fdcd 100644
+--- a/xen/arch/x86/x86_64/entry.S
++++ b/xen/arch/x86/x86_64/entry.S
+@@ -39,6 +39,10 @@ ENTRY(switch_to_kernel)
+ restore_all_guest:
+         ASSERT_INTERRUPTS_DISABLED
+ 
++        mov VCPU_domain(%rbx), %rax
++        cmpb $0, DOMAIN_arch_pv_xpti(%rax)
++        je .Lrag_keep_cr3
++
+         /* Copy guest mappings and switch to per-CPU root page table. */
+         mov   %cr3, %r9
+         GET_STACK_END(dx)
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index 9f6d9d230d..35ceaa3f25 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -259,6 +259,8 @@ struct pv_domain
+     struct mapcache_domain mapcache;
+ 
+     struct cpuidmasks *cpuidmasks;
++
++    bool xpti;
+ };
+ 
+ struct monitor_write_data {
+diff --git a/xen/include/asm-x86/smp.h b/xen/include/asm-x86/smp.h
+index 33c2c32f42..af54cad1f6 100644
+--- a/xen/include/asm-x86/smp.h
++++ b/xen/include/asm-x86/smp.h
+@@ -72,6 +72,9 @@ void set_nr_sockets(void);
+ /* Representing HT and core siblings in each socket. */
+ extern cpumask_t **socket_cpumask;
+ 
++extern int8_t opt_xpti;
++extern bool opt_xpti_dom0;
++
+ #endif /* !__ASSEMBLY__ */
+ 
+ #endif
