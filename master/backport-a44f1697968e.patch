@@ -1,0 +1,94 @@
+From a44f1697968e04fcc6145e3bd51c748b57047240 Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Tue, 20 Feb 2018 10:16:56 +0100
+Subject: [PATCH] x86/nmi: start NMI watchdog on CPU0 after SMP bootstrap
+
+We're noticing a reproducible system boot hang on certain
+Skylake platforms where the BIOS is configured in legacy
+boot mode with x2APIC disabled. The system stalls immediately
+after writing the first SMP initialization sequence into APIC ICR.
+
+The cause of the problem is watchdog NMI handler execution -
+somewhere near the end of NMI handling (after it's already
+rescheduled the next NMI) it tries to access IO port 0x61
+to get the actual NMI reason on CPU0. Unfortunately, this
+port is emulated by BIOS using SMIs and this emulation for
+some reason takes more time than we expect during INIT-SIPI-SIPI
+sequence. As the result, the system is constantly moving between
+NMI and SMI handler and not making any progress.
+
+To avoid this, initialize the watchdog after SMP bootstrap on
+CPU0 and, additionally, protect the NMI handler by moving
+IO port access before NMI re-scheduling. The latter should also
+help in case of post boot CPU onlining. Although we're running
+watchdog at much lower frequency at this point, it's neveretheless
+possible we may trigger the issue anyway.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/arch/x86/apic.c b/xen/arch/x86/apic.c
+index 8df5bd3..89b1e85 100644
+--- a/xen/arch/x86/apic.c
++++ b/xen/arch/x86/apic.c
+@@ -688,7 +688,7 @@ void setup_local_APIC(void)
+         printk("Leaving ESR disabled.\n");
+     }
+ 
+-    if (nmi_watchdog == NMI_LOCAL_APIC)
++    if (nmi_watchdog == NMI_LOCAL_APIC && smp_processor_id())
+         setup_apic_nmi_watchdog();
+     apic_pm_activate();
+ }
+diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
+index dab064b..c19bbe7 100644
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -1272,7 +1272,10 @@ int __cpu_up(unsigned int cpu)
+ void __init smp_cpus_done(void)
+ {
+     if ( nmi_watchdog == NMI_LOCAL_APIC )
++    {
++        setup_apic_nmi_watchdog();
+         check_nmi_watchdog();
++    }
+ 
+     setup_ioapic_dest();
+ 
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index d0b0b5c..d66795e 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -3696,7 +3696,7 @@ static nmi_callback_t *nmi_callback = dummy_nmi_callback;
+ void do_nmi(const struct cpu_user_regs *regs)
+ {
+     unsigned int cpu = smp_processor_id();
+-    unsigned char reason;
++    unsigned char reason = 0;
+     bool_t handle_unknown = 0;
+ 
+     ++nmi_count(cpu);
+@@ -3704,6 +3704,16 @@ void do_nmi(const struct cpu_user_regs *regs)
+     if ( nmi_callback(regs, cpu) )
+         return;
+ 
++    /*
++     * Accessing port 0x61 may trap to SMM which has been actually
++     * observed on some production SKX servers. This SMI sometimes
++     * takes enough time for the next NMI tick to happen. By reading
++     * this port before we re-arm the NMI watchdog, we reduce the chance
++     * of having an NMI watchdog expire while in the SMI handler.
++     */
++    if ( cpu == 0 )
++        reason = inb(0x61);
++
+     if ( (nmi_watchdog == NMI_NONE) ||
+          (!nmi_watchdog_tick(regs) && watchdog_force) )
+         handle_unknown = 1;
+@@ -3711,7 +3721,6 @@ void do_nmi(const struct cpu_user_regs *regs)
+     /* Only the BSP gets external NMIs from the system. */
+     if ( cpu == 0 )
+     {
+-        reason = inb(0x61);
+         if ( reason & 0x80 )
+             pci_serr_error(regs);
+         if ( reason & 0x40 )
