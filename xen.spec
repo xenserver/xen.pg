@@ -27,11 +27,12 @@ Name:    xen
 Version: 4.7.4
 Release: 2.11
 License: GPL
-URL:     http://www.xen.org
+URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
+Source4: https://repo.citrite.net/list/ctx-local-contrib/citrix/branding/Citrix_Logo_Black.png
 #Patch0:  xen-development.patch
 
 ExclusiveArch: i686 x86_64
@@ -93,10 +94,15 @@ Xen Hypervisor.
 
 %package hypervisor
 Summary: The Xen Hypervisor
+License: Various (See description)
 Group: System/Hypervisor
 Requires(post): coreutils grep
 %description hypervisor
-This package contains the Xen Hypervisor.
+This package contains the Xen Hypervisor with selected patches provided by Citrix.
+
+Citrix, the Citrix logo, Xen, XenServer, and certain other marks appearing herein are proprietary trademarks of Citrix Systems, Inc., and are registered in the U.S. and other countries. You may not redistribute this package, nor display or otherwise use any Citrix trademarks or any marks that incorporate Citrix trademarks without the express prior written authorization of Citrix. Nothing herein shall restrict your rights, if any, in the software contained within this package under an applicable open source license.
+
+Portions of this package are © 2017 Citrix Systems, Inc. For other copyright and licensing information see the relevant source RPM.
 
 %package hypervisor-debuginfo
 Summary: The Xen Hypervisor debug information
@@ -195,6 +201,7 @@ rm -f tools/firmware/etherboot/patches/series
 base_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info)
 pq_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info-pq)
 echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
+cp %{SOURCE4} .
 
 %build
 
@@ -260,6 +267,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 /boot/%{name}-%{version}-%{release}-d.map
 /boot/%{name}-%{version}-%{release}-d.config
 %config %{_sysconfdir}/sysconfig/kernel-xen
+%doc Citrix_Logo_Black.png
 %ghost %attr(0644,root,root) %{_sysconfdir}/sysconfig/kernel-xen-args
 
 %files hypervisor-debuginfo
