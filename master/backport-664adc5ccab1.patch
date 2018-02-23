@@ -27,13 +27,13 @@ appearing to succeed, but because Xen actually ignored the write.
 Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Kevin Tian <kevin.tian@intel.com>
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index ffb84d9..4227b91 100644
+index 4f210431f0..b4fcc868f3 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
 @@ -3858,7 +3858,7 @@ int hvm_msr_write_intercept(unsigned int msr, uint64_t msr_content,
      struct vcpu *v = current;
      bool_t mtrr;
-     unsigned int edx, index;
+     unsigned int edx, ebx, index;
 -    int ret = X86EMUL_OKAY;
 +    int ret;
  
@@ -57,10 +57,10 @@ index ffb84d9..4227b91 100644
      {
      case MSR_EFER:
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index d81fdec..3e32148 100644
+index 3ed7dde7c7..de8d97cd78 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -2998,7 +2998,6 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
+@@ -3053,7 +3053,6 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
              goto gp_fault;
          break;
      case IA32_FEATURE_CONTROL_MSR:
@@ -68,7 +68,7 @@ index d81fdec..3e32148 100644
      case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
          /* None of these MSRs are writeable. */
          goto gp_fault;
-@@ -3013,23 +3012,6 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
+@@ -3068,23 +3067,6 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
              goto gp_fault;
          break;
  
@@ -93,7 +93,7 @@ index d81fdec..3e32148 100644
          if ( passive_domain_do_wrmsr(msr, msr_content) )
              return X86EMUL_OKAY;
 diff --git a/xen/arch/x86/msr.c b/xen/arch/x86/msr.c
-index 5e925d7..baba44f 100644
+index 5e925d75ce..baba44f43d 100644
 --- a/xen/arch/x86/msr.c
 +++ b/xen/arch/x86/msr.c
 @@ -148,6 +148,50 @@ int guest_rdmsr(const struct vcpu *v, uint32_t msr, uint64_t *val)
@@ -148,10 +148,10 @@ index 5e925d7..baba44f 100644
   * Local variables:
   * mode: C
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index d0211d8..d0b0b5c 100644
+index c59e3972a4..aef491fdbe 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
-@@ -2734,8 +2734,15 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -2749,8 +2749,15 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
      case 0x30: /* WRMSR */ {
          uint32_t eax = regs->eax;
          uint32_t edx = regs->edx;
@@ -167,15 +167,16 @@ index d0211d8..d0b0b5c 100644
 +
          switch ( regs->_ecx )
          {
-         case MSR_FS_BASE:
-@@ -2876,22 +2883,6 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+             uint32_t ebx, dummy;
+@@ -2893,23 +2900,10 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
                  wrmsrl(regs->_ecx, msr_content);
              break;
  
 -        case MSR_INTEL_PLATFORM_INFO:
--            /* The MSR is read-only. */
--            goto fail;
--
+         case MSR_ARCH_CAPABILITIES:
+             /* The MSR is read-only. */
+             goto fail;
+ 
 -        case MSR_INTEL_MISC_FEATURES_ENABLES:
 -            if ( boot_cpu_data.x86_vendor != X86_VENDOR_INTEL ||
 -                 (msr_content & ~MSR_MISC_FEATURES_CPUID_FAULTING) ||
@@ -188,11 +189,11 @@ index d0211d8..d0b0b5c 100644
 -                !!(msr_content & MSR_MISC_FEATURES_CPUID_FAULTING);
 -            break;
 -
-         case MSR_P6_PERFCTR(0)...MSR_P6_PERFCTR(7):
-         case MSR_P6_EVNTSEL(0)...MSR_P6_EVNTSEL(3):
-         case MSR_CORE_PERF_FIXED_CTR0...MSR_CORE_PERF_FIXED_CTR2:
+         case MSR_SPEC_CTRL:
+             domain_cpuid(currd, 7, 0, &dummy, &dummy, &dummy, &edx);
+             if ( !(edx & cpufeat_mask(X86_FEATURE_IBRSB)) )
 diff --git a/xen/include/asm-x86/msr.h b/xen/include/asm-x86/msr.h
-index 5cf175a..229fd21 100644
+index 5cf175adad..229fd21f7b 100644
 --- a/xen/include/asm-x86/msr.h
 +++ b/xen/include/asm-x86/msr.h
 @@ -206,6 +206,7 @@ int init_vcpu_msr_policy(struct vcpu *v);

@@ -1,0 +1,52 @@
+From 2e6775eb544cfef7266443c17e167190a2d6c663 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Wed, 20 Dec 2017 16:21:31 +0100
+Subject: [PATCH] improve XENMEM_add_to_physmap_batch address checking
+
+As a follow-up to XSA-212 we should have addressed a similar issue here:
+The handles being advanced at the top of xenmem_add_to_physmap_batch()
+means we allow hypervisor space accesses (in particular, for "errs",
+writes) with suitably crafted input arguments. This isn't a security
+issue in this case because of the limited width of struct
+xen_add_to_physmap_batch's size field: It being 16-bits wide, only the
+r/o M2P area can be accessed. Still we can and should do better.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 7f080956e9eed821fd42013bef11c1a2873fbeba
+master date: 2017-11-28 13:15:12 +0100
+---
+ xen/common/memory.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index 2dedb8c9e4..c0c691a98a 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -774,6 +774,11 @@ static int xenmem_add_to_physmap_batch(struct domain *d,
+     guest_handle_add_offset(xatpb->errs, start);
+     xatpb->size -= start;
+ 
++    if ( !guest_handle_okay(xatpb->idxs, xatpb->size) ||
++         !guest_handle_okay(xatpb->gpfns, xatpb->size) ||
++         !guest_handle_okay(xatpb->errs, xatpb->size) )
++        return -EFAULT;
++
+     while ( xatpb->size > done )
+     {
+         xen_ulong_t idx;
+@@ -1092,10 +1097,7 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+         if ( start_extent != (typeof(xatpb.size))start_extent )
+             return -EDOM;
+ 
+-        if ( copy_from_guest(&xatpb, arg, 1) ||
+-             !guest_handle_okay(xatpb.idxs, xatpb.size) ||
+-             !guest_handle_okay(xatpb.gpfns, xatpb.size) ||
+-             !guest_handle_okay(xatpb.errs, xatpb.size) )
++        if ( copy_from_guest(&xatpb, arg, 1) )
+             return -EFAULT;
+ 
+         /* This mapspace is unsupported for this hypercall. */
+-- 
+2.14.1
+

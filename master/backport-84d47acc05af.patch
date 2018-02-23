@@ -1,0 +1,119 @@
+From 84d47acc05af516d813f1952e853c4ca2be2adba Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 14 Feb 2018 11:38:30 +0100
+Subject: [PATCH] x86/hvm: Permit guests direct access to
+ MSR_{SPEC_CTRL,PRED_CMD}
+
+For performance reasons, HVM guests should have direct access to these MSRs
+when possible.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+master commit: 5a2fe171144ebcc908ea1fca45058d6010f6a286
+master date: 2018-01-26 14:10:21 +0000
+---
+ xen/arch/x86/domctl.c      | 13 +++++++++++++
+ xen/arch/x86/hvm/svm/svm.c |  7 +++++++
+ xen/arch/x86/hvm/vmx/vmx.c | 21 +++++++++++++++++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index fd5056bcbe..25e071354a 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -181,6 +181,11 @@ static void update_domain_cpuid_info(struct domain *d,
+         else
+             ctl->edx &= ~cpufeat_mask(X86_FEATURE_STIBP);
+ 
++        /*
++         * If the IBRS/IBPB policy has changed, we need to recalculate the MSR
++         * interception bitmaps.
++         */
++        call_policy_changed = is_hvm_domain(d);
+         break;
+ 
+     case 0xd:
+@@ -241,6 +246,14 @@ static void update_domain_cpuid_info(struct domain *d,
+             d->arch.pv_domain.cpuidmasks->e1cd = mask;
+         }
+         break;
++
++    case 0x80000008:
++        /*
++         * If the IBPB policy has changed, we need to recalculate the MSR
++         * interception bitmaps.
++         */
++        call_policy_changed = is_hvm_domain(d);
++        break;
+     }
+ 
+     if ( call_policy_changed )
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index f2662f86d5..b3fde283c0 100644
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -615,6 +615,7 @@ static void svm_cpuid_policy_changed(struct vcpu *v)
+     struct arch_svm_struct *arch_svm = &v->arch.hvm_svm;
+     struct vmcb_struct *vmcb = arch_svm->vmcb;
+     u32 bitmap = vmcb_get_exception_intercepts(vmcb);
++    uint32_t ebx, dummy;
+ 
+     if ( opt_hvm_fep ||
+          (v->domain->arch.x86_vendor != boot_cpu_data.x86_vendor) )
+@@ -623,6 +624,12 @@ static void svm_cpuid_policy_changed(struct vcpu *v)
+         bitmap &= ~(1U << TRAP_invalid_op);
+ 
+     vmcb_set_exception_intercepts(vmcb, bitmap);
++
++    /* Give access to MSR_PRED_CMD if the guest has been told about it. */
++    domain_cpuid(v->domain, 0x80000008, 0, &dummy, &ebx, &dummy, &dummy);
++    svm_intercept_msr(v, MSR_PRED_CMD,
++                      ebx & cpufeat_mask(X86_FEATURE_IBPB) ? MSR_INTERCEPT_NONE
++                                                           : MSR_INTERCEPT_RW);
+ }
+ 
+ static void svm_sync_vmcb(struct vcpu *v)
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 8402aa1774..86807cc1b8 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -544,6 +544,8 @@ void vmx_update_exception_bitmap(struct vcpu *v)
+ 
+ static void vmx_cpuid_policy_changed(struct vcpu *v)
+ {
++    uint32_t _7d0, e8b, dummy;
++
+     if ( opt_hvm_fep ||
+          (v->domain->arch.x86_vendor != boot_cpu_data.x86_vendor) )
+         v->arch.hvm_vmx.exception_bitmap |= (1U << TRAP_invalid_op);
+@@ -553,6 +555,25 @@ static void vmx_cpuid_policy_changed(struct vcpu *v)
+     vmx_vmcs_enter(v);
+     vmx_update_exception_bitmap(v);
+     vmx_vmcs_exit(v);
++
++    domain_cpuid(v->domain, 7, 0, &dummy, &dummy, &dummy, &_7d0);
++    domain_cpuid(v->domain, 0x80000008, 0, &dummy, &e8b, &dummy, &dummy);
++
++    /*
++     * We can safely pass MSR_SPEC_CTRL through to the guest, even if STIBP
++     * isn't enumerated in hardware, as SPEC_CTRL_STIBP is ignored.
++     */
++    if ( _7d0 & cpufeat_mask(X86_FEATURE_IBRSB) )
++        vmx_disable_intercept_for_msr(v, MSR_SPEC_CTRL, MSR_TYPE_R | MSR_TYPE_W);
++    else
++        vmx_enable_intercept_for_msr(v, MSR_SPEC_CTRL, MSR_TYPE_R | MSR_TYPE_W);
++
++    /* MSR_PRED_CMD is safe to pass through if the guest knows about it. */
++    if ( (_7d0 & cpufeat_mask(X86_FEATURE_IBRSB)) ||
++         (e8b & cpufeat_mask(X86_FEATURE_IBPB)) )
++        vmx_disable_intercept_for_msr(v, MSR_PRED_CMD, MSR_TYPE_R | MSR_TYPE_W);
++    else
++        vmx_enable_intercept_for_msr(v, MSR_PRED_CMD, MSR_TYPE_R | MSR_TYPE_W);
+ }
+ 
+ static int vmx_guest_x86_mode(struct vcpu *v)
+-- 
+2.14.1
+

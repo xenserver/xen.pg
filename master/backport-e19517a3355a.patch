@@ -29,11 +29,24 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
 Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
 master commit: 5784de3e2067ed73efc2fe42e62831e8ae7f46c4
 master date: 2018-01-16 17:49:03 +0100
+---
+ xen/arch/x86/domain.c              |   5 +
+ xen/arch/x86/mm.c                  |  17 ++++
+ xen/arch/x86/smpboot.c             | 198 +++++++++++++++++++++++++++++++++++++
+ xen/arch/x86/x86_64/asm-offsets.c  |   2 +
+ xen/arch/x86/x86_64/compat/entry.S |  11 +++
+ xen/arch/x86/x86_64/entry.S        | 149 +++++++++++++++++++++++++++-
+ xen/include/asm-x86/asm_defns.h    |  30 ++++++
+ xen/include/asm-x86/current.h      |  12 +++
+ xen/include/asm-x86/processor.h    |   1 +
+ xen/include/asm-x86/x86_64/page.h  |   5 +-
+ 10 files changed, 424 insertions(+), 6 deletions(-)
+
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index ceeadabbfd..523729e99b 100644
+index 6539b75fa7..3cf18f95b7 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -1950,6 +1950,9 @@ static void paravirt_ctxt_switch_to(struct vcpu *v)
+@@ -1949,6 +1949,9 @@ static void paravirt_ctxt_switch_to(struct vcpu *v)
  
      switch_kernel_stack(v);
  
@@ -43,7 +56,7 @@ index ceeadabbfd..523729e99b 100644
      cr4 = pv_guest_cr4_to_real_cr4(v);
      if ( unlikely(cr4 != read_cr4()) )
          write_cr4(cr4);
-@@ -2097,6 +2100,8 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
+@@ -2096,6 +2099,8 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
  
      ASSERT(local_irq_is_enabled());
  
@@ -53,7 +66,7 @@ index ceeadabbfd..523729e99b 100644
      /* Allow at most one CPU at a time to be dirty. */
      ASSERT(cpumask_weight(&dirty_mask) <= 1);
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index f21184f997..027c38e39b 100644
+index 50f500c940..c9e4003989 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
 @@ -3857,6 +3857,7 @@ long do_mmu_update(
@@ -359,13 +372,13 @@ index a3ae7a475f..4f2ba28520 100644
      BLANK();
  
 diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
-index 794bb44266..9b7acb48a5 100644
+index 7ee01597a3..f7e53fb3cb 100644
 --- a/xen/arch/x86/x86_64/compat/entry.S
 +++ b/xen/arch/x86/x86_64/compat/entry.S
-@@ -269,6 +269,17 @@ ENTRY(cstar_enter)
-         pushq %rcx
+@@ -270,6 +270,17 @@ ENTRY(cstar_enter)
          pushq $0
-         SAVE_VOLATILE TRAP_syscall
+         movl  $TRAP_syscall, 4(%rsp)
+         SAVE_ALL
 +
 +        GET_STACK_END(bx)
 +        mov   STACK_CPUINFO_FIELD(xen_cr3)(%rbx), %rcx
@@ -381,7 +394,7 @@ index 794bb44266..9b7acb48a5 100644
          movq  VCPU_domain(%rbx),%rcx
          cmpb  $0,DOMAIN_is_32bit_pv(%rcx)
 diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
-index 708d9b9402..72d9366f52 100644
+index cebb1e4f4f..d63e734bb3 100644
 --- a/xen/arch/x86/x86_64/entry.S
 +++ b/xen/arch/x86/x86_64/entry.S
 @@ -36,6 +36,32 @@ ENTRY(switch_to_kernel)
@@ -440,10 +453,10 @@ index 708d9b9402..72d9366f52 100644
          RESTORE_ALL adj=8
          iretq
  
-@@ -98,7 +140,18 @@ ENTRY(lstar_enter)
-         pushq %rcx
+@@ -99,7 +141,18 @@ ENTRY(lstar_enter)
          pushq $0
-         SAVE_VOLATILE TRAP_syscall
+         movl  $TRAP_syscall, 4(%rsp)
+         SAVE_ALL
 -        GET_CURRENT(bx)
 +
 +        GET_STACK_END(bx)
@@ -460,10 +473,10 @@ index 708d9b9402..72d9366f52 100644
          testb $TF_kernel_mode,VCPU_thread_flags(%rbx)
          jz    switch_to_kernel
  
-@@ -247,7 +300,18 @@ GLOBAL(sysenter_eflags_saved)
-         pushq $0 /* null rip */
+@@ -248,7 +301,18 @@ GLOBAL(sysenter_eflags_saved)
          pushq $0
-         SAVE_VOLATILE TRAP_syscall
+         movl  $TRAP_syscall, 4(%rsp)
+         SAVE_ALL
 -        GET_CURRENT(bx)
 +
 +        GET_STACK_END(bx)
@@ -480,9 +493,9 @@ index 708d9b9402..72d9366f52 100644
          cmpb  $0,VCPU_sysenter_disables_events(%rbx)
          movq  VCPU_sysenter_addr(%rbx),%rax
          setne %cl
-@@ -283,13 +347,23 @@ ENTRY(int80_direct_trap)
-         pushq $0
-         SAVE_VOLATILE 0x80
+@@ -284,13 +348,23 @@ ENTRY(int80_direct_trap)
+         movl  $0x80, 4(%rsp)
+         SAVE_ALL
  
 +        GET_STACK_END(bx)
 +        mov   STACK_CPUINFO_FIELD(xen_cr3)(%rbx), %rcx
@@ -630,10 +643,10 @@ index 708d9b9402..72d9366f52 100644
          jne   ret_from_intr
  
 diff --git a/xen/include/asm-x86/asm_defns.h b/xen/include/asm-x86/asm_defns.h
-index 279d70298f..1326fa85e4 100644
+index 6e5c079ad8..6cfdaa1aa0 100644
 --- a/xen/include/asm-x86/asm_defns.h
 +++ b/xen/include/asm-x86/asm_defns.h
-@@ -127,9 +127,30 @@ void ret_from_intr(void);
+@@ -93,9 +93,30 @@ void ret_from_intr(void);
          UNLIKELY_DONE(mp, tag);   \
          __UNLIKELY_END(tag)
  
@@ -664,7 +677,7 @@ index 279d70298f..1326fa85e4 100644
          orq  %rsp, %r##reg
  
  #define GET_CPUINFO_FIELD(field, reg)             \
-@@ -211,6 +232,15 @@ void ret_from_intr(void);
+@@ -177,6 +198,15 @@ void ret_from_intr(void);
  #define ASM_STAC ASM_AC(STAC)
  #define ASM_CLAC ASM_AC(CLAC)
  
@@ -738,3 +751,6 @@ index 589f22552e..afc77c3237 100644
  #define root_get_pfn              l4e_get_pfn
  #define root_get_flags            l4e_get_flags
  #define root_get_intpte           l4e_get_intpte
+-- 
+2.14.1
+
