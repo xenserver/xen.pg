@@ -13,7 +13,7 @@ rather than relying on its calling context for separation.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 diff --git a/xen/arch/x86/hvm/svm/entry.S b/xen/arch/x86/hvm/svm/entry.S
-index 64f0dcd909..379f4d7fd8 100644
+index 64f0dcd..379f4d7 100644
 --- a/xen/arch/x86/hvm/svm/entry.S
 +++ b/xen/arch/x86/hvm/svm/entry.S
 @@ -78,6 +78,9 @@ UNLIKELY_END(svm_trace)
@@ -40,7 +40,7 @@ index 64f0dcd909..379f4d7fd8 100644
          mov  VMCB_rax(%rcx),%rax
          mov  %rax,UREGS_rax(%rsp)
 diff --git a/xen/arch/x86/hvm/vmx/entry.S b/xen/arch/x86/hvm/vmx/entry.S
-index cc6188e7db..21c24f10bb 100644
+index cc6188e..21c24f1 100644
 --- a/xen/arch/x86/hvm/vmx/entry.S
 +++ b/xen/arch/x86/hvm/vmx/entry.S
 @@ -37,6 +37,9 @@ ENTRY(vmx_asm_vmexit_handler)
@@ -76,7 +76,7 @@ index cc6188e7db..21c24f10bb 100644
          BUG  /* vmx_vmentry_failure() shouldn't return. */
  
 diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
-index 66cba94c21..b0408770e3 100644
+index 66cba94..b040877 100644
 --- a/xen/arch/x86/setup.c
 +++ b/xen/arch/x86/setup.c
 @@ -616,6 +616,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
@@ -88,7 +88,7 @@ index 66cba94c21..b0408770e3 100644
      percpu_init_areas();
  
 diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
-index dc2d87bc79..47e62ae98b 100644
+index 93140e9..a5104f0 100644
 --- a/xen/arch/x86/smpboot.c
 +++ b/xen/arch/x86/smpboot.c
 @@ -41,6 +41,7 @@
@@ -108,7 +108,7 @@ index dc2d87bc79..47e62ae98b 100644
      /*
       * Just as during early bootstrap, it is convenient here to disable
 diff --git a/xen/arch/x86/x86_64/asm-offsets.c b/xen/arch/x86/x86_64/asm-offsets.c
-index 1a43b91df2..697ba323cb 100644
+index 6f6f7a4..c46fb12 100644
 --- a/xen/arch/x86/x86_64/asm-offsets.c
 +++ b/xen/arch/x86/x86_64/asm-offsets.c
 @@ -135,6 +135,7 @@ void __dummy__(void)
@@ -119,16 +119,16 @@ index 1a43b91df2..697ba323cb 100644
      OFFSET(VCPU_user_regs, struct vcpu, arch.user_regs);
      OFFSET(VCPU_flags, struct vcpu, arch.flags);
      OFFSET(VCPU_guest_table_user, struct vcpu, arch.guest_table_user);
-@@ -194,6 +195,8 @@ void __dummy__(void)
+@@ -192,6 +193,8 @@ void __dummy__(void)
+     OFFSET(CPUINFO_processor_id, struct cpu_info, processor_id);
+     OFFSET(CPUINFO_current_vcpu, struct cpu_info, current_vcpu);
      OFFSET(CPUINFO_cr4, struct cpu_info, cr4);
-     OFFSET(CPUINFO_xen_cr3, struct cpu_info, xen_cr3);
-     OFFSET(CPUINFO_pv_cr3, struct cpu_info, pv_cr3);
 +    OFFSET(CPUINFO_shadow_spec_ctrl, struct cpu_info, shadow_spec_ctrl);
 +    OFFSET(CPUINFO_use_shadow_spec_ctrl, struct cpu_info, use_shadow_spec_ctrl);
      OFFSET(CPUINFO_per_cpu_offset, struct cpu_info, per_cpu_offset);
      DEFINE(CPUINFO_sizeof, sizeof(struct cpu_info));
      BLANK();
-@@ -210,6 +213,9 @@ void __dummy__(void)
+@@ -208,6 +211,9 @@ void __dummy__(void)
      OFFSET(TRAPBOUNCE_eip, struct trap_bounce, eip);
      BLANK();
  
@@ -139,7 +139,7 @@ index 1a43b91df2..697ba323cb 100644
      DEFINE(ASM_PERFC_hypercalls, PERFC_hypercalls);
      DEFINE(ASM_PERFC_exceptions, PERFC_exceptions);
 diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
-index 7130bb9425..6133261e4d 100644
+index cfd41f0..d07ca4d 100644
 --- a/xen/arch/x86/x86_64/compat/entry.S
 +++ b/xen/arch/x86/x86_64/compat/entry.S
 @@ -17,6 +17,10 @@ ENTRY(compat_hypercall)
@@ -164,112 +164,119 @@ index 7130bb9425..6133261e4d 100644
          RESTORE_ALL adj=8 compat=1
  .Lft0:  iretq
          _ASM_PRE_EXTABLE(.Lft0, handle_exception)
-@@ -209,6 +217,9 @@ ENTRY(cstar_enter)
+@@ -208,6 +216,10 @@ ENTRY(cstar_enter)
+         pushq $0
          movl  $TRAP_syscall, 4(%rsp)
          SAVE_ALL
- 
++
 +        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo Clob: acd */
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 +
-         GET_STACK_END(bx)
-         mov   STACK_CPUINFO_FIELD(xen_cr3)(%rbx), %rcx
-         neg   %rcx
+         GET_CURRENT(bx)
+         movq  VCPU_domain(%rbx),%rcx
+         cmpb  $0,DOMAIN_is_32bit_pv(%rcx)
 diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
-index dd6b1721cf..d19c018a14 100644
+index 25a9e7b..004ca32 100644
 --- a/xen/arch/x86/x86_64/entry.S
 +++ b/xen/arch/x86/x86_64/entry.S
-@@ -64,6 +64,9 @@ restore_all_guest:
-         write_cr3 rax, rdi, rsi
- .Lrag_keep_cr3:
- 
+@@ -36,6 +36,10 @@ ENTRY(switch_to_kernel)
+ /* %rbx: struct vcpu, interrupts disabled */
+ restore_all_guest:
+         ASSERT_INTERRUPTS_DISABLED
++
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe beyond this point. */
 +        SPEC_CTRL_EXIT_TO_GUEST /* Req: b=curr %rsp=regs/cpuinfo, Clob: acd */
 +
          RESTORE_ALL
          testw $TRAP_syscall,4(%rsp)
          jz    iret_exit_to_guest
-@@ -114,6 +117,9 @@ UNLIKELY_START(g, exit_cr3)
-         write_cr3 rax, rdi, rsi
- UNLIKELY_END(exit_cr3)
- 
+@@ -70,6 +74,8 @@ iret_exit_to_guest:
+         ALIGN
+ /* No special register assumptions. */
+ restore_all_xen:
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe beyond this point. */
 +        SPEC_CTRL_EXIT_TO_XEN /* Req: nothing           Clob: acd */
-+
          RESTORE_ALL adj=8
          iretq
  
-@@ -144,6 +150,9 @@ ENTRY(lstar_enter)
+@@ -99,6 +105,10 @@ ENTRY(lstar_enter)
+         pushq $0
          movl  $TRAP_syscall, 4(%rsp)
          SAVE_ALL
- 
++
 +        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo Clob: acd */
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 +
-         GET_STACK_END(bx)
-         mov   STACK_CPUINFO_FIELD(xen_cr3)(%rbx), %rcx
-         neg   %rcx
-@@ -247,6 +256,9 @@ GLOBAL(sysenter_eflags_saved)
+         GET_CURRENT(bx)
+         testb $TF_kernel_mode,VCPU_thread_flags(%rbx)
+         jz    switch_to_kernel
+@@ -191,6 +201,10 @@ GLOBAL(sysenter_eflags_saved)
+         pushq $0
          movl  $TRAP_syscall, 4(%rsp)
          SAVE_ALL
- 
++
 +        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo Clob: acd */
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 +
-         GET_STACK_END(bx)
-         mov   STACK_CPUINFO_FIELD(xen_cr3)(%rbx), %rcx
-         neg   %rcx
-@@ -293,6 +305,9 @@ ENTRY(int80_direct_trap)
+         GET_CURRENT(bx)
+         cmpb  $0,VCPU_sysenter_disables_events(%rbx)
+         movq  VCPU_sysenter_addr(%rbx),%rax
+@@ -227,6 +241,9 @@ ENTRY(int80_direct_trap)
          movl  $0x80, 4(%rsp)
          SAVE_ALL
  
 +        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo Clob: acd */
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 +
-         GET_STACK_END(bx)
-         mov   STACK_CPUINFO_FIELD(xen_cr3)(%rbx), %rcx
-         neg   %rcx
-@@ -461,6 +476,9 @@ ENTRY(dom_crash_sync_extable)
+         cmpb  $0,untrusted_msi(%rip)
+ UNLIKELY_START(ne, msi_check)
+         movl  $0x80,%edi
+@@ -384,6 +401,10 @@ ENTRY(dom_crash_sync_extable)
+ 
  ENTRY(common_interrupt)
          SAVE_ALL CLAC
- 
++
 +        SPEC_CTRL_ENTRY_FROM_INTR /* Req: %rsp=regs         Clob: acd */
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 +
-         GET_STACK_END(14)
-         mov   STACK_CPUINFO_FIELD(xen_cr3)(%r14), %rcx
-         mov   %rcx, %r15
-@@ -499,6 +517,9 @@ ENTRY(page_fault)
+         CR4_PV32_RESTORE
+         movq %rsp,%rdi
+         callq do_IRQ
+@@ -404,6 +425,10 @@ ENTRY(page_fault)
+ /* No special register assumptions. */
  GLOBAL(handle_exception)
          SAVE_ALL CLAC
- 
++
 +        SPEC_CTRL_ENTRY_FROM_INTR /* Req: %rsp=regs         Clob: acd */
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 +
-         GET_STACK_END(14)
-         mov   STACK_CPUINFO_FIELD(xen_cr3)(%r14), %rcx
-         mov   %rcx, %r15
-@@ -692,6 +713,9 @@ ENTRY(double_fault)
+ handle_exception_saved:
+         GET_CURRENT(bx)
+         testb $X86_EFLAGS_IF>>8,UREGS_eflags+1(%rsp)
+@@ -578,6 +603,10 @@ ENTRY(double_fault)
+         movl  $TRAP_double_fault,4(%rsp)
          /* Set AC to reduce chance of further SMAP faults */
          SAVE_ALL STAC
- 
++
 +        SPEC_CTRL_ENTRY_FROM_INTR /* Req: %rsp=regs Clob: acd */
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 +
-         GET_STACK_END(bx)
-         mov   STACK_CPUINFO_FIELD(xen_cr3)(%rbx), %rbx
-         test  %rbx, %rbx
-@@ -721,6 +745,9 @@ ENTRY(nmi)
+         movq  %rsp,%rdi
+         call  do_double_fault
+         BUG   /* do_double_fault() shouldn't return. */
+@@ -596,6 +625,10 @@ ENTRY(nmi)
+         movl  $TRAP_nmi,4(%rsp)
  handle_ist_exception:
          SAVE_ALL CLAC
- 
++
 +        SPEC_CTRL_ENTRY_FROM_INTR /* Req: %rsp=regs Clob: acd */
 +        /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 +
-         GET_STACK_END(14)
-         mov   STACK_CPUINFO_FIELD(xen_cr3)(%r14), %rcx
-         mov   %rcx, %r15
+         CR4_PV32_RESTORE
+         testb $3,UREGS_cs(%rsp)
+         jz    1f
 diff --git a/xen/include/asm-x86/asm_defns.h b/xen/include/asm-x86/asm_defns.h
-index 960c3ae3c1..61a132b930 100644
+index 1acef90..62e4ee1 100644
 --- a/xen/include/asm-x86/asm_defns.h
 +++ b/xen/include/asm-x86/asm_defns.h
 @@ -7,6 +7,7 @@
@@ -280,7 +287,7 @@ index 960c3ae3c1..61a132b930 100644
  #include <asm/processor.h>
  #include <asm/percpu.h>
  #include <xen/stringify.h>
-@@ -385,4 +386,6 @@ static always_inline void stac(void)
+@@ -355,4 +356,6 @@ static always_inline void stac(void)
  # define ASM_FLAG_OUT(yes, no) no
  #endif
  
@@ -288,13 +295,13 @@ index 960c3ae3c1..61a132b930 100644
 +
  #endif /* __X86_ASM_DEFNS_H__ */
 diff --git a/xen/include/asm-x86/current.h b/xen/include/asm-x86/current.h
-index 397fa4c38f..25415922af 100644
+index e6587e6..8ef02f9 100644
 --- a/xen/include/asm-x86/current.h
 +++ b/xen/include/asm-x86/current.h
-@@ -54,6 +54,12 @@ struct cpu_info {
-      */
-     unsigned long xen_cr3;
-     unsigned long pv_cr3;
+@@ -42,6 +42,12 @@ struct cpu_info {
+     struct vcpu *current_vcpu;
+     unsigned long per_cpu_offset;
+     unsigned long cr4;
 +
 +    /* See asm-x86/spec_ctrl_asm.h for usage. */
 +    unsigned int shadow_spec_ctrl;
@@ -305,7 +312,7 @@ index 397fa4c38f..25415922af 100644
  };
  
 diff --git a/xen/include/asm-x86/nops.h b/xen/include/asm-x86/nops.h
-index 1368a971df..d048843bd9 100644
+index 1368a97..d048843 100644
 --- a/xen/include/asm-x86/nops.h
 +++ b/xen/include/asm-x86/nops.h
 @@ -49,7 +49,7 @@
@@ -331,7 +338,7 @@ index 1368a971df..d048843bd9 100644
  
  #endif /* __X86_ASM_NOPS_H__ */
 diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
-index d0b44f6b83..29a31a931f 100644
+index d0b44f6..29a31a9 100644
 --- a/xen/include/asm-x86/spec_ctrl.h
 +++ b/xen/include/asm-x86/spec_ctrl.h
 @@ -20,8 +20,17 @@
@@ -354,7 +361,7 @@ index d0b44f6b83..29a31a931f 100644
  /*
 diff --git a/xen/include/asm-x86/spec_ctrl_asm.h b/xen/include/asm-x86/spec_ctrl_asm.h
 new file mode 100644
-index 0000000000..13e058ce85
+index 0000000..13e058c
 --- /dev/null
 +++ b/xen/include/asm-x86/spec_ctrl_asm.h
 @@ -0,0 +1,230 @@
