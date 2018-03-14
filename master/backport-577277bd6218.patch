@@ -1,0 +1,145 @@
+From 577277bd62181256efd37ab561341dbe9abaf2bd Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 6 Mar 2018 16:22:54 +0100
+Subject: [PATCH] x86/pv: Avoid leaking other guests' MSR_TSC_AUX values into
+ PV context
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If the CPU pipeline supports RDTSCP or RDPID, a guest can observe the value in
+MSR_TSC_AUX, irrespective of whether the relevant CPUID features are
+advertised/hidden.
+
+At the moment, paravirt_ctxt_switch_to() only writes to MSR_TSC_AUX if
+TSC_MODE_PVRDTSCP mode is enabled, but this is not the default mode.
+Therefore, default PV guests can read the value from a previously scheduled
+HVM vcpu, or TSC_MODE_PVRDTSCP-enabled PV guest.
+
+Alter the PV path to always write to MSR_TSC_AUX, using 0 in the common case.
+
+To amortise overhead cost, introduce wrmsr_tsc_aux() which performs a lazy
+update of the MSR, and use this function consistently across the codebase.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+master commit: cc0e45db277922b5723a7b1d9657d6f744230cf1
+master date: 2018-02-27 10:47:23 +0000
+---
+ xen/arch/x86/domain.c      |  6 +++---
+ xen/arch/x86/hvm/hvm.c     |  2 +-
+ xen/arch/x86/hvm/svm/svm.c |  2 +-
+ xen/arch/x86/hvm/vmx/vmx.c |  2 +-
+ xen/arch/x86/time.c        |  1 +
+ xen/include/asm-x86/msr.h  | 16 ++++++++++++++--
+ 6 files changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index a84b179c9f..aa81f9e1f2 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -1973,9 +1973,9 @@ static void paravirt_ctxt_switch_to(struct vcpu *v)
+     if ( unlikely(v->arch.debugreg[7] & DR7_ACTIVE_MASK) )
+         activate_debugregs(v);
+ 
+-    if ( (v->domain->arch.tsc_mode ==  TSC_MODE_PVRDTSCP) &&
+-         boot_cpu_has(X86_FEATURE_RDTSCP) )
+-        write_rdtscp_aux(v->domain->arch.incarnation);
++    if ( cpu_has_rdtscp )
++        wrmsr_tsc_aux(v->domain->arch.tsc_mode == TSC_MODE_PVRDTSCP
++                      ? v->domain->arch.incarnation : 0);
+ }
+ 
+ /* Update per-VCPU guest runstate shared memory area (if registered). */
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index b6275dfb21..6a39388ad0 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -3892,7 +3892,7 @@ int hvm_msr_write_intercept(unsigned int msr, uint64_t msr_content,
+         v->arch.hvm_vcpu.msr_tsc_aux = (uint32_t)msr_content;
+         if ( cpu_has_rdtscp
+              && (v->domain->arch.tsc_mode != TSC_MODE_PVRDTSCP) )
+-            wrmsrl(MSR_TSC_AUX, (uint32_t)msr_content);
++            wrmsr_tsc_aux(msr_content);
+         break;
+ 
+     case MSR_IA32_APICBASE:
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index b3fde283c0..e5bc5122e4 100644
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -1079,7 +1079,7 @@ static void svm_ctxt_switch_to(struct vcpu *v)
+     svm_tsc_ratio_load(v);
+ 
+     if ( cpu_has_rdtscp )
+-        wrmsrl(MSR_TSC_AUX, hvm_msr_tsc_aux(v));
++        wrmsr_tsc_aux(hvm_msr_tsc_aux(v));
+ }
+ 
+ static void noreturn svm_do_resume(struct vcpu *v)
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 86807cc1b8..a4124e4a35 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -510,7 +510,7 @@ static void vmx_restore_guest_msrs(struct vcpu *v)
+     }
+ 
+     if ( cpu_has_rdtscp )
+-        wrmsrl(MSR_TSC_AUX, hvm_msr_tsc_aux(v));
++        wrmsr_tsc_aux(hvm_msr_tsc_aux(v));
+ }
+ 
+ void vmx_update_cpu_exec_control(struct vcpu *v)
+diff --git a/xen/arch/x86/time.c b/xen/arch/x86/time.c
+index 6438b47b8f..4c6b34ff00 100644
+--- a/xen/arch/x86/time.c
++++ b/xen/arch/x86/time.c
+@@ -65,6 +65,7 @@ struct platform_timesource {
+ };
+ 
+ static DEFINE_PER_CPU(struct cpu_time, cpu_time);
++DEFINE_PER_CPU(uint32_t, tsc_aux);
+ 
+ /* Calibrate all CPUs to platform timer every EPOCH. */
+ #define EPOCH MILLISECS(1000)
+diff --git a/xen/include/asm-x86/msr.h b/xen/include/asm-x86/msr.h
+index 4f233d5270..4b4c15668c 100644
+--- a/xen/include/asm-x86/msr.h
++++ b/xen/include/asm-x86/msr.h
+@@ -88,8 +88,6 @@ static inline uint64_t rdtsc(void)
+     __write_tsc(val);                                           \
+ })
+ 
+-#define write_rdtscp_aux(val) wrmsr(MSR_TSC_AUX, (val), 0)
+-
+ #define rdpmc(counter,low,high) \
+      __asm__ __volatile__("rdpmc" \
+ 			  : "=a" (low), "=d" (high) \
+@@ -175,6 +173,20 @@ void write_efer(u64 val);
+ 
+ DECLARE_PER_CPU(u32, ler_msr);
+ 
++DECLARE_PER_CPU(uint32_t, tsc_aux);
++
++/* Lazy update of MSR_TSC_AUX */
++static inline void wrmsr_tsc_aux(uint32_t val)
++{
++    uint32_t *this_tsc_aux = &this_cpu(tsc_aux);
++
++    if ( *this_tsc_aux != val )
++    {
++        wrmsr(MSR_TSC_AUX, val, 0);
++        *this_tsc_aux = val;
++    }
++}
++
+ #endif /* !__ASSEMBLY__ */
+ 
+ #endif /* __ASM_MSR_H */
+-- 
+2.14.1
+

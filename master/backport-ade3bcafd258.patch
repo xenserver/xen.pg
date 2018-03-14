@@ -1,0 +1,58 @@
+From ade3bcafd25883130fc234121ed7416d531e456d Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 23 Feb 2018 10:20:10 +0100
+Subject: [PATCH] x86/PV: correctly count MSRs to migrate
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+---
+ xen/arch/x86/domctl.c | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index 25e071354a..68933878b8 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -1249,7 +1249,8 @@ long arch_do_domctl(
+         struct xen_domctl_vcpu_msrs *vmsrs = &domctl->u.vcpu_msrs;
+         struct xen_domctl_vcpu_msr msr;
+         struct vcpu *v;
+-        uint32_t nr_msrs = 0;
++        uint32_t nr_msrs = 0, edx, dummy;
++        bool_t has_ibrsb;
+ 
+         ret = -ESRCH;
+         if ( (vmsrs->vcpu >= d->max_vcpus) ||
+@@ -1265,6 +1266,10 @@ long arch_do_domctl(
+         if ( boot_cpu_has(X86_FEATURE_DBEXT) )
+             nr_msrs += 4;
+ 
++        domain_cpuid(d, 7, 0, &dummy, &dummy, &dummy, &edx);
++        has_ibrsb = !!(edx & cpufeat_mask(X86_FEATURE_IBRSB));
++        nr_msrs += has_ibrsb;
++
+         if ( domctl->cmd == XEN_DOMCTL_get_vcpu_msrs )
+         {
+             ret = 0; copyback = 1;
+@@ -1274,8 +1279,6 @@ long arch_do_domctl(
+                 vmsrs->msr_count = nr_msrs;
+             else
+             {
+-                uint32_t edx, dummy;
+-
+                 i = 0;
+ 
+                 vcpu_pause(v);
+@@ -1313,9 +1316,7 @@ long arch_do_domctl(
+                     }
+                 }
+ 
+-                domain_cpuid(d, 7, 0, &dummy, &dummy, &dummy, &edx);
+-                if ( (edx & cpufeat_mask(X86_FEATURE_IBRSB)) &&
+-                     v->arch.spec_ctrl )
++                if ( has_ibrsb && v->arch.spec_ctrl )
+                 {
+                     if ( i < vmsrs->msr_count && !ret )
+                     {
+-- 
+2.14.1
+
