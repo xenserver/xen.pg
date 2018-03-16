@@ -786,10 +786,10 @@ index 0000000..7dcc36c
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..eb09e32
+index 0000000..59ed0df
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1288 @@
+@@ -0,0 +1,1345 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1446,6 +1446,41 @@ index 0000000..eb09e32
 +    return rc;
 +}
 +
++static int pci_get_id(uint16_t seg, uint8_t bus, uint8_t dev, uint8_t func,
++                      const char *type, uint16_t *id)
++{
++    char namebuf[64], buf[32];
++    FILE *file;
++
++    snprintf(namebuf, sizeof(namebuf), SYSFS_PCI_DEV"/"PCI_SBDF"/%s",
++             seg, bus, dev, func, type);
++
++    file = fopen(namebuf, "r");
++    if ( !file )
++    {
++        xg_err("Cannot open '%s': %s\n", namebuf, strerror(errno));
++        return -1;
++    }
++
++    if ( !fgets(buf, sizeof(buf), file) )
++    {
++        xg_err("Cannot read %s id from '%s': %s\n",
++               type, namebuf, strerror(errno));
++        fclose(file);
++        return -1;
++    }
++
++    if ( sscanf(buf, "%"SCNx16, id) != 1 )
++    {
++        xg_err("Invalid %s id\n", type);
++        fclose(file);
++        return -1;
++    }
++
++    fclose(file);
++    return 0;
++}
++
 +static int get_mmio_dev(uint16_t seg, uint8_t bus, uint8_t dev, uint8_t func,
 +                        uint64_t *mmio_dev)
 +{
@@ -1570,6 +1605,7 @@ index 0000000..eb09e32
 +    struct xen_reserved_device_memory *xrdm[MAX_RMRR_DEVICES] = {0};
 +    unsigned long rmrr_overlapped_ram = 0;
 +    bool allow_memory_relocate = ALLOW_MEMORY_RELOCATE;
++    bool apply_mxgpu_workaround = false;
 +    char *s;
 +
 +    if ( pci_passthrough_sbdf_list )
@@ -1579,6 +1615,7 @@ index 0000000..eb09e32
 +        {
 +            unsigned int seg, bus, device, func;
 +            uint64_t mmio_dev;
++            uint16_t vendor_id, device_id;
 +
 +            xg_info("Getting RMRRs for device '%s'\n",s);
 +            if ( parse_pci_sbdf(s, &seg, &bus, &device, &func) )
@@ -1601,6 +1638,15 @@ index 0000000..eb09e32
 +                exit(1);
 +            }
 +            mmio_total += mmio_dev;
++
++            if ( !pci_get_id(seg, bus, device, func, "vendor", &vendor_id) &&
++                 vendor_id == 0x1002 &&
++                 !pci_get_id(seg, bus, device, func, "device", &device_id) &&
++                 device_id == 0x692f )
++            {
++                xg_info("MxGPU device found. Applying MMIO hole workaround\n");
++                apply_mxgpu_workaround = true;
++            }
 +
 +            s = strtok (NULL, ",");
 +        }
@@ -1626,6 +1672,17 @@ index 0000000..eb09e32
 +    {
 +        while (mmio_size < mmio_total && (uint32_t)(mmio_size << 1) != 0)
 +            mmio_size <<= 1;
++
++        if ( apply_mxgpu_workaround )
++        {
++            /*
++             * The S7150x2 cards have buggy PLX bridges so boost the
++             * low MMIO hole to at least 2G to make sure no guest RAM
++             * aliases any ranges in use by those bridges.
++             */
++            if ( mmio_size < 0x80000000 )
++                mmio_size = 0x80000000;
++        }
 +
 +        xg_info("Calculated provisional MMIO hole size as 0x%lx\n", mmio_size);
 +    }
