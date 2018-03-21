@@ -363,7 +363,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxenevtchn.so.1
 %{_libdir}/libxenevtchn.so.1.0
 %{_libdir}/libxengnttab.so.1
-%{_libdir}/libxengnttab.so.1.0
+%{_libdir}/libxengnttab.so.1.1
 %{_libdir}/libxenstore.so.3.0
 %{_libdir}/libxenstore.so.3.0.3
 %{_libdir}/libxenvchan.so.4.7
