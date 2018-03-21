@@ -1,0 +1,61 @@
+From 529218f468d537916452943331e071cdb3a2fabc Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 16 Mar 2018 17:20:59 +0100
+Subject: [PATCH] x86: ignore guest microcode loading attempts
+
+The respective MSRs are write-only, and hence attempts by guests to
+write to these are - as of 1f1d183d49 ("x86/HVM: don't give the wrong
+impression of WRMSR succeeding") no longer ignored. Restore original
+behavior for the two affected MSRs.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 59c0983e10d70ea2368085271b75fb007811fe52
+master date: 2018-03-15 12:44:24 +0100
+---
+ xen/arch/x86/hvm/hvm.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 6a39388ad0..2596597b3a 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -3791,6 +3791,8 @@ int hvm_msr_read_intercept(unsigned int msr, uint64_t *msr_content)
+         *msr_content = var_range_base[index];
+         break;
+ 
++    case MSR_AMD_PATCHLOADER:
++    case MSR_IA32_UCODE_WRITE:
+     case MSR_PRED_CMD:
+         /* Write-only */
+         goto gp_fault;
+@@ -3873,6 +3875,26 @@ int hvm_msr_write_intercept(unsigned int msr, uint64_t msr_content,
+            return X86EMUL_EXCEPTION;
+         break;
+ 
++    case MSR_AMD_PATCHLOADER:
++        /*
++         * See note on MSR_IA32_UCODE_WRITE below, which may or may not apply
++         * to AMD CPUs as well (at least the architectural/CPUID part does).
++         */
++        if ( v->domain->arch.x86_vendor != X86_VENDOR_AMD )
++            goto gp_fault;
++        break;
++
++    case MSR_IA32_UCODE_WRITE:
++        /*
++         * Some versions of Windows at least on certain hardware try to load
++         * microcode before setting up an IDT. Therefore we must not inject #GP
++         * for such attempts. Also the MSR is architectural and not qualified
++         * by any CPUID bit.
++         */
++        if ( v->domain->arch.x86_vendor != X86_VENDOR_INTEL )
++            goto gp_fault;
++        break;
++
+     case MSR_IA32_XSS:
+         /* No XSS features currently supported for guests. */
+         if ( !cpu_has_xsaves || msr_content != 0 )
+-- 
+2.14.1
+

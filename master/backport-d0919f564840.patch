@@ -1,0 +1,101 @@
+From d0919f5648403c68d9f4a50a6900ced9e63f276c Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 20 Mar 2018 14:48:08 +0100
+Subject: [PATCH] cpufreq/ondemand: fix race while offlining CPU
+
+Offlining a CPU involves stopping the cpufreq governor. The on-demand
+governor will kill the timer before letting generic code proceed, but
+since that generally isn't happening on the subject CPU,
+cpufreq_dbs_timer_resume() may run in parallel. If that managed to
+invoke the timer handler, that handler needs to run to completion before
+dbs_timer_exit() may safely exit.
+
+Make the "stoppable" field a tristate, changing it from +1 to -1 around
+the timer function invocation, and make dbs_timer_exit() wait for it to
+become non-negative (still writing zero if it's +1).
+
+Also adjust coding style in cpufreq_dbs_timer_resume().
+
+Reported-by: Martin Cerveny <martin@c-home.cz>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Tested-by: Martin Cerveny <martin@c-home.cz>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+master commit: 185413355fe331cbc926d48568838227234c9a20
+master date: 2018-03-09 17:30:49 +0100
+---
+ xen/drivers/cpufreq/cpufreq_ondemand.c | 32 +++++++++++++++++++-------------
+ xen/include/acpi/cpufreq/cpufreq.h     |  2 +-
+ 2 files changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/xen/drivers/cpufreq/cpufreq_ondemand.c b/xen/drivers/cpufreq/cpufreq_ondemand.c
+index fe6c63da8e..6b905d7cfc 100644
+--- a/xen/drivers/cpufreq/cpufreq_ondemand.c
++++ b/xen/drivers/cpufreq/cpufreq_ondemand.c
+@@ -204,7 +204,14 @@ static void dbs_timer_init(struct cpu_dbs_info_s *dbs_info)
+ static void dbs_timer_exit(struct cpu_dbs_info_s *dbs_info)
+ {
+     dbs_info->enable = 0;
+-    dbs_info->stoppable = 0;
++
++    /*
++     * The timer function may be running (from cpufreq_dbs_timer_resume) -
++     * wait for it to complete.
++     */
++    while ( cmpxchg(&dbs_info->stoppable, 1, 0) < 0 )
++        cpu_relax();
++
+     kill_timer(&per_cpu(dbs_timer, dbs_info->cpu));
+ }
+ 
+@@ -369,23 +376,22 @@ void cpufreq_dbs_timer_suspend(void)
+ 
+ void cpufreq_dbs_timer_resume(void)
+ {
+-    int cpu;
+-    struct timer* t;
+-    s_time_t now;
++    unsigned int cpu = smp_processor_id();
++    int8_t *stoppable = &per_cpu(cpu_dbs_info, cpu).stoppable;
+ 
+-    cpu = smp_processor_id();
+-
+-    if ( per_cpu(cpu_dbs_info,cpu).stoppable )
++    if ( *stoppable )
+     {
+-        now = NOW();
+-        t = &per_cpu(dbs_timer, cpu);
+-        if (t->expires <= now)
++        s_time_t now = NOW();
++        struct timer *t = &per_cpu(dbs_timer, cpu);
++
++        if ( t->expires <= now )
+         {
++            if ( !cmpxchg(stoppable, 1, -1) )
++                return;
+             t->function(t->data);
++            (void)cmpxchg(stoppable, -1, 1);
+         }
+         else
+-        {
+-            set_timer(t, align_timer(now , dbs_tuners_ins.sampling_rate));
+-        }
++            set_timer(t, align_timer(now, dbs_tuners_ins.sampling_rate));
+     }
+ }
+diff --git a/xen/include/acpi/cpufreq/cpufreq.h b/xen/include/acpi/cpufreq/cpufreq.h
+index 48ad1d0004..c26aa8dee8 100644
+--- a/xen/include/acpi/cpufreq/cpufreq.h
++++ b/xen/include/acpi/cpufreq/cpufreq.h
+@@ -227,8 +227,8 @@ struct cpu_dbs_info_s {
+     struct cpufreq_frequency_table *freq_table;
+     int cpu;
+     unsigned int enable:1;
+-    unsigned int stoppable:1;
+     unsigned int turbo_enabled:1;
++    int8_t stoppable;
+ };
+ 
+ int cpufreq_governor_dbs(struct cpufreq_policy *policy, unsigned int event);
+-- 
+2.14.1
+

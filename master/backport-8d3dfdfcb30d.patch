@@ -1,0 +1,113 @@
+From 8d3dfdfcb30da71a9939733e4593c476decaaddf Mon Sep 17 00:00:00 2001
+From: Quan Xu <xuquan8@huawei.com>
+Date: Tue, 20 Mar 2018 14:44:45 +0100
+Subject: [PATCH] x86/apicv: fix wrong IPI suppression during posted interrupt
+ delivery
+
+__vmx_deliver_posted_interrupt() wrongly used a softirq bit to decide whether
+to suppress an IPI. Its logic was: the first time an IPI was sent, we set
+the softirq bit. Next time, we would check that softirq bit before sending
+another IPI. If the 1st IPI arrived at the pCPU which was in
+non-root mode, the hardware would consume the IPI and sync PIR to vIRR.
+During the process, no one (both hardware and software) will clear the
+softirq bit. As a result, the following IPI would be wrongly suppressed.
+
+This patch discards the suppression check, always sending an IPI.
+The softirq also need to be raised. But there is a little change.
+This patch moves the place where we raise a softirq for
+'cpu != smp_processor_id()' case to the IPI interrupt handler.
+Namely, don't raise a softirq for this case and set the interrupt handler
+to pi_notification_interrupt()(in which a softirq is raised) regardless of
+VT-d PI enabled or not. The only difference is when an IPI arrives at the
+pCPU which is happened in non-root mode, the code will not raise a useless
+softirq since the IPI is consumed by hardware rather than raise a softirq
+unconditionally.
+
+Signed-off-by: Quan Xu <xuquan8@huawei.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: b151125b4d89d7ec139ac34470e3c709fb4b1b4d
+master date: 2017-03-03 12:00:35 +0100
+---
+ xen/arch/x86/hvm/vmx/vmx.c | 50 +++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 43 insertions(+), 7 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index a6a32db1e2..ff7d5ac8f4 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -1951,13 +1951,53 @@ static void __vmx_deliver_posted_interrupt(struct vcpu *v)
+     bool_t running = v->is_running;
+ 
+     vcpu_unblock(v);
++    /*
++     * Just like vcpu_kick(), nothing is needed for the following two cases:
++     * 1. The target vCPU is not running, meaning it is blocked or runnable.
++     * 2. The target vCPU is the current vCPU and we're in non-interrupt
++     * context.
++     */
+     if ( running && (in_irq() || (v != current)) )
+     {
++        /*
++         * Note: Only two cases will reach here:
++         * 1. The target vCPU is running on other pCPU.
++         * 2. The target vCPU is the current vCPU.
++         *
++         * Note2: Don't worry the v->processor may change. The vCPU being
++         * moved to another processor is guaranteed to sync PIR to vIRR,
++         * due to the involved scheduling cycle.
++         */
+         unsigned int cpu = v->processor;
+ 
+-        if ( !test_and_set_bit(VCPU_KICK_SOFTIRQ, &softirq_pending(cpu))
+-             && (cpu != smp_processor_id()) )
++        /*
++         * For case 1, we send an IPI to the pCPU. When an IPI arrives, the
++         * target vCPU maybe is running in non-root mode, running in root
++         * mode, runnable or blocked. If the target vCPU is running in
++         * non-root mode, the hardware will sync PIR to vIRR for
++         * 'posted_intr_vector' is special to the pCPU. If the target vCPU is
++         * running in root-mode, the interrupt handler starts to run.
++         * Considering an IPI may arrive in the window between the call to
++         * vmx_intr_assist() and interrupts getting disabled, the interrupt
++         * handler should raise a softirq to ensure events will be delivered
++         * in time. If the target vCPU is runnable, it will sync PIR to
++         * vIRR next time it is chose to run. In this case, a IPI and a
++         * softirq is sent to a wrong vCPU which will not have any adverse
++         * effect. If the target vCPU is blocked, since vcpu_block() checks
++         * whether there is an event to be delivered through
++         * local_events_need_delivery() just after blocking, the vCPU must
++         * have synced PIR to vIRR. Similarly, there is a IPI and a softirq
++         * sent to a wrong vCPU.
++         */
++        if ( cpu != smp_processor_id() )
+             send_IPI_mask(cpumask_of(cpu), posted_intr_vector);
++        /*
++         * For case 2, raising a softirq ensures PIR will be synced to vIRR.
++         * As any softirq will do, as an optimization we only raise one if
++         * none is pending already.
++         */
++        else if ( !softirq_pending(cpu) )
++            raise_softirq(VCPU_KICK_SOFTIRQ);
+     }
+ }
+ 
+@@ -2393,13 +2433,9 @@ const struct hvm_function_table * __init start_vmx(void)
+ 
+     if ( cpu_has_vmx_posted_intr_processing )
+     {
++        alloc_direct_apic_vector(&posted_intr_vector, pi_notification_interrupt);
+         if ( iommu_intpost )
+-        {
+-            alloc_direct_apic_vector(&posted_intr_vector, pi_notification_interrupt);
+             alloc_direct_apic_vector(&pi_wakeup_vector, pi_wakeup_interrupt);
+-        }
+-        else
+-            alloc_direct_apic_vector(&posted_intr_vector, event_check_interrupt);
+     }
+     else
+     {
+-- 
+2.14.1
+
