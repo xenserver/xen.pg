@@ -25,7 +25,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.7.4
-Release: 5.0.2
+Release: 5.0.3
 License: GPLv2+ and LGPLv2+ and BSD
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -318,6 +318,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/%{name}/foreign/x86_32.h
 %{_includedir}/%{name}/foreign/x86_64.h
 %{_includedir}/%{name}/grant_table.h
+%{_includedir}/%{name}/hvm/dm_op.h
 %{_includedir}/%{name}/hvm/e820.h
 %{_includedir}/%{name}/hvm/hvm_info_table.h
 %{_includedir}/%{name}/hvm/hvm_op.h
@@ -369,7 +370,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 
 %files libs
 %{_libdir}/libxenevtchn.so.1
-%{_libdir}/libxenevtchn.so.1.0
+%{_libdir}/libxenevtchn.so.1.1
 %{_libdir}/libxengnttab.so.1
 %{_libdir}/libxengnttab.so.1.1
 %{_libdir}/libxenstore.so.3.0
@@ -566,8 +567,12 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxencall.so.1.0
 %{_libdir}/libxenctrl.so.4.7
 %{_libdir}/libxenctrl.so.4.7.0
+%{_libdir}/libxendevicemodel.so.1
+%{_libdir}/libxendevicemodel.so.1.2
 %{_libdir}/libxenforeignmemory.so.1
 %{_libdir}/libxenforeignmemory.so.1.2
+%{_libdir}/libxentoolcore.so.1
+%{_libdir}/libxentoolcore.so.1.0
 %{_libdir}/libxenguest.so.4.7
 %{_libdir}/libxenguest.so.4.7.0
 %{_libdir}/libxenlight.so.4.7
@@ -594,6 +599,10 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxenctrl.a
 %{_libdir}/libxenctrl.so
 
+%{_includedir}/xendevicemodel.h
+%{_libdir}/libxendevicemodel.a
+%{_libdir}/libxendevicemodel.so
+
 %{_includedir}/xenforeignmemory.h
 %{_libdir}/libxenforeignmemory.a
 %{_libdir}/libxenforeignmemory.so
@@ -605,6 +614,10 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/xentoollog.h
 %{_libdir}/libxentoollog.a
 %{_libdir}/libxentoollog.so
+
+%{_includedir}/xentoolcore.h
+%{_libdir}/libxentoolcore.a
+%{_libdir}/libxentoolcore.so
 
 %{_includedir}/_libxl_list.h
 %{_includedir}/_libxl_types.h
