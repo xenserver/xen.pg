@@ -375,6 +375,8 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxengnttab.so.1.1
 %{_libdir}/libxenstore.so.3.0
 %{_libdir}/libxenstore.so.3.0.3
+%{_libdir}/libxentoolcore.so.1
+%{_libdir}/libxentoolcore.so.1.0
 %{_libdir}/libxenvchan.so.4.7
 %{_libdir}/libxenvchan.so.4.7.0
 
@@ -399,6 +401,11 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %exclude %{_includedir}/xenstore-compat/xs.h
 %exclude %{_includedir}/xs_lib.h
 %exclude %{_includedir}/xenstore-compat/xs_lib.h
+
+%{_includedir}/xentoolcore.h
+%{_libdir}/libxentoolcore.a
+%{_libdir}/libxentoolcore.so
+
 # Lib Xen Vchan
 %{_includedir}/libxenvchan.h
 %{_libdir}/libxenvchan.a
@@ -571,8 +578,6 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxendevicemodel.so.1.2
 %{_libdir}/libxenforeignmemory.so.1
 %{_libdir}/libxenforeignmemory.so.1.2
-%{_libdir}/libxentoolcore.so.1
-%{_libdir}/libxentoolcore.so.1.0
 %{_libdir}/libxenguest.so.4.7
 %{_libdir}/libxenguest.so.4.7.0
 %{_libdir}/libxenlight.so.4.7
@@ -614,10 +619,6 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/xentoollog.h
 %{_libdir}/libxentoollog.a
 %{_libdir}/libxentoollog.so
-
-%{_includedir}/xentoolcore.h
-%{_libdir}/libxentoolcore.a
-%{_libdir}/libxentoolcore.so
 
 %{_includedir}/_libxl_list.h
 %{_includedir}/_libxl_types.h
