@@ -1,0 +1,113 @@
+From be45a36a5d6ae99eb1c2865aa4b4f5fd9b20b1ed Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 7 Mar 2018 18:58:36 +0000
+Subject: [PATCH] x86/msr: Blacklist various MSRs which guests definitely
+ shouldn't be using
+
+The main purpose is to blacklist the Intel Resource Director Technology MSRs.
+We do not yet virtualise support for guests, but Linux has been observed to
+probe for these MSRs without checking CPUID first.
+
+The architecturally inaccessable ranges don't need to fall back into the
+legacy ranges, because they are not going to eventually evaluate as
+accessible.
+
+The Silicon Debug interface will probably never be virtualised for guests, but
+doesn't want to leak through from real hardware.  SGX isn't yet virtualised,
+but likely will be in the future.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/msr.c b/xen/arch/x86/msr.c
+index 31983edc54..071c95c958 100644
+--- a/xen/arch/x86/msr.c
++++ b/xen/arch/x86/msr.c
+@@ -138,7 +138,28 @@ int guest_rdmsr(const struct vcpu *v, uint32_t msr, uint64_t *val)
+                _MSR_MISC_FEATURES_CPUID_FAULTING;
+         break;
+ 
++        /* Specific blacklisted MSRs while the legacy handlers still exist. */
++    case MSR_SGX_PUBKEY_HASH(0) ... MSR_SGX_PUBKEY_HASH(3):
++    case MSR_SGX_SVN_STATUS:
++    case MSR_DEBUG_INTERFACE:
++    case MSR_L3_QOS_CFG:
++    case MSR_L2_QOS_CFG:
++    case MSR_QM_EVTSEL:
++    case MSR_QM_CTR:
++    case MSR_PQR_ASSOC:
++    case MSR_CAT_MASK_START ... MSR_CAT_MASK_LAST:
++        goto gp_fault;
++
+     default:
++        /*
++         * Blacklist the architecturally inaccessable MSRs. No point wandering
++         * the legacy handlers.
++         */
++        if ( msr > 0x1fff &&
++             (msr < 0xc0000000 || msr > 0xc0001fff) &&
++             (msr < 0xc0010000 || msr > 0xc0011fff) )
++            goto gp_fault;
++
+         return X86EMUL_UNHANDLEABLE;
+     }
+ 
+@@ -183,7 +204,28 @@ int guest_wrmsr(struct vcpu *v, uint32_t msr, uint64_t val)
+         break;
+     }
+ 
++        /* Specific blacklisted MSRs while the legacy handlers still exist. */
++    case MSR_SGX_PUBKEY_HASH(0) ... MSR_SGX_PUBKEY_HASH(3):
++    case MSR_SGX_SVN_STATUS:
++    case MSR_DEBUG_INTERFACE:
++    case MSR_L3_QOS_CFG:
++    case MSR_L2_QOS_CFG:
++    case MSR_QM_EVTSEL:
++    case MSR_QM_CTR:
++    case MSR_PQR_ASSOC:
++    case MSR_CAT_MASK_START ... MSR_CAT_MASK_LAST:
++        goto gp_fault;
++
+     default:
++        /*
++         * Blacklist the architecturally inaccessable MSRs. No point wandering
++         * the legacy handlers.
++         */
++        if ( msr > 0x1fff &&
++             (msr < 0xc0000000 || msr > 0xc0001fff) &&
++             (msr < 0xc0010000 || msr > 0xc0011fff) )
++            goto gp_fault;
++
+         return X86EMUL_UNHANDLEABLE;
+     }
+ 
+diff --git a/xen/include/asm-x86/msr-index.h b/xen/include/asm-x86/msr-index.h
+index 2bba5a069f..6dca5ec4d1 100644
+--- a/xen/include/asm-x86/msr-index.h
++++ b/xen/include/asm-x86/msr-index.h
+@@ -39,6 +39,8 @@
+ #define MSR_PRED_CMD			0x00000049
+ #define PRED_CMD_IBPB			(_AC(1, ULL) << 0)
+ 
++#define MSR_SGX_PUBKEY_HASH(x)		(0x0000008c + (x)) /* 0 ... 3 */
++
+ #define MSR_ARCH_CAPABILITIES		0x0000010a
+ 
+ /* Intel MSRs. Some also available on other CPUs */
+@@ -68,6 +70,18 @@
+ /* Lower 6 bits define the format of the address in the LBR stack */
+ #define MSR_IA32_PERF_CAP_LBR_FORMAT	0x3f
+ 
++#define MSR_SGX_SVN_STATUS		0x00000500
++
++#define MSR_DEBUG_INTERFACE		0x00000c80
++
++#define MSR_L3_QOS_CFG			0x00000c81
++#define MSR_L2_QOS_CFG			0x00000c82
++#define MSR_QM_EVTSEL			0x00000c8d
++#define MSR_QM_CTR			0x00000c8e
++#define MSR_PQR_ASSOC			0x00000c8f
++#define MSR_CAT_MASK_START		0x00000c90
++#define MSR_CAT_MASK_LAST		0x00000d8f
++
+ #define MSR_IA32_BNDCFGS		0x00000d90
+ #define IA32_BNDCFGS_ENABLE		0x00000001
+ #define IA32_BNDCFGS_PRESERVE		0x00000002
