@@ -21,7 +21,7 @@ Finally, pv_hypercall() will treat a NULL hypercall function pointer as
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
 diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
-index 9159184..c495c0e 100644
+index ad16037954..c3ab6f2e20 100644
 --- a/xen/arch/x86/Makefile
 +++ b/xen/arch/x86/Makefile
 @@ -28,6 +28,7 @@ obj-y += e820.o
@@ -34,7 +34,7 @@ index 9159184..c495c0e 100644
  obj-y += io_apic.o
 diff --git a/xen/arch/x86/hypercall.c b/xen/arch/x86/hypercall.c
 new file mode 100644
-index 0000000..6535f40
+index 0000000000..6535f401df
 --- /dev/null
 +++ b/xen/arch/x86/hypercall.c
 @@ -0,0 +1,157 @@
@@ -196,7 +196,7 @@ index 0000000..6535f40
 + * End:
 + */
 diff --git a/xen/arch/x86/trace.c b/xen/arch/x86/trace.c
-index bd8596c..f11b309 100644
+index bd8596c5aa..f11b30903f 100644
 --- a/xen/arch/x86/trace.c
 +++ b/xen/arch/x86/trace.c
 @@ -6,33 +6,6 @@
@@ -234,14 +234,11 @@ index bd8596c..f11b309 100644
                       int use_error_code, unsigned error_code)
  {
 diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
-index 904101d..734177b 100644
+index 21a5b1b680..06527931ba 100644
 --- a/xen/arch/x86/x86_64/compat/entry.S
 +++ b/xen/arch/x86/x86_64/compat/entry.S
-@@ -25,71 +25,10 @@ UNLIKELY_START(ne, msi_check)
-         LOAD_C_CLOBBERED compat=1 ax=0
- UNLIKELY_END(msi_check)
- 
--        movl  UREGS_rax(%rsp),%eax
+@@ -34,68 +34,8 @@ UNLIKELY_END(msi_check)
+         LOAD_C_CLOBBERED compat=1
          GET_CURRENT(bx)
  
 -        cmpl  $NR_hypercalls,%eax
@@ -268,7 +265,7 @@ index 904101d..734177b 100644
 -        xchgl %ecx,%esi              /* Arg 2, Arg 4 */
 -        movl  %edx,%edx              /* Arg 3        */
 -        movl  %edi,%r8d              /* Arg 5        */
--        movl  %ebp,%r9d              /* Arg 6        */
+-        movl  UREGS_rbp(%rsp),%r9d   /* Arg 6        */
 -        movl  UREGS_rbx(%rsp),%edi   /* Arg 1        */
 -#define SHADOW_BYTES 0  /* No on-stack shadow state */
 -#endif
@@ -311,7 +308,7 @@ index 904101d..734177b 100644
  
  /* %rbx: struct vcpu */
  ENTRY(compat_test_all_events)
-@@ -167,10 +106,6 @@ compat_process_trap:
+@@ -172,10 +112,6 @@ compat_process_trap:
          call  compat_create_bounce_frame
          jmp   compat_test_all_events
  
@@ -323,15 +320,15 @@ index 904101d..734177b 100644
  ENTRY(compat_restore_all_guest)
          ASSERT_INTERRUPTS_DISABLED
 diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
-index 708d9b9..48bdb19 100644
+index 2a50560c33..32bb46eb59 100644
 --- a/xen/arch/x86/x86_64/entry.S
 +++ b/xen/arch/x86/x86_64/entry.S
-@@ -102,61 +102,8 @@ ENTRY(lstar_enter)
+@@ -186,62 +186,8 @@ ENTRY(lstar_enter)
          testb $TF_kernel_mode,VCPU_thread_flags(%rbx)
          jz    switch_to_kernel
  
 -/*hypercall:*/
--        movq  %r10,%rcx
+-        LOAD_C_CLOBBERED cx=0
 -        cmpq  $NR_hypercalls,%rax
 -        jae   bad_hypercall
 -#ifndef NDEBUG
@@ -366,7 +363,8 @@ index 708d9b9..48bdb19 100644
 -UNLIKELY_END(trace)
 -        leaq  hypercall_table(%rip),%r10
 -        PERFC_INCR(hypercalls, %rax, %rbx)
--        callq *(%r10,%rax,8)
+-        mov   (%r10, %rax, 8), %rax
+-        INDIRECT_CALL %rax
 -#ifndef NDEBUG
 -        /* Deliberately corrupt parameter regs used by this hypercall. */
 -        popq  %r10         # Shadow RIP
@@ -390,7 +388,7 @@ index 708d9b9..48bdb19 100644
  
  /* %rbx: struct vcpu */
  test_all_events:
-@@ -232,10 +179,6 @@ process_trap:
+@@ -316,10 +262,6 @@ process_trap:
          call create_bounce_frame
          jmp  test_all_events
  
@@ -399,5 +397,5 @@ index 708d9b9..48bdb19 100644
 -        jmp  test_all_events
 -
  ENTRY(sysenter_entry)
-         sti
+         /* sti could live here when we don't switch page tables below. */
          pushq $FLAT_USER_SS
