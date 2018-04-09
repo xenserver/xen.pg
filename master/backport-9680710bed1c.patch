@@ -1,0 +1,46 @@
+From 9680710bed1c174ced7a170cb94e30b4ae4fff5e Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 9 Apr 2018 12:25:18 +0200
+Subject: [PATCH] x86/emul: Fix backport of "x86/emul: Fix the decoding of
+ segment overrides in 64bit mode"
+
+The logic in c/s b7dce29d is correct for master, but depends on c/s 216c29765
+"x86emul: don't assume a memory operand", and in particular changed the type
+of override_seg and the constant used to signify "no override".
+
+When backported, the "no override in place" case causes x86_seg_none to be
+used in place of x86_seg_ds, which has implications for the correctness of
+emulated memory reads and writes.
+
+Problems from this manifest as a reliable failure to boot shadow guests in the
+following manner:
+
+  (d3) [15145.989017] Press F12 for boot menu.
+  (d3) [15145.989730]
+  (d3) [15146.000273] Boot device: CD-Rom5814MB medium detected
+  (d3) [15146.013234]  - success.
+  (XEN) [15146.324244] paging.c:694:d0v3 Tried to do a paging op on itself.
+  (XEN) [15204.719457] sh error: sh_remove_shadows(): can't find all shadows of mfn 112cd54 (shadow_flags=00002000)
+  (XEN) [15204.719462] domain_crash called from common.c:2884
+  (XEN) [15204.719466] Domain 3 (vcpu#0) crashed on cpu#31:
+
+Other problems with regular MMIO emulation haven't been observed, but
+shouldn't be ruled out.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
+index a11f2cdb3a..622ce066f7 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate/x86_emulate.c
+@@ -1679,8 +1679,8 @@ x86_emulate(
+  done_prefixes:
+ 
+     /* %{e,c,s,d}s overrides are ignored in 64bit mode. */
+-    if ( mode_64bit() && override_seg < x86_seg_fs )
+-        override_seg = x86_seg_none;
++    if ( mode_64bit() && (unsigned int)override_seg < x86_seg_fs )
++        override_seg = -1;
+ 
+     if ( rex_prefix & REX_W )
+         op_bytes = 8;
