@@ -11,7 +11,7 @@ index 9695f67..5ec7dba 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index a8dcf1d..0939fa0 100644
+index 39edb46..2485320 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
 @@ -466,6 +466,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
@@ -793,10 +793,10 @@ index 0000000..64e6733
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..d3db7c3
+index 0000000..4ff13ca
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1357 @@
+@@ -0,0 +1,1375 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1151,8 +1151,18 @@ index 0000000..d3db7c3
 +    f->vcpu_cap = xenstore_get("platform/vcpu/cap");
 +    f->nx       = xenstore_get("platform/nx");
 +    f->viridian = xenstore_get("platform/viridian");
-+    f->viridian_time_ref_count = xenstore_get("platform/viridian_time_ref_count");
-+    f->viridian_reference_tsc = xenstore_get("platform/viridian_reference_tsc");
++
++    if ( !opt_vgpu )
++    {
++        f->viridian_time_ref_count = xenstore_get("platform/viridian_time_ref_count");
++        f->viridian_reference_tsc = xenstore_get("platform/viridian_reference_tsc");
++    }
++    else
++    {
++       f->viridian_reference_tsc = 0;
++       f->viridian_time_ref_count = 0;
++    }
++
 +    f->apic     = xenstore_get("platform/apic");
 +    f->pae      = xenstore_get("platform/pae");
 +    f->tsc_mode = xenstore_get("platform/tsc_mode");
@@ -1214,8 +1224,12 @@ index 0000000..d3db7c3
 +            f->apic, f->acpi, f->acpi_s4, f->acpi_s3, f->tsc_mode, f->hpet);
 +    xg_info("nomigrate %d, timeoffset %" PRId64 "\n",
 +            f->nomigrate, f->timeoffset);
-+    xg_info("viridian: %d, time_ref_count: %d, reference_tsc: %d\n",
-+            f->viridian, f->viridian_time_ref_count, f->viridian_reference_tsc);
++    if ( !opt_vgpu )
++        xg_info("viridian: %d, time_ref_count: %d, reference_tsc: %d\n",
++                f->viridian, f->viridian_time_ref_count, f->viridian_reference_tsc);
++    else
++        xg_info("viridian: %d, ignoring time_ref_count and reference_tsc due to vgpu.\n",
++                f->viridian);
 +    for (n = 0; n < f->vcpus; n++){
 +        xg_info("vcpu/%d/affinity:%s\n", n, (f->vcpu_affinity[n])?f->vcpu_affinity[n]:"unset");
 +    }
@@ -2085,10 +2099,14 @@ index 0000000..d3db7c3
 +    if ( hvm )
 +    {
 +        /*
-+         * We have to do this even in the domain restore case as XenServers
-+         * prior to 6.0.2 did not create a viridian save record.
++         * We generally have to do this even in the domain restore case as
++         * XenServers prior to 6.0.2 did not create a viridian save record.
++         *
++         * However, if we're restoring with a VGPU, we know we have the save
++         * record, but are less sure what the viridian values were when
++         * started, and so should avoid setting in this case.
 +         */
-+        if (f.viridian)
++        if (f.viridian && !opt_vgpu)
 +            hvm_set_viridian_features(&f);
 +
 +        xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
@@ -2156,10 +2174,10 @@ index 0000000..d3db7c3
 + */
 diff --git a/tools/xenguest/xg_emu.c b/tools/xenguest/xg_emu.c
 new file mode 100644
-index 0000000..565bbbc
+index 0000000..76cd081
 --- /dev/null
 +++ b/tools/xenguest/xg_emu.c
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,444 @@
 +#include <xenctrl.h>
 +#include <xenguest.h>
 +#include <xenstore.h>
@@ -2174,7 +2192,7 @@ index 0000000..565bbbc
 +
 +static sem_t sem_stopped;
 +static int live_stage = XGS_POLICY_CONTINUE_PRECOPY;
-+static int pv_mode = false;
++static bool pv_mode = false;
 +
 +static struct emu_client progress_cli = { .num = -1 };
 +static int last_iter = 0;
@@ -2387,6 +2405,7 @@ index 0000000..565bbbc
 +    union
 +    {
 +       int *a_int;
++       bool *a_bool;
 +       char **a_str;
 +    };
 +};
@@ -2394,7 +2413,8 @@ index 0000000..565bbbc
 +const static struct arg_list setable_args[] = {
 +    {"store_port",   int_type,  .a_int = &arg_store_port},
 +    {"console_port", int_type,  .a_int = &arg_console_port},
-+    {"pv",           bool_type, .a_int = &pv_mode},
++    {"pv",           bool_type, .a_bool = &pv_mode},
++    {"vgpu",         bool_type, .a_bool = &opt_vgpu},
 +    {NULL,           -1,        .a_int = NULL}
 +};
 +
