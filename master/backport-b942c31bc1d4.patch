@@ -1,0 +1,126 @@
+From b942c31bc1d40234922be5bee9689fe349e1d835 Mon Sep 17 00:00:00 2001
+From: Luwei Kang <luwei.kang@intel.com>
+Date: Mon, 5 Sep 2016 12:46:13 +0200
+Subject: [PATCH] x86/cpuid: AVX-512 feature detection
+
+AVX512 is an extention of AVX2. Its spec can be found at:
+https://software.intel.com/sites/default/files/managed/b4/3a/319433-024.pdf
+This patch detects AVX512 features by CPUID.
+
+Signed-off-by: Luwei Kang <luwei.kang@intel.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 7c391bf185..68f5f2b4ec 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -3558,6 +3558,20 @@ void hvm_cpuid(unsigned int input, unsigned int *eax, unsigned int *ebx,
+                                   xstate_sizes[_XSTATE_BNDCSR]);
+             }
+ 
++            if ( _ebx & cpufeat_mask(X86_FEATURE_AVX512F) )
++            {
++                xfeature_mask |= XSTATE_OPMASK | XSTATE_ZMM | XSTATE_HI_ZMM;
++                xstate_size = max(xstate_size,
++                                  xstate_offsets[_XSTATE_OPMASK] +
++                                  xstate_sizes[_XSTATE_OPMASK]);
++                xstate_size = max(xstate_size,
++                                  xstate_offsets[_XSTATE_ZMM] +
++                                  xstate_sizes[_XSTATE_ZMM]);
++                xstate_size = max(xstate_size,
++                                  xstate_offsets[_XSTATE_HI_ZMM] +
++                                  xstate_sizes[_XSTATE_HI_ZMM]);
++            }
++
+             if ( _ecx & cpufeat_mask(X86_FEATURE_PKU) )
+             {
+                 xfeature_mask |= XSTATE_PKRU;
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index 731d05423e..fc943c0257 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -942,7 +942,7 @@ void pv_cpuid(struct cpu_user_regs *regs)
+ 
+     switch ( leaf )
+     {
+-        uint32_t tmp, _ecx;
++        uint32_t tmp, _ecx, _ebx;
+ 
+     case 0x00000001:
+         c &= pv_featureset[FEATURESET_1c];
+@@ -1127,6 +1127,26 @@ void pv_cpuid(struct cpu_user_regs *regs)
+                                xstate_sizes[_XSTATE_YMM]);
+             }
+ 
++            if ( !is_control_domain(currd) && !is_hardware_domain(currd) )
++                domain_cpuid(currd, 7, 0, &tmp, &_ebx, &tmp, &tmp);
++            else
++                cpuid_count(7, 0, &tmp, &_ebx, &tmp, &tmp);
++            _ebx &= pv_featureset[FEATURESET_7b0];
++
++            if ( _ebx & cpufeat_mask(X86_FEATURE_AVX512F) )
++            {
++                xfeature_mask |= XSTATE_OPMASK | XSTATE_ZMM | XSTATE_HI_ZMM;
++                xstate_size = max(xstate_size,
++                                  xstate_offsets[_XSTATE_OPMASK] +
++                                  xstate_sizes[_XSTATE_OPMASK]);
++                xstate_size = max(xstate_size,
++                                  xstate_offsets[_XSTATE_ZMM] +
++                                  xstate_sizes[_XSTATE_ZMM]);
++                xstate_size = max(xstate_size,
++                                  xstate_offsets[_XSTATE_HI_ZMM] +
++                                  xstate_sizes[_XSTATE_HI_ZMM]);
++            }
++
+             a = (uint32_t)xfeature_mask;
+             d = (uint32_t)(xfeature_mask >> 32);
+             c = xstate_size;
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index 3d57339a9b..70a17f73cd 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -206,15 +206,24 @@ XEN_CPUFEATURE(PQM,           5*32+12) /*   Platform QoS Monitoring */
+ XEN_CPUFEATURE(NO_FPU_SEL,    5*32+13) /*!  FPU CS/DS stored as zero */
+ XEN_CPUFEATURE(MPX,           5*32+14) /*S  Memory Protection Extensions */
+ XEN_CPUFEATURE(PQE,           5*32+15) /*   Platform QoS Enforcement */
++XEN_CPUFEATURE(AVX512F,       5*32+16) /*A  AVX-512 Foundation Instructions */
++XEN_CPUFEATURE(AVX512DQ,      5*32+17) /*A  AVX-512 Doubleword & Quadword Instrs */
+ XEN_CPUFEATURE(RDSEED,        5*32+18) /*A  RDSEED instruction */
+ XEN_CPUFEATURE(ADX,           5*32+19) /*A  ADCX, ADOX instructions */
+ XEN_CPUFEATURE(SMAP,          5*32+20) /*S  Supervisor Mode Access Prevention */
++XEN_CPUFEATURE(AVX512IFMA,    5*32+21) /*A  AVX-512 Integer Fused Multiply Add */
+ XEN_CPUFEATURE(CLFLUSHOPT,    5*32+23) /*A  CLFLUSHOPT instruction */
+ XEN_CPUFEATURE(CLWB,          5*32+24) /*A  CLWB instruction */
++XEN_CPUFEATURE(AVX512PF,      5*32+26) /*A  AVX-512 Prefetch Instructions */
++XEN_CPUFEATURE(AVX512ER,      5*32+27) /*A  AVX-512 Exponent & Reciprocal Instrs */
++XEN_CPUFEATURE(AVX512CD,      5*32+28) /*A  AVX-512 Conflict Detection Instrs */
+ XEN_CPUFEATURE(SHA,           5*32+29) /*A  SHA1 & SHA256 instructions */
++XEN_CPUFEATURE(AVX512BW,      5*32+30) /*A  AVX-512 Byte and Word Instructions */
++XEN_CPUFEATURE(AVX512VL,      5*32+31) /*A  AVX-512 Vector Length Extensions */
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000007:0.ecx, word 6 */
+ XEN_CPUFEATURE(PREFETCHWT1,   6*32+ 0) /*A  PREFETCHWT1 instruction */
++XEN_CPUFEATURE(AVX512VBMI,    6*32+ 1) /*A  AVX-512 Vector Byte Manipulation Instrs */
+ XEN_CPUFEATURE(PKU,           6*32+ 3) /*H  Protection Keys for Userspace */
+ XEN_CPUFEATURE(OSPKE,         6*32+ 4) /*!  OS Protection Keys Enable */
+ 
+diff --git a/xen/tools/gen-cpuid.py b/xen/tools/gen-cpuid.py
+index 19a7c22b9b..0240e55f51 100755
+--- a/xen/tools/gen-cpuid.py
++++ b/xen/tools/gen-cpuid.py
+@@ -245,6 +245,16 @@ def crunch_numbers(state):
+         # standard 3DNow in the earlier K6 processors.
+         _3DNOW: [_3DNOWEXT],
+ 
++        # This is just the dependency between AVX512 and AVX2 of XSTATE feature flags.
++        # If want to use AVX512, AVX2 must be supported and enabled.
++        AVX2: [AVX512F],
++
++        # AVX512F is taken to mean hardware support for EVEX encoded instructions,
++        # 512bit registers, and the instructions themselves. All further AVX512 features
++        # are built on top of AVX512F
++        AVX512F: [AVX512DQ, AVX512IFMA, AVX512PF, AVX512ER, AVX512CD,
++                  AVX512BW, AVX512VL, AVX512VBMI],
++
+         # The features:
+         #   * Single Thread Indirect Branch Predictors
+         #   * Speculative Store Bypass Disable
