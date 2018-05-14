@@ -1,0 +1,112 @@
+From 5d1240b3710cfcf98bc943891ff76520969fe903 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 9 May 2018 13:59:56 +0100
+Subject: [PATCH] x86/spec_ctrl: Explicitly set Xen's default MSR_SPEC_CTRL
+ value
+
+With the impending ability to disable MSR_SPEC_CTRL handling on a
+per-guest-type basis, the first exit-from-guest may not have the side effect
+of loading Xen's choice of value.  Explicitly set Xen's default during the BSP
+and AP boot paths.
+
+For the BSP however, delay setting a non-zero MSR_SPEC_CTRL default until
+after dom0 has been constructed when safe to do so.  Oracle report that this
+speeds up boots of some hardware by 50s.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index e04a1e4..0ad69d0 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -1621,6 +1621,13 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+ 
+     setup_io_bitmap(dom0);
+ 
++    if ( bsp_delay_spec_ctrl )
++    {
++        get_cpu_info()->spec_ctrl_flags &= ~SCF_use_shadow;
++        barrier();
++        wrmsrl(MSR_SPEC_CTRL, default_xen_spec_ctrl);
++    }
++
+     /* Jump to the 1:1 virtual mappings of cpu0_stack. */
+     asm volatile ("mov %[stk], %%rsp; jmp %c[fn]" ::
+                   [stk] "g" (__va(__pa(get_stack_bottom()))),
+diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
+index 554d5a7..767ad39 100644
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -356,6 +356,14 @@ void start_secondary(void *unused)
+     else
+         microcode_resume_cpu(cpu);
+ 
++    /*
++     * If MSR_SPEC_CTRL is available, apply Xen's default setting and discard
++     * any firmware settings.  Note: MSR_SPEC_CTRL may only become available
++     * after loading microcode.
++     */
++    if ( boot_cpu_has(X86_FEATURE_IBRSB) )
++        wrmsrl(MSR_SPEC_CTRL, default_xen_spec_ctrl);
++
+     smp_callin();
+ 
+     setup_secondary_APIC_clock();
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index d743dcf..f049c2b 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -38,6 +38,8 @@ static int8_t __initdata opt_ibrs = -1;
+ static bool_t __initdata opt_rsb_pv = 1;
+ static bool_t __initdata opt_rsb_hvm = 1;
+ bool_t __read_mostly opt_ibpb = 1;
++
++bool_t __initdata bsp_delay_spec_ctrl;
+ uint8_t __read_mostly default_xen_spec_ctrl;
+ uint8_t __read_mostly default_spec_ctrl_flags;
+ 
+@@ -330,6 +332,32 @@ void __init init_speculation_mitigations(void)
+     init_shadow_spec_ctrl_state();
+ 
+     print_details(thunk, caps);
++
++    /*
++     * If MSR_SPEC_CTRL is available, apply Xen's default setting and discard
++     * any firmware settings.  For performance reasons on native hardware, we
++     * delay applying non-zero settings until after dom0 has been constructed.
++     */
++    if ( boot_cpu_has(X86_FEATURE_IBRSB) )
++    {
++        bsp_delay_spec_ctrl = !cpu_has_hypervisor && default_xen_spec_ctrl;
++
++        /*
++         * If delaying MSR_SPEC_CTRL setup, use the same mechanism as
++         * spec_ctrl_enter_idle(), by using a shadow value of zero.
++         */
++        if ( bsp_delay_spec_ctrl )
++        {
++            struct cpu_info *info = get_cpu_info();
++
++            info->shadow_spec_ctrl = 0;
++            barrier();
++            info->spec_ctrl_flags |= SCF_use_shadow;
++            barrier();
++        }
++
++        wrmsrl(MSR_SPEC_CTRL, bsp_delay_spec_ctrl ? 0 : default_xen_spec_ctrl);
++    }
+ }
+ 
+ static void __init __maybe_unused build_assertions(void)
+diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
+index 4824673..121b4fd 100644
+--- a/xen/include/asm-x86/spec_ctrl.h
++++ b/xen/include/asm-x86/spec_ctrl.h
+@@ -27,6 +27,8 @@
+ void init_speculation_mitigations(void);
+ 
+ extern bool_t opt_ibpb;
++
++extern bool_t bsp_delay_spec_ctrl;
+ extern uint8_t default_xen_spec_ctrl;
+ extern uint8_t default_spec_ctrl_flags;
+ 
