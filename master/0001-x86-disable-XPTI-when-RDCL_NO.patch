@@ -1,6 +1,6 @@
-From bee0732d2066691d8204e418d10110930ee4d4f8 Mon Sep 17 00:00:00 2001
-From: Jan Beulich <JBeulich@suse.com>
-Date: Mon, 19 Mar 2018 07:37:54 -0600
+From a09627839d69606b35e7dbc0fde4ed92c0cdd4bc Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Wed, 18 Apr 2018 16:48:15 +0200
 Subject: [PATCH] x86: disable XPTI when RDCL_NO
 
 Use the respective ARCH_CAPABILITIES MSR bit, but don't expose the MSR
@@ -11,8 +11,10 @@ Tested-by: Juergen Gross <jgross@suse.com>
 Reviewed-by: Juergen Gross <jgross@suse.com>
 Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Acked-by: Wei Liu <wei.liu2@citrix.com>
+master commit: bee0732d2066691d8204e418d10110930ee4d4f8
+master date: 2018-04-05 15:48:23 +0100
 diff --git a/tools/libxl/libxl_cpuid.c b/tools/libxl/libxl_cpuid.c
-index 279b3c3c32..041b64a509 100644
+index 279b3c3..041b64a 100644
 --- a/tools/libxl/libxl_cpuid.c
 +++ b/tools/libxl/libxl_cpuid.c
 @@ -160,6 +160,7 @@ int libxl_cpuid_parse_config(libxl_cpuid_policy_list *cpuid, const char* str)
@@ -24,21 +26,36 @@ index 279b3c3c32..041b64a509 100644
          {"tbm",          0x80000001, NA, CPUID_REG_ECX, 21,  1},
          {"nodeid",       0x80000001, NA, CPUID_REG_ECX, 19,  1},
 diff --git a/tools/misc/xen-cpuid.c b/tools/misc/xen-cpuid.c
-index 0981366e06..409fec44ee 100644
+index 0981366..06a9c7f 100644
 --- a/tools/misc/xen-cpuid.c
 +++ b/tools/misc/xen-cpuid.c
-@@ -153,7 +153,8 @@ static const char *str_7d0[32] =
+@@ -152,8 +152,9 @@ static const char *str_7d0[32] =
+     [0 ... 25] = "REZ",
  
      [26] = "ibrsb",         [27] = "stibp",
++    [28] = "REZ",           [29] = "arch_caps",
  
 -    [28 ... 31] = "REZ",
-+    [28] = "REZ",           [29] = "arch_caps",
 +    [30 ... 31] = "REZ",
  };
  
  static struct {
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 04cb0fe..43007c5 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -430,6 +430,9 @@ void identify_cpu(struct cpuinfo_x86 *c)
+ 		if (test_bit(X86_FEATURE_RSB_VMEXIT,
+ 		             boot_cpu_data.x86_capability))
+ 			__set_bit(X86_FEATURE_RSB_VMEXIT, c->x86_capability);
++		if (test_bit(X86_FEATURE_NO_XPTI,
++		             boot_cpu_data.x86_capability))
++			__set_bit(X86_FEATURE_NO_XPTI, c->x86_capability);
+ 
+ 		/* AND the already accumulated flags with these */
+ 		for ( i = 0 ; i < NCAPINTS ; i++ )
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 01e293fcf7..1b08bf513b 100644
+index 3824fa8..ec323ec 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
 @@ -4011,7 +4011,7 @@ long do_mmu_update(
@@ -51,20 +68,20 @@ index 01e293fcf7..1b08bf513b 100644
                            (1 + !!(page->u.inuse.type_info & PGT_pinned) +
                             (pagetable_get_pfn(curr->arch.guest_table) == mfn) +
 diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
-index 0bc0cae8b4..0a0b6debf6 100644
+index f5051e3..e04a1e4 100644
 --- a/xen/arch/x86/setup.c
 +++ b/xen/arch/x86/setup.c
-@@ -70,6 +70,9 @@ boolean_param("smep", opt_smep);
- static bool_t __initdata opt_smap = 1;
- boolean_param("smap", opt_smap);
+@@ -112,6 +112,9 @@ struct cpuinfo_x86 __read_mostly boot_cpu_data = { 0, 0, 0, 0, -1 };
+ 
+ unsigned long __read_mostly mmu_cr4_features = XEN_MINIMAL_CR4;
  
 +static int8_t __initdata opt_xpti = -1;
 +boolean_param("xpti", opt_xpti);
 +
- unsigned long __read_mostly cr4_pv32_mask;
- 
- /* Boot dom0 in pvh mode */
-@@ -1431,6 +1434,22 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+ bool_t __read_mostly acpi_disabled;
+ bool_t __initdata acpi_force;
+ static char __initdata acpi_param[10] = "";
+@@ -1421,6 +1424,22 @@ void __init noreturn __start_xen(unsigned long mbi_p)
  
      cr4_pv32_mask = mmu_cr4_features & XEN_CR4_PV32_BITS;
  
@@ -88,7 +105,7 @@ index 0bc0cae8b4..0a0b6debf6 100644
          set_in_cr4(X86_CR4_FSGSBASE);
  
 diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
-index e5305de47b..218c78557e 100644
+index a2451ef..51c24fa 100644
 --- a/xen/arch/x86/smpboot.c
 +++ b/xen/arch/x86/smpboot.c
 @@ -748,8 +748,6 @@ static int clone_mapping(const void *ptr, root_pgentry_t *rpt)
@@ -109,7 +126,7 @@ index e5305de47b..218c78557e 100644
          return 0;
  
      rpt = alloc_xen_pagetable();
-@@ -1035,9 +1033,6 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
+@@ -1036,9 +1034,6 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
  
      stack_base[0] = stack_start;
  
@@ -120,27 +137,27 @@ index e5305de47b..218c78557e 100644
      if ( rc )
          panic("Error %d setting up PV root page table\n", rc);
 diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
-index 8f943cc408..463cfb254a 100644
+index e170bb9..6a18755 100644
 --- a/xen/include/asm-x86/cpufeature.h
 +++ b/xen/include/asm-x86/cpufeature.h
 @@ -34,6 +34,7 @@
  #define X86_FEATURE_XEN_IBRS_CLEAR	((FSCAPINTS+0)*32+ 15) /* IBRSB && IBRS clear in Xen */
  #define X86_FEATURE_RSB_NATIVE		((FSCAPINTS+0)*32+ 16) /* RSB overwrite needed for native */
  #define X86_FEATURE_RSB_VMEXIT		((FSCAPINTS+0)*32+ 17) /* RSB overwrite needed for vmexit */
-+#define X86_FEATURE_NO_XPTI		((FSCAPINTS+0)*32+ 20) /* XPTI mitigation not in use */
++#define X86_FEATURE_NO_XPTI		((FSCAPINTS+0)*32+ 18) /* XPTI mitigation not in use */
  
  #define cpufeat_word(idx)	((idx) / 32)
  #define cpufeat_bit(idx)	((idx) % 32)
-@@ -101,6 +102,7 @@
- #define cpu_has_rtm		boot_cpu_has(X86_FEATURE_RTM)
- #define cpu_has_pdcm		boot_cpu_has(X86_FEATURE_PDCM)
+@@ -98,6 +99,7 @@
+ #define cpu_has_hypervisor	boot_cpu_has(X86_FEATURE_HYPERVISOR)
+ #define cpu_has_cmp_legacy	boot_cpu_has(X86_FEATURE_CMP_LEGACY)
  #define cpu_has_lfence_dispatch boot_cpu_has(X86_FEATURE_LFENCE_DISPATCH)
 +#define cpu_has_no_xpti         boot_cpu_has(X86_FEATURE_NO_XPTI)
  
  enum _cache_type {
      CACHE_TYPE_NULL = 0,
 diff --git a/xen/include/asm-x86/msr-index.h b/xen/include/asm-x86/msr-index.h
-index 2bba5a069f..6963a9aa3d 100644
+index 0fd34ed..5c794ac 100644
 --- a/xen/include/asm-x86/msr-index.h
 +++ b/xen/include/asm-x86/msr-index.h
 @@ -40,6 +40,8 @@
@@ -153,7 +170,7 @@ index 2bba5a069f..6963a9aa3d 100644
  /* Intel MSRs. Some also available on other CPUs */
  #define MSR_IA32_PERFCTR0		0x000000c1
 diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
-index 9da4cf6b4e..7714108350 100644
+index 9da4cf6..7714108 100644
 --- a/xen/include/public/arch-x86/cpufeatureset.h
 +++ b/xen/include/public/arch-x86/cpufeatureset.h
 @@ -229,6 +229,7 @@ XEN_CPUFEATURE(IBPB,          8*32+12) /*A  IBPB support only (no IBRS, used by
