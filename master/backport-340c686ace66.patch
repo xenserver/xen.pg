@@ -1,6 +1,6 @@
-From fd4c1388fa0533769216fac853b9894f165c5b34 Mon Sep 17 00:00:00 2001
+From 340c686ace663ade6a683a12bbe6a85a6eda1adf Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Fri, 13 Apr 2018 15:42:34 +0000
+Date: Tue, 29 May 2018 10:39:56 +0200
 Subject: [PATCH] x86/msr: Virtualise MSR_SPEC_CTRL.SSBD for guests to use
 
 Almost all infrastructure is already in place.  Update the reserved bits
@@ -8,8 +8,10 @@ calculation in guest_wrmsr(), and offer SSBD to guests by default.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: cd53023df952cf0084be9ee3d15a90f8837049c2
+master date: 2018-05-21 14:20:06 +0100
 diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
-index 6893387..49ca8dd 100644
+index 68933878b8..49ca8dd10d 100644
 --- a/xen/arch/x86/domctl.c
 +++ b/xen/arch/x86/domctl.c
 @@ -1365,7 +1365,8 @@ long arch_do_domctl(
@@ -23,35 +25,37 @@ index 6893387..49ca8dd 100644
                      v->arch.spec_ctrl = msr.value;
                      continue;
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index ff1c6fa..865e091 100644
+index f62b021c5e..5ba00b22c5 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
-@@ -3994,7 +3994,8 @@ int hvm_msr_write_intercept(unsigned int msr, uint64_t msr_content,
+@@ -3991,7 +3991,9 @@ int hvm_msr_write_intercept(unsigned int msr, uint64_t msr_content,
           * when STIBP isn't enumerated in hardware.
           */
  
 -        if ( msr_content & ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP) )
 +        if ( msr_content & ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP |
-+                             ((edx & cpufeat_mask(X86_FEATURE_SSBD) ? SPEC_CTRL_SSBD : 0))) )
++                             (edx & cpufeat_mask(X86_FEATURE_SSBD)
++                              ? SPEC_CTRL_SSBD : 0)) )
              goto gp_fault; /* Rsvd bit set? */
  
          v->arch.spec_ctrl = msr_content;
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 0f34b21..4ed7988 100644
+index 1e2e7d4a7e..731d05423e 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
-@@ -2906,7 +2906,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -2903,7 +2903,9 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
               * when STIBP isn't enumerated in hardware.
               */
  
 -            if ( msr_content & ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP) )
 +            if ( msr_content & ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP |
-+                                 ((edx & cpufeat_mask(X86_FEATURE_SSBD) ? SPEC_CTRL_SSBD : 0))) )
++                                 (edx & cpufeat_mask(X86_FEATURE_SSBD)
++                                  ? SPEC_CTRL_SSBD : 0)) )
                  goto fail; /* Rsvd bit set? */
  
              v->arch.spec_ctrl = eax;
 diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
-index f711658..3d57339 100644
+index f7116585ea..3d57339a9b 100644
 --- a/xen/include/public/arch-x86/cpufeatureset.h
 +++ b/xen/include/public/arch-x86/cpufeatureset.h
 @@ -230,7 +230,7 @@ XEN_CPUFEATURE(IBPB,          8*32+12) /*A  IBPB support only (no IBRS, used by

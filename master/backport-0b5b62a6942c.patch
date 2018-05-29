@@ -1,6 +1,6 @@
-From fb0d6d90dca81fe463867c4d46c985d3b2bc0c4a Mon Sep 17 00:00:00 2001
+From 0b5b62a6942cd92c2a5ec87561ad9e8a83a8ce89 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Tue, 17 Apr 2018 14:15:04 +0100
+Date: Tue, 29 May 2018 10:33:09 +0200
 Subject: [PATCH] x86/spec_ctrl: Split X86_FEATURE_SC_MSR into PV and HVM
  variants
 
@@ -9,12 +9,15 @@ HVM guests, split the feature used to control runtime alternatives into two.
 Xen will use MSR_SPEC_CTRL itself if either of these features are active.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: fa9eb09d446a1279f5e861e6b84fa8675dabf148
+master date: 2018-05-16 12:19:10 +0100
 diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
-index dce4506..f8542b3 100644
+index e1c479a72d..147c83d942 100644
 --- a/xen/arch/x86/cpu/common.c
 +++ b/xen/arch/x86/cpu/common.c
-@@ -420,9 +420,12 @@ void identify_cpu(struct cpuinfo_x86 *c)
+@@ -417,9 +417,12 @@ void identify_cpu(struct cpuinfo_x86 *c)
  		if (test_bit(X86_FEATURE_IND_THUNK_JMP,
  			     boot_cpu_data.x86_capability))
  			__set_bit(X86_FEATURE_IND_THUNK_JMP, c->x86_capability);
@@ -30,7 +33,7 @@ index dce4506..f8542b3 100644
  		             boot_cpu_data.x86_capability))
  			__set_bit(X86_FEATURE_SC_RSB_PV, c->x86_capability);
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index a67daa2..d743dcf 100644
+index 410f248757..b4bc5d009d 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
 @@ -112,7 +112,8 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
@@ -54,10 +57,10 @@ index a67daa2..d743dcf 100644
          if ( ibrs )
              default_xen_spec_ctrl |= SPEC_CTRL_IBRS;
 diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
-index e472176..a53ae29 100644
+index 2466f5b7f7..d6b995157e 100644
 --- a/xen/include/asm-x86/cpufeature.h
 +++ b/xen/include/asm-x86/cpufeature.h
-@@ -30,7 +30,8 @@
+@@ -30,11 +30,12 @@
  #define X86_FEATURE_IND_THUNK_LFENCE	((FSCAPINTS+0)*32+ 11) /* Use IND_THUNK_LFENCE */
  #define X86_FEATURE_IND_THUNK_JMP	((FSCAPINTS+0)*32+ 12) /* Use IND_THUNK_JMP */
  #define X86_FEATURE_XEN_IBPB		((FSCAPINTS+0)*32+ 13) /* IBRSB || IBPB */
@@ -67,36 +70,13 @@ index e472176..a53ae29 100644
  #define X86_FEATURE_SC_RSB_PV		((FSCAPINTS+0)*32+ 16) /* RSB overwrite needed for PV */
  #define X86_FEATURE_SC_RSB_HVM		((FSCAPINTS+0)*32+ 17) /* RSB overwrite needed for HVM */
  #define X86_FEATURE_NO_XPTI		((FSCAPINTS+0)*32+ 18) /* XPTI mitigation not in use */
-diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
-index 6c11562..4824673 100644
---- a/xen/include/asm-x86/spec_ctrl.h
-+++ b/xen/include/asm-x86/spec_ctrl.h
-@@ -52,9 +52,9 @@ static always_inline void spec_ctrl_enter_idle(struct cpu_info *info)
-     barrier();
-     info->spec_ctrl_flags |= SCF_use_shadow;
-     barrier();
--    asm volatile ( ALTERNATIVE(ASM_NOP3, "wrmsr", %c3)
-+    asm volatile ( ALTERNATIVE_2(ASM_NOP3, "wrmsr", %c3, "wrmsr", %c4)
-                    :: "a" (val), "c" (MSR_SPEC_CTRL), "d" (0),
--                      "i" (X86_FEATURE_SC_MSR)
-+                      "i" (X86_FEATURE_SC_MSR_PV), "i" (X86_FEATURE_SC_MSR_HVM)
-                    : "memory" );
- }
+-#define X86_FEATURE_SC_MSR_IDLE		((FSCAPINTS+0)*32+ 19) /* SC_MSR && default_xen_spec_ctrl */
++#define X86_FEATURE_SC_MSR_IDLE		((FSCAPINTS+0)*32+ 19) /* (SC_MSR_PV || SC_MSR_HVM) && default_xen_spec_ctrl */
  
-@@ -69,9 +69,9 @@ static always_inline void spec_ctrl_exit_idle(struct cpu_info *info)
-      */
-     info->spec_ctrl_flags &= ~SCF_use_shadow;
-     barrier();
--    asm volatile ( ALTERNATIVE(ASM_NOP3, "wrmsr", %c3)
-+    asm volatile ( ALTERNATIVE_2(ASM_NOP3, "wrmsr", %c3, "wrmsr", %c4)
-                    :: "a" (val), "c" (MSR_SPEC_CTRL), "d" (0),
--                      "i" (X86_FEATURE_SC_MSR)
-+                      "i" (X86_FEATURE_SC_MSR_PV), "i" (X86_FEATURE_SC_MSR_HVM)
-                    : "memory" );
- }
- 
+ #define cpufeat_word(idx)	((idx) / 32)
+ #define cpufeat_bit(idx)	((idx) % 32)
 diff --git a/xen/include/asm-x86/spec_ctrl_asm.h b/xen/include/asm-x86/spec_ctrl_asm.h
-index b330e20..4d864eb 100644
+index b330e20e0e..4d864eb4ec 100644
 --- a/xen/include/asm-x86/spec_ctrl_asm.h
 +++ b/xen/include/asm-x86/spec_ctrl_asm.h
 @@ -223,36 +223,36 @@

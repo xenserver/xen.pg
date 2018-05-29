@@ -1,14 +1,23 @@
-From 05697789020a0bec95b3edaccadf192f4d78544d Mon Sep 17 00:00:00 2001
-From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Mon, 5 Feb 2018 14:50:10 +0000
-Subject: [PATCH] x86/xpti: Introduce an ability to disable XPTI for dom0
+From 53c6a024699165314a02fde4f427148cda8546fb Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Thu, 26 Apr 2018 13:33:12 +0200
+Subject: [PATCH] xen/x86: support per-domain flag for xpti
 
-Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Instead of switching XPTI globally on or off add a per-domain flag for
+that purpose. This allows to modify the xpti boot parameter to support
+running dom0 without Meltdown mitigations. Using "xpti=no-dom0" as boot
+parameter will achieve that.
+
+Move the xpti boot parameter handling to xen/arch/x86/pv/domain.c as
+it is pv-domain specific.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
 diff --git a/docs/misc/xen-command-line.markdown b/docs/misc/xen-command-line.markdown
-index 90ec1c7..4e7a759 100644
+index b4e009c7ce..843b3e82ba 100644
 --- a/docs/misc/xen-command-line.markdown
 +++ b/docs/misc/xen-command-line.markdown
-@@ -1763,14 +1763,24 @@ clustered mode.  The default, given no hint from the **FADT**, is cluster
+@@ -1717,14 +1717,24 @@ clustered mode.  The default, given no hint from the **FADT**, is cluster
  mode.
  
  ### xpti
@@ -16,7 +25,7 @@ index 90ec1c7..4e7a759 100644
 +> `= List of [ default | <boolean> | dom0=<bool> | domu=<bool> ]`
  
 -> Default: `false` on AMD hardware
-+> Default: `false` on hardware known not to be vulnerable to Meltdown (e.g. AMD)
++> Default: `false` on hardware not to be vulnerable to Meltdown (e.g. AMD)
  > Default: `true` everywhere else
  
  Override default selection of whether to isolate 64-bit PV guest page
@@ -36,86 +45,75 @@ index 90ec1c7..4e7a759 100644
  > `= <boolean>`
  
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index e80c30d..58ecb4f 100644
+index aa81f9e1f2..bb421435c4 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -336,6 +336,22 @@ static inline int may_switch_mode(struct domain *d)
-     return (!is_hvm_domain(d) && (d->tot_pages == 0));
- }
- 
-+static void set_domain_xpti(struct domain *d)
-+{
-+    if ( !is_pv_domain(d) )
-+        return;
-+
-+    if ( d->arch.is_32bit_pv )
-+    {
-+        d->arch.pv_domain.xpti = false;
-+        return;
-+    }
-+
-+    /* XPTI is only for 64-bit PV domains */
-+    d->arch.pv_domain.xpti = opt_xpti & (is_hardware_domain(d)
-+                                         ? OPT_XPTI_DOM0 : OPT_XPTI_DOMU);
-+}
-+
- int switch_native(struct domain *d)
- {
-     struct vcpu *v;
-@@ -359,6 +375,8 @@ int switch_native(struct domain *d)
- 
-     d->arch.x87_fip_width = cpu_has_fpu_sel ? 0 : 8;
- 
-+    set_domain_xpti(d);
-+
-     return 0;
- }
- 
-@@ -395,6 +413,8 @@ int switch_compat(struct domain *d)
+@@ -394,6 +394,8 @@ int switch_compat(struct domain *d)
  
      d->arch.x87_fip_width = 4;
  
-+    set_domain_xpti(d);
++    d->arch.pv_domain.xpti = 0;
 +
      return 0;
  
   undo_and_fail:
-@@ -701,6 +721,8 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags,
-      */
-     d->arch.x87_fip_width = cpu_has_fpu_sel ? 0 : 8;
+@@ -667,9 +669,14 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags,
+             goto fail;
+     }
+     else
++    {
+         /* 64-bit PV guest by default. */
+         d->arch.is_32bit_pv = d->arch.has_32bit_shinfo = 0;
  
-+    set_domain_xpti(d);
++        d->arch.pv_domain.xpti = opt_xpti & (is_hardware_domain(d)
++                                             ? OPT_XPTI_DOM0 : OPT_XPTI_DOMU);
++    }
 +
-     return 0;
- 
-  fail:
+     /* initialize default tsc behavior in case tools don't */
+     tsc_set_info(d, TSC_MODE_DEFAULT, 0UL, 0, 0);
+     spin_lock_init(&d->arch.vtsc_lock);
 diff --git a/xen/arch/x86/domain_build.c b/xen/arch/x86/domain_build.c
-index 20d4d8b..5d2c0f2 100644
+index d449535891..cdb7b66617 100644
 --- a/xen/arch/x86/domain_build.c
 +++ b/xen/arch/x86/domain_build.c
 @@ -1001,6 +1001,7 @@ int __init construct_dom0(
      if ( compat32 )
      {
          d->arch.is_32bit_pv = d->arch.has_32bit_shinfo = 1;
-+        d->arch.pv_domain.xpti = false;
++        d->arch.pv_domain.xpti = 0;
          v->vcpu_info = (void *)&d->shared_info->compat.vcpu_info[0];
          if ( setup_compat_arg_xlat(v) != 0 )
              BUG();
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 4f37c32..6e3d574 100644
+index 12adc1e1b4..54f7351644 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -4015,7 +4015,7 @@ long do_mmu_update(
-                      * to the page lock we hold, its pinned status, and uses on
-                      * this (v)CPU.
-                      */
--                    if ( !rc && !cpu_has_no_xpti &&
-+                    if ( !rc && pg_owner->arch.pv_domain.xpti &&
-                          ((page->u.inuse.type_info & PGT_count_mask) >
-                           (1 + !!(page->u.inuse.type_info & PGT_pinned) +
-                            (pagetable_get_pfn(curr->arch.guest_table) == mfn) +
+@@ -499,8 +499,21 @@ void make_cr3(struct vcpu *v, unsigned long mfn)
+ 
+ void write_ptbase(struct vcpu *v)
+ {
+-    get_cpu_info()->root_pgt_changed = 1;
+-    switch_cr3(v->arch.cr3);
++    struct cpu_info *cpu_info = get_cpu_info();
++
++    if ( is_pv_vcpu(v) && v->domain->arch.pv_domain.xpti )
++    {
++        cpu_info->root_pgt_changed = 1;
++        cpu_info->pv_cr3 = __pa(this_cpu(root_pgt));
++        switch_cr3(v->arch.cr3);
++    }
++    else
++    {
++        /* Make sure to clear xen_cr3 before pv_cr3; switch_cr3() serializes. */
++        cpu_info->xen_cr3 = 0;
++        switch_cr3(v->arch.cr3);
++        cpu_info->pv_cr3 = 0;
++    }
+ }
+ 
+ /*
 diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
-index 9a3f006..7fe190a 100644
+index 0ad69d02bb..6ce807bf6d 100644
 --- a/xen/arch/x86/setup.c
 +++ b/xen/arch/x86/setup.c
 @@ -112,9 +112,6 @@ struct cpuinfo_x86 __read_mostly boot_cpu_data = { 0, 0, 0, 0, -1 };
@@ -128,7 +126,7 @@ index 9a3f006..7fe190a 100644
  bool_t __read_mostly acpi_disabled;
  bool_t __initdata acpi_force;
  static char __initdata acpi_param[10] = "";
-@@ -1436,22 +1433,6 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+@@ -1424,22 +1421,6 @@ void __init noreturn __start_xen(unsigned long mbi_p)
  
      cr4_pv32_mask = mmu_cr4_features & XEN_CR4_PV32_BITS;
  
@@ -151,37 +149,52 @@ index 9a3f006..7fe190a 100644
      if ( cpu_has_fsgsbase )
          set_in_cr4(X86_CR4_FSGSBASE);
  
+diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
+index bb3b1eccb7..9caba91b7d 100644
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -322,7 +322,7 @@ void start_secondary(void *unused)
+     spin_debug_disable();
+ 
+     get_cpu_info()->xen_cr3 = 0;
+-    get_cpu_info()->pv_cr3 = this_cpu(root_pgt) ? __pa(this_cpu(root_pgt)) : 0;
++    get_cpu_info()->pv_cr3 = 0;
+ 
+     load_system_tables();
+ 
+@@ -1047,7 +1047,7 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
+         panic("Error %d setting up PV root page table\n", rc);
+     if ( per_cpu(root_pgt, 0) )
+     {
+-        get_cpu_info()->pv_cr3 = __pa(per_cpu(root_pgt, 0));
++        get_cpu_info()->pv_cr3 = 0;
+ 
+         /*
+          * All entry points which may need to switch page tables have to start
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index 76d433a..11cda63 100644
+index e2a3fdb561..d8528e30c5 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
-@@ -177,6 +177,9 @@ static int __init parse_spec_ctrl(const char *s)
- }
- custom_param("spec-ctrl", parse_spec_ctrl);
- 
-+#define OPT_XPTI_DEFAULT  0xff
-+uint8_t __read_mostly opt_xpti = OPT_XPTI_DEFAULT;
-+
- static void __init print_details(enum ind_thunk thunk, uint64_t caps)
- {
-     bool_t use_spec_ctrl = (boot_cpu_has(X86_FEATURE_SC_MSR_PV) ||
-@@ -233,8 +236,9 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+@@ -233,8 +233,9 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
             boot_cpu_has(X86_FEATURE_SC_MSR_HVM)      ? " MSR_SPEC_CTRL" : "",
             boot_cpu_has(X86_FEATURE_SC_RSB_HVM)      ? " RSB"           : "");
  
 -    printk("XPTI: %s\n",
 -           boot_cpu_has(X86_FEATURE_NO_XPTI) ? "disabled" : "enabled");
-+    printk("XPTI: Dom0 %s, DomU (64-bit PV only) %s\n",
++    printk("  XPTI (64-bit PV only): Dom0 %s, DomU %s\n",
 +           opt_xpti & OPT_XPTI_DOM0 ? "enabled" : "disabled",
 +           opt_xpti & OPT_XPTI_DOMU ? "enabled" : "disabled");
  }
  
  /* Calculate whether Retpoline is known-safe on this CPU. */
-@@ -320,6 +324,67 @@ static bool_t __init retpoline_safe(uint64_t caps)
+@@ -320,6 +321,70 @@ static bool_t __init retpoline_safe(uint64_t caps)
      }
  }
  
-+static __init void xpti_init_default(bool force)
++#define OPT_XPTI_DEFAULT  0xff
++uint8_t __read_mostly opt_xpti = OPT_XPTI_DEFAULT;
++
++static __init void xpti_init_default(bool_t force)
 +{
 +    uint64_t caps = 0;
 +
@@ -199,17 +212,17 @@ index 76d433a..11cda63 100644
 +        opt_xpti = OPT_XPTI_DOM0 | OPT_XPTI_DOMU;
 +}
 +
-+static __init int parse_xpti(const char *s)
++static __init int parse_xpti(char *s)
 +{
-+    const char *ss;
++    char *ss;
 +    int val, rc = 0;
 +
-+    xpti_init_default(false);
++    xpti_init_default(0);
 +
 +    do {
 +        ss = strchr(s, ',');
-+        if ( !ss )
-+            ss = strchr(s, '\0');
++        if ( ss )
++            *ss = '\0';
 +
 +        switch ( parse_bool(s) )
 +        {
@@ -223,7 +236,7 @@ index 76d433a..11cda63 100644
 +
 +        default:
 +            if ( !strcmp(s, "default") )
-+                xpti_init_default(true);
++                xpti_init_default(1);
 +            else if ( (val = parse_boolean("dom0", s, ss)) >= 0 )
 +                opt_xpti = (opt_xpti & ~OPT_XPTI_DOM0) |
 +                           (val ? OPT_XPTI_DOM0 : 0);
@@ -236,7 +249,7 @@ index 76d433a..11cda63 100644
 +        }
 +
 +        s = ss + 1;
-+    } while ( *ss );
++    } while ( ss );
 +
 +    return rc;
 +}
@@ -249,7 +262,7 @@ index 76d433a..11cda63 100644
      if ( default_xen_spec_ctrl )
          __set_bit(X86_FEATURE_SC_MSR_IDLE, boot_cpu_data.x86_capability);
  
-+    xpti_init_default(false);
++    xpti_init_default(0);
 +    if ( opt_xpti == 0 )
 +        __set_bit(X86_FEATURE_NO_XPTI, boot_cpu_data.x86_capability);
 +    else
@@ -258,35 +271,22 @@ index 76d433a..11cda63 100644
      print_details(thunk, caps);
  
      /*
-diff --git a/xen/arch/x86/x86_64/asm-offsets.c b/xen/arch/x86/x86_64/asm-offsets.c
-index b601ca0..d625b22 100644
---- a/xen/arch/x86/x86_64/asm-offsets.c
-+++ b/xen/arch/x86/x86_64/asm-offsets.c
-@@ -173,6 +173,7 @@ void __dummy__(void)
-     BLANK();
- 
-     OFFSET(DOMAIN_is_32bit_pv, struct domain, arch.is_32bit_pv);
-+    OFFSET(DOMAIN_arch_pv_xpti, struct domain, arch.pv_domain.xpti);
-     BLANK();
- 
-     OFFSET(VMCB_rax, struct vmcb_struct, rax);
-diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
-index 0355c5b..d257a77 100644
---- a/xen/arch/x86/x86_64/entry.S
-+++ b/xen/arch/x86/x86_64/entry.S
-@@ -42,6 +42,10 @@ restore_all_guest:
-         /* Stash guest SPEC_CTRL value while we can read struct vcpu. */
-         mov   VCPU_arch_spec_ctrl(%rbx), %r15d
- 
-+        mov VCPU_domain(%rbx), %rax
-+        cmpb $0, DOMAIN_arch_pv_xpti(%rax)
-+        je .Lrag_keep_cr3
-+
-         /* Copy guest mappings and switch to per-CPU root page table. */
-         mov   VCPU_cr3(%rbx), %r9
-         GET_STACK_END(dx)
+diff --git a/xen/include/asm-x86/current.h b/xen/include/asm-x86/current.h
+index e4c6b0224a..7baa737c7c 100644
+--- a/xen/include/asm-x86/current.h
++++ b/xen/include/asm-x86/current.h
+@@ -45,7 +45,8 @@ struct cpu_info {
+     /*
+      * Of the two following fields the latter is being set to the CR3 value
+      * to be used on the given pCPU for loading whenever 64-bit PV guest
+-     * context is being entered. The value never changes once set.
++     * context is being entered. A value of zero indicates no setting of CR3
++     * is to be performed.
+      * The former is the value to restore when re-entering Xen, if any. IOW
+      * its value being zero means there's nothing to restore. However, its
+      * value can also be negative, indicating to the exit-to-Xen code that
 diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
-index c3a867c..cb0ea55 100644
+index af80e7d172..c495c119e1 100644
 --- a/xen/include/asm-x86/domain.h
 +++ b/xen/include/asm-x86/domain.h
 @@ -257,6 +257,9 @@ struct pv_domain
@@ -294,13 +294,26 @@ index c3a867c..cb0ea55 100644
      atomic_t nr_l4_pages;
  
 +    /* XPTI active? */
-+    bool xpti;
++    bool_t xpti;
 +
      /* map_domain_page() mapping cache. */
      struct mapcache_domain mapcache;
  
+diff --git a/xen/include/asm-x86/flushtlb.h b/xen/include/asm-x86/flushtlb.h
+index ab855f9393..9b73eb7c80 100644
+--- a/xen/include/asm-x86/flushtlb.h
++++ b/xen/include/asm-x86/flushtlb.h
+@@ -136,7 +136,7 @@ void flush_area_mask(const cpumask_t *, const void *va, unsigned int flags);
+ 
+ #define flush_root_pgtbl_domain(d)                                       \
+ {                                                                        \
+-    if ( !cpu_has_no_xpti && is_pv_domain(d) && !is_pv_32bit_domain(d) ) \
++    if ( is_pv_domain(d) && (d)->arch.pv_domain.xpti )                   \
+         flush_mask((d)->domain_dirty_cpumask, FLUSH_ROOT_PGTBL);         \
+ }
+ 
 diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
-index dd084d2..45ac200 100644
+index dd084d2d4d..45ac200f11 100644
 --- a/xen/include/asm-x86/spec_ctrl.h
 +++ b/xen/include/asm-x86/spec_ctrl.h
 @@ -33,6 +33,10 @@ extern bool_t bsp_delay_spec_ctrl;

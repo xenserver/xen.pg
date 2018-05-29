@@ -1,0 +1,110 @@
+From fb665b3c2a6905ec8f85bf94becf3f05979ec23d Mon Sep 17 00:00:00 2001
+From: Wei Liu <wei.liu2@citrix.com>
+Date: Fri, 2 Mar 2018 16:23:38 +0000
+Subject: [PATCH] x86: invpcid support
+
+Provide the functions needed for different modes. Add cpu_has_invpcid.
+
+Signed-off-by: Wei Liu <wei.liu2@citrix.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/Rules.mk b/xen/arch/x86/Rules.mk
+index 7ea1e8ebe7..19e3fc5db1 100644
+--- a/xen/arch/x86/Rules.mk
++++ b/xen/arch/x86/Rules.mk
+@@ -17,6 +17,7 @@ $(call as-insn-check,CFLAGS,CC,"rdfsbase %rax",-DHAVE_GAS_FSGSBASE)
+ $(call as-insn-check,CFLAGS,CC,".equ \"x\"$$(comma)1", \
+                      -U__OBJECT_LABEL__ -DHAVE_GAS_QUOTED_SYM \
+                      '-D__OBJECT_LABEL__=$(subst $(BASEDIR)/,,$(CURDIR))/$$@')
++$(call as-insn-check,CFLAGS,CC,"invpcid (%rax)$$(comma)%rax",-DHAVE_AS_INVPCID)
+ 
+ CFLAGS += -mno-red-zone -mno-sse -fpic
+ CFLAGS += -fno-asynchronous-unwind-tables
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index d6b995157e..04d9e28e9b 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -75,6 +75,7 @@
+ #define cpu_has_fsgsbase	boot_cpu_has(X86_FEATURE_FSGSBASE)
+ #define cpu_has_aperfmperf	boot_cpu_has(X86_FEATURE_APERFMPERF)
+ #define cpu_has_smep            boot_cpu_has(X86_FEATURE_SMEP)
++#define cpu_has_invpcid         boot_cpu_has(X86_FEATURE_INVPCID)
+ #define cpu_has_smap            boot_cpu_has(X86_FEATURE_SMAP)
+ #define cpu_has_fpu_sel         (!boot_cpu_has(X86_FEATURE_NO_FPU_SEL))
+ #define cpu_has_ffxsr           ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) \
+diff --git a/xen/include/asm-x86/invpcid.h b/xen/include/asm-x86/invpcid.h
+new file mode 100644
+index 0000000000..b46624a865
+--- /dev/null
++++ b/xen/include/asm-x86/invpcid.h
+@@ -0,0 +1,70 @@
++#ifndef _ASM_X86_INVPCID_H_
++#define _ASM_X86_INVPCID_H_
++
++#include <xen/types.h>
++
++#define INVPCID_TYPE_INDIV_ADDR      0
++#define INVPCID_TYPE_SINGLE_CTXT     1
++#define INVPCID_TYPE_ALL_INCL_GLOBAL 2
++#define INVPCID_TYPE_ALL_NON_GLOBAL  3
++
++#define INVPCID_OPCODE ".byte 0x66, 0x0f, 0x38, 0x82\n"
++#define MODRM_ECX_01   ".byte 0x01\n"
++
++static inline void invpcid(unsigned int pcid, unsigned long addr,
++                           unsigned int type)
++{
++    struct {
++        uint64_t pcid:12;
++        uint64_t reserved:52;
++        uint64_t addr;
++    } desc = { .pcid = pcid, .addr = addr };
++
++    asm volatile (
++#ifdef HAVE_AS_INVPCID
++                  "invpcid %[desc], %q[type]"
++                  : /* No output */
++                  : [desc] "m" (desc), [type] "r" (type)
++#else
++                  INVPCID_OPCODE MODRM_ECX_01
++                  : /* No output */
++                  : "a" (type), "c" (&desc)
++#endif
++                  : "memory" );
++}
++
++/* Flush all mappings for a given PCID and addr, not including globals */
++static inline void invpcid_flush_one(unsigned int pcid, unsigned long addr)
++{
++    invpcid(pcid, addr, INVPCID_TYPE_INDIV_ADDR);
++}
++
++/* Flush all mappings for a given PCID, not including globals */
++static inline void invpcid_flush_single_context(unsigned int pcid)
++{
++    invpcid(pcid, 0, INVPCID_TYPE_SINGLE_CTXT);
++}
++
++/* Flush all mappings, including globals, for all PCIDs */
++static inline void invpcid_flush_all(void)
++{
++    invpcid(0, 0, INVPCID_TYPE_ALL_INCL_GLOBAL);
++}
++
++/* Flush all mappings for all PCIDs, excluding globals */
++static inline void invpcid_flush_all_nonglobals(void)
++{
++    invpcid(0, 0, INVPCID_TYPE_ALL_NON_GLOBAL);
++}
++
++#endif	/* _ASM_X86_INVPCID_H_ */
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
