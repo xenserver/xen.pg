@@ -1,4 +1,4 @@
-From 107fb2a7582f49e5b1594ce6de9d6b20b4495ea0 Mon Sep 17 00:00:00 2001
+From 7b3c276e8d4fc9558c2418f640888d58e27df15d Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 7 Jun 2018 17:00:37 +0100
 Subject: [PATCH 2/2] x86/spec-ctrl: Mitigations for LazyFPU
@@ -15,10 +15,10 @@ This is part of XSA-xxx / CVE-2018-3665
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
 diff --git a/docs/misc/xen-command-line.markdown b/docs/misc/xen-command-line.markdown
-index 4e7a75982a..1001e43de2 100644
+index 24d1974..c61636b 100644
 --- a/docs/misc/xen-command-line.markdown
 +++ b/docs/misc/xen-command-line.markdown
-@@ -1495,7 +1495,7 @@ false disable the quirk workaround, which is also the default.
+@@ -1479,7 +1479,7 @@ false disable the quirk workaround, which is also the default.
  
  ### spec-ctrl (x86)
  > `= List of [ <bool>, xen=<bool>, {pv,hvm,msr-sc,rsb}=<bool>,
@@ -27,7 +27,7 @@ index 4e7a75982a..1001e43de2 100644
  
  Controls for speculative execution sidechannel mitigations.  By default, Xen
  will pick the most appropriate mitigations based on compiled in support,
-@@ -1545,6 +1545,11 @@ hardware, this is a global option applied at boot, and not virtualised for
+@@ -1529,6 +1529,11 @@ hardware, this is a global option applied at boot, and not virtualised for
  guest use.  On Intel hardware, the feature is virtualised for guests,
  independently of Xen's choice of setting.
  
@@ -40,7 +40,7 @@ index 4e7a75982a..1001e43de2 100644
  > `= <boolean>`
  
 diff --git a/xen/arch/x86/i387.c b/xen/arch/x86/i387.c
-index dff0863bf6..1bac6283c1 100644
+index dff0863..1bac628 100644
 --- a/xen/arch/x86/i387.c
 +++ b/xen/arch/x86/i387.c
 @@ -16,6 +16,7 @@
@@ -61,7 +61,7 @@ index dff0863bf6..1bac6283c1 100644
          return rc;
  
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index ca3026311d..6b783af201 100644
+index ca30263..b78e8b1 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
 @@ -44,6 +44,7 @@ static enum ind_thunk {
@@ -72,29 +72,12 @@ index ca3026311d..6b783af201 100644
  
  bool_t __initdata bsp_delay_spec_ctrl;
  uint8_t __read_mostly default_xen_spec_ctrl;
-@@ -117,6 +118,7 @@ static int __init parse_spec_ctrl(const char *s)
-             opt_thunk = THUNK_JMP;
-             opt_ibrs = 0;
-             opt_ibpb = 0;
-+            opt_eager_fpu = 0;
-         }
-         else if ( val > 0 )
-             rc = -EINVAL;
-@@ -170,6 +172,8 @@ static int __init parse_spec_ctrl(const char *s)
-             opt_ibpb = val;
-         else if ( (val = parse_boolean("ssbd", s, ss)) >= 0 )
-             opt_ssbd = val;
-+        else if ( (val = parse_boolean("eager-fpu", s, ss)) >= 0 )
-+            opt_eager_fpu = val;
-         else
-             rc = -EINVAL;
- 
-@@ -180,6 +184,82 @@ static int __init parse_spec_ctrl(const char *s)
+@@ -90,6 +91,82 @@ static int __init parse_bti(const char *s)
  }
- custom_param("spec-ctrl", parse_spec_ctrl);
+ custom_param("bti", parse_bti);
  
 +/* Calculate whether this CPU speculates past #NM */
-+static bool __init should_use_eager_fpu(void)
++static bool_t __init should_use_eager_fpu(void)
 +{
 +    /*
 +     * Assume all unrecognised processors are ok.  This is only known to
@@ -102,7 +85,7 @@ index ca3026311d..6b783af201 100644
 +     */
 +    if ( boot_cpu_data.x86_vendor != X86_VENDOR_INTEL ||
 +         boot_cpu_data.x86 != 6 )
-+        return false;
++        return 0;
 +
 +    switch ( boot_cpu_data.x86_model )
 +    {
@@ -135,7 +118,7 @@ index ca3026311d..6b783af201 100644
 +    case 0x67: /* Cannonlake? */
 +    case 0x8e: /* Kabylake M */
 +    case 0x9e: /* Kabylake D */
-+        return true;
++        return 1;
 +
 +        /*
 +         * Atom processors are not vulnerable.
@@ -153,25 +136,42 @@ index ca3026311d..6b783af201 100644
 +    case 0x5c: /* Goldmont */
 +    case 0x5f: /* Denverton */
 +    case 0x7a: /* Gemini Lake */
-+        return false;
++        return 0;
 +
 +        /*
-+         * Knights processors are ...
++         * Knights processors are not vulnerable.
 +         */
 +    case 0x57: /* Knights Landing */
 +    case 0x85: /* Knights Mill */
-+        /* return TODO */
++        return 0;
 +
 +    default:
 +        printk("Unrecognised CPU model %#x - assuming vulnerable to LazyFPU\n",
 +               boot_cpu_data.x86_model);
-+        return true;
++        return 1;
 +    }
 +}
 +
- static void __init print_details(enum ind_thunk thunk, uint64_t caps)
- {
-     bool_t use_spec_ctrl = (boot_cpu_has(X86_FEATURE_SC_MSR_PV) ||
+ #define OPT_XPTI_DEFAULT  0xff
+ uint8_t __read_mostly opt_xpti = OPT_XPTI_DEFAULT;
+ 
+@@ -117,6 +194,7 @@ static int __init parse_spec_ctrl(const char *s)
+             opt_thunk = THUNK_JMP;
+             opt_ibrs = 0;
+             opt_ibpb = 0;
++            opt_eager_fpu = 0;
+         }
+         else if ( val > 0 )
+             rc = -EINVAL;
+@@ -170,6 +248,8 @@ static int __init parse_spec_ctrl(const char *s)
+             opt_ibpb = val;
+         else if ( (val = parse_boolean("ssbd", s, ss)) >= 0 )
+             opt_ssbd = val;
++        else if ( (val = parse_boolean("eager-fpu", s, ss)) >= 0 )
++            opt_eager_fpu = val;
+         else
+             rc = -EINVAL;
+ 
 @@ -226,15 +306,19 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
       * Alternatives blocks for protecting against and/or virtualising
       * mitigation support for guests.
@@ -208,7 +208,7 @@ index ca3026311d..6b783af201 100644
      init_shadow_spec_ctrl_state();
  
 diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
-index 45ac200f11..d81c855f57 100644
+index 45ac200..d81c855 100644
 --- a/xen/include/asm-x86/spec_ctrl.h
 +++ b/xen/include/asm-x86/spec_ctrl.h
 @@ -28,6 +28,7 @@ void init_speculation_mitigations(void);
