@@ -1,4 +1,4 @@
-From 65af4f7ad93728f34be8b9aa7f60349fc63c5937 Mon Sep 17 00:00:00 2001
+From fd144b6d7a690108494a9d6141d10ac69ba287bf Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 7 Jun 2018 17:00:37 +0100
 Subject: [PATCH 1/2] x86: Support fully eager FPU context switching
@@ -8,9 +8,8 @@ This is controlled on a per-vcpu bases for flexibility.
 This is part of XSA-xxx / CVE-2018-3665
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
-Reviewed-by: Jan Beulich <jbeulich@suse.com>
 diff --git a/xen/arch/x86/i387.c b/xen/arch/x86/i387.c
-index 86b098d..dff0863 100644
+index 86b098d..2eb213a 100644
 --- a/xen/arch/x86/i387.c
 +++ b/xen/arch/x86/i387.c
 @@ -211,7 +211,7 @@ void vcpu_restore_fpu_eager(struct vcpu *v)
@@ -22,16 +21,23 @@ index 86b098d..dff0863 100644
          return;
  
      /* Avoid recursion */
-@@ -222,7 +222,7 @@ void vcpu_restore_fpu_eager(struct vcpu *v)
+@@ -222,9 +222,13 @@ void vcpu_restore_fpu_eager(struct vcpu *v)
       * above) we also need to restore full state, to prevent subsequently
       * saving state belonging to another vCPU.
       */
 -    if ( xstate_all(v) )
-+    if ( v->arch.fully_eager_fpu || xstate_all(v) )
++    if ( v->arch.fully_eager_fpu || (v->arch.xsave_area && xstate_all(v)) )
      {
-         fpu_xrstor(v, XSTATE_ALL);
+-        fpu_xrstor(v, XSTATE_ALL);
++        if ( cpu_has_xsave )
++            fpu_xrstor(v, XSTATE_ALL);
++        else
++            fpu_fxrstor(v);
++
          v->fpu_initialised = 1;
-@@ -248,6 +248,8 @@ void vcpu_restore_fpu_lazy(struct vcpu *v)
+         v->fpu_dirtied = 1;
+     }
+@@ -248,6 +252,8 @@ void vcpu_restore_fpu_lazy(struct vcpu *v)
      if ( v->fpu_dirtied )
          return;
  
