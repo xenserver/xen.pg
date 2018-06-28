@@ -84,7 +84,7 @@ BuildRequires: e4fsprogs-devel
 BuildRequires: lzo-devel
 
 # For xenguest
-BuildRequires: json-c-devel libempserver
+BuildRequires: json-c-devel libempserver-devel
 
 # Misc
 BuildRequires: libtool
