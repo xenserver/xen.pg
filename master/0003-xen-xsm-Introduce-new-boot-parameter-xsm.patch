@@ -1,0 +1,93 @@
+From 1694e605f396fcec2284bd22f4458dfa7cceeb2d Mon Sep 17 00:00:00 2001
+From: Xin Li <xin.li@citrix.com>
+Date: Fri, 29 Jun 2018 14:33:04 +0800
+Subject: [PATCH 3/4] xen/xsm: Introduce new boot parameter xsm
+
+Introduce new boot parameter xsm to choose which xsm module is enabled,
+and set default to dummy.
+
+Signed-off-by: Xin Li <xin.li@citrix.com>
+
+diff --git a/docs/misc/xen-command-line.markdown b/docs/misc/xen-command-line.markdown
+index f5a0db0..59866ca 100644
+--- a/docs/misc/xen-command-line.markdown
++++ b/docs/misc/xen-command-line.markdown
+@@ -737,6 +737,19 @@ hardware domain is architecture dependent.
+ Note that specifying zero as domU value means zero, while for dom0 it means
+ to use the default.
+ 
++### xsm
++> `= default | flask`
++
++> Default: `default`
++
++Specify which XSM module should be enabled.  This option is only available if
++the hypervisor was compiled with XSM support.
++
++* `default`: this is the default choice.  Basic restriction for common deployment
++  (the dummy module) will be applied.  it's also used when XSM is compiled out.
++* `flask`: this is the policy based access control.  To choose this, the
++  separated option in kconfig must also be enabled.
++
+ ### flask
+ > `= permissive | enforcing | late | disabled`
+ 
+diff --git a/xen/xsm/xsm_core.c b/xen/xsm/xsm_core.c
+index ab03ae3..154e8df 100644
+--- a/xen/xsm/xsm_core.c
++++ b/xen/xsm/xsm_core.c
+@@ -27,6 +27,32 @@
+ 
+ struct xsm_operations *xsm_ops;
+ 
++enum xsm_bootparam {
++    XSM_BOOTPARAM_DUMMY,
++    XSM_BOOTPARAM_FLASK,
++};
++
++static enum xsm_bootparam __initdata xsm_bootparam = XSM_BOOTPARAM_DUMMY;
++
++static int __init parse_xsm_param(const char *s)
++{
++    int rc = 0;
++
++    if ( !strcmp(s, "default") )
++        xsm_bootparam = XSM_BOOTPARAM_DUMMY;
++#ifdef CONFIG_XSM_FLASK
++    else if ( !strcmp(s, "flask") )
++        xsm_bootparam = XSM_BOOTPARAM_FLASK;
++#endif
++    else {
++        printk("XSM: can't parse boot parameter xsm=%s\n", s);
++        rc = -EINVAL;
++    }
++
++    return rc;
++}
++custom_param("xsm", parse_xsm_param);
++
+ static inline int verify(struct xsm_operations *ops)
+ {
+     /* verify the security_operations structure exists */
+@@ -54,7 +80,20 @@ static int __init xsm_core_init(const void *policy_buffer, size_t policy_size)
+     }
+ 
+     xsm_ops = &dummy_xsm_ops;
+-    flask_init(policy_buffer, policy_size);
++
++    switch ( xsm_bootparam )
++    {
++    case XSM_BOOTPARAM_DUMMY:
++        break;
++
++    case XSM_BOOTPARAM_FLASK:
++        flask_init(policy_buffer, policy_size);
++        break;
++
++    default:
++        printk("XSM: Invalid value for xsm= boot parameter\n");
++        break;
++    }
+ 
+     return 0;
+ }
