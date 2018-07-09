@@ -5,9 +5,6 @@
 %define with_sysv 0
 %define with_systemd 1
 
-# Pass '--without default_debug_hypervisor' to link to the production version by default
-%define default_debug_hypervisor %{?_without_default_debug_hypervisor:0}%{?!_without_default_debug_hypervisor:1}
-
 %define COMMON_OPTIONS DESTDIR=%{buildroot} %{?_smp_mflags}
 
 # For 32bit dom0 userspace, we need to cross compile a 64bit Xen
@@ -28,7 +25,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.7.5
-Release: 6.0.0
+Release: 6.0.4
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -727,13 +724,8 @@ ln -sf %{name}-%{version}-%{release}.gz /boot/xen-release.gz
 
 # Point /boot/xen.gz appropriately
 if [ ! -e /boot/xen.gz ]; then
-%if %{default_debug_hypervisor}
     # Use a debug hypervisor by default
     ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen.gz
-%else
-    # Use a production hypervisor by default
-    ln -sf %{name}-%{version}-%{release}.gz /boot/xen.gz
-%endif
 else
     # Else look at the current link, and whether it is debug
     path="`readlink -f /boot/xen.gz`"
