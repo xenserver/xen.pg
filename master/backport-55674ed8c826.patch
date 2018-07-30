@@ -1,0 +1,76 @@
+From 55674ed8c82665dff5d32e663360b870f367090a Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 28 Jun 2018 11:29:21 +0200
+Subject: [PATCH] x86/EFI: fix FPU state handling around runtime calls
+
+There are two issues.  First, the nonlazy xstates were never restored
+after returning from the runtime call.
+
+Secondly, with the fully_eager_fpu mitigation for XSA-267 / LazyFPU, the
+unilateral stts() is no longer correct, and hits an assertion later when
+a lazy state restore tries to occur for a fully eager vcpu.
+
+Fix both of these issues by calling vcpu_restore_fpu_eager().  As EFI
+runtime services can be used in the idle context, the idle assertion
+needs to move until after the fully_eager_fpu check.
+
+Introduce a "curr" local variable and replace other uses of "current"
+at the same time.
+
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Tested-by: Juergen Gross <jgross@suse.com>
+master commit: 437211cb696515ee5bd5dae0ab72866c9f382a33
+master date: 2018-06-21 11:35:46 +0200
+diff --git a/xen/arch/x86/i387.c b/xen/arch/x86/i387.c
+index 279878f..992d4d2 100644
+--- a/xen/arch/x86/i387.c
++++ b/xen/arch/x86/i387.c
+@@ -209,12 +209,12 @@ static inline void fpu_fxsave(struct vcpu *v)
+ /* Restore FPU state whenever VCPU is schduled in. */
+ void vcpu_restore_fpu_eager(struct vcpu *v)
+ {
+-    ASSERT(!is_idle_vcpu(v));
+-    
+     /* Restore nonlazy extended state (i.e. parts not tracked by CR0.TS). */
+     if ( !v->arch.fully_eager_fpu && !v->arch.nonlazy_xstate_used )
+         return;
+ 
++    ASSERT(!is_idle_vcpu(v));
++
+     /* Avoid recursion */
+     clts();
+ 
+diff --git a/xen/common/efi/runtime.c b/xen/common/efi/runtime.c
+index 9ec1e1c..ba54f10 100644
+--- a/xen/common/efi/runtime.c
++++ b/xen/common/efi/runtime.c
+@@ -114,14 +114,16 @@ struct efi_rs_state efi_rs_enter(void)
+ 
+ void efi_rs_leave(struct efi_rs_state *state)
+ {
++    struct vcpu *curr = current;
++
+     if ( !state->cr3 )
+         return;
+     write_cr3(state->cr3);
+-    if ( is_pv_vcpu(current) && !is_idle_vcpu(current) )
++    if ( is_pv_vcpu(curr) && !is_idle_vcpu(curr) )
+     {
+         struct desc_ptr gdt_desc = {
+             .limit = LAST_RESERVED_GDT_BYTE,
+-            .base  = GDT_VIRT_START(current)
++            .base  = GDT_VIRT_START(curr)
+         };
+ 
+         asm volatile ( "lgdt %0" : : "m" (gdt_desc) );
+@@ -129,7 +131,7 @@ void efi_rs_leave(struct efi_rs_state *state)
+     irq_exit();
+     efi_rs_on_cpu = NR_CPUS;
+     spin_unlock(&efi_rs_lock);
+-    stts();
++    vcpu_restore_fpu_eager(curr);
+ }
+ 
+ bool_t efi_rs_using_pgtables(void)
