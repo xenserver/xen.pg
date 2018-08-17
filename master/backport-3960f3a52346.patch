@@ -1,0 +1,89 @@
+From 3960f3a52346348e6b0306f65d19375612bd35b9 Mon Sep 17 00:00:00 2001
+From: Marcello Seri <marcello.seri@citrix.com>
+Date: Thu, 31 May 2018 14:05:37 +0100
+Subject: [PATCH] ocaml/xenstored: reduce use of unsafe conversions
+
+The rationalisation of the Xs_ring interface in the xb library
+allows to further reduce the unsafe calls withouth introducing
+copies. This patch also contains some further code cleanups.
+
+Signed-off-by: Marcello Seri <marcello.seri@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+Tested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-acked-by: Juergen Gross <jgross@suse.com>
+diff --git a/tools/ocaml/xenstored/logging.ml b/tools/ocaml/xenstored/logging.ml
+index 9b37b71f64..92b16946c9 100644
+--- a/tools/ocaml/xenstored/logging.ml
++++ b/tools/ocaml/xenstored/logging.ml
+@@ -253,13 +253,11 @@ let string_of_access_type = function
+ 	*)
+ 
+ let sanitize_data data =
+-	let data = Bytes.copy data in
+-	for i = 0 to Bytes.length data - 1
+-	do
+-		if Bytes.get data i = '\000' then
+-			Bytes.set data i ' '
+-	done;
+-	String.escaped (Bytes.unsafe_to_string data)
++	let data = String.init
++		(String.length data)
++		(fun i -> let c = data.[i] in if c = '\000' then ' ' else c)
++	in
++	String.escaped data
+ 
+ let activate_access_log = ref true
+ let access_log_destination = ref (File "/var/log/xenstored-access.log")
+@@ -292,9 +290,7 @@ let access_logging ~con ~tid ?(data="") ~level access_type =
+ 				let date = string_of_date() in
+ 				let tid = string_of_tid ~con tid in
+ 				let access_type = string_of_access_type access_type in
+-				(* we can use unsafe_of_string here as the sanitize_data function
+-				   immediately makes a copy of the data and operates on that. *)
+-				let data = sanitize_data (Bytes.unsafe_of_string data) in
++				let data = sanitize_data data in
+ 				let prefix = prefix !access_log_destination date in
+ 				let msg = Printf.sprintf "%s %s %s %s" prefix tid access_type data in
+ 				logger.write ~level msg)
+diff --git a/tools/ocaml/xenstored/stdext.ml b/tools/ocaml/xenstored/stdext.ml
+index 869fec36f2..305a330aa5 100644
+--- a/tools/ocaml/xenstored/stdext.ml
++++ b/tools/ocaml/xenstored/stdext.ml
+@@ -122,7 +122,7 @@ let pidfile_write filename =
+ 		let pid = Unix.getpid () in
+ 		let buf = string_of_int pid ^ "\n" in
+ 		let len = String.length buf in
+-		if Unix.write fd (Bytes.unsafe_of_string buf) 0 len <> len
++		if Unix.write_substring fd buf 0 len <> len
+ 		then failwith "pidfile_write failed";
+ 	)
+ 	(fun () -> Unix.close fd)
+diff --git a/tools/ocaml/xenstored/utils.ml b/tools/ocaml/xenstored/utils.ml
+index 9bd7a971da..da2791de61 100644
+--- a/tools/ocaml/xenstored/utils.ml
++++ b/tools/ocaml/xenstored/utils.ml
+@@ -46,12 +46,11 @@ let get_hierarchy path =
+ let hexify s =
+ 	let hexseq_of_char c = sprintf "%02x" (Char.code c) in
+ 	let hs = Bytes.create (String.length s * 2) in
+-	for i = 0 to String.length s - 1
+-	do
+-		let seq = hexseq_of_char s.[i] in
++	String.iteri (fun i c ->
++		let seq = hexseq_of_char c in
+ 		Bytes.set hs (i * 2) seq.[0];
+ 		Bytes.set hs (i * 2 + 1) seq.[1];
+-	done;
++	) s;
+ 	Bytes.unsafe_to_string hs
+ 
+ let unhexify hs =
+@@ -91,7 +90,7 @@ let create_unix_socket name =
+ 
+ let read_file_single_integer filename =
+ 	let fd = Unix.openfile filename [ Unix.O_RDONLY ] 0o640 in
+-	let buf = Bytes.make 20 (char_of_int 0) in
++	let buf = Bytes.make 20 '\000' in
+ 	let sz = Unix.read fd buf 0 20 in
+ 	Unix.close fd;
+ 	int_of_string (Bytes.sub_string buf 0 sz)
