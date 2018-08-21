@@ -5,6 +5,9 @@
 %define with_sysv 0
 %define with_systemd 1
 
+# Pass '--without default_debug_hypervisor' to link to the production version by default
+%define default_debug_hypervisor %{?_without_default_debug_hypervisor:0}%{?!_without_default_debug_hypervisor:1}
+
 %define COMMON_OPTIONS DESTDIR=%{buildroot} %{?_smp_mflags}
 
 # For 32bit dom0 userspace, we need to cross compile a 64bit Xen
@@ -25,7 +28,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.7.6
-Release: 6.0.4
+Release: 6.0.10
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -105,7 +108,7 @@ This package contains the Xen Project Hypervisor with selected patches provided 
 
 Citrix, the Citrix logo, Xen, XenServer, and certain other marks appearing herein are proprietary trademarks of Citrix Systems, Inc., and are registered in the U.S. and other countries. You may not redistribute this package, nor display or otherwise use any Citrix trademarks or any marks that incorporate Citrix trademarks without the express prior written authorization of Citrix. Nothing herein shall restrict your rights, if any, in the software contained within this package under an applicable open source license.
 
-Portions of this package are © 2017 Citrix Systems, Inc. For other copyright and licensing information see the relevant source RPM.
+Portions of this package are © 2018 Citrix Systems, Inc. For other copyright and licensing information see the relevant source RPM.
 
 %package hypervisor-debuginfo
 Summary: The Xen Hypervisor debug information
@@ -724,8 +727,13 @@ ln -sf %{name}-%{version}-%{release}.gz /boot/xen-release.gz
 
 # Point /boot/xen.gz appropriately
 if [ ! -e /boot/xen.gz ]; then
+%if %{default_debug_hypervisor}
     # Use a debug hypervisor by default
     ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen.gz
+%else
+    # Use a production hypervisor by default
+    ln -sf %{name}-%{version}-%{release}.gz /boot/xen.gz
+%endif
 else
     # Else look at the current link, and whether it is debug
     path="`readlink -f /boot/xen.gz`"
@@ -742,6 +750,18 @@ fi
 
 mkdir -p %{_rundir}/reboot-required.d/%{name}
 touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
+
+# Update grub.cfg to avoid Dom0 vCPU oversubscription
+
+%triggerin hypervisor -- grub
+if [ -e /boot/grub/grub.cfg ]; then
+    sed -i 's/dom0_max_vcpus=\([0-9a-fA-FxX]\+\)\( \|$\)/dom0_max_vcpus=1-\1\2/g' /boot/grub/grub.cfg
+fi
+
+%triggerin hypervisor -- grub-efi
+if [ -e /boot/efi/EFI/xenserver/grub.cfg ]; then
+    sed -i 's/dom0_max_vcpus=\([0-9a-fA-FxX]\+\)\( \|$\)/dom0_max_vcpus=1-\1\2/g' /boot/efi/EFI/xenserver/grub.cfg
+fi
 
 %if %with_systemd
 %post dom0-tools
