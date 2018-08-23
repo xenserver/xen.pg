@@ -1,0 +1,60 @@
+From 7626edeaca972e3e823535dcc44338f6b2f0b21f Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Thu, 16 Aug 2018 09:27:30 +0200
+Subject: [PATCH] x86/hvm/emulate: make sure rep I/O emulation does not cross
+ GFN boundaries
+
+When emulating a rep I/O operation it is possible that the ioreq will
+describe a single operation that spans multiple GFNs. This is fine as long
+as all those GFNs fall within an MMIO region covered by a single device
+model, but unfortunately the higher levels of the emulation code do not
+guarantee that. This is something that should almost certainly be fixed,
+but in the meantime this patch makes sure that MMIO is truncated at GFN
+boundaries and hence the appropriate device model is re-evaluated for each
+target GFN.
+
+NOTE: This patch does not deal with the case of a single MMIO operation
+      spanning a GFN boundary. That is more complex to deal with and is
+      deferred to a subsequent patch.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+
+Convert calculations to be 32-bit only.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+---
+ xen/arch/x86/hvm/emulate.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 8385c62..20d1d5b 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -184,6 +184,24 @@ static int hvmemul_do_io(
+         hvmtrace_io_assist(&p);
+     }
+ 
++    /*
++     * Make sure that we truncate rep MMIO at any GFN boundary. This is
++     * necessary to ensure that the correct device model is targetted
++     * or that we correctly handle a rep op spanning MMIO and RAM.
++     */
++    if ( unlikely(p.count > 1) && p.type == IOREQ_TYPE_COPY )
++    {
++        unsigned int off = p.addr & ~PAGE_MASK;
++        unsigned int tail = PAGE_SIZE - off;
++
++        if ( tail < p.size ) /* single rep spans GFN */
++            p.count = 1;
++        else
++            p.count = min(p.count,
++                          (p.df ? (off + p.size) : tail) / p.size);
++    }
++    ASSERT(p.count);
++
+     vio->io_req = p;
+ 
+     rc = hvm_io_intercept(&p);
+-- 
+2.7.4
+
