@@ -1,8 +1,8 @@
-From 64c5b3f3800b02c2d4d774c4e508cf2fe078aa5d Mon Sep 17 00:00:00 2001
+From 87dba8038bcb401ffc23ec226860b7b3ec2c3943 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Mon, 7 May 2018 11:57:00 +0100
-Subject: [PATCH] x86/vmx: Factor locate_msr_entry() out of
- vmx_find_msr() and vmx_add_msr()
+Subject: [PATCH] x86/vmx: Factor locate_msr_entry() out of vmx_find_msr() and
+ vmx_add_msr()
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -20,14 +20,13 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
 Acked-by: Kevin Tian <kevin.tian@intel.com>
 (cherry picked from commit 4d94828cf11104256dccea1fa7762f00575dfaa0)
 diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
-index 5ea9fb8..a68f4d1 100644
+index e924685..8020e10 100644
 --- a/xen/arch/x86/hvm/vmx/vmcs.c
 +++ b/xen/arch/x86/hvm/vmx/vmcs.c
-@@ -1308,24 +1308,36 @@ static int construct_vmcs(struct vcpu *v)
+@@ -1332,12 +1332,37 @@ static int construct_vmcs(struct vcpu *v)
      return rc;
  }
  
--static int vmx_msr_entry_key_cmp(const void *key, const void *elt)
 +/*
 + * Search an MSR list looking for an MSR entry, or the slot in which it should
 + * live (to keep the data sorted) if an entry is not found.
@@ -37,14 +36,7 @@ index 5ea9fb8..a68f4d1 100644
 + */
 +static struct vmx_msr_entry *locate_msr_entry(
 +    struct vmx_msr_entry *start, struct vmx_msr_entry *end, uint32_t msr)
- {
--    const u32 *msr = key;
--    const struct vmx_msr_entry *entry = elt;
--
--    if ( *msr > entry->index )
--        return 1;
--    if ( *msr < entry->index )
--        return -1;
++{
 +    while ( start < end )
 +    {
 +        struct vmx_msr_entry *mid = start + (end - start) / 2;
@@ -56,33 +48,39 @@ index 5ea9fb8..a68f4d1 100644
 +        else
 +            return mid;
 +    }
- 
--    return 0;
++
 +    return start;
- }
- 
++}
++
  struct vmx_msr_entry *vmx_find_msr(uint32_t msr, enum vmx_msr_list_type type)
  {
      struct vcpu *curr = current;
      struct arch_vmx_struct *vmx = &curr->arch.hvm_vmx;
 -    struct vmx_msr_entry *start = NULL;
+-    unsigned int i, total;
 +    struct vmx_msr_entry *start = NULL, *ent, *end;
-     unsigned int total;
++    unsigned int total;
  
      switch ( type )
-@@ -1347,7 +1359,10 @@ struct vmx_msr_entry *vmx_find_msr(uint32_t msr, enum vmx_msr_list_type type)
+     {
+@@ -1358,13 +1383,10 @@ struct vmx_msr_entry *vmx_find_msr(uint32_t msr, enum vmx_msr_list_type type)
      if ( !start )
          return NULL;
  
--    return bsearch(&msr, start, total, sizeof(*start), vmx_msr_entry_key_cmp);
+-    for ( i = 0; i < total; i++ )
+-    {
+-        if ( start[i].index == msr )
+-            return &start[i];
+-    }
 +    end = start + total;
 +    ent = locate_msr_entry(start, end, msr);
-+
+ 
+-    return NULL;
 +    return ((ent < end) && (ent->index == msr)) ? ent : NULL;
  }
  
  int vmx_add_msr(uint32_t msr, enum vmx_msr_list_type type)
-@@ -1399,10 +1414,10 @@ int vmx_add_msr(uint32_t msr, enum vmx_msr_list_type type)
+@@ -1416,10 +1438,10 @@ int vmx_add_msr(uint32_t msr, enum vmx_msr_list_type type)
  
      start = *ptr;
      end   = start + total;

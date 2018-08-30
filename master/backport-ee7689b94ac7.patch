@@ -20,10 +20,10 @@ Acked-by: Kevin Tian <kevin.tian@intel.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
 (cherry picked from commit ee7689b94ac7094b975ab4a023cfeae209da0a36)
 diff --git a/xen/arch/x86/cpu/vpmu_intel.c b/xen/arch/x86/cpu/vpmu_intel.c
-index fdc9c83..aa958a9 100644
+index 48e1a16..d8c003a 100644
 --- a/xen/arch/x86/cpu/vpmu_intel.c
 +++ b/xen/arch/x86/cpu/vpmu_intel.c
-@@ -458,13 +458,11 @@ static int core2_vpmu_alloc_resource(struct vcpu *v)
+@@ -454,13 +454,11 @@ static int core2_vpmu_alloc_resource(struct vcpu *v)
  
      if ( has_hvm_container_vcpu(v) )
      {
@@ -40,10 +40,21 @@ index fdc9c83..aa958a9 100644
  
      core2_vpmu_cxt = xzalloc_bytes(sizeof(*core2_vpmu_cxt) +
 diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
-index c0edef5..e2c4b3f 100644
+index b85214b..22f2588 100644
 --- a/xen/arch/x86/hvm/vmx/vmcs.c
 +++ b/xen/arch/x86/hvm/vmx/vmcs.c
-@@ -1367,7 +1367,8 @@ struct vmx_msr_entry *vmx_find_msr(const struct vcpu *v, uint32_t msr,
+@@ -1304,8 +1304,8 @@ static int construct_vmcs(struct vcpu *v)
+     }
+ 
+     if ( opt_l1d_flush && paging_mode_hap(d) )
+-        rc = vmx_add_msr(v, MSR_FLUSH_CMD, VMX_MSR_GUEST_LOADONLY)
+-            ?: vmx_write_guest_loadonly_msr(v, MSR_FLUSH_CMD, FLUSH_CMD_L1D);
++        rc = vmx_add_msr(v, MSR_FLUSH_CMD, FLUSH_CMD_L1D,
++                         VMX_MSR_GUEST_LOADONLY);
+ 
+  out:
+     vmx_vmcs_exit(v);
+@@ -1379,7 +1379,8 @@ struct vmx_msr_entry *vmx_find_msr(const struct vcpu *v, uint32_t msr,
      return ((ent < end) && (ent->index == msr)) ? ent : NULL;
  }
  
@@ -53,8 +64,8 @@ index c0edef5..e2c4b3f 100644
  {
      struct arch_vmx_struct *vmx = &v->arch.hvm_vmx;
      struct vmx_msr_entry **ptr, *start = NULL, *ent, *end;
-@@ -1426,11 +1427,9 @@ int vmx_add_msr(struct vcpu *v, uint32_t msr, enum vmx_msr_list_type type)
-     ent   = locate_msr_entry(start, end, msr);
+@@ -1450,11 +1451,9 @@ int vmx_add_msr(struct vcpu *v, uint32_t msr, enum vmx_msr_list_type type)
+     ent   = locate_msr_entry(start + substart, start + subend, msr);
  
      if ( (ent < end) && (ent->index == msr) )
 -    {
@@ -67,7 +78,7 @@ index c0edef5..e2c4b3f 100644
      if ( total == (PAGE_SIZE / sizeof(*ent)) )
      {
          rc = -ENOSPC;
-@@ -1445,17 +1444,18 @@ int vmx_add_msr(struct vcpu *v, uint32_t msr, enum vmx_msr_list_type type)
+@@ -1469,7 +1468,6 @@ int vmx_add_msr(struct vcpu *v, uint32_t msr, enum vmx_msr_list_type type)
      switch ( type )
      {
      case VMX_MSR_HOST:
@@ -75,24 +86,27 @@ index c0edef5..e2c4b3f 100644
          __vmwrite(VM_EXIT_MSR_LOAD_COUNT, ++vmx->host_msr_count);
          break;
  
-     case VMX_MSR_GUEST:
+@@ -1478,11 +1476,14 @@ int vmx_add_msr(struct vcpu *v, uint32_t msr, enum vmx_msr_list_type type)
+ 
+         /* Fallthrough */
+     case VMX_MSR_GUEST_LOADONLY:
 -        ent->data = 0;
-         __vmwrite(VM_EXIT_MSR_STORE_COUNT, ++vmx->msr_count);
-         __vmwrite(VM_ENTRY_MSR_LOAD_COUNT, vmx->msr_count);
+         __vmwrite(VM_ENTRY_MSR_LOAD_COUNT, ++vmx->msr_load_count);
          break;
      }
  
 +    /* Set the msr's value. */
 + found:
 +    ent->data = val;
++
      rc = 0;
  
   out:
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index 1431df4..76542ab 100644
+index 918ab09..7ad22dd 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -3100,7 +3100,7 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
+@@ -3119,7 +3119,7 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
  
                  for ( i = 0; i < lbr->count; i++ )
                  {
@@ -102,21 +116,24 @@ index 1431df4..76542ab 100644
                      if ( unlikely(rc) )
                      {
 diff --git a/xen/include/asm-x86/hvm/vmx/vmcs.h b/xen/include/asm-x86/hvm/vmx/vmcs.h
-index 3abd8bd..5da01c5 100644
+index dd45f6e..73e14a8 100644
 --- a/xen/include/asm-x86/hvm/vmx/vmcs.h
 +++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
-@@ -611,16 +611,24 @@ enum vmx_msr_list_type {
-     VMX_MSR_GUEST,          /* MSRs saved on VMExit, loaded on VMEntry. */
+@@ -614,24 +614,24 @@ enum vmx_msr_list_type {
  };
  
--int vmx_add_msr(struct vcpu *v, uint32_t msr, enum vmx_msr_list_type type);
-+/**
+ /**
+- * Add an MSR to an MSR list.  No-op if the MSR already exists.
+- *
+- * It is undefined behaviour to try and insert the same MSR into both the
+- * GUEST and GUEST_LOADONLY list.
 + * Add an MSR to an MSR list (inserting space for the entry if necessary), and
 + * set the MSRs value.
-+ *
-+ * May fail if unable to allocate memory for the list, or the total number of
-+ * entries exceeds the memory allocated.
-+ */
+  *
+  * May fail if unable to allocate memory for the list, or the total number of
+  * entries exceeds the memory allocated.
+  */
+-int vmx_add_msr(struct vcpu *v, uint32_t msr, enum vmx_msr_list_type type);
 +int vmx_add_msr(struct vcpu *v, uint32_t msr, uint64_t val,
 +                enum vmx_msr_list_type type);
  
@@ -126,7 +143,7 @@ index 3abd8bd..5da01c5 100644
 -    return vmx_add_msr(v, msr, VMX_MSR_GUEST);
 +    return vmx_add_msr(v, msr, val, VMX_MSR_GUEST);
  }
--
+ 
 -static inline int vmx_add_host_load_msr(struct vcpu *v, uint32_t msr)
 +static inline int vmx_add_host_load_msr(struct vcpu *v, uint32_t msr,
 +                                        uint64_t val)

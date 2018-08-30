@@ -1,4 +1,4 @@
-From dc7674d2a350285900f85fd2a0d820fb650081e9 Mon Sep 17 00:00:00 2001
+From f05a33e327b87b30a14b6926e232c712ee7c4a1d Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Fri, 13 Apr 2018 15:34:01 +0000
 Subject: [PATCH] x86/msr: Virtualise MSR_FLUSH_CMD for guests
@@ -16,11 +16,12 @@ This is part of XSA-273 / CVE-2018-3646.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit fd9823faf9df057a69a9a53c2e100691d3f4267c)
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index a357fbf..8923f5f 100644
+index 5ba00b2..522430b 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
-@@ -3864,6 +3864,7 @@ int hvm_msr_read_intercept(unsigned int msr, uint64_t *msr_content)
+@@ -3795,6 +3795,7 @@ int hvm_msr_read_intercept(unsigned int msr, uint64_t *msr_content)
      case MSR_AMD_PATCHLOADER:
      case MSR_IA32_UCODE_WRITE:
      case MSR_PRED_CMD:
@@ -28,7 +29,7 @@ index a357fbf..8923f5f 100644
          /* Write-only */
          goto gp_fault;
  
-@@ -4090,6 +4091,17 @@ int hvm_msr_write_intercept(unsigned int msr, uint64_t msr_content,
+@@ -4012,6 +4013,17 @@ int hvm_msr_write_intercept(unsigned int msr, uint64_t msr_content,
          wrmsrl(MSR_PRED_CMD, msr_content);
          break;
  
@@ -47,45 +48,38 @@ index a357fbf..8923f5f 100644
          /* Read-only */
          goto gp_fault;
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index 86d6e76..a489b7d 100644
+index 85502c0..a9e87b5 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
 @@ -574,6 +574,12 @@ static void vmx_cpuid_policy_changed(struct vcpu *v)
-         vmx_clear_msr_intercept(v, MSR_PRED_CMD, VMX_MSR_RW);
+         vmx_disable_intercept_for_msr(v, MSR_PRED_CMD, MSR_TYPE_R | MSR_TYPE_W);
      else
-         vmx_set_msr_intercept(v, MSR_PRED_CMD, VMX_MSR_RW);
+         vmx_enable_intercept_for_msr(v, MSR_PRED_CMD, MSR_TYPE_R | MSR_TYPE_W);
 +
 +    /* MSR_FLUSH_CMD is safe to pass through if the guest knows about it. */
 +    if ( _7d0 & cpufeat_mask(X86_FEATURE_L1D_FLUSH) )
-+        vmx_clear_msr_intercept(v, MSR_FLUSH_CMD, VMX_MSR_RW);
++        vmx_disable_intercept_for_msr(v, MSR_FLUSH_CMD, MSR_TYPE_R | MSR_TYPE_W);
 +    else
-+        vmx_set_msr_intercept(v, MSR_FLUSH_CMD, VMX_MSR_RW);
++        vmx_enable_intercept_for_msr(v, MSR_FLUSH_CMD, MSR_TYPE_R | MSR_TYPE_W);
  }
  
  static int vmx_guest_x86_mode(struct vcpu *v)
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 90200cf..7506edf 100644
+index d528be9..139737b 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
-@@ -2962,6 +2962,17 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -2924,6 +2924,10 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
              wrmsrl(MSR_PRED_CMD, msr_content);
              break;
  
 +        case MSR_FLUSH_CMD:
-+            _domain_cpuid(currd, 7, 0, &dummy, &dummy, &dummy, &edx);
-+            if ( !(edx & cpufeat_mask(X86_FEATURE_L1D_FLUSH)) )
-+                goto fail; /* MSR available? */
-+
-+            if ( msr_content & ~FLUSH_CMD_L1D )
-+                goto fail; /* Rsvd bit set? */
-+
-+            wrmsrl(MSR_FLUSH_CMD, msr_content);
++            /* Not available to PV guests. */
 +            break;
 +
          case MSR_P6_PERFCTR(0)...MSR_P6_PERFCTR(7):
          case MSR_P6_EVNTSEL(0)...MSR_P6_EVNTSEL(3):
          case MSR_CORE_PERF_FIXED_CTR0...MSR_CORE_PERF_FIXED_CTR2:
-@@ -3099,6 +3110,7 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -3055,6 +3059,7 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
              break;
  
          case MSR_PRED_CMD:
@@ -94,11 +88,11 @@ index 90200cf..7506edf 100644
              goto fail;
  
 diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
-index 6e0cfdb..d0f82c1 100644
+index cc0c4f3..f5fb483 100644
 --- a/xen/include/public/arch-x86/cpufeatureset.h
 +++ b/xen/include/public/arch-x86/cpufeatureset.h
-@@ -241,7 +241,7 @@ XEN_CPUFEATURE(AVX512_4VNNIW, 9*32+ 2) /*A AVX512 Neural Network Instructions */
- XEN_CPUFEATURE(AVX512_4FMAPS, 9*32+ 3) /*A AVX512 Multiply Accumulation Single Precision */
+@@ -229,7 +229,7 @@ XEN_CPUFEATURE(IBPB,          8*32+12) /*A  IBPB support only (no IBRS, used by
+ /* Intel-defined CPU features, CPUID level 0x00000007:0.edx, word 9 */
  XEN_CPUFEATURE(IBRSB,         9*32+26) /*A  IBRS and IBPB support (used by Intel) */
  XEN_CPUFEATURE(STIBP,         9*32+27) /*A! STIBP */
 -XEN_CPUFEATURE(L1D_FLUSH,     9*32+28) /*   MSR_FLUSH_CMD and L1D flush. */

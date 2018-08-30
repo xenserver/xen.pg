@@ -1,11 +1,11 @@
-From 900faff7d57d8960c3b135bfba6ce6bf7560a3b8 Mon Sep 17 00:00:00 2001
+From 0aa4696e13be72a5aadd2f6b347ece1af38d8c67 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Tue, 29 May 2018 18:44:16 +0100
 Subject: [PATCH] x86/spec-ctrl: Introduce an option to control L1D_FLUSH for
- HVM guests
+ HVM HAP guests
 
 This mitigation requires up-to-date microcode, and is enabled by default on
-affected hardware if available.
+affected hardware if available, and is used for HVM guests
 
 The default for SMT/Hyperthreading is far more complicated to reason about,
 not least because we don't know if the user is going to want to run any HVM
@@ -17,11 +17,12 @@ This is part of XSA-273 / CVE-2018-3620.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 3bd36952dab60290f33d6791070b57920e10754b)
 diff --git a/docs/misc/xen-command-line.markdown b/docs/misc/xen-command-line.markdown
-index d378627..2b35ed2 100644
+index d24ceb3..20d110e 100644
 --- a/docs/misc/xen-command-line.markdown
 +++ b/docs/misc/xen-command-line.markdown
-@@ -1525,7 +1525,8 @@ false disable the quirk workaround, which is also the default.
+@@ -1515,7 +1515,8 @@ false disable the quirk workaround, which is also the default.
  
  ### spec-ctrl (x86)
  > `= List of [ <bool>, xen=<bool>, {pv,hvm,msr-sc,rsb}=<bool>,
@@ -31,7 +32,7 @@ index d378627..2b35ed2 100644
  
  Controls for speculative execution sidechannel mitigations.  By default, Xen
  will pick the most appropriate mitigations based on compiled in support,
-@@ -1580,6 +1581,12 @@ from using fully eager FPU context switches.  This is currently implemented as
+@@ -1570,6 +1571,12 @@ from using fully eager FPU context switches.  This is currently implemented as
  a global control.  By default, Xen will choose to use fully eager context
  switches on hardware believed to speculate past #NM exceptions.
  
@@ -45,30 +46,30 @@ index d378627..2b35ed2 100644
  > `= <boolean>`
  
 diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
-index 8e8c887..f6c546e 100644
+index 33bcf6b..45bc59c 100644
 --- a/xen/arch/x86/hvm/vmx/vmcs.c
 +++ b/xen/arch/x86/hvm/vmx/vmcs.c
-@@ -39,6 +39,7 @@
+@@ -38,6 +38,7 @@
+ #include <asm/hvm/vmx/vmcs.h>
  #include <asm/flushtlb.h>
- #include <asm/monitor.h>
  #include <asm/shadow.h>
 +#include <asm/spec_ctrl.h>
  #include <asm/tboot.h>
  #include <asm/apic.h>
  
-@@ -1302,6 +1303,10 @@ static int construct_vmcs(struct vcpu *v)
+@@ -1326,6 +1327,10 @@ static int construct_vmcs(struct vcpu *v)
          vmx_vlapic_msr_changed(v);
      }
  
 +    if ( opt_l1d_flush && paging_mode_hap(d) )
-+        rc = vmx_add_msr(v, MSR_FLUSH_CMD, FLUSH_CMD_L1D,
-+                         VMX_MSR_GUEST_LOADONLY);
++        rc = vmx_add_msr(v, MSR_FLUSH_CMD, VMX_MSR_GUEST_LOADONLY)
++            ?: vmx_write_guest_loadonly_msr(v, MSR_FLUSH_CMD, FLUSH_CMD_L1D);
 +
   out:
      vmx_vmcs_exit(v);
  
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index 116a68d..1a1c9b6 100644
+index bbc74e7..97ae219 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
 @@ -23,6 +23,7 @@
@@ -104,7 +105,7 @@ index 116a68d..1a1c9b6 100644
          else
              rc = -EINVAL;
  
-@@ -274,7 +279,7 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+@@ -273,7 +278,7 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
                 "\n");
  
      /* Settings for Xen's protection, irrespective of guests. */
@@ -113,7 +114,7 @@ index 116a68d..1a1c9b6 100644
             thunk == THUNK_NONE      ? "N/A" :
             thunk == THUNK_RETPOLINE ? "RETPOLINE" :
             thunk == THUNK_LFENCE    ? "LFENCE" :
-@@ -283,7 +288,8 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+@@ -282,7 +287,8 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
             (default_xen_spec_ctrl & SPEC_CTRL_IBRS)  ? "IBRS+" :  "IBRS-",
             !boot_cpu_has(X86_FEATURE_SSBD)           ? "" :
             (default_xen_spec_ctrl & SPEC_CTRL_SSBD)  ? " SSBD+" : " SSBD-",
@@ -123,7 +124,7 @@ index 116a68d..1a1c9b6 100644
  
      /* L1TF diagnostics, printed if vulnerable or PV shadowing is in use. */
      if ( cpu_has_bug_l1tf || opt_pv_l1tf )
-@@ -853,6 +859,36 @@ void __init init_speculation_mitigations(void)
+@@ -851,6 +857,36 @@ void __init init_speculation_mitigations(void)
              opt_pv_l1tf = OPT_PV_L1TF_DOMU;
      }
  
@@ -150,16 +151,40 @@ index 116a68d..1a1c9b6 100644
 +    if ( opt_smt == -1 && cpu_has_bug_l1tf &&
 +         boot_cpu_data.x86_num_siblings > 1 )
 +    {
-+        printk("**********************************************\n");
++        printk("******************************************************\n");
 +        printk("Booted on L1TF-vulnerable hardware with SMT/Hyperthreading\n");
 +        printk("enabled.  Please assess your configuration and choose an\n");
 +        printk("explicit 'smt=<bool>' setting.  See XSA-273.\n");
-+        printk("**********************************************\n");
++        printk("******************************************************\n");
 +    }
 +
      print_details(thunk, caps);
  
      /*
+diff --git a/xen/include/asm-x86/hvm/vmx/vmcs.h b/xen/include/asm-x86/hvm/vmx/vmcs.h
+index f85957c..8bbcff9 100644
+--- a/xen/include/asm-x86/hvm/vmx/vmcs.h
++++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
+@@ -644,6 +644,19 @@ static inline int vmx_write_guest_msr(struct vcpu *v, uint32_t msr,
+     return 0;
+ }
+ 
++static inline int vmx_write_guest_loadonly_msr(struct vcpu *v, uint32_t msr,
++                                               uint64_t val)
++{
++    struct vmx_msr_entry *ent = vmx_find_msr(v, msr, VMX_MSR_GUEST_LOADONLY);
++
++    if ( !ent )
++        return -ESRCH;
++
++    ent->data = val;
++
++    return 0;
++}
++
+ void vmx_disable_intercept_for_msr(struct vcpu *v, u32 msr, int type);
+ void vmx_enable_intercept_for_msr(struct vcpu *v, u32 msr, int type);
+ void vmx_vmcs_switch(paddr_t from, paddr_t to);
 diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
 index 4d21e43..ee7f18d 100644
 --- a/xen/include/asm-x86/spec_ctrl.h

@@ -1,4 +1,4 @@
-From 00c72675904713a9f51200de1b0b24ea327ddcc5 Mon Sep 17 00:00:00 2001
+From a51e6a362f8a1c03de41d675ed98672fec656d2c Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Mon, 7 May 2018 11:57:00 +0100
 Subject: [PATCH] x86/vmx: API improvements for MSR load/save infrastructure
@@ -23,75 +23,70 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
 Acked-by: Kevin Tian <kevin.tian@intel.com>
 (cherry picked from commit f54b63e8617ada823be43d60467a43c8224b7909)
 diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
-index 82a2e10..c469ff1 100644
+index d457d27..8ddb317 100644
 --- a/xen/arch/x86/hvm/vmx/vmcs.c
 +++ b/xen/arch/x86/hvm/vmx/vmcs.c
-@@ -1321,22 +1321,26 @@ static int vmx_msr_entry_key_cmp(const void *key, const void *elt)
-     return 0;
+@@ -1332,58 +1332,62 @@ static int construct_vmcs(struct vcpu *v)
+     return rc;
  }
  
--struct vmx_msr_entry *vmx_find_msr(u32 msr, int type)
+-int vmx_read_guest_msr(u32 msr, u64 *val)
 +struct vmx_msr_entry *vmx_find_msr(uint32_t msr, enum vmx_msr_list_type type)
  {
      struct vcpu *curr = current;
-     unsigned int msr_count;
--    struct vmx_msr_entry *msr_area;
+-    unsigned int i, msr_count = curr->arch.hvm_vmx.msr_count;
+-    const struct vmx_msr_entry *msr_area = curr->arch.hvm_vmx.msr_area;
++    unsigned int msr_count;
 +    struct vmx_msr_entry *msr_area = NULL;
++    unsigned int i;
  
--    if ( type == VMX_GUEST_MSR )
+-    for ( i = 0; i < msr_count; i++ )
 +    switch ( type )
      {
--        msr_count = curr->arch.hvm_vmx.msr_count;
--        msr_area = curr->arch.hvm_vmx.msr_area;
+-        if ( msr_area[i].index == msr )
+-        {
+-            *val = msr_area[i].data;
+-            return 0;
+-        }
 -    }
--    else
--    {
--        ASSERT(type == VMX_HOST_MSR);
 +    case VMX_MSR_HOST:
-         msr_count = curr->arch.hvm_vmx.host_msr_count;
-         msr_area = curr->arch.hvm_vmx.host_msr_area;
++        msr_count = curr->arch.hvm_vmx.host_msr_count;
++        msr_area = curr->arch.hvm_vmx.host_msr_area;
 +        break;
-+
+ 
+-    return -ESRCH;
+-}
 +    case VMX_MSR_GUEST:
 +        msr_count = curr->arch.hvm_vmx.msr_count;
 +        msr_area = curr->arch.hvm_vmx.msr_area;
 +        break;
-+
-+    default:
-+        ASSERT_UNREACHABLE();
-     }
  
-     if ( msr_area == NULL )
-@@ -1346,48 +1350,27 @@ struct vmx_msr_entry *vmx_find_msr(u32 msr, int type)
-                    vmx_msr_entry_key_cmp);
- }
- 
--int vmx_read_guest_msr(u32 msr, u64 *val)
--{
--    struct vmx_msr_entry *ent;
--
--    if ( (ent = vmx_find_msr(msr, VMX_GUEST_MSR)) != NULL )
--    {
--        *val = ent->data;
--        return 0;
--    }
--
--    return -ESRCH;
--}
--
 -int vmx_write_guest_msr(u32 msr, u64 val)
 -{
--    struct vmx_msr_entry *ent;
--
--    if ( (ent = vmx_find_msr(msr, VMX_GUEST_MSR)) != NULL )
--    {
--        ent->data = val;
--        return 0;
--    }
--
+-    struct vcpu *curr = current;
+-    unsigned int i, msr_count = curr->arch.hvm_vmx.msr_count;
+-    struct vmx_msr_entry *msr_area = curr->arch.hvm_vmx.msr_area;
++    default:
++        ASSERT_UNREACHABLE();
++    }
++
++    if ( msr_area == NULL )
++        return NULL;
+ 
+     for ( i = 0; i < msr_count; i++ )
+     {
+         if ( msr_area[i].index == msr )
+-        {
+-            msr_area[i].data = val;
+-            return 0;
+-        }
++            return &msr_area[i];
+     }
+ 
 -    return -ESRCH;
--}
--
++    return NULL;
+ }
+ 
 -int vmx_add_msr(u32 msr, int type)
 +int vmx_add_msr(uint32_t msr, enum vmx_msr_list_type type)
  {
@@ -100,13 +95,13 @@ index 82a2e10..c469ff1 100644
      struct vmx_msr_entry **msr_area, *msr_area_elem;
  
 -    if ( type == VMX_GUEST_MSR )
-+    switch ( type )
-     {
+-    {
 -        msr_count = &curr->arch.hvm_vmx.msr_count;
 -        msr_area = &curr->arch.hvm_vmx.msr_area;
 -    }
 -    else
--    {
++    switch ( type )
+     {
 -        ASSERT(type == VMX_HOST_MSR);
 +    case VMX_MSR_HOST:
          msr_count = &curr->arch.hvm_vmx.host_msr_count;
@@ -124,7 +119,7 @@ index 82a2e10..c469ff1 100644
      }
  
      if ( *msr_area == NULL )
-@@ -1395,13 +1378,17 @@ int vmx_add_msr(u32 msr, int type)
+@@ -1391,13 +1395,17 @@ int vmx_add_msr(u32 msr, int type)
          if ( (*msr_area = alloc_xenheap_page()) == NULL )
              return -ENOMEM;
  
@@ -144,8 +139,8 @@ index 82a2e10..c469ff1 100644
 -            __vmwrite(VM_EXIT_MSR_LOAD_ADDR, virt_to_maddr(*msr_area));
      }
  
-     for ( idx = 0; idx < *msr_count && (*msr_area)[idx].index <= msr; idx++ )
-@@ -1420,16 +1407,18 @@ int vmx_add_msr(u32 msr, int type)
+     for ( idx = 0; idx < *msr_count; idx++ )
+@@ -1413,16 +1421,18 @@ int vmx_add_msr(u32 msr, int type)
  
      ++*msr_count;
  
@@ -170,56 +165,20 @@ index 82a2e10..c469ff1 100644
      }
  
      return 0;
-diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index 603f240..02aeb90 100644
---- a/xen/arch/x86/hvm/vmx/vmx.c
-+++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -4069,7 +4069,7 @@ static void lbr_tsx_fixup(void)
-     struct vmx_msr_entry *msr_area = curr->arch.hvm_vmx.msr_area;
-     struct vmx_msr_entry *msr;
- 
--    if ( (msr = vmx_find_msr(lbr_from_start, VMX_GUEST_MSR)) != NULL )
-+    if ( (msr = vmx_find_msr(lbr_from_start, VMX_MSR_GUEST)) != NULL )
-     {
-         /*
-          * Sign extend into bits 61:62 while preserving bit 63
-@@ -4079,7 +4079,7 @@ static void lbr_tsx_fixup(void)
-             msr->data |= ((LBR_FROM_SIGNEXT_2MSB & msr->data) << 2);
-     }
- 
--    if ( (msr = vmx_find_msr(lbr_lastint_from, VMX_GUEST_MSR)) != NULL )
-+    if ( (msr = vmx_find_msr(lbr_lastint_from, VMX_MSR_GUEST)) != NULL )
-         msr->data |= ((LBR_FROM_SIGNEXT_2MSB & msr->data) << 2);
- }
- 
-@@ -4107,8 +4107,8 @@ static void bdw_erratum_bdf14_fixup(void)
-      * erratum BDF14. Fix up MSR_IA32_LASTINT{FROM,TO}IP by
-      * sign-extending into bits 48:63.
-      */
--    sign_extend_msr(MSR_IA32_LASTINTFROMIP, VMX_GUEST_MSR);
--    sign_extend_msr(MSR_IA32_LASTINTTOIP, VMX_GUEST_MSR);
-+    sign_extend_msr(MSR_IA32_LASTINTFROMIP, VMX_MSR_GUEST);
-+    sign_extend_msr(MSR_IA32_LASTINTTOIP, VMX_MSR_GUEST);
- }
- 
- static void lbr_fixup(void)
 diff --git a/xen/include/asm-x86/hvm/vmx/vmcs.h b/xen/include/asm-x86/hvm/vmx/vmcs.h
-index 18a91e5..61e93ef 100644
+index 1b68e3d..c18df0e 100644
 --- a/xen/include/asm-x86/hvm/vmx/vmcs.h
 +++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
-@@ -581,9 +581,6 @@ enum vmcs_field {
- 
- #define VMCS_VPID_WIDTH 16
+@@ -575,18 +575,56 @@ extern const unsigned int vmx_introspection_force_enabled_msrs_size;
+ #define MSR_TYPE_R 1
+ #define MSR_TYPE_W 2
  
 -#define VMX_GUEST_MSR 0
 -#define VMX_HOST_MSR  1
 -
- /* VM Instruction error numbers */
- enum vmx_insn_errno
- {
-@@ -601,6 +598,52 @@ enum vmx_insn_errno
-     VMX_INSN_FAIL_INVALID                  = ~0,
- };
+ /* VM Instruction error numbers. */
+ #define VMX_INSN_INVALID_CONTROL_STATE       7
+ #define VMX_INSN_INVALID_HOST_STATE          8
  
 +/* MSR load/save list infrastructure. */
 +enum vmx_msr_list_type {
@@ -265,25 +224,17 @@ index 18a91e5..61e93ef 100644
 +    return 0;
 +}
 +
-+
-+/* MSR intercept bitmap infrastructure. */
- enum vmx_msr_intercept_type {
-     VMX_MSR_R  = 1,
-     VMX_MSR_W  = 2,
-@@ -611,10 +654,6 @@ void vmx_clear_msr_intercept(struct vcpu *v, unsigned int msr,
-                              enum vmx_msr_intercept_type type);
- void vmx_set_msr_intercept(struct vcpu *v, unsigned int msr,
-                            enum vmx_msr_intercept_type type);
+ void vmx_disable_intercept_for_msr(struct vcpu *v, u32 msr, int type);
+ void vmx_enable_intercept_for_msr(struct vcpu *v, u32 msr, int type);
 -int vmx_read_guest_msr(u32 msr, u64 *val);
 -int vmx_write_guest_msr(u32 msr, u64 val);
--struct vmx_msr_entry *vmx_find_msr(u32 msr, int type);
 -int vmx_add_msr(u32 msr, int type);
  void vmx_vmcs_switch(paddr_t from, paddr_t to);
  void vmx_set_eoi_exit_bitmap(struct vcpu *v, u8 vector);
  void vmx_clear_eoi_exit_bitmap(struct vcpu *v, u8 vector);
-@@ -629,15 +668,6 @@ void virtual_vmcs_vmwrite(const struct vcpu *, u32 encoding, u64 val);
- enum vmx_insn_errno virtual_vmcs_vmwrite_safe(const struct vcpu *v,
-                                               u32 vmcs_encoding, u64 val);
+@@ -596,15 +634,6 @@ void virtual_vmcs_exit(const struct vcpu *);
+ u64 virtual_vmcs_vmread(const struct vcpu *, u32 encoding);
+ void virtual_vmcs_vmwrite(const struct vcpu *, u32 encoding, u64 val);
  
 -static inline int vmx_add_guest_msr(u32 msr)
 -{

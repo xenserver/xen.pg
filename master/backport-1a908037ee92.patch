@@ -1,4 +1,4 @@
-From 82658a1c8f398a20e2e1949fb4705fb33f08300b Mon Sep 17 00:00:00 2001
+From 1a908037ee92848d14cb20cafbd95078b7dcbbb5 Mon Sep 17 00:00:00 2001
 From: Juergen Gross <jgross@suse.com>
 Date: Mon, 23 Jul 2018 08:11:40 +0200
 Subject: [PATCH] x86/pv: Force a guest into shadow mode when it writes an
@@ -18,11 +18,13 @@ This is part of XSA-273 / CVE-2018-3620.
 Signed-off-by: Juergen Gross <jgross@suse.com>
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Tim Deegan <tim@xen.org>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 06e8b622d3f3c0fa5075e91b041c6f45549ad70a)
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 68fd5fd..3df40f4 100644
+index ef7e6b7..544cc00 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -1231,7 +1231,7 @@ get_page_from_l2e(
+@@ -1229,7 +1229,7 @@ get_page_from_l2e(
      int rc;
  
      if ( !(l2e_get_flags(l2e) & _PAGE_PRESENT) )
@@ -31,7 +33,7 @@ index 68fd5fd..3df40f4 100644
  
      if ( unlikely((l2e_get_flags(l2e) & L2_DISALLOW_MASK)) )
      {
-@@ -1272,7 +1272,7 @@ get_page_from_l3e(
+@@ -1270,7 +1270,7 @@ get_page_from_l3e(
      int rc;
  
      if ( !(l3e_get_flags(l3e) & _PAGE_PRESENT) )
@@ -40,7 +42,7 @@ index 68fd5fd..3df40f4 100644
  
      if ( unlikely((l3e_get_flags(l3e) & l3_disallow_mask(d))) )
      {
-@@ -1298,7 +1298,7 @@ get_page_from_l4e(
+@@ -1296,7 +1296,7 @@ get_page_from_l4e(
      int rc;
  
      if ( !(l4e_get_flags(l4e) & _PAGE_PRESENT) )
@@ -49,10 +51,10 @@ index 68fd5fd..3df40f4 100644
  
      if ( unlikely((l4e_get_flags(l4e) & L4_DISALLOW_MASK)) )
      {
-@@ -1555,6 +1555,13 @@ static int alloc_l1_table(struct page_info *page)
-                 break;
-             }
+@@ -1540,6 +1540,13 @@ static int alloc_l1_table(struct page_info *page)
  
+     for ( i = 0; i < L1_PAGETABLE_ENTRIES; i++ )
+     {
 +        if ( !(l1e_get_flags(pl1e[i]) & _PAGE_PRESENT) )
 +        {
 +            ret = pv_l1tf_check_l1e(d, pl1e[i]) ? -ERESTART : 0;
@@ -60,10 +62,10 @@ index 68fd5fd..3df40f4 100644
 +                goto out;
 +        }
 +
-         adjust_guest_l1e(pl1e[i], d);
-     }
- 
-@@ -1563,6 +1570,7 @@ static int alloc_l1_table(struct page_info *page)
+         if ( is_guest_l1_slot(i) )
+             switch ( ret = get_page_from_l1e(pl1e[i], d, d) )
+             {
+@@ -1561,6 +1568,7 @@ static int alloc_l1_table(struct page_info *page)
  
   fail:
      MEM_LOG("Failure in alloc_l1_table: entry %d", i);
@@ -71,7 +73,7 @@ index 68fd5fd..3df40f4 100644
      while ( i-- > 0 )
          if ( is_guest_l1_slot(i) )
              put_page_from_l1e(pl1e[i], d);
-@@ -2162,6 +2170,8 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
+@@ -2160,6 +2168,8 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
              rc = -EBUSY;
          }
      }
@@ -80,7 +82,7 @@ index 68fd5fd..3df40f4 100644
      else if ( unlikely(!UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, pt_vcpu,
                                       preserve_ad)) )
      {
-@@ -2224,6 +2234,8 @@ static int mod_l2_entry(l2_pgentry_t *pl2e,
+@@ -2222,6 +2232,8 @@ static int mod_l2_entry(l2_pgentry_t *pl2e,
              rc = -EBUSY;
          }
      }
@@ -89,7 +91,7 @@ index 68fd5fd..3df40f4 100644
      else if ( unlikely(!UPDATE_ENTRY(l2, pl2e, ol2e, nl2e, pfn, vcpu,
                                       preserve_ad)) )
      {
-@@ -2291,6 +2303,8 @@ static int mod_l3_entry(l3_pgentry_t *pl3e,
+@@ -2289,6 +2301,8 @@ static int mod_l3_entry(l3_pgentry_t *pl3e,
              rc = -EFAULT;
          }
      }
@@ -98,7 +100,7 @@ index 68fd5fd..3df40f4 100644
      else if ( unlikely(!UPDATE_ENTRY(l3, pl3e, ol3e, nl3e, pfn, vcpu,
                                       preserve_ad)) )
      {
-@@ -2355,6 +2369,8 @@ static int mod_l4_entry(l4_pgentry_t *pl4e,
+@@ -2353,6 +2367,8 @@ static int mod_l4_entry(l4_pgentry_t *pl4e,
              rc = -EFAULT;
          }
      }
@@ -107,21 +109,19 @@ index 68fd5fd..3df40f4 100644
      else if ( unlikely(!UPDATE_ENTRY(l4, pl4e, ol4e, nl4e, pfn, vcpu,
                                       preserve_ad)) )
      {
-@@ -5618,6 +5634,12 @@ static int ptwr_emulated_update(
-         break;
-     }
+@@ -5585,6 +5601,10 @@ static int ptwr_emulated_update(
  
-+    if ( !(l1e_get_flags(nl1e) & _PAGE_PRESENT) && pv_l1tf_check_l1e(d, nl1e) )
-+    {
-+        put_page_from_l1e(nl1e, d);
-+        return X86EMUL_RETRY;
-+    }
+     /* Check the new PTE. */
+     nl1e = l1e_from_intpte(val);
 +
-     adjust_guest_l1e(nl1e, d);
- 
-     /* Checked successfully: do the update (write or cmpxchg). */
++    if ( !(l1e_get_flags(nl1e) & _PAGE_PRESENT) && pv_l1tf_check_l1e(d, nl1e) )
++        return X86EMUL_RETRY;
++
+     switch ( ret = get_page_from_l1e(nl1e, d, d) )
+     {
+     default:
 diff --git a/xen/include/asm-x86/shadow.h b/xen/include/asm-x86/shadow.h
-index 9396d5e..7453de4 100644
+index 7c658c1..de09e81 100644
 --- a/xen/include/asm-x86/shadow.h
 +++ b/xen/include/asm-x86/shadow.h
 @@ -114,8 +114,102 @@ static inline int shadow_domctl(struct domain *d, xen_domctl_shadow_op_t *sc,

@@ -15,10 +15,10 @@ Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
 Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Kevin Tian <kevin.tian@intel.com>
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index fc6e400151..7cea88e340 100644
+index 39dae15..ebd6bde 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -2329,6 +2329,7 @@ static void pi_notification_interrupt(struct cpu_user_regs *regs)
+@@ -2422,6 +2422,7 @@ static void pi_notification_interrupt(struct cpu_user_regs *regs)
  }
  
  static void __init lbr_tsx_fixup_check(void);
@@ -26,7 +26,7 @@ index fc6e400151..7cea88e340 100644
  
  const struct hvm_function_table * __init start_vmx(void)
  {
-@@ -2394,6 +2395,7 @@ const struct hvm_function_table * __init start_vmx(void)
+@@ -2483,6 +2484,7 @@ const struct hvm_function_table * __init start_vmx(void)
      setup_vmcs_dump();
  
      lbr_tsx_fixup_check();
@@ -34,7 +34,7 @@ index fc6e400151..7cea88e340 100644
  
      return &vmx_function_table;
  }
-@@ -2692,7 +2694,11 @@ enum
+@@ -2781,7 +2783,11 @@ enum
  
  #define LBR_FROM_SIGNEXT_2MSB  ((1ULL << 59) | (1ULL << 60))
  
@@ -46,7 +46,7 @@ index fc6e400151..7cea88e340 100644
  static uint32_t __read_mostly lbr_from_start;
  static uint32_t __read_mostly lbr_from_end;
  static uint32_t __read_mostly lbr_lastint_from;
-@@ -2729,6 +2735,13 @@ static void __init lbr_tsx_fixup_check(void)
+@@ -2818,6 +2824,13 @@ static void __init lbr_tsx_fixup_check(void)
      }
  }
  
@@ -60,8 +60,8 @@ index fc6e400151..7cea88e340 100644
  static int is_last_branch_msr(u32 ecx)
  {
      const struct lbr_info *lbr = last_branch_msr_get();
-@@ -2994,8 +3007,11 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
-                     if ( (rc = vmx_add_guest_msr(lbr->base + i)) == 0 )
+@@ -3099,8 +3112,11 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
+                     if ( (rc = vmx_add_guest_msr(v, lbr->base + i)) == 0 )
                      {
                          vmx_disable_intercept_for_msr(v, lbr->base + i, MSR_TYPE_R | MSR_TYPE_W);
 -                        v->arch.hvm_vmx.lbr_tsx_fixup_enabled =
@@ -74,15 +74,15 @@ index fc6e400151..7cea88e340 100644
                      }
          }
  
-@@ -4018,6 +4034,44 @@ static void lbr_tsx_fixup(void)
+@@ -4130,6 +4146,46 @@ static void lbr_tsx_fixup(void)
          msr->data |= ((LBR_FROM_SIGNEXT_2MSB & msr->data) << 2);
  }
  
-+static void sign_extend_msr(u32 msr, int type)
++static void sign_extend_msr(struct vcpu *v, u32 msr, int type)
 +{
 +    struct vmx_msr_entry *entry;
 +
-+    if ( (entry = vmx_find_msr(msr, type)) != NULL )
++    if ( (entry = vmx_find_msr(v, msr, type)) != NULL )
 +    {
 +        if ( entry->data & VADDR_TOP_BIT )
 +            entry->data |= CANONICAL_MASK;
@@ -93,6 +93,8 @@ index fc6e400151..7cea88e340 100644
 +
 +static void bdw_erratum_bdf14_fixup(void)
 +{
++    struct vcpu *curr = current;
++
 +    /*
 +     * Occasionally, on certain Broadwell CPUs MSR_IA32_LASTINTTOIP has
 +     * been observed to have the top three bits corrupted as though the
@@ -102,8 +104,8 @@ index fc6e400151..7cea88e340 100644
 +     * erratum BDF14. Fix up MSR_IA32_LASTINT{FROM,TO}IP by
 +     * sign-extending into bits 48:63.
 +     */
-+    sign_extend_msr(MSR_IA32_LASTINTFROMIP, VMX_GUEST_MSR);
-+    sign_extend_msr(MSR_IA32_LASTINTTOIP, VMX_GUEST_MSR);
++    sign_extend_msr(curr, MSR_IA32_LASTINTFROMIP, VMX_MSR_GUEST);
++    sign_extend_msr(curr, MSR_IA32_LASTINTTOIP, VMX_MSR_GUEST);
 +}
 +
 +static void lbr_fixup(void)
@@ -119,7 +121,7 @@ index fc6e400151..7cea88e340 100644
  void vmx_vmenter_helper(const struct cpu_user_regs *regs)
  {
      struct vcpu *curr = current;
-@@ -4074,8 +4128,8 @@ void vmx_vmenter_helper(const struct cpu_user_regs *regs)
+@@ -4186,8 +4242,8 @@ void vmx_vmenter_helper(const struct cpu_user_regs *regs)
      }
  
   out:
@@ -131,10 +133,10 @@ index fc6e400151..7cea88e340 100644
      HVMTRACE_ND(VMENTRY, 0, 1/*cycles*/, 0, 0, 0, 0, 0, 0, 0);
  
 diff --git a/xen/include/asm-x86/hvm/vmx/vmcs.h b/xen/include/asm-x86/hvm/vmx/vmcs.h
-index 34686d1c69..03dcaf13f5 100644
+index e0cc318..de568b1 100644
 --- a/xen/include/asm-x86/hvm/vmx/vmcs.h
 +++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
-@@ -213,7 +213,7 @@ struct arch_vmx_struct {
+@@ -221,7 +221,7 @@ struct arch_vmx_struct {
      /* Are we emulating rather than VMENTERing? */
      uint8_t              vmx_emulate;
  
@@ -144,7 +146,7 @@ index 34686d1c69..03dcaf13f5 100644
      /* Bitmask of segments that we can't safely use in virtual 8086 mode */
      uint16_t             vm86_segment_mask;
 diff --git a/xen/include/asm-x86/x86_64/page.h b/xen/include/asm-x86/x86_64/page.h
-index afc77c3237..49092d5d81 100644
+index afc77c3..49092d5 100644
 --- a/xen/include/asm-x86/x86_64/page.h
 +++ b/xen/include/asm-x86/x86_64/page.h
 @@ -28,6 +28,9 @@
