@@ -1,0 +1,200 @@
+From d933f1a53c06002351c1e36d40615e40bd4bf6af Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 19 Jan 2018 18:04:27 +0000
+Subject: [PATCH] tools/ocaml: Drop coredump infrastructure
+
+It is unused, and uses an obsolete hypercall which has never ever functioned
+for HVM guests.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index 75006e711c..16ed669fc6 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -97,14 +97,6 @@ exception Error of string
+ 
+ type handle
+ 
+-(* this is only use by coredumping *)
+-external sizeof_core_header: unit -> int
+-       = "stub_sizeof_core_header"
+-external sizeof_vcpu_guest_context: unit -> int
+-       = "stub_sizeof_vcpu_guest_context"
+-external sizeof_xen_pfn: unit -> int = "stub_sizeof_xen_pfn"
+-(* end of use *)
+-
+ external interface_open: unit -> handle = "stub_xc_interface_open"
+ external interface_close: handle -> unit = "stub_xc_interface_close"
+ 
+@@ -248,84 +240,6 @@ external get_cpu_featureset : handle -> featureset_index -> int64 array = "stub_
+ external watchdog : handle -> int -> int32 -> int
+   = "stub_xc_watchdog"
+ 
+-(* core dump structure *)
+-type core_magic = Magic_hvm | Magic_pv
+-
+-type core_header = {
+-	xch_magic: core_magic;
+-	xch_nr_vcpus: int;
+-	xch_nr_pages: nativeint;
+-	xch_index_offset: int64;
+-	xch_ctxt_offset: int64;
+-	xch_pages_offset: int64;
+-}
+-
+-external marshall_core_header: core_header -> string = "stub_marshall_core_header"
+-
+-(* coredump *)
+-let coredump xch domid fd =
+-	let dump s =
+-		let wd = Unix.write fd s 0 (String.length s) in
+-		if wd <> String.length s then
+-			failwith "error while writing";
+-		in
+-
+-	let info = domain_getinfo xch domid in
+-
+-	let nrpages = info.total_memory_pages in
+-	let ctxt = Array.make info.max_vcpu_id None in
+-	let nr_vcpus = ref 0 in
+-	for i = 0 to info.max_vcpu_id - 1
+-	do
+-		ctxt.(i) <- try
+-			let v = vcpu_context_get xch domid i in
+-			incr nr_vcpus;
+-			Some v
+-			with _ -> None
+-	done;
+-
+-	(* FIXME page offset if not rounded to sup *)
+-	let page_offset =
+-		Int64.add
+-			(Int64.of_int (sizeof_core_header () +
+-			 (sizeof_vcpu_guest_context () * !nr_vcpus)))
+-			(Int64.of_nativeint (
+-				Nativeint.mul
+-					(Nativeint.of_int (sizeof_xen_pfn ()))
+-					nrpages)
+-				)
+-		in
+-
+-	let header = {
+-		xch_magic = if info.hvm_guest then Magic_hvm else Magic_pv;
+-		xch_nr_vcpus = !nr_vcpus;
+-		xch_nr_pages = nrpages;
+-		xch_ctxt_offset = Int64.of_int (sizeof_core_header ());
+-		xch_index_offset = Int64.of_int (sizeof_core_header ()
+-					+ sizeof_vcpu_guest_context ());
+-		xch_pages_offset = page_offset;
+-	} in
+-
+-	dump (marshall_core_header header);
+-	for i = 0 to info.max_vcpu_id - 1
+-	do
+-		match ctxt.(i) with
+-		| None -> ()
+-		| Some ctxt_i -> dump ctxt_i
+-	done;
+-	let pfns = domain_get_pfn_list xch domid nrpages in
+-	if Array.length pfns <> Nativeint.to_int nrpages then
+-		failwith "could not get the page frame list";
+-
+-	let page_size = Xenmmap.getpagesize () in
+-	for i = 0 to Nativeint.to_int nrpages - 1
+-	do
+-		let page = map_foreign_range xch domid page_size pfns.(i) in
+-		let data = Xenmmap.read page 0 page_size in
+-		Xenmmap.unmap page;
+-		dump data
+-	done
+-
+ (* ** Misc ** *)
+ 
+ (**
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index 720e4b2f92..9e32acd7e0 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -67,10 +67,6 @@ type domain_create_flag = CDF_HVM | CDF_HAP
+ 
+ exception Error of string
+ type handle
+-external sizeof_core_header : unit -> int = "stub_sizeof_core_header"
+-external sizeof_vcpu_guest_context : unit -> int
+-  = "stub_sizeof_vcpu_guest_context"
+-external sizeof_xen_pfn : unit -> int = "stub_sizeof_xen_pfn"
+ external interface_open : unit -> handle = "stub_xc_interface_open"
+ external interface_close : handle -> unit = "stub_xc_interface_close"
+ val with_intf : (handle -> 'a) -> 'a
+@@ -151,18 +147,6 @@ external version_capabilities : handle -> string
+ type featureset_index = Featureset_raw | Featureset_host | Featureset_pv | Featureset_hvm
+ external get_cpu_featureset : handle -> featureset_index -> int64 array = "stub_xc_get_cpu_featureset"
+ 
+-type core_magic = Magic_hvm | Magic_pv
+-type core_header = {
+-  xch_magic : core_magic;
+-  xch_nr_vcpus : int;
+-  xch_nr_pages : nativeint;
+-  xch_index_offset : int64;
+-  xch_ctxt_offset : int64;
+-  xch_pages_offset : int64;
+-}
+-external marshall_core_header : core_header -> string
+-  = "stub_marshall_core_header"
+-val coredump : handle -> domid -> Unix.file_descr -> unit
+ external pages_to_kib : int64 -> int64 = "stub_pages_to_kib"
+ val pages_to_mib : int64 -> int64
+ external watchdog : handle -> int -> int32 -> int
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index 5e455519d4..802d6228c9 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -72,47 +72,6 @@ static void Noreturn failwith_xc(xc_interface *xch)
+ 	caml_raise_with_string(*caml_named_value("xc.error"), error_str);
+ }
+ 
+-CAMLprim value stub_sizeof_core_header(value unit)
+-{
+-	CAMLparam1(unit);
+-	CAMLreturn(Val_int(sizeof(struct xc_core_header)));
+-}
+-
+-CAMLprim value stub_sizeof_vcpu_guest_context(value unit)
+-{
+-	CAMLparam1(unit);
+-	CAMLreturn(Val_int(sizeof(struct vcpu_guest_context)));
+-}
+-
+-CAMLprim value stub_sizeof_xen_pfn(value unit)
+-{
+-	CAMLparam1(unit);
+-	CAMLreturn(Val_int(sizeof(xen_pfn_t)));
+-}
+-
+-#define XC_CORE_MAGIC     0xF00FEBED
+-#define XC_CORE_MAGIC_HVM 0xF00FEBEE
+-
+-CAMLprim value stub_marshall_core_header(value header)
+-{
+-	CAMLparam1(header);
+-	CAMLlocal1(s);
+-	struct xc_core_header c_header;
+-
+-	c_header.xch_magic = (Field(header, 0))
+-		? XC_CORE_MAGIC
+-		: XC_CORE_MAGIC_HVM;
+-	c_header.xch_nr_vcpus = Int_val(Field(header, 1));
+-	c_header.xch_nr_pages = Nativeint_val(Field(header, 2));
+-	c_header.xch_ctxt_offset = Int64_val(Field(header, 3));
+-	c_header.xch_index_offset = Int64_val(Field(header, 4));
+-	c_header.xch_pages_offset = Int64_val(Field(header, 5));
+-
+-	s = caml_alloc_string(sizeof(c_header));
+-	memcpy(String_val(s), (char *) &c_header, sizeof(c_header));
+-	CAMLreturn(s);
+-}
+-
+ CAMLprim value stub_xc_interface_open(void)
+ {
+ 	CAMLparam0();
