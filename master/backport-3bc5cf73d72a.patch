@@ -1,0 +1,87 @@
+From 3bc5cf73d72a743ec37567ca9203be5c0a28a5d5 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Wed, 14 Dec 2016 07:51:56 +0000
+Subject: [PATCH] livepatch: Fix documentation of timeout
+
+The hypervisor expects the timeout from the hypercall to be in
+nanoseconds, so document this correctly. Also correctly document
+what happens when timeout is set to zero.
+
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/docs/misc/livepatch.markdown b/docs/misc/livepatch.markdown
+index 89c1050772..b032e2ee38 100644
+--- a/docs/misc/livepatch.markdown
++++ b/docs/misc/livepatch.markdown
+@@ -655,9 +655,9 @@ The caller provides:
+   payload. If the operation takes more time than the upper bound of time
+   the `rc` in `xen_livepatch_status' retrieved via **XEN_SYSCTL_LIVEPATCH_GET**
+   will be -XEN_EBUSY.
+- * `time` the upper bound of time (ms) the cmd should take. Zero means infinite.
+-   If within the time the operation does not succeed the operation would go in
+-   error state.
++ * `time` the upper bound of time (ns) the cmd should take. Zero means to use
++   the hypervisor default. If within the time the operation does not succeed
++   the operation would go in error state.
+  * `pad` - *MUST* be zero.
+ 
+ The return value will be zero unless the provided fields are incorrect.
+@@ -672,9 +672,10 @@ The structure is as follow:
+ struct xen_sysctl_livepatch_action {  
+     xen_livepatch_name_t name;              /* IN, name of the patch. */  
+     uint32_t cmd;                           /* IN: LIVEPATCH_ACTION_* */  
+-    uint32_t time;                          /* IN: Zero if no timeout. */   
+-                                            /* Or upper bound of time (ms) */   
+-                                            /* for operation to take. */  
++    uint32_t time;                          /* IN: If zero then uses */
++                                            /* hypervisor default. */
++                                            /* Or upper bound of time (ns) */
++                                            /* for operation to take. */
+ };  
+ 
+ </pre>
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 0a31295817..fc8f125604 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -2678,7 +2678,7 @@ int xc_livepatch_list(xc_interface *xch, unsigned int max, unsigned int start,
+  * The operations are asynchronous and the hypervisor may take a while
+  * to complete them. The `timeout` offers an option to expire the
+  * operation if it could not be completed within the specified time
+- * (in ms). Value of 0 means let hypervisor decide the best timeout.
++ * (in ns). Value of 0 means let hypervisor decide the best timeout.
+  */
+ int xc_livepatch_apply(xc_interface *xch, char *name, uint32_t timeout);
+ int xc_livepatch_revert(xc_interface *xch, char *name, uint32_t timeout);
+diff --git a/xen/common/livepatch.c b/xen/common/livepatch.c
+index dc6778a397..d4d8de05c3 100644
+--- a/xen/common/livepatch.c
++++ b/xen/common/livepatch.c
+@@ -1127,8 +1127,8 @@ static int schedule_work(struct payload *data, uint32_t cmd, uint32_t timeout)
+     livepatch_work.data = data;
+     livepatch_work.timeout = timeout ?: MILLISECS(30);
+ 
+-    dprintk(XENLOG_DEBUG, LIVEPATCH "%s: timeout is %"PRI_stime"ms\n",
+-            data->name, livepatch_work.timeout / MILLISECS(1));
++    dprintk(XENLOG_DEBUG, LIVEPATCH "%s: timeout is %"PRIu32"ns\n",
++            data->name, livepatch_work.timeout);
+ 
+     atomic_set(&livepatch_work.semaphore, -1);
+ 
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index 8197c14283..a50c63bcf4 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -1011,8 +1011,9 @@ struct xen_sysctl_livepatch_action {
+ #define LIVEPATCH_ACTION_APPLY        3
+ #define LIVEPATCH_ACTION_REPLACE      4
+     uint32_t cmd;                           /* IN: LIVEPATCH_ACTION_*. */
+-    uint32_t timeout;                       /* IN: Zero if no timeout. */
+-                                            /* Or upper bound of time (ms) */
++    uint32_t timeout;                       /* IN: If zero then uses */
++                                            /* hypervisor default. */
++                                            /* Or upper bound of time (ns) */
+                                             /* for operation to take. */
+ };
+ typedef struct xen_sysctl_livepatch_action xen_sysctl_livepatch_action_t;
