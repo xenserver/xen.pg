@@ -1,0 +1,110 @@
+From 36b9c6544546fe4a48648f108fbfaae170f2d914 Mon Sep 17 00:00:00 2001
+From: Anthony PERARD <anthony.perard@citrix.com>
+Date: Tue, 20 Oct 2015 16:57:51 +0100
+Subject: [PATCH] hvmloader: Load SeaBIOS from hvm_start_info modules
+
+... and do not include the SeaBIOS ROM into hvmloader anymore.
+
+This also fix the dependency on roms.inc, hvmloader.o does not include it.
+
+Signed-off-by: Anthony PERARD <anthony.perard@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/tools/firmware/hvmloader/Makefile b/tools/firmware/hvmloader/Makefile
+index f2f4791..ed0bfad 100644
+--- a/tools/firmware/hvmloader/Makefile
++++ b/tools/firmware/hvmloader/Makefile
+@@ -45,7 +45,6 @@ CIRRUSVGA_DEBUG ?= n
+ 
+ OVMF_DIR := ../ovmf-dir
+ ROMBIOS_DIR := ../rombios
+-SEABIOS_DIR := ../seabios-dir
+ 
+ ifeq ($(CONFIG_ROMBIOS),y)
+ STDVGA_ROM    := ../vgabios/VGABIOS-lgpl-latest.bin
+@@ -80,19 +79,13 @@ endif
+ ifeq ($(CONFIG_SEABIOS),y)
+ OBJS += seabios.o
+ CFLAGS += -DENABLE_SEABIOS
+-ifeq ($(SEABIOS_PATH),)
+-	SEABIOS_ROM := $(SEABIOS_DIR)/out/bios.bin
+-else
+-	SEABIOS_ROM := $(SEABIOS_PATH)
+-endif
+-ROMS += $(SEABIOS_ROM)
+ endif
+ 
+ .PHONY: all
+ all: subdirs-all
+ 	$(MAKE) hvmloader
+ 
+-ovmf.o rombios.o seabios.o hvmloader.o: roms.inc
++ovmf.o rombios.o: roms.inc
+ smbios.o: CFLAGS += -D__SMBIOS_DATE__="\"$(SMBIOS_REL_DATE)\""
+ 
+ hvmloader: $(OBJS) acpi/acpi.a
+@@ -109,12 +102,6 @@ ifneq ($(ROMBIOS_ROM),)
+ 	echo "#endif" >> $@.new
+ endif
+ 
+-ifneq ($(SEABIOS_ROM),)
+-	echo "#ifdef ROM_INCLUDE_SEABIOS" >> $@.new
+-	sh ./mkhex seabios $(SEABIOS_ROM) >> $@.new
+-	echo "#endif" >> $@.new
+-endif
+-
+ ifneq ($(OVMF_ROM),)
+ 	echo "#ifdef ROM_INCLUDE_OVMF" >> $@.new
+ 	sh ./mkhex ovmf $(OVMF_ROM) >> $@.new
+diff --git a/tools/firmware/hvmloader/seabios.c b/tools/firmware/hvmloader/seabios.c
+index c6b3d9f..c5d2b34 100644
+--- a/tools/firmware/hvmloader/seabios.c
++++ b/tools/firmware/hvmloader/seabios.c
+@@ -27,9 +27,6 @@
+ #include "smbios_types.h"
+ #include "acpi/acpi2_0.h"
+ 
+-#define ROM_INCLUDE_SEABIOS
+-#include "roms.inc"
+-
+ extern unsigned char dsdt_anycpu_qemu_xen[];
+ extern int dsdt_anycpu_qemu_xen_len;
+ 
+@@ -127,22 +124,30 @@ static void seabios_setup_e820(void)
+     struct e820entry *e820 = scratch_alloc(sizeof(struct e820entry)*16, 0);
+     info->e820 = (uint32_t)e820;
+ 
++    /* Upper boundary already checked by seabios_load(). */
++    BUG_ON(seabios_config.bios_address < 0x000c0000);
+     /* SeaBIOS reserves memory in e820 as necessary so no low reservation. */
+-    info->e820_nr = build_e820_table(e820, 0, 0x100000-sizeof(seabios));
++    info->e820_nr = build_e820_table(e820, 0, seabios_config.bios_address);
+     dump_e820_table(e820, info->e820_nr);
+ }
+ 
+-struct bios_config seabios_config = {
+-    .name = "SeaBIOS",
++static void seabios_load(const struct bios_config *bios,
++                         void *bios_addr, uint32_t bios_length)
++{
++    unsigned int bios_dest = 0x100000 - bios_length;
+ 
+-    .image = seabios,
+-    .image_size = sizeof(seabios),
++    BUG_ON(bios_dest + bios_length > HVMLOADER_PHYSICAL_ADDRESS);
++    memcpy((void *)bios_dest, bios_addr, bios_length);
++    seabios_config.bios_address = bios_dest;
++    seabios_config.image_size = bios_length;
++}
+ 
+-    .bios_address = 0x100000 - sizeof(seabios),
++struct bios_config seabios_config = {
++    .name = "SeaBIOS",
+ 
+     .load_roms = NULL,
+ 
+-    .bios_load = NULL,
++    .bios_load = seabios_load,
+ 
+     .bios_info_setup = seabios_setup_bios_info,
+     .bios_info_finish = seabios_finish_bios_info,
