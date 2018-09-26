@@ -28,7 +28,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.7.6
-Release: 7.0.0
+Release: 7.0.2
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -302,6 +302,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/%{name}/arch-x86/cpuid.h
 %{_includedir}/%{name}/arch-x86/cpufeatureset.h
 %{_includedir}/%{name}/arch-x86/hvm/save.h
+%{_includedir}/%{name}/arch-x86/hvm/start_info.h
 %{_includedir}/%{name}/arch-x86/pmu.h
 %{_includedir}/%{name}/arch-x86/xen-mca.h
 %{_includedir}/%{name}/arch-x86/xen-x86_32.h
