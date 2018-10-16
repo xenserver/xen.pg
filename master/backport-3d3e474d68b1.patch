@@ -1,0 +1,48 @@
+From 3d3e474d68b1a063d19b9a330c3463025104970c Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Wed, 7 Nov 2018 09:54:57 +0100
+Subject: [PATCH] x86: work around HLE host lockup erratum
+
+XACQUIRE prefixed accesses to the 4Mb range of memory starting at 1Gb
+are liable to lock up the processor. Disallow use of this memory range.
+
+Unfortunately the available Core Gen7 and Gen8 spec updates are pretty
+old, so I can only guess that they're similarly affected when Core Gen6
+is and the Xeon counterparts are, too.
+
+This is part of XSA-282.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: cc76410d20aff2cc07b268b0713dc1d2740c6e12
+master date: 2018-11-07 09:33:24 +0100
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 075072c..ec81e69 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -6975,6 +6975,25 @@ const struct platform_bad_page *__init get_platform_badpages(unsigned int *array
+         { .mfn = 0x20138000 >> PAGE_SHIFT },
+         { .mfn = 0x40004000 >> PAGE_SHIFT },
+     };
++    static const struct platform_bad_page __initconst hle_bad_page = {
++        .mfn = 0x40000000 >> PAGE_SHIFT, .order = 10
++    };
++
++    switch ( cpuid_eax(1) & 0x000f3ff0 )
++    {
++        unsigned int ebx, dummy;
++
++    case 0x000406e0: /* erratum SKL167 */
++    case 0x00050650: /* erratum SKZ63 */
++    case 0x000506e0: /* errata SKL167 / SKW159 */
++    case 0x000806e0: /* erratum KBL??? */
++    case 0x000906e0: /* errata KBL??? / KBW114 / CFW103 */
++        *array_size = (cpuid_eax(0) >= 7 &&
++                       !(cpuid_ecx(1) & cpufeat_mask(X86_FEATURE_HYPERVISOR)) &&
++                       (cpuid_count(7, 0, &dummy, &ebx, &dummy, &dummy),
++                        ebx & cpufeat_mask(X86_FEATURE_HLE)));
++        return &hle_bad_page;
++    }
+ 
+     *array_size = ARRAY_SIZE(snb_bad_pages);
+     igd_id = pci_conf_read32(0, 0, 2, 0, 0);

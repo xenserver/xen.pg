@@ -22,9 +22,9 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.7.5
+Version: 4.7.6
 Release: 1.26
-License: GPL
+License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=RELEASE-%{version}&prefix=%{name}-%{version}&format=tar.gz#/%{name}-%{version}.tar.gz
 Source1: sysconfig_kernel-xen
@@ -100,7 +100,7 @@ This package contains the Xen Hypervisor with selected patches provided by Citri
 
 Citrix, the Citrix logo, Xen, XenServer, and certain other marks appearing herein are proprietary trademarks of Citrix Systems, Inc., and are registered in the U.S. and other countries. You may not redistribute this package, nor display or otherwise use any Citrix trademarks or any marks that incorporate Citrix trademarks without the express prior written authorization of Citrix. Nothing herein shall restrict your rights, if any, in the software contained within this package under an applicable open source license.
 
-Portions of this package are © 2017 Citrix Systems, Inc. For other copyright and licensing information see the relevant source RPM.
+Portions of this package are © 2018 Citrix Systems, Inc. For other copyright and licensing information see the relevant source RPM.
 
 %package hypervisor-debuginfo
 Summary: The Xen Hypervisor debug information

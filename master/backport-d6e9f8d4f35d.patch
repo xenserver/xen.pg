@@ -35,10 +35,10 @@ Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
 Acked-by: Kevin Tian <kevin.tian@intel.com>
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index dcfa03b149..08128890de 100644
+index ca8755d..39dae15 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -2411,6 +2411,8 @@ static void pi_notification_interrupt(struct cpu_user_regs *regs)
+@@ -2421,6 +2421,8 @@ static void pi_notification_interrupt(struct cpu_user_regs *regs)
      raise_softirq(VCPU_KICK_SOFTIRQ);
  }
  
@@ -47,7 +47,7 @@ index dcfa03b149..08128890de 100644
  const struct hvm_function_table * __init start_vmx(void)
  {
      set_in_cr4(X86_CR4_VMXE);
-@@ -2470,6 +2472,8 @@ const struct hvm_function_table * __init start_vmx(void)
+@@ -2480,6 +2482,8 @@ const struct hvm_function_table * __init start_vmx(void)
  
      setup_vmcs_dump();
  
@@ -56,7 +56,7 @@ index dcfa03b149..08128890de 100644
      return &vmx_function_table;
  }
  
-@@ -2658,6 +2662,14 @@ static int vmx_cr_access(unsigned long exit_qualification)
+@@ -2668,6 +2672,14 @@ static int vmx_cr_access(unsigned long exit_qualification)
      return X86EMUL_OKAY;
  }
  
@@ -71,7 +71,7 @@ index dcfa03b149..08128890de 100644
  static const struct lbr_info {
      u32 base, count;
  } p4_lbr[] = {
-@@ -2746,6 +2758,56 @@ static const struct lbr_info *last_branch_msr_get(void)
+@@ -2756,6 +2768,56 @@ static const struct lbr_info *last_branch_msr_get(void)
      return NULL;
  }
  
@@ -128,10 +128,10 @@ index dcfa03b149..08128890de 100644
  static int is_last_branch_msr(u32 ecx)
  {
      const struct lbr_info *lbr = last_branch_msr_get();
-@@ -3009,7 +3071,11 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
+@@ -3035,7 +3097,11 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
              for ( ; (rc == 0) && lbr->count; lbr++ )
                  for ( i = 0; (rc == 0) && (i < lbr->count); i++ )
-                     if ( (rc = vmx_add_guest_msr(lbr->base + i)) == 0 )
+                     if ( (rc = vmx_add_guest_msr(v, lbr->base + i)) == 0 )
 +                    {
                          vmx_disable_intercept_for_msr(v, lbr->base + i, MSR_TYPE_R | MSR_TYPE_W);
 +                        v->arch.hvm_vmx.lbr_tsx_fixup_enabled =
@@ -140,18 +140,18 @@ index dcfa03b149..08128890de 100644
          }
  
          if ( (rc < 0) ||
-@@ -4017,6 +4083,27 @@ out:
+@@ -4043,6 +4109,27 @@ out:
      }
  }
  
 +static void lbr_tsx_fixup(void)
 +{
 +    struct vcpu *curr = current;
-+    unsigned int msr_count = curr->arch.hvm_vmx.msr_count;
++    unsigned int msr_count = curr->arch.hvm_vmx.msr_save_count;
 +    struct vmx_msr_entry *msr_area = curr->arch.hvm_vmx.msr_area;
 +    struct vmx_msr_entry *msr;
 +
-+    if ( (msr = vmx_find_msr(lbr_from_start, VMX_GUEST_MSR)) != NULL )
++    if ( (msr = vmx_find_msr(curr, lbr_from_start, VMX_MSR_GUEST)) != NULL )
 +    {
 +        /*
 +         * Sign extend into bits 61:62 while preserving bit 63
@@ -161,14 +161,14 @@ index dcfa03b149..08128890de 100644
 +            msr->data |= ((LBR_FROM_SIGNEXT_2MSB & msr->data) << 2);
 +    }
 +
-+    if ( (msr = vmx_find_msr(lbr_lastint_from, VMX_GUEST_MSR)) != NULL )
++    if ( (msr = vmx_find_msr(curr, lbr_lastint_from, VMX_MSR_GUEST)) != NULL )
 +        msr->data |= ((LBR_FROM_SIGNEXT_2MSB & msr->data) << 2);
 +}
 +
  void vmx_vmenter_helper(const struct cpu_user_regs *regs)
  {
      struct vcpu *curr = current;
-@@ -4073,6 +4160,9 @@ void vmx_vmenter_helper(const struct cpu_user_regs *regs)
+@@ -4099,6 +4186,9 @@ void vmx_vmenter_helper(const struct cpu_user_regs *regs)
      }
  
   out:
@@ -179,10 +179,10 @@ index dcfa03b149..08128890de 100644
  
      __vmwrite(GUEST_RIP,    regs->rip);
 diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
-index 681350dc09..f45d31813d 100644
+index 8be98c0..52a8a79 100644
 --- a/xen/include/asm-x86/cpufeature.h
 +++ b/xen/include/asm-x86/cpufeature.h
-@@ -99,6 +99,9 @@
+@@ -101,6 +101,9 @@
  #define cpu_has_eist		boot_cpu_has(X86_FEATURE_EIST)
  #define cpu_has_hypervisor	boot_cpu_has(X86_FEATURE_HYPERVISOR)
  #define cpu_has_cmp_legacy	boot_cpu_has(X86_FEATURE_CMP_LEGACY)
@@ -193,7 +193,7 @@ index 681350dc09..f45d31813d 100644
  #define cpu_has_no_xpti         boot_cpu_has(X86_FEATURE_NO_XPTI)
  
 diff --git a/xen/include/asm-x86/hvm/vmx/vmcs.h b/xen/include/asm-x86/hvm/vmx/vmcs.h
-index 50559db754..4f4d99bfbd 100644
+index c4c11ea..3553b8f 100644
 --- a/xen/include/asm-x86/hvm/vmx/vmcs.h
 +++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
 @@ -20,6 +20,7 @@
@@ -204,7 +204,7 @@ index 50559db754..4f4d99bfbd 100644
  #include <irq_vectors.h>
  
  extern void vmcs_dump_vcpu(struct vcpu *v);
-@@ -211,6 +212,9 @@ struct arch_vmx_struct {
+@@ -219,6 +220,9 @@ struct arch_vmx_struct {
      uint8_t              vmx_realmode;
      /* Are we emulating rather than VMENTERing? */
      uint8_t              vmx_emulate;
@@ -215,10 +215,10 @@ index 50559db754..4f4d99bfbd 100644
      uint16_t             vm86_segment_mask;
      /* Shadow CS, SS, DS, ES, FS, GS, TR while in virtual 8086 mode */
 diff --git a/xen/include/asm-x86/msr-index.h b/xen/include/asm-x86/msr-index.h
-index 146123d7e6..e5601b5059 100644
+index 76d92d8..19bcc6d 100644
 --- a/xen/include/asm-x86/msr-index.h
 +++ b/xen/include/asm-x86/msr-index.h
-@@ -70,6 +70,8 @@
+@@ -74,6 +74,8 @@
  #define MSR_IA32_PEBS_ENABLE		0x000003f1
  #define MSR_IA32_DS_AREA		0x00000600
  #define MSR_IA32_PERF_CAPABILITIES	0x00000345
