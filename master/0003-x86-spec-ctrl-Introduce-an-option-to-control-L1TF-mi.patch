@@ -1,4 +1,4 @@
-From f15c1fcd198c09158f545a1048b42304016b320c Mon Sep 17 00:00:00 2001
+From c9641d4b1fa43904c1b24a787899961c5a5428f2 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Mon, 23 Jul 2018 13:46:10 +0000
 Subject: [PATCH] x86/spec-ctrl: Introduce an option to control L1TF mitigation
@@ -15,11 +15,13 @@ investigation.
 This is part of XSA-273 / CVE-2018-3620.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 66a4e986819a86ba66ca2fe9d925e62a4fd30114)
 diff --git a/docs/misc/xen-command-line.markdown b/docs/misc/xen-command-line.markdown
-index 3a9fff0..e5bf5d3 100644
+index 3a9fff0..39d6985 100644
 --- a/docs/misc/xen-command-line.markdown
 +++ b/docs/misc/xen-command-line.markdown
-@@ -1388,6 +1388,30 @@ do; there may be other custom operating systems which do.  If you're
+@@ -1388,6 +1388,27 @@ do; there may be other custom operating systems which do.  If you're
  certain you don't plan on having PV guests which use this feature,
  turning it off can reduce the attack surface.
  
@@ -28,9 +30,6 @@ index 3a9fff0..e5bf5d3 100644
 +
 +> Default: `false` on believed-unaffected hardware.
 +>          `domu`  on believed-affected hardware.
-+
-+**WARNING: Any use of this option may interfere with heuristics.  Use with
-+extreme care.**
 +
 +Mitigations for L1TF / XSA-273 / CVE-2018-3620 for PV guests.
 +
@@ -63,10 +62,10 @@ index 8de35fe..615ecf3 100644
            Under a small number of specific workloads, shadow paging may be
            deliberately used as a performance optimisation.
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index ceccc94..28081df 100644
+index 0883610..2fd20c0 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
-@@ -187,6 +187,56 @@ static int __init parse_spec_ctrl(char *s)
+@@ -187,6 +187,55 @@ static int __init parse_spec_ctrl(char *s)
  }
  custom_param("spec-ctrl", parse_spec_ctrl);
  
@@ -81,12 +80,14 @@ index ceccc94..28081df 100644
 +    if ( opt_pv_l1tf == -1 )
 +        opt_pv_l1tf = 0;
 +
++    /* Interpret 'pv-l1tf' alone in its positive boolean form. */
++    if ( *s == '\0' )
++        opt_pv_l1tf = OPT_PV_L1TF_DOM0 | OPT_PV_L1TF_DOMU;
++
 +    do {
 +        ss = strchr(s, ',');
 +        if ( ss )
 +            *ss = '\0';
-+        else
-+            ss = strchr(s, '\0');
 +
 +        switch ( parse_bool(s) )
 +        {
@@ -95,13 +96,10 @@ index ceccc94..28081df 100644
 +            break;
 +
 +        case 1:
-+        def_true:
 +            opt_pv_l1tf = OPT_PV_L1TF_DOM0 | OPT_PV_L1TF_DOMU;
 +            break;
 +
 +        default:
-+            if ( s == ss )
-+                goto def_true;
 +            if ( (val = parse_boolean("dom0", s, ss)) >= 0 )
 +                opt_pv_l1tf = ((opt_pv_l1tf & ~OPT_PV_L1TF_DOM0) |
 +                               (val ? OPT_PV_L1TF_DOM0 : 0));
@@ -114,7 +112,7 @@ index ceccc94..28081df 100644
 +        }
 +
 +        s = ss + 1;
-+    } while ( *ss );
++    } while ( ss );
 +
 +    return rc;
 +}
@@ -123,7 +121,7 @@ index ceccc94..28081df 100644
  static void __init print_details(enum ind_thunk thunk, uint64_t caps)
  {
      unsigned int _7d0 = 0, e8b = 0, tmp;
-@@ -210,9 +260,16 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+@@ -210,9 +259,16 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
             (caps & ARCH_CAPS_RSBA)                  ? " RSBA"      : "",
             (caps & ARCH_CAPS_SSB_NO)                ? " SSB_NO"    : "");
  
@@ -143,7 +141,7 @@ index ceccc94..28081df 100644
  
      /* Settings for Xen's protection, irrespective of guests. */
      printk("  Xen settings: BTI-Thunk %s, SPEC_CTRL: %s%s, Other:%s\n",
-@@ -226,6 +283,13 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+@@ -226,6 +282,13 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
             (default_xen_spec_ctrl & SPEC_CTRL_SSBD)  ? " SSBD+" : " SSBD-",
             opt_ibpb                                  ? " IBPB"  : "");
  
@@ -157,7 +155,7 @@ index ceccc94..28081df 100644
      /*
       * Alternatives blocks for protecting against and/or virtualising
       * mitigation support for guests.
-@@ -247,6 +311,10 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+@@ -247,6 +310,10 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
      printk("  XPTI (64-bit PV only): Dom0 %s, DomU %s\n",
             opt_xpti & OPT_XPTI_DOM0 ? "enabled" : "disabled",
             opt_xpti & OPT_XPTI_DOMU ? "enabled" : "disabled");
@@ -168,7 +166,7 @@ index ceccc94..28081df 100644
  }
  
  /* Calculate whether Retpoline is known-safe on this CPU. */
-@@ -771,6 +839,18 @@ void __init init_speculation_mitigations(void)
+@@ -770,6 +837,18 @@ void __init init_speculation_mitigations(void)
  
      l1tf_calculations(caps);
  
