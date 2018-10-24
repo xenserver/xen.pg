@@ -1,0 +1,341 @@
+From a28c525d6074abee12a2f4b4245da438d44a5182 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Subject: x86/vvmx: Disallow the use of VT-x instructions when nested virt is disabled
+
+c/s ac6a4500b "vvmx: set vmxon_region_pa of vcpu out of VMX operation to an
+invalid address" was a real bugfix as described, but has a very subtle bug
+which results in all VT-x instructions being usable by a guest.
+
+The toolstack constructs a guest by issuing:
+
+  XEN_DOMCTL_createdomain
+  XEN_DOMCTL_max_vcpus
+
+and optionally later, HVMOP_set_param to enable nested virt.
+
+As a result, the call to nvmx_vcpu_initialise() in hvm_vcpu_initialise()
+(which is what makes the above patch look correct during review) is actually
+dead code.  In practice, nvmx_vcpu_initialise() first gets called when nested
+virt is enabled, which is typically never.
+
+As a result, the zeroed memory of struct vcpu causes nvmx_vcpu_in_vmx() to
+return true before nested virt is enabled for the guest.
+
+Fixing the order of initialisation is a work in progress for other reasons,
+but not viable for security backports.
+
+A compounding factor is that the vmexit handlers for all instructions, other
+than VMXON, pass 0 into vmx_inst_check_privilege()'s vmxop_check parameter,
+which skips the CR4.VMXE check.  (This is one of many reasons why nested virt
+isn't a supported feature yet.)
+
+However, the overall result is that when nested virt is not enabled by the
+toolstack (i.e. the default configuration for all production guests), the VT-x
+instructions (other than VMXON) are actually usable, and Xen very quickly
+falls over the fact that the nvmx structure is uninitialised.
+
+In order to fail safe in the supported case, re-implement all the VT-x
+instruction handling using a single function with a common prologue, covering
+all the checks which should cause #UD or #GP faults.  This deliberately
+doesn't use any state from the nvmx structure, in case there are other lurking
+issues.
+
+This is XSA-278
+
+Reported-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index c981156..d3024ab 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -582,7 +582,7 @@ static void vmx_cpuid_policy_changed(struct vcpu *v)
+         vmx_set_msr_intercept(v, MSR_FLUSH_CMD, VMX_MSR_RW);
+ }
+ 
+-static int vmx_guest_x86_mode(struct vcpu *v)
++int vmx_guest_x86_mode(struct vcpu *v)
+ {
+     unsigned long cs_ar_bytes;
+ 
+@@ -3966,57 +3966,17 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+     }
+ 
+     case EXIT_REASON_VMXOFF:
+-        if ( nvmx_handle_vmxoff(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+-
+     case EXIT_REASON_VMXON:
+-        if ( nvmx_handle_vmxon(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+-
+     case EXIT_REASON_VMCLEAR:
+-        if ( nvmx_handle_vmclear(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+- 
+     case EXIT_REASON_VMPTRLD:
+-        if ( nvmx_handle_vmptrld(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+-
+     case EXIT_REASON_VMPTRST:
+-        if ( nvmx_handle_vmptrst(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+-
+     case EXIT_REASON_VMREAD:
+-        if ( nvmx_handle_vmread(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+- 
+     case EXIT_REASON_VMWRITE:
+-        if ( nvmx_handle_vmwrite(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+-
+     case EXIT_REASON_VMLAUNCH:
+-        if ( nvmx_handle_vmlaunch(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+-
+     case EXIT_REASON_VMRESUME:
+-        if ( nvmx_handle_vmresume(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+-
+     case EXIT_REASON_INVEPT:
+-        if ( nvmx_handle_invept(regs) == X86EMUL_OKAY )
+-            update_guest_eip();
+-        break;
+-
+     case EXIT_REASON_INVVPID:
+-        if ( nvmx_handle_invvpid(regs) == X86EMUL_OKAY )
++        if ( nvmx_handle_vmx_insn(regs, exit_reason) == X86EMUL_OKAY )
+             update_guest_eip();
+         break;
+ 
+diff --git a/xen/arch/x86/hvm/vmx/vvmx.c b/xen/arch/x86/hvm/vmx/vvmx.c
+index d4fd15b..3de38b3 100644
+--- a/xen/arch/x86/hvm/vmx/vvmx.c
++++ b/xen/arch/x86/hvm/vmx/vvmx.c
+@@ -1458,7 +1458,7 @@ void nvmx_switch_guest(void)
+  * VMX instructions handling
+  */
+ 
+-int nvmx_handle_vmxon(struct cpu_user_regs *regs)
++static int nvmx_handle_vmxon(struct cpu_user_regs *regs)
+ {
+     struct vcpu *v=current;
+     struct nestedvmx *nvmx = &vcpu_2_nvmx(v);
+@@ -1511,7 +1511,7 @@ int nvmx_handle_vmxon(struct cpu_user_regs *regs)
+     return X86EMUL_OKAY;
+ }
+ 
+-int nvmx_handle_vmxoff(struct cpu_user_regs *regs)
++static int nvmx_handle_vmxoff(struct cpu_user_regs *regs)
+ {
+     struct vcpu *v=current;
+     struct nestedvmx *nvmx = &vcpu_2_nvmx(v);
+@@ -1600,7 +1600,7 @@ static int nvmx_vmresume(struct vcpu *v, struct cpu_user_regs *regs)
+     return X86EMUL_OKAY;
+ }
+ 
+-int nvmx_handle_vmresume(struct cpu_user_regs *regs)
++static int nvmx_handle_vmresume(struct cpu_user_regs *regs)
+ {
+     bool_t launched;
+     struct vcpu *v = current;
+@@ -1677,7 +1677,7 @@ int nvmx_handle_vmlaunch(struct cpu_user_regs *regs)
+     return rc;
+ }
+ 
+-int nvmx_handle_vmptrld(struct cpu_user_regs *regs)
++static int nvmx_handle_vmptrld(struct cpu_user_regs *regs)
+ {
+     struct vcpu *v = current;
+     struct vmx_inst_decoded decode;
+@@ -1748,7 +1748,7 @@ out:
+     return X86EMUL_OKAY;
+ }
+ 
+-int nvmx_handle_vmptrst(struct cpu_user_regs *regs)
++static int nvmx_handle_vmptrst(struct cpu_user_regs *regs)
+ {
+     struct vcpu *v = current;
+     struct vmx_inst_decoded decode;
+@@ -1770,7 +1770,7 @@ int nvmx_handle_vmptrst(struct cpu_user_regs *regs)
+     return X86EMUL_OKAY;
+ }
+ 
+-int nvmx_handle_vmclear(struct cpu_user_regs *regs)
++static int nvmx_handle_vmclear(struct cpu_user_regs *regs)
+ {
+     struct vcpu *v = current;
+     struct vmx_inst_decoded decode;
+@@ -1822,7 +1822,7 @@ int nvmx_handle_vmclear(struct cpu_user_regs *regs)
+     return X86EMUL_OKAY;
+ }
+ 
+-int nvmx_handle_vmread(struct cpu_user_regs *regs)
++static int nvmx_handle_vmread(struct cpu_user_regs *regs)
+ {
+     struct vcpu *v = current;
+     struct vmx_inst_decoded decode;
+@@ -1861,7 +1861,7 @@ int nvmx_handle_vmread(struct cpu_user_regs *regs)
+     return X86EMUL_OKAY;
+ }
+ 
+-int nvmx_handle_vmwrite(struct cpu_user_regs *regs)
++static int nvmx_handle_vmwrite(struct cpu_user_regs *regs)
+ {
+     struct vcpu *v = current;
+     struct vmx_inst_decoded decode;
+@@ -2005,7 +2005,7 @@ int pv_invept(struct vcpu *v, const struct pv_invept_desc *desc)
+     return 0;
+ }
+ 
+-int nvmx_handle_invept(struct cpu_user_regs *regs)
++static int nvmx_handle_invept(struct cpu_user_regs *regs)
+ {
+     struct vmx_inst_decoded decode;
+     int ret;
+@@ -2060,7 +2060,7 @@ int nvmx_handle_invept(struct cpu_user_regs *regs)
+     return X86EMUL_OKAY;
+ }
+ 
+-int nvmx_handle_invvpid(struct cpu_user_regs *regs)
++static int nvmx_handle_invvpid(struct cpu_user_regs *regs)
+ {
+     struct vmx_inst_decoded decode;
+     unsigned long vpid;
+@@ -2086,6 +2086,83 @@ int nvmx_handle_invvpid(struct cpu_user_regs *regs)
+     return X86EMUL_OKAY;
+ }
+ 
++int nvmx_handle_vmx_insn(struct cpu_user_regs *regs, unsigned int exit_reason)
++{
++    struct vcpu *curr = current;
++    unsigned long ss_attr;
++    int ret;
++
++    if ( !(curr->arch.hvm_vcpu.guest_cr[4] & X86_CR4_VMXE) ||
++         !nestedhvm_enabled(curr->domain) ||
++         (vmx_guest_x86_mode(curr) < (hvm_long_mode_enabled(curr) ? 8 : 2)) )
++    {
++        hvm_inject_hw_exception(TRAP_invalid_op, HVM_DELIVER_NO_ERROR_CODE);
++        return X86EMUL_EXCEPTION;
++    }
++
++    __vmread(GUEST_SS_AR_BYTES, &ss_attr);
++    if ( (ss_attr >> 5) & 3 ) /* ss.dpl */
++    {
++        hvm_inject_hw_exception(TRAP_gp_fault, HVM_DELIVER_NO_ERROR_CODE);
++        return X86EMUL_EXCEPTION;
++    }
++
++    switch ( exit_reason )
++    {
++    case EXIT_REASON_VMXOFF:
++        ret = nvmx_handle_vmxoff(regs);
++        break;
++
++    case EXIT_REASON_VMXON:
++        ret = nvmx_handle_vmxon(regs);
++        break;
++
++    case EXIT_REASON_VMCLEAR:
++        ret = nvmx_handle_vmclear(regs);
++        break;
++
++    case EXIT_REASON_VMPTRLD:
++        ret = nvmx_handle_vmptrld(regs);
++        break;
++
++    case EXIT_REASON_VMPTRST:
++        ret = nvmx_handle_vmptrst(regs);
++        break;
++
++    case EXIT_REASON_VMREAD:
++        ret = nvmx_handle_vmread(regs);
++        break;
++
++    case EXIT_REASON_VMWRITE:
++        ret = nvmx_handle_vmwrite(regs);
++        break;
++
++    case EXIT_REASON_VMLAUNCH:
++        ret = nvmx_handle_vmlaunch(regs);
++        break;
++
++    case EXIT_REASON_VMRESUME:
++        ret = nvmx_handle_vmresume(regs);
++        break;
++
++    case EXIT_REASON_INVEPT:
++        ret = nvmx_handle_invept(regs);
++        break;
++
++    case EXIT_REASON_INVVPID:
++        ret = nvmx_handle_invvpid(regs);
++        break;
++
++    default:
++        ASSERT_UNREACHABLE();
++        domain_crash(curr->domain);
++        ret = X86EMUL_UNHANDLEABLE;
++        break;
++    }
++
++    return ret;
++}
++
+ #define __emul_value(enable1, default1) \
+     ((enable1 | default1) << 32 | (default1))
+ 
+diff --git a/xen/include/asm-x86/hvm/vmx/vmx.h b/xen/include/asm-x86/hvm/vmx/vmx.h
+index 70ac3b5..793ef7e 100644
+--- a/xen/include/asm-x86/hvm/vmx/vmx.h
++++ b/xen/include/asm-x86/hvm/vmx/vmx.h
+@@ -575,6 +575,8 @@ static inline int __vmxon(u64 addr)
+     return rc;
+ }
+ 
++int vmx_guest_x86_mode(struct vcpu *v);
++
+ void vmx_get_segment_register(struct vcpu *, enum x86_segment,
+                               struct segment_register *);
+ void vmx_inject_extint(int trap, uint8_t source);
+diff --git a/xen/include/asm-x86/hvm/vmx/vvmx.h b/xen/include/asm-x86/hvm/vmx/vvmx.h
+index afd3035..b27596f 100644
+--- a/xen/include/asm-x86/hvm/vmx/vvmx.h
++++ b/xen/include/asm-x86/hvm/vmx/vvmx.h
+@@ -125,9 +125,6 @@ void nvmx_domain_relinquish_resources(struct domain *d);
+ 
+ bool_t nvmx_ept_enabled(struct vcpu *v);
+ 
+-int nvmx_handle_vmxon(struct cpu_user_regs *regs);
+-int nvmx_handle_vmxoff(struct cpu_user_regs *regs);
+-
+ #define EPT_TRANSLATE_SUCCEED       0
+ #define EPT_TRANSLATE_VIOLATION     1
+ #define EPT_TRANSLATE_MISCONFIG     2
+@@ -222,15 +219,7 @@ enum vmx_insn_errno set_vvmcs_real_safe(const struct vcpu *, u32 encoding,
+ uint64_t get_shadow_eptp(struct vcpu *v);
+ 
+ void nvmx_destroy_vmcs(struct vcpu *v);
+-int nvmx_handle_vmptrld(struct cpu_user_regs *regs);
+-int nvmx_handle_vmptrst(struct cpu_user_regs *regs);
+-int nvmx_handle_vmclear(struct cpu_user_regs *regs);
+-int nvmx_handle_vmread(struct cpu_user_regs *regs);
+-int nvmx_handle_vmwrite(struct cpu_user_regs *regs);
+-int nvmx_handle_vmresume(struct cpu_user_regs *regs);
+-int nvmx_handle_vmlaunch(struct cpu_user_regs *regs);
+-int nvmx_handle_invept(struct cpu_user_regs *regs);
+-int nvmx_handle_invvpid(struct cpu_user_regs *regs);
++int nvmx_handle_vmx_insn(struct cpu_user_regs *regs, unsigned int exit_reason);
+ int nvmx_msr_read_intercept(unsigned int msr,
+                                 u64 *msr_content);
+ 
