@@ -1,0 +1,147 @@
+From 852b162c8255b2bdecde76e89e272149548e0669 Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Wed, 7 Nov 2018 09:31:17 +0000
+Subject: [PATCH] Allocate space in structs pre-emptively to increase chances
+ of livepatching
+
+1. Expand FEATURESET for 2 more words
+2. Reserve space in struct msr_domain_policy and msr_vcpu_policy
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+diff --git a/xen/drivers/passthrough/vtd/iommu.h b/xen/drivers/passthrough/vtd/iommu.h
+index c55ee0879b..221d9496e7 100644
+--- a/xen/drivers/passthrough/vtd/iommu.h
++++ b/xen/drivers/passthrough/vtd/iommu.h
+@@ -525,6 +525,9 @@ struct intel_iommu {
+     struct ir_ctrl ir_ctrl;
+     struct iommu_flush flush;
+     struct acpi_drhd_unit *drhd;
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ struct iommu {
+@@ -541,6 +544,9 @@ struct iommu {
+     struct intel_iommu *intel;
+     unsigned long *domid_bitmap;  /* domain id bitmap */
+     u16 *domid_map;               /* domain id mapping array */
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ static inline struct qi_ctrl *iommu_qi_ctrl(struct iommu *iommu)
+diff --git a/xen/include/asm-x86/amd-iommu.h b/xen/include/asm-x86/amd-iommu.h
+index 4ad9bff5ba..8c60b98ded 100644
+--- a/xen/include/asm-x86/amd-iommu.h
++++ b/xen/include/asm-x86/amd-iommu.h
+@@ -104,6 +104,9 @@ struct amd_iommu {
+     uint64_t exclusion_limit;
+ 
+     int enabled;
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ struct ivrs_mappings {
+@@ -181,6 +184,9 @@ struct guest_iommu {
+ 
+     /* guest interrupt settings */
+     struct guest_iommu_msi  msi;
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ extern bool_t iommuv2_enabled;
+diff --git a/xen/include/asm-x86/hvm/domain.h b/xen/include/asm-x86/hvm/domain.h
+index f86efd9b22..a3dace7c46 100644
+--- a/xen/include/asm-x86/hvm/domain.h
++++ b/xen/include/asm-x86/hvm/domain.h
+@@ -46,6 +46,9 @@ struct hvm_ioreq_vcpu {
+     struct vcpu      *vcpu;
+     evtchn_port_t    ioreq_evtchn;
+     bool_t           pending;
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[1];
+ };
+ 
+ #define NR_IO_RANGE_TYPES (XEN_DMOP_IO_RANGE_PCI + 1)
+@@ -71,6 +74,9 @@ struct hvm_ioreq_server {
+     struct rangeset        *range[NR_IO_RANGE_TYPES];
+     bool_t                 enabled;
+     bool_t                 bufioreq_atomic;
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ struct hvm_domain {
+diff --git a/xen/include/asm-x86/msr.h b/xen/include/asm-x86/msr.h
+index f28928af3a..ab1bc76e84 100644
+--- a/xen/include/asm-x86/msr.h
++++ b/xen/include/asm-x86/msr.h
+@@ -211,6 +211,9 @@ struct msr_domain_policy
+         bool available; /* This MSR is non-architectural */
+         bool cpuid_faulting;
+     } plaform_info;
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ /* MSR policy object for per-vCPU MSRs */
+@@ -221,6 +224,9 @@ struct msr_vcpu_policy
+         bool available; /* This MSR is non-architectural */
+         bool cpuid_faulting;
+     } misc_features_enables;
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ void init_guest_msr_policy(void);
+diff --git a/xen/include/asm-x86/p2m.h b/xen/include/asm-x86/p2m.h
+index c06b0d9409..6690ae9c48 100644
+--- a/xen/include/asm-x86/p2m.h
++++ b/xen/include/asm-x86/p2m.h
+@@ -337,6 +337,9 @@ struct p2m_domain {
+         struct ept_data ept;
+         /* NPT-equivalent structure could be added here. */
+     };
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ /* get host p2m table */
+diff --git a/xen/include/xen/grant_table.h b/xen/include/xen/grant_table.h
+index e0b0eb4436..eb5050b696 100644
+--- a/xen/include/xen/grant_table.h
++++ b/xen/include/xen/grant_table.h
+@@ -83,6 +83,9 @@ struct grant_table {
+     /* The defined versions are 1 and 2.  Set to 0 if we don't know
+        what version to use yet. */
+     unsigned              gt_version;
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ static inline void grant_read_lock(struct grant_table *gt)
+diff --git a/xen/tools/gen-cpuid.py b/xen/tools/gen-cpuid.py
+index 5db5222bfe..f802c6ce52 100755
+--- a/xen/tools/gen-cpuid.py
++++ b/xen/tools/gen-cpuid.py
+@@ -123,6 +123,8 @@ def crunch_numbers(state):
+ 
+     # Size of bitmaps
+     state.nr_entries = nr_entries = (max(state.names.keys()) >> 5) + 1
++    reserved_entries_num = 4
++    state.nr_entries = nr_entries = nr_entries + reserved_entries_num
+ 
+     # Features common between 1d and e1d.
+     common_1d = (FPU, VME, DE, PSE, TSC, MSR, PAE, MCE, CX8, APIC,
