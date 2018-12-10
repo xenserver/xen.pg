@@ -1,0 +1,61 @@
+From bdc7cab76a7f212b57c804034bb2f4036522dd15 Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Mon, 12 Nov 2018 17:59:38 +0000
+Subject: [PATCH] CA-298922: Add support for p2m_ioreq_server to RMW emulation
+
+Previously emulation of RMW instruction didn't account for the case
+of p2m_ioreq_server typed memory where we have real RAM underneath
+but still need to send IOREQ to the server.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index c86bd7f..68d4bbe 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -1242,8 +1242,33 @@ static int hvmemul_rmw(
+ 
+     if ( mapping )
+     {
+-        rc = x86_emul_rmw(mapping, bytes, eflags, state, ctxt);
+-        hvmemul_unmap_linear_addr(mapping, addr, bytes, hvmemul_ctxt);
++        paddr_t gpa;
++        p2m_type_t p2mt;
++
++        rc = hvmemul_linear_to_phys(addr, &gpa, bytes, &reps, pfec, hvmemul_ctxt);
++        if ( rc != X86EMUL_OKAY )
++            goto out;
++
++        (void) get_gfn_query_unlocked(current->domain, gpa >> PAGE_SHIFT, &p2mt);
++        if ( p2mt == p2m_ioreq_server )
++        {
++            unsigned long data = 0;
++
++            if ( bytes > sizeof(data) )
++               rc = X86EMUL_UNHANDLEABLE;
++            if ( rc == X86EMUL_OKAY )
++            {
++                memcpy(&data, mapping, bytes);
++                rc = x86_emul_rmw(&data, bytes, eflags, state, ctxt);
++            }
++            if ( rc == X86EMUL_OKAY )
++            {
++                latch_linear_to_phys(vio, addr, gpa, true);
++                rc = hvmemul_linear_mmio_write(addr, bytes, &data, pfec,
++                                               hvmemul_ctxt, true);
++            }
++        } else
++            rc = x86_emul_rmw(mapping, bytes, eflags, state, ctxt);
+     }
+     else
+     {
+@@ -1262,6 +1287,10 @@ static int hvmemul_rmw(
+                                            hvmemul_ctxt, known_gpfn);
+     }
+ 
++ out:
++    if ( mapping )
++        hvmemul_unmap_linear_addr(mapping, addr, bytes, hvmemul_ctxt);
++
+     return rc;
+ }
+ 

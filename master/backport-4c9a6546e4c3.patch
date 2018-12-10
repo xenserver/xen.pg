@@ -1,0 +1,125 @@
+From 4c9a6546e4c33ba2b170d5c1d0c340c1dd384ffc Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 24 Jan 2018 16:59:42 +0000
+Subject: [PATCH] xen: Remove domain_crash_synchronous() completely
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+domain_crash_synchronous() is unsafe to use in general as it may leave
+spinlocks held, temporary memory allocated, etc.
+
+With domain_crash_synchronous() removed from the ARM code in 4.11, take the
+opportunity to remove the infrastructure completely by opencoding the softirq
+loop in the remaining callsites, all of which are destined for deletion.
+
+None of these sites are at risk of having a pending ioreq to qemu, which means
+that the vcpu_end_shutdown_deferral() isn't necessary.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index 789d7ff..ddff346 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -2215,7 +2215,10 @@ void asm_domain_crash_synchronous(unsigned long addr)
+     printk("domain_crash_sync called from entry.S: fault at %p %pS\n",
+            _p(addr), _p(addr));
+ 
+-    __domain_crash_synchronous();
++    __domain_crash(current->domain);
++
++    for ( ; ; )
++        do_softirq();
+ }
+ 
+ /*
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index 6cbf135..1dffcd8 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -698,17 +698,6 @@ void __domain_crash(struct domain *d)
+ }
+ 
+ 
+-void __domain_crash_synchronous(void)
+-{
+-    __domain_crash(current->domain);
+-
+-    vcpu_end_shutdown_deferral(current);
+-
+-    for ( ; ; )
+-        do_softirq();
+-}
+-
+-
+ int domain_shutdown(struct domain *d, u8 reason)
+ {
+     struct vcpu *v;
+diff --git a/xen/common/wait.c b/xen/common/wait.c
+index a57bc10..4f830a1 100644
+--- a/xen/common/wait.c
++++ b/xen/common/wait.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <xen/sched.h>
++#include <xen/softirq.h>
+ #include <xen/wait.h>
+ #include <xen/errno.h>
+ 
+@@ -135,7 +136,10 @@ static void __prepare_to_wait(struct waitqueue_vcpu *wqv)
+     if ( vcpu_set_hard_affinity(curr, cpumask_of(wqv->wakeup_cpu)) )
+     {
+         gdprintk(XENLOG_ERR, "Unable to set vcpu affinity\n");
+-        domain_crash_synchronous();
++        domain_crash(current->domain);
++
++        for ( ; ; )
++            do_softirq();
+     }
+ 
+     /* Hand-rolled setjmp(). */
+@@ -166,7 +170,10 @@ static void __prepare_to_wait(struct waitqueue_vcpu *wqv)
+     if ( unlikely(wqv->esp == 0) )
+     {
+         gdprintk(XENLOG_ERR, "Stack too large in %s\n", __func__);
+-        domain_crash_synchronous();
++        domain_crash(current->domain);
++
++        for ( ; ; )
++            do_softirq();
+     }
+ 
+     cpu_info->guest_cpu_user_regs.entry_vector = entry_vector;
+@@ -196,7 +203,7 @@ void check_wakeup_from_wait(void)
+         if ( vcpu_set_hard_affinity(curr, cpumask_of(wqv->wakeup_cpu)) )
+         {
+             gdprintk(XENLOG_ERR, "Unable to set vcpu affinity\n");
+-            domain_crash_synchronous();
++            domain_crash(current->domain);
+         }
+         wait(); /* takes us back into the scheduler */
+     }
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index e79d5a3..d7d26cd 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -616,16 +616,6 @@ void __domain_crash(struct domain *d);
+ } while (0)
+ 
+ /*
+- * Mark current domain as crashed and synchronously deschedule from the local
+- * processor. This function never returns.
+- */
+-void noreturn __domain_crash_synchronous(void);
+-#define domain_crash_synchronous() do {                                   \
+-    printk("domain_crash_sync called from %s:%d\n", __FILE__, __LINE__);  \
+-    __domain_crash_synchronous();                                         \
+-} while (0)
+-
+-/*
+  * Called from assembly code, with an optional address to help indicate why
+  * the crash occured.  If addr is 0, look up address from last extable
+  * redirection.

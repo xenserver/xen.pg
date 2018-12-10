@@ -1,0 +1,144 @@
+From 0b24ef785379fff7cfb6e240e985f230155b2b12 Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Wed, 7 Nov 2018 09:34:17 +0100
+Subject: [PATCH] mm/page_alloc: make bootscrub happen in idle-loop
+
+Scrubbing RAM during boot may take a long time on machines with lots
+of RAM. Add 'idle' option to bootscrub which marks all pages dirty
+initially so they will eventually be scrubbed in idle-loop on every
+online CPU.
+
+It's guaranteed that the allocator will return scrubbed pages by doing
+eager scrubbing during allocation (unless MEMF_no_scrub was provided).
+
+Use the new 'idle' option as the default one.
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/docs/misc/xen-command-line.markdown b/docs/misc/xen-command-line.markdown
+index 0886706368..988e0254e3 100644
+--- a/docs/misc/xen-command-line.markdown
++++ b/docs/misc/xen-command-line.markdown
+@@ -227,14 +227,19 @@ that byte `0x12345678` is bad, you would place `badpage=0x12345` on
+ Xen's command line.
+ 
+ ### bootscrub
+-> `= <boolean>`
++> `= idle | <boolean>`
+ 
+-> Default: `true`
++> Default: `idle`
+ 
+ Scrub free RAM during boot.  This is a safety feature to prevent
+ accidentally leaking sensitive VM data into other VMs if Xen crashes
+ and reboots.
+ 
++In `idle` mode, RAM is scrubbed in background on all CPUs during idle-loop
++with a guarantee that memory allocations always provide scrubbed pages.
++This option reduces boot time on machines with a large amount of RAM while
++still providing security benefits.
++
+ ### bootscrub\_chunk
+ > `= <size>`
+ 
+diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
+index 482f0988f7..3b78f36e21 100644
+--- a/xen/common/page_alloc.c
++++ b/xen/common/page_alloc.c
+@@ -161,8 +161,42 @@ string_param("badpage", opt_badpage);
+ /*
+  * no-bootscrub -> Free pages are not zeroed during boot.
+  */
+-static bool_t opt_bootscrub __initdata = 1;
+-boolean_param("bootscrub", opt_bootscrub);
++enum bootscrub_mode {
++    BOOTSCRUB_OFF,
++    BOOTSCRUB_ON,
++    BOOTSCRUB_IDLE,
++};
++static enum bootscrub_mode __initdata opt_bootscrub = BOOTSCRUB_IDLE;
++static int __init parse_bootscrub_param(const char *s)
++{
++    /* Interpret 'bootscrub' alone in its positive boolean form */
++    if ( *s == '\0' )
++    {
++        opt_bootscrub = BOOTSCRUB_ON;
++        return 0;
++    }
++
++    switch ( parse_bool(s, NULL) )
++    {
++    case 0:
++        opt_bootscrub = BOOTSCRUB_OFF;
++        break;
++
++    case 1:
++        opt_bootscrub = BOOTSCRUB_ON;
++        break;
++
++    default:
++        if ( !strcmp(s, "idle") )
++            opt_bootscrub = BOOTSCRUB_IDLE;
++        else
++            return -EINVAL;
++        break;
++    }
++
++    return 0;
++}
++custom_param("bootscrub", parse_bootscrub_param);
+ 
+ /*
+  * bootscrub_chunk -> Amount of bytes to scrub lockstep on non-SMT CPUs
+@@ -1726,6 +1760,7 @@ static void init_heap_pages(
+     struct page_info *pg, unsigned long nr_pages)
+ {
+     unsigned long i;
++    bool idle_scrub = false;
+ 
+     /*
+      * Some pages may not go through the boot allocator (e.g reserved
+@@ -1737,6 +1772,9 @@ static void init_heap_pages(
+     first_valid_mfn = mfn_min(page_to_mfn(pg), first_valid_mfn);
+     spin_unlock(&heap_lock);
+ 
++    if ( system_state < SYS_STATE_active && opt_bootscrub == BOOTSCRUB_IDLE )
++        idle_scrub = true;
++
+     for ( i = 0; i < nr_pages; i++ )
+     {
+         unsigned int nid = phys_to_nid(page_to_maddr(pg+i));
+@@ -1763,7 +1801,7 @@ static void init_heap_pages(
+             nr_pages -= n;
+         }
+ 
+-        free_heap_pages(pg + i, 0, scrub_debug);
++        free_heap_pages(pg + i, 0, scrub_debug || idle_scrub);
+     }
+ }
+ 
+@@ -2039,8 +2077,23 @@ void __init heap_init_late(void)
+      */
+     setup_low_mem_virq();
+ 
+-    if ( opt_bootscrub )
++    switch ( opt_bootscrub )
++    {
++    default:
++        ASSERT_UNREACHABLE();
++        /* Fall through */
++
++    case BOOTSCRUB_IDLE:
++        printk("Scrubbing free RAM in background\n");
++        break;
++
++    case BOOTSCRUB_ON:
+         scrub_heap_pages();
++        break;
++
++    case BOOTSCRUB_OFF:
++        break;
++    }
+ }
+ 
+ 

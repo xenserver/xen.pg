@@ -2,36 +2,36 @@ Expose vcpus as multiple cores in a smaller number of sockets,
 by adjusting the cpuid responses appropriately.
 
 diff --git a/tools/flask/policy/modules/dom0.te b/tools/flask/policy/modules/dom0.te
-index cb56095..d9cd948 100644
+index 10e5fbf..2eb645e 100644
 --- a/tools/flask/policy/modules/dom0.te
 +++ b/tools/flask/policy/modules/dom0.te
 @@ -40,7 +40,7 @@ allow dom0_t dom0_t:domain {
  allow dom0_t dom0_t:domain2 {
  	set_cpuid gettsc settsc setscheduler set_max_evtchn set_vnumainfo
- 	get_vnumainfo psr_cmt_op psr_cat_op
+ 	get_vnumainfo psr_cmt_op psr_alloc set_gnttab_limits
 -	get_runstate_info
 +	get_runstate_info setcorespersocket
  };
  allow dom0_t dom0_t:resource { add remove };
  
 diff --git a/tools/flask/policy/modules/xen.if b/tools/flask/policy/modules/xen.if
-index 46699bd..8335938 100644
+index 9c0600f..1f2b41c 100644
 --- a/tools/flask/policy/modules/xen.if
 +++ b/tools/flask/policy/modules/xen.if
-@@ -52,7 +52,7 @@ define(`create_domain_common', `
- 			settime setdomainhandle };
+@@ -53,7 +53,7 @@ define(`create_domain_common', `
  	allow $1 $2:domain2 { set_cpuid settsc setscheduler setclaim
  			set_max_evtchn set_vnumainfo get_vnumainfo cacheflush
+ 			psr_cmt_op psr_alloc soft_reset set_gnttab_limits
 -			get_runstate_info
 +			get_runstate_info setcorespersocket
- 			psr_cmt_op psr_cat_op soft_reset };
+ 			resource_map };
  	allow $1 $2:security check_context;
  	allow $1 $2:shadow enable;
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index d4b29b8..f6cf3b5 100644
+index cda1d97..6d8c5a4 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
-@@ -1313,6 +1313,10 @@ int xc_domain_disable_migrate(xc_interface *xch, uint32_t domid);
+@@ -1379,6 +1379,10 @@ int xc_domain_disable_migrate(xc_interface *xch, uint32_t domid);
  int xc_domain_query_disable_migrate(xc_interface *xch, uint32_t domid,
                                      bool *migration_disabled);
  
@@ -39,14 +39,14 @@ index d4b29b8..f6cf3b5 100644
 +                                   uint32_t domid,
 +                                   uint32_t cores_per_socket);
 +
- int xc_domain_maximum_gpfn(xc_interface *xch, domid_t domid, xen_pfn_t *gpfns);
+ int xc_domain_maximum_gpfn(xc_interface *xch, uint32_t domid, xen_pfn_t *gpfns);
  
- int xc_domain_nr_gpfns(xc_interface *xch, domid_t domid, xen_pfn_t *gpfns);
+ int xc_domain_nr_gpfns(xc_interface *xch, uint32_t domid, xen_pfn_t *gpfns);
 diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
-index 6333fd2..9d5e5fa 100644
+index 96ca2a5..555944e 100644
 --- a/tools/libxc/xc_domain.c
 +++ b/tools/libxc/xc_domain.c
-@@ -825,6 +825,20 @@ int xc_domain_get_tsc_info(xc_interface *xch,
+@@ -914,6 +914,20 @@ int xc_domain_get_tsc_info(xc_interface *xch,
  }
  
  
@@ -64,108 +64,101 @@ index 6333fd2..9d5e5fa 100644
 +    return do_domctl(xch, &domctl);
 +}
 +
- int xc_domain_maximum_gpfn(xc_interface *xch, domid_t domid, xen_pfn_t *gpfns)
+ int xc_domain_maximum_gpfn(xc_interface *xch, uint32_t domid, xen_pfn_t *gpfns)
  {
      long rc = do_memory_op(xch, XENMEM_maximum_gpfn, &domid, sizeof(domid));
-diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
-index 6cc9940..4027cc3 100644
---- a/xen/arch/x86/hvm/svm/svm.c
-+++ b/xen/arch/x86/hvm/svm/svm.c
-@@ -1606,14 +1606,52 @@ static void svm_cpuid_intercept(
+diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
+index 0e3f551..f44e2fa 100644
+--- a/xen/arch/x86/cpuid.c
++++ b/xen/arch/x86/cpuid.c
+@@ -703,6 +703,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
  {
-     unsigned int input = *eax;
-     struct vcpu *v = current;
-+    unsigned int cps = v->domain->cores_per_socket;
+     const struct domain *d = v->domain;
+     const struct cpuid_policy *p = d->arch.cpuid;
++    unsigned int cps = d->cores_per_socket;
  
-     hvm_cpuid(input, eax, ebx, ecx, edx);
+     *res = EMPTY_LEAF;
  
-     switch (input) {
-+    case 1:
-+        if ( cps > 0 )
-+        {
-+            /* to fake out #vcpus per socket first force on HT/MC */
-+            *edx |= cpufeat_mask(X86_FEATURE_HTT);
-+            /* fake out #vcpus and inform guest of #cores per package */
-+            *ebx &= 0xFF00FFFF;
-+            /*
-+             * This (cps * 2) is wrong, and contrary to the statement in the
-+             * AMD manual.  However, Xen unconditionally offers Intel-style
-+             * APIC IDs (odd IDs for hyperthreads) which breaks the AMD APIC
-+             * Enumeration Requirements.
-+             *
-+             * Fake up cores-per-socket as a socket with twice as many cores
-+             * as expected, with every odd core offline.
-+             */
-+            *ebx |= (((cps * 2) & 0xFF) << 16);
-+        }
-+        break;
-     case 0x80000001:
-         /* Fix up VLAPIC details. */
-         if ( vlapic_hw_disabled(vcpu_vlapic(v)) )
-             __clear_bit(X86_FEATURE_APIC & 31, edx);
-+        if ( cps > 0 )
-+            *ecx |= cpufeat_mask(X86_FEATURE_CMP_LEGACY);
-+        break;
-+    case 0x80000008:
-+        if ( cps > 0 )
-+        {
-+            *ecx &= 0xFFFF0F00;
-+            /*
-+             * This (cps * 2) is wrong, and contrary to the statement in the
-+             * AMD manual.  However, Xen unconditionally offers Intel-style
-+             * APIC IDs (odd IDs for hyperthreads) which breaks the AMD APIC
-+             * Enumeration Requirements.
-+             *
-+             * Fake up cores-per-socket as a socket with twice as many cores
-+             * as expected, with every odd core offline.
-+             */
-+            *ecx |= ((cps * 2) - 1) & 0xFF;
-+        }
-         break;
-     case 0x8000001c: 
-     {
-diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index 7ad22dd..fadf060 100644
---- a/xen/arch/x86/hvm/vmx/vmx.c
-+++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -2539,11 +2539,32 @@ static void vmx_cpuid_intercept(
- {
-     unsigned int input = *eax;
-     struct vcpu *v = current;
-+    unsigned int cps = v->domain->cores_per_socket;
- 
-     hvm_cpuid(input, eax, ebx, ecx, edx);
- 
-     switch ( input )
-     {
-+        case 0x00000001:
+@@ -819,6 +820,24 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
+             /* OSXSAVE clear in policy.  Fast-forward CR4 back in. */
+             if ( v->arch.hvm_vcpu.guest_cr[4] & X86_CR4_OSXSAVE )
+                 res->c |= cpufeat_mask(X86_FEATURE_OSXSAVE);
++
 +            if ( cps > 0 )
 +            {
 +                /* to fake out #vcpus per socket first force on HT/MC */
-+                *edx |= cpufeat_mask(X86_FEATURE_HTT);
++                res->d |= cpufeat_mask(X86_FEATURE_HTT);
 +                /* fake out #vcpus and inform guest of #cores per package */
-+                *ebx &= 0xFF00FFFF;
-+                *ebx |= (((cps * 2) & 0xFF) << 16);
++                res->b &= 0xFF00FFFF;
++                /*
++                 * This (cps * 2) is wrong, and contrary to the statement in the
++                 * AMD manual.  However, Xen unconditionally offers Intel-style
++                 * APIC IDs (odd IDs for hyperthreads) which breaks the AMD APIC
++                 * Enumeration Requirements.
++                 *
++                 * Fake up cores-per-socket as a socket with twice as many cores
++                 * as expected, with every odd core offline.
++                 */
++                res->b |= (((cps * 2) & 0xFF) << 16);
 +            }
-+            break;
+         }
+         else /* PV domain */
+         {
+@@ -929,6 +948,15 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
+         }
+         goto common_leaf1_adjustments;
+ 
++    case 0x4:
++        if ( is_hvm_domain(d) && p->x86_vendor == X86_VENDOR_INTEL && cps > 0 )
++        {
++            /* fake out cores per socket */
++            res->a &= 0x3FFF; /* one thread, one core */
++            res->a |= (((cps * 2) - 1) << 26);
++        }
++        break;
 +
-+        case 0x00000004:
-+            if ( cps > 0 )
-+            {
-+                /* fake out cores per socket */
-+                *eax &= 0x3FFF; /* one thread, one core */
-+                *eax |= (((cps * 2) - 1) << 26);
-+            }
-+            break;
+     case 0x5:
+         /*
+          * Leak the hardware MONITOR leaf under the same conditions that the
+@@ -1015,6 +1043,9 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
+              is_hvm_domain(d) && !hvm_long_mode_active(v) )
+             res->d &= ~cpufeat_mask(X86_FEATURE_SYSCALL);
+ 
++        if ( p->x86_vendor == X86_VENDOR_AMD && cps > 0 && is_hvm_domain(d) )
++            res->c |= cpufeat_mask(X86_FEATURE_CMP_LEGACY);
 +
-         case 0x80000001:
-             /* SYSCALL is visible iff running in long mode. */
-             if ( hvm_long_mode_enabled(v) )
+     common_leaf1_adjustments:
+         if ( is_hvm_domain(d) )
+         {
+@@ -1057,6 +1088,23 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
+         }
+         break;
+ 
++    case 0x80000008:
++        if ( p->x86_vendor == X86_VENDOR_AMD && cps > 0 )
++        {
++            res->c &= 0xFFFF0F00;
++            /*
++             * This (cps * 2) is wrong, and contrary to the statement in the
++             * AMD manual.  However, Xen unconditionally offers Intel-style
++             * APIC IDs (odd IDs for hyperthreads) which breaks the AMD APIC
++             * Enumeration Requirements.
++             *
++             * Fake up cores-per-socket as a socket with twice as many cores
++             * as expected, with every odd core offline.
++             */
++            res->c |= ((cps * 2) - 1) & 0xFF;
++        }
++        break;
++
+     case 0x8000001c:
+         if ( (v->arch.xcr0 & X86_XCR0_LWP) && cpu_has_svm )
+             /* Turn on available bit and other features specified in lwp_cfg. */
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index 844e227..596b19b 100644
+index d430ae4..c322aab 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -1156,6 +1156,32 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+@@ -1145,6 +1145,32 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
          copyback = 1;
          break;
  
@@ -178,7 +171,7 @@ index 844e227..596b19b 100644
 +            ret = -EEXIST;
 +
 +        /* Only meaningful for HVM domains. */
-+        else if ( !has_hvm_container_domain(d) )
++        else if ( !is_hvm_domain(d) )
 +            ret = -EOPNOTSUPP;
 +
 +        /* Cores per socket is strictly within the bounds of max_vcpus. */
@@ -199,10 +192,10 @@ index 844e227..596b19b 100644
          ret = arch_do_domctl(op, d, u_domctl);
          break;
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index 6ed7e65..efad119 100644
+index 484683e..95d02aa 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1171,6 +1171,13 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
+@@ -1133,6 +1133,13 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
  /* Some vcpus are runnable, some are blocked */
  #define DOMAIN_RUNSTATE_partial_contention 5
  
@@ -216,7 +209,7 @@ index 6ed7e65..efad119 100644
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1254,6 +1261,7 @@ struct xen_domctl {
+@@ -1218,6 +1225,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
  #define XEN_DOMCTL_gdbsx_domstatus             1003
@@ -224,7 +217,7 @@ index 6ed7e65..efad119 100644
      uint32_t interface_version; /* XEN_DOMCTL_INTERFACE_VERSION */
      domid_t  domain;
      union {
-@@ -1303,6 +1311,7 @@ struct xen_domctl {
+@@ -1266,6 +1274,7 @@ struct xen_domctl {
          struct xen_domctl_set_virq_handler  set_virq_handler;
          struct xen_domctl_set_max_evtchn    set_max_evtchn;
          struct xen_domctl_runstate_info     domain_runstate;
@@ -233,10 +226,10 @@ index 6ed7e65..efad119 100644
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index edf0e4a..1e7386a 100644
+index d0ed693..265e603 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -481,6 +481,8 @@ struct domain
+@@ -498,6 +498,8 @@ struct domain
      spinlock_t runstate_lock;
      atomic_t runstate_missed_changes;
      domain_runstate_info_t runstate;
@@ -246,10 +239,10 @@ index edf0e4a..1e7386a 100644
  
  /* Protect updates/reads (resp.) of domain_list and domain_hash. */
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
-index 6aaeaad..835c875 100644
+index 26a1577..b70c1ac 100644
 --- a/xen/xsm/flask/hooks.c
 +++ b/xen/xsm/flask/hooks.c
-@@ -751,6 +751,9 @@ static int flask_domctl(struct domain *d, int cmd)
+@@ -754,6 +754,9 @@ static int flask_domctl(struct domain *d, int cmd)
      case XEN_DOMCTL_get_runstate_info:
          return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__GET_RUNSTATE_INFO);
  
@@ -260,11 +253,11 @@ index 6aaeaad..835c875 100644
          return avc_unknown_permission("domctl", cmd);
      }
 diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
-index 11f8ef9..2dfbd9a 100644
+index 0807ca8..ffd0bb4 100644
 --- a/xen/xsm/flask/policy/access_vectors
 +++ b/xen/xsm/flask/policy/access_vectors
-@@ -250,6 +250,8 @@ class domain2
-     psr_cat_op
+@@ -256,6 +256,8 @@ class domain2
+     resource_map
  # XEN_DOMCTL_get_runstate_info
      get_runstate_info
 +# XEN_DOMCTL_setcorespersocket

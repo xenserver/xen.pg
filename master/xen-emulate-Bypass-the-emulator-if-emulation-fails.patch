@@ -7,35 +7,39 @@ If emulation fails in hvm_do_resume(), single-step instead.
 
 Signed-off-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
 diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
-index 2baff6f..3fc811a 100644
+index cd8c823..c21aba3 100644
 --- a/xen/arch/x86/hvm/emulate.c
 +++ b/xen/arch/x86/hvm/emulate.c
-@@ -1904,8 +1904,8 @@ int hvm_emulate_one_mmio(unsigned long mfn, unsigned long gla)
+@@ -2102,8 +2102,8 @@ int hvm_emulate_one_mmio(unsigned long mfn, unsigned long gla)
      return rc;
  }
  
--void hvm_mem_access_emulate_one(enum emul_kind kind, unsigned int trapnr,
+-void hvm_emulate_one_vm_event(enum emul_kind kind, unsigned int trapnr,
 -    unsigned int errcode)
-+int hvm_mem_access_emulate_one(enum emul_kind kind, unsigned int trapnr,
++int hvm_emulate_one_vm_event(enum emul_kind kind, unsigned int trapnr,
 +    unsigned int errcode, bool_t treat_unhandleable)
  {
      struct hvm_emulate_ctxt ctx = {{ 0 }};
      int rc;
-@@ -1933,10 +1933,11 @@ void hvm_mem_access_emulate_one(enum emul_kind kind, unsigned int trapnr,
+@@ -2146,14 +2146,12 @@ void hvm_emulate_one_vm_event(enum emul_kind kind, unsigned int trapnr,
           * returning makes the current instruction cause a page fault again,
           * consistent with X86EMUL_RETRY.
           */
 -        return;
 +        return rc;
+     case X86EMUL_UNIMPLEMENTED:
+-        if ( hvm_monitor_emul_unimplemented() )
+-            return;
+-        /* fall-through */
      case X86EMUL_UNHANDLEABLE:
-         hvm_dump_emulation_state(XENLOG_G_DEBUG "Mem event", &ctx);
+         hvm_dump_emulation_state(XENLOG_G_DEBUG, "Mem event", &ctx, rc);
 -        hvm_inject_hw_exception(trapnr, errcode);
 +        if ( treat_unhandleable )
 +            hvm_inject_hw_exception(trapnr, errcode);
          break;
      case X86EMUL_EXCEPTION:
-         if ( ctx.exn_pending )
-@@ -1945,6 +1946,8 @@ void hvm_mem_access_emulate_one(enum emul_kind kind, unsigned int trapnr,
+         hvm_inject_event(&ctx.ctxt.event);
+@@ -2161,6 +2159,8 @@ void hvm_emulate_one_vm_event(enum emul_kind kind, unsigned int trapnr,
      }
  
      hvm_emulate_writeback(&ctx);
@@ -43,21 +47,21 @@ index 2baff6f..3fc811a 100644
 +    return rc;
  }
  
- void hvm_emulate_prepare(
+ void hvm_emulate_init_once(
 diff --git a/xen/arch/x86/hvm/vm_event.c b/xen/arch/x86/hvm/vm_event.c
-index 3a2c8f8..d80b162 100644
+index b15a654..cc9e63f 100644
 --- a/xen/arch/x86/hvm/vm_event.c
 +++ b/xen/arch/x86/hvm/vm_event.c
-@@ -85,8 +85,15 @@ void hvm_vm_event_do_resume(struct vcpu *v)
+@@ -92,8 +92,15 @@ void hvm_vm_event_do_resume(struct vcpu *v)
              vmx_start_reexecute_instruction(v, v->arch.vm_event->gpa,
                                              XENMEM_access_x);
          else
--            hvm_mem_access_emulate_one(kind, TRAP_invalid_op,
--                                       HVM_DELIVER_NO_ERROR_CODE);
+-            hvm_emulate_one_vm_event(kind, TRAP_invalid_op,
+-                                     X86_EVENT_NO_EC);
 +        {
-+            int rc = hvm_mem_access_emulate_one(kind, TRAP_invalid_op,
-+                                                HVM_DELIVER_NO_ERROR_CODE,
-+                                                !opt_introspection_extn);
++            int rc = hvm_emulate_one_vm_event(kind, TRAP_invalid_op,
++                                              X86_EVENT_NO_EC,
++                                              !opt_introspection_extn);
 +
 +            if ( opt_introspection_extn && rc == X86EMUL_UNHANDLEABLE )
 +                vmx_start_reexecute_instruction(v, v->arch.vm_event->gpa,
@@ -67,19 +71,19 @@ index 3a2c8f8..d80b162 100644
          v->arch.vm_event->emulate_flags = 0;
      }
 diff --git a/xen/include/asm-x86/hvm/emulate.h b/xen/include/asm-x86/hvm/emulate.h
-index d0d374b..720b5ff 100644
+index 6d13665..4d0e54f 100644
 --- a/xen/include/asm-x86/hvm/emulate.h
 +++ b/xen/include/asm-x86/hvm/emulate.h
-@@ -47,9 +47,10 @@ int hvm_emulate_one(
+@@ -54,9 +54,10 @@ bool __nonnull(1, 2) hvm_emulate_one_insn(
+     const char *descr);
+ int hvm_emulate_one(
      struct hvm_emulate_ctxt *hvmemul_ctxt);
- int hvm_emulate_one_no_write(
-     struct hvm_emulate_ctxt *hvmemul_ctxt);
--void hvm_mem_access_emulate_one(enum emul_kind kind,
-+int hvm_mem_access_emulate_one(enum emul_kind kind,
+-void hvm_emulate_one_vm_event(enum emul_kind kind,
++int hvm_emulate_one_vm_event(enum emul_kind kind,
      unsigned int trapnr,
 -    unsigned int errcode);
 +    unsigned int errcode,
 +    bool_t treat_unhandleable);
- void hvm_emulate_prepare(
+ /* Must be called once to set up hvmemul state. */
+ void hvm_emulate_init_once(
      struct hvm_emulate_ctxt *hvmemul_ctxt,
-     struct cpu_user_regs *regs);

@@ -1,8 +1,8 @@
 diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
-index 304fccf..5fbf550 100644
+index 304fccf..ada379f 100644
 --- a/xen/common/pv_iommu.c
 +++ b/xen/common/pv_iommu.c
-@@ -17,13 +17,238 @@
+@@ -17,13 +17,243 @@
   * along with this program; If not, see <http://www.gnu.org/licenses/>.
   */
  
@@ -25,7 +25,7 @@ index 304fccf..5fbf550 100644
 +                             (readonly) ? P2M_ALLOC : P2M_UNSHARE);
 +    if ( !(*page) )
 +    {
-+        *frame = INVALID_MFN;
++        *frame = mfn_x(INVALID_MFN);
 +        if ( p2m_is_shared(p2mt) )
 +            return -EIO;
 +        if ( p2m_is_paging(p2mt) )
@@ -35,13 +35,13 @@ index 304fccf..5fbf550 100644
 +        }
 +        return -EIO;
 +    }
-+    *frame = page_to_mfn(*page);
++    *frame = mfn_x(page_to_mfn(*page));
 +#else
 +    *frame = gmfn_to_mfn(rd, gfn);
-+    *page = mfn_valid(*frame) ? mfn_to_page(*frame) : NULL;
++    *page = mfn_valid(_mfn(*frame)) ? mfn_to_page(*frame) : NULL;
 +    if ( (!(page)) || (!get_page*page, rd) )
 +    {
-+        *frame = INVALID_MFN;
++        *frame = mfn_x(INVALID_MFN);
 +        *page = NULL;
 +        rc = -EIO;
 +    }
@@ -112,7 +112,7 @@ index 304fccf..5fbf550 100644
 +            if ( (op->flags & IOMMU_MAP_OP_no_ref_cnt) )
 +            {
 +                mfn = op->u.map_page.gfn;
-+                page = mfn_to_page(mfn);
++                page = mfn_to_page(_mfn(mfn));
 +                if (!page)
 +                {
 +                    op->status = -EPERM; // Should this be something else?
@@ -222,6 +222,17 @@ index 304fccf..5fbf550 100644
 +    }
 +
 +flush_pages:
++    if ( count > 1 )
++    {
++        int rc = 0;
++
++        this_cpu(iommu_dont_flush_iotlb) = 0;
++        if ( i )
++            rc = iommu_iotlb_flush_all(d);
++
++        if ( rc < 0 )
++            ret = rc;
++    }
 +    if ( ret > 0 )
 +    {
 +        XEN_GUEST_HANDLE_PARAM(pv_iommu_op_t) op =
@@ -231,12 +242,6 @@ index 304fccf..5fbf550 100644
 +        arg = guest_handle_cast(op, void);
 +        ret = hypercall_create_continuation(__HYPERVISOR_iommu_op,
 +                                           "hi", arg, count - i);
-+    }
-+    if ( count > 1 )
-+    {
-+        this_cpu(iommu_dont_flush_iotlb) = 0;
-+        if ( i )
-+            iommu_iotlb_flush_all(d);
 +    }
 +    return ret;
  }

@@ -1,0 +1,108 @@
+From 129025fe30934c6a04bbd9c05ade479d34ce4985 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 3 Oct 2018 10:32:54 +0100
+Subject: [PATCH] oxenstored: Don't re-open a xenctrl handle for every domain
+ introduction
+
+Currently, an xc handle is opened in main() which is used for cleanup
+activities, and a new xc handle is temporarily opened every time a domain is
+introduced.  This is inefficient, and amongst other things, requires full root
+privileges for the lifetime of oxenstored.
+
+All code using the Xenctrl handle is in domains.ml, so initialise xc as a
+global (now happens just before main() is called) and drop it as a parameter
+from Domains.create and Domains.cleanup.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+diff --git a/tools/ocaml/xenstored/domains.ml b/tools/ocaml/xenstored/domains.ml
+index 4134630..71dde16 100644
+--- a/tools/ocaml/xenstored/domains.ml
++++ b/tools/ocaml/xenstored/domains.ml
+@@ -18,6 +18,8 @@ let debug fmt = Logging.debug "domains" fmt
+ let error fmt = Logging.error "domains" fmt
+ let warn fmt  = Logging.warn  "domains" fmt
+ 
++let xc = Xenctrl.interface_open ()
++
+ type domains = {
+ 	eventchn: Event.t;
+ 	table: (Xenctrl.domid, Domain.t) Hashtbl.t;
+@@ -86,7 +88,7 @@ let remove_from_queue dom queue =
+ 		| None -> ()
+ 		| Some x -> if x=dom then d := None) queue
+ 
+-let cleanup xc doms =
++let cleanup doms =
+ 	let notify = ref false in
+ 	let dead_dom = ref [] in
+ 
+@@ -120,7 +122,7 @@ let cleanup xc doms =
+ let resume doms domid =
+ 	()
+ 
+-let create xc doms domid mfn port =
++let create doms domid mfn port =
+ 	let interface = Xenctrl.map_foreign_range xc domid (Xenmmap.getpagesize()) mfn in
+ 	let dom = Domain.make domid mfn port interface doms.eventchn in
+ 	Hashtbl.add doms.table domid dom;
+diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
+index 7e51bcc..74c69f8 100644
+--- a/tools/ocaml/xenstored/process.ml
++++ b/tools/ocaml/xenstored/process.ml
+@@ -410,8 +410,7 @@ let do_introduce con t domains cons data =
+ 		if Domains.exist domains domid then
+ 			Domains.find domains domid
+ 		else try
+-			let ndom = Xenctrl.with_intf (fun xc ->
+-				Domains.create xc domains domid mfn port) in
++			let ndom = Domains.create domains domid mfn port in
+ 			Connections.add_domain cons ndom;
+ 			Connections.fire_spec_watches cons "@introduceDomain";
+ 			ndom
+diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
+index 332a69b..49fc18b 100644
+--- a/tools/ocaml/xenstored/xenstored.ml
++++ b/tools/ocaml/xenstored/xenstored.ml
+@@ -177,12 +177,11 @@ let from_channel_f chan domain_f watch_f store_f =
+ let from_channel store cons doms chan =
+ 	(* don't let the permission get on our way, full perm ! *)
+ 	let op = Store.get_ops store Perms.Connection.full_rights in
+-	let xc = Xenctrl.interface_open () in
+ 
+ 	let domain_f domid mfn port =
+ 		let ndom =
+ 			if domid > 0 then
+-				Domains.create xc doms domid mfn port
++				Domains.create doms domid mfn port
+ 			else
+ 				Domains.create0 doms
+ 			in
+@@ -196,8 +195,7 @@ let from_channel store cons doms chan =
+ 		op.Store.write path value;
+ 		op.Store.setperms path perms
+ 		in
+-	finally (fun () -> from_channel_f chan domain_f watch_f store_f)
+-	        (fun () -> Xenctrl.interface_close xc)
++	from_channel_f chan domain_f watch_f store_f
+ 
+ let from_file store cons doms file =
+ 	let channel = open_in file in
+@@ -328,8 +326,6 @@ let _ =
+ 		(if cf.domain_init then [ Event.fd eventchn ] else [])
+ 		in
+ 
+-	let xc = Xenctrl.interface_open () in
+-
+ 	let process_special_fds rset =
+ 		let accept_connection can_write fd =
+ 			let (cfd, addr) = Unix.accept fd in
+@@ -340,7 +336,7 @@ let _ =
+ 			debug "pending port %d" (Xeneventchn.to_int port);
+ 			finally (fun () ->
+ 				if Some port = eventchn.Event.virq_port then (
+-					let (notify, deaddom) = Domains.cleanup xc domains in
++					let (notify, deaddom) = Domains.cleanup domains in
+ 					List.iter (Connections.del_domain cons) deaddom;
+ 					if deaddom <> [] || notify then
+ 						Connections.fire_spec_watches cons "@releaseDomain"

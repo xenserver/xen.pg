@@ -1,0 +1,156 @@
+From c3acf04dbd703403759025877cca3a1e27e8e59e Mon Sep 17 00:00:00 2001
+From: Wei Liu <wei.liu2@citrix.com>
+Date: Mon, 26 Nov 2018 10:40:44 +0000
+Subject: [PATCH] tools: set Dom0 UUID if requested
+
+Introduce XEN_DOM0_UUID in Xen's global configuration file.  Make
+xen-init-dom0 accept an extra argument for UUID.
+
+Also switch xs_open error message in xen-init-dom0 to use perror.
+
+Signed-off-by: Wei Liu <wei.liu2@citrix.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+Reviewed-by: Anthony PERARD <anthony.perard@citrix.com>
+Acked-by: Ian Jackson <ian.jackson@eu.citrix.com>
+diff --git a/tools/helpers/Makefile b/tools/helpers/Makefile
+index 4f3bbe6a7d..f759528322 100644
+--- a/tools/helpers/Makefile
++++ b/tools/helpers/Makefile
+@@ -14,6 +14,7 @@ XEN_INIT_DOM0_OBJS = xen-init-dom0.o init-dom-json.o
+ $(XEN_INIT_DOM0_OBJS): CFLAGS += $(CFLAGS_libxentoollog)
+ $(XEN_INIT_DOM0_OBJS): CFLAGS += $(CFLAGS_libxenstore)
+ $(XEN_INIT_DOM0_OBJS): CFLAGS += $(CFLAGS_libxenlight)
++$(XEN_INIT_DOM0_OBJS): CFLAGS += $(CFLAGS_libxenctrl)
+ 
+ INIT_XENSTORE_DOMAIN_OBJS = init-xenstore-domain.o init-dom-json.o
+ $(INIT_XENSTORE_DOMAIN_OBJS): CFLAGS += $(CFLAGS_libxentoollog)
+@@ -26,7 +27,7 @@ $(INIT_XENSTORE_DOMAIN_OBJS): CFLAGS += $(CFLAGS_libxenlight)
+ all: $(PROGS)
+ 
+ xen-init-dom0: $(XEN_INIT_DOM0_OBJS)
+-	$(CC) $(LDFLAGS) -o $@ $(XEN_INIT_DOM0_OBJS) $(LDLIBS_libxentoollog) $(LDLIBS_libxenstore) $(LDLIBS_libxenlight) $(APPEND_LDFLAGS)
++	$(CC) $(LDFLAGS) -o $@ $(XEN_INIT_DOM0_OBJS) $(LDLIBS_libxenctrl) $(LDLIBS_libxentoollog) $(LDLIBS_libxenstore) $(LDLIBS_libxenlight) $(APPEND_LDFLAGS)
+ 
+ $(INIT_XENSTORE_DOMAIN_OBJS): _paths.h
+ 
+diff --git a/tools/helpers/xen-init-dom0.c b/tools/helpers/xen-init-dom0.c
+index 09bc0027f9..a1e5729458 100644
+--- a/tools/helpers/xen-init-dom0.c
++++ b/tools/helpers/xen-init-dom0.c
+@@ -3,7 +3,9 @@
+ #include <string.h>
+ #include <stdio.h>
+ 
++#include <xenctrl.h>
+ #include <xenstore.h>
++#include <libxl.h>
+ 
+ #include "init-dom-json.h"
+ 
+@@ -13,13 +15,30 @@
+ int main(int argc, char **argv)
+ {
+     int rc;
+-    struct xs_handle *xsh;
++    struct xs_handle *xsh = NULL;
++    xc_interface *xch = NULL;
+     char *domname_string = NULL, *domid_string = NULL;
++    libxl_uuid uuid;
++
++    /* Accept 0 or 1 argument */
++    if (argc > 2) {
++        fprintf(stderr, "too many arguments\n");
++        rc = 1;
++        goto out;
++    }
+ 
+     xsh = xs_open(0);
+     if (!xsh) {
+-        fprintf(stderr, "cannot open xenstore connection\n");
+-        exit(1);
++        perror("cannot open xenstore connection");
++        rc = 1;
++        goto out;
++    }
++
++    xch = xc_interface_open(NULL, NULL, 0);
++    if (!xch) {
++        perror("xc_interface_open() failed");
++        rc = 1;
++        goto out;
+     }
+ 
+     /* Sanity check: this program can only be run once. */
+@@ -31,7 +50,23 @@ int main(int argc, char **argv)
+         goto out;
+     }
+ 
+-    rc = gen_stub_json_config(0, NULL);
++    libxl_uuid_clear(&uuid);
++
++    /* If UUID is supplied, parse it. */
++    if (argc == 2 && libxl_uuid_from_string(&uuid, argv[1])) {
++        fprintf(stderr, "failed to parse UUID %s\n", argv[1]);
++        rc = 1;
++        goto out;
++    }
++
++    if (!libxl_uuid_is_nil(&uuid) &&
++        xc_domain_sethandle(xch, 0, libxl_uuid_bytearray(&uuid))) {
++        perror("failed to set Dom0 UUID");
++        rc = 1;
++        goto out;
++    }
++
++    rc = gen_stub_json_config(0, &uuid);
+     if (rc)
+         goto out;
+ 
+@@ -55,6 +90,7 @@ out:
+     free(domid_string);
+     free(domname_string);
+     xs_close(xsh);
++    xc_interface_close(xch);
+     return rc;
+ }
+ 
+diff --git a/tools/hotplug/Linux/init.d/sysconfig.xencommons.in b/tools/hotplug/Linux/init.d/sysconfig.xencommons.in
+index 92569cd61b..0fc6557d4a 100644
+--- a/tools/hotplug/Linux/init.d/sysconfig.xencommons.in
++++ b/tools/hotplug/Linux/init.d/sysconfig.xencommons.in
+@@ -95,3 +95,6 @@ XENSTORE_DOMAIN_ARGS=
+ 
+ # qemu path
+ #QEMU_XEN=@qemu_xen_path@
++
++# Dom0 UUID
++#XEN_DOM0_UUID=00000000-0000-0000-0000-000000000000
+diff --git a/tools/hotplug/Linux/init.d/xencommons.in b/tools/hotplug/Linux/init.d/xencommons.in
+index ec42b05587..a33058ed44 100644
+--- a/tools/hotplug/Linux/init.d/xencommons.in
++++ b/tools/hotplug/Linux/init.d/xencommons.in
+@@ -63,7 +63,7 @@ do_start () {
+ 	@XEN_SCRIPT_DIR@/launch-xenstore || exit 1
+ 
+ 	echo Setting domain 0 name, domid and JSON config...
+-	${LIBEXEC_BIN}/xen-init-dom0
++	${LIBEXEC_BIN}/xen-init-dom0 ${XEN_DOM0_UUID}
+ 
+ 	echo Starting xenconsoled...
+ 	test -z "$XENCONSOLED_TRACE" || XENCONSOLED_ARGS=" --log=$XENCONSOLED_TRACE"
+diff --git a/tools/hotplug/Linux/systemd/xen-init-dom0.service.in b/tools/hotplug/Linux/systemd/xen-init-dom0.service.in
+index 3befadcea3..beed3126c6 100644
+--- a/tools/hotplug/Linux/systemd/xen-init-dom0.service.in
++++ b/tools/hotplug/Linux/systemd/xen-init-dom0.service.in
+@@ -7,8 +7,9 @@ ConditionPathExists=/proc/xen/capabilities
+ [Service]
+ Type=oneshot
+ RemainAfterExit=true
++EnvironmentFile=@CONFIG_DIR@/@CONFIG_LEAF_DIR@/xencommons
+ ExecStartPre=/bin/grep -q control_d /proc/xen/capabilities
+-ExecStart=@LIBEXEC_BIN@/xen-init-dom0
++ExecStart=@LIBEXEC_BIN@/xen-init-dom0 $XEN_DOM0_UUID
+ 
+ [Install]
+ WantedBy=multi-user.target

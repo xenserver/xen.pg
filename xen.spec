@@ -27,7 +27,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.7.6
+Version: 4.11.1
 Release: 7.0.4
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
@@ -36,7 +36,6 @@ Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
 Source4: https://repo.citrite.net/list/ctx-local-contrib/citrix/branding/Citrix_Logo_Black.png
-#Patch0:  xen-development.patch
 
 ExclusiveArch: i686 x86_64
 
@@ -62,9 +61,6 @@ BuildRequires: python-devel
 # For ocaml stubs
 BuildRequires: ocaml ocaml-findlib
 
-# For ipxe
-BuildRequires: ipxe-source
-
 BuildRequires: libblkid-devel
 
 # For xentop
@@ -83,6 +79,9 @@ BuildRequires: lzo-devel
 
 # For xenguest
 BuildRequires: json-c-devel libempserver-devel
+
+# For manpages
+BuildRequires: perl pandoc python-markdown
 
 # Misc
 BuildRequires: libtool
@@ -145,6 +144,7 @@ This package contains the Xen Hypervisor general development for all domains.
 Summary: Xen Hypervisor Domain 0 tools
 Requires: xen-dom0-libs = %{version}
 Requires: xen-tools = %{version}
+Requires: ipxe
 %if %with_systemd
 Requires(post): systemd
 Requires(preun): systemd
@@ -198,10 +198,6 @@ the XenServer installer environment.
 %prep
 %autosetup -p1
 
-mkdir -p tools/firmware/etherboot/ipxe/
-cp /usr/src/ipxe-source.tar.gz tools/firmware/etherboot/ipxe.tar.gz
-rm -f tools/firmware/etherboot/patches/series
-#%patch0 -p1 -b ~development
 base_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info)
 pq_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info-pq)
 echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
@@ -215,7 +211,7 @@ export WGET=/bin/false FETCHER=/bin/false
 %configure \
         --disable-seabios --disable-stubdom --disable-xsmpolicy --disable-blktap2 \
 	--with-system-qemu=%{_libdir}/xen/bin/qemu-system-i386 --with-xenstored=oxenstored \
-	--enable-systemd
+	--enable-systemd --with-system-ipxe=/usr/share/ipxe/ipxe.bin
 
 %install
 
@@ -255,7 +251,7 @@ cp buildconfigs/config-debug %{buildroot}/boot/%{name}-%{version}-%{release}-d.c
 chmod -x %{buildroot}/boot/xen-syms-*
 
 # Build tools and man pages
-%{?cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools install
+%{?cov_wrap} %{__make} %{TOOLS_OPTIONS} install-tools
 %{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
 %{?cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/tests/mce-test/tools install
 
@@ -330,8 +326,10 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/%{name}/hvm/params.h
 %{_includedir}/%{name}/hvm/pvdrivers.h
 %{_includedir}/%{name}/hvm/save.h
+%{_includedir}/%{name}/io/9pfs.h
 %{_includedir}/%{name}/io/blkif.h
 %{_includedir}/%{name}/io/console.h
+%{_includedir}/%{name}/io/displif.h
 %{_includedir}/%{name}/io/fbif.h
 %{_includedir}/%{name}/io/fsif.h
 %{_includedir}/%{name}/io/kbdif.h
@@ -339,7 +337,9 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/%{name}/io/netif.h
 %{_includedir}/%{name}/io/pciif.h
 %{_includedir}/%{name}/io/protocols.h
+%{_includedir}/%{name}/io/pvcalls.h
 %{_includedir}/%{name}/io/ring.h
+%{_includedir}/%{name}/io/sndif.h
 %{_includedir}/%{name}/io/tpmif.h
 %{_includedir}/%{name}/io/usbif.h
 %{_includedir}/%{name}/io/vscsiif.h
@@ -379,25 +379,28 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxenstore.so.3.0.3
 %{_libdir}/libxentoolcore.so.1
 %{_libdir}/libxentoolcore.so.1.0
-%{_libdir}/libxenvchan.so.4.7
-%{_libdir}/libxenvchan.so.4.7.0
+%{_libdir}/libxenvchan.so.4.11
+%{_libdir}/libxenvchan.so.4.11.0
 
 %files libs-devel
 # Lib Xen Evtchn
 %{_includedir}/xenevtchn.h
 %{_libdir}/libxenevtchn.a
 %{_libdir}/libxenevtchn.so
+/usr/share/pkgconfig/xenevtchn.pc
 
 # Lib Xen Gnttab
 %{_includedir}/xengnttab.h
 %{_libdir}/libxengnttab.a
 %{_libdir}/libxengnttab.so
+/usr/share/pkgconfig/xengnttab.pc
 
 # Lib XenStore
 %{_includedir}/xenstore.h
 %{_includedir}/xenstore_lib.h
 %{_libdir}/libxenstore.a
 %{_libdir}/libxenstore.so
+/usr/share/pkgconfig/xenstore.pc
 # Legacy XenStore header files, excluded to discourage their use
 %exclude %{_includedir}/xs.h
 %exclude %{_includedir}/xenstore-compat/xs.h
@@ -407,11 +410,13 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/xentoolcore.h
 %{_libdir}/libxentoolcore.a
 %{_libdir}/libxentoolcore.so
+/usr/share/pkgconfig/xentoolcore.pc
 
 # Lib Xen Vchan
 %{_includedir}/libxenvchan.h
 %{_libdir}/libxenvchan.a
 %{_libdir}/libxenvchan.so
+/usr/share/pkgconfig/xenvchan.pc
 
 %files dom0-tools
 %{_sysconfdir}/bash_completion.d/xl.sh
@@ -438,6 +443,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_sysconfdir}/xen/scripts/colo-proxy-setup
 %{_sysconfdir}/xen/scripts/external-device-migrate
 %{_sysconfdir}/xen/scripts/hotplugpath.sh
+%{_sysconfdir}/xen/scripts/launch-xenstore
 %{_sysconfdir}/xen/scripts/locking.sh
 %{_sysconfdir}/xen/scripts/logging.sh
 %{_sysconfdir}/xen/scripts/vif-bridge
@@ -498,6 +504,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libexecdir}/%{name}/bin/xenpaging
 %{_libexecdir}/%{name}/bin/xenpvnetboot
 %{_libexecdir}/%{name}/boot/hvmloader
+%{_libexecdir}/%{name}/boot/xen-shim
 %{_sbindir}/flask-get-bool
 %{_sbindir}/flask-getenforce
 %{_sbindir}/flask-label-pci
@@ -507,6 +514,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_sbindir}/gdbsx
 %{_sbindir}/kdd
 %{_sbindir}/oxenstored
+%{_sbindir}/xen-diag
 %{_sbindir}/xen-hptool
 %{_sbindir}/xen-hvmcrash
 %{_sbindir}/xen-hvmctx
@@ -530,8 +538,6 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_sbindir}/xentrace_setsize
 %{_sbindir}/xenwatchdogd
 %{_sbindir}/xl
-%exclude %{_sbindir}/gtracestat
-%exclude %{_sbindir}/gtraceview
 %exclude %{_sbindir}/xen-bugtool
 %exclude %{_sbindir}/xen-tmem-list-parse
 %exclude %{_sbindir}/xenlockprof
@@ -541,9 +547,18 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_mandir}/man1/xenstore-ls.1.gz
 %{_mandir}/man1/xenstore.1.gz
 %{_mandir}/man1/xl.1.gz
+%{_mandir}/man5/xl-disk-configuration.5.gz
+%{_mandir}/man5/xl-network-configuration.5.gz
 %{_mandir}/man5/xl.cfg.5.gz
 %{_mandir}/man5/xl.conf.5.gz
 %{_mandir}/man5/xlcpupool.cfg.5.gz
+%{_mandir}/man7/xen-pci-device-reservations.7.gz
+%{_mandir}/man7/xen-pv-channel.7.gz
+%{_mandir}/man7/xen-tscmode.7.gz
+%{_mandir}/man7/xen-vbd-interface.7.gz
+%{_mandir}/man7/xl-numa-placement.7.gz
+%exclude %{_mandir}/man7/xen-vtpm.7.gz
+%exclude %{_mandir}/man7/xen-vtpmmgr.7.gz
 %{_mandir}/man8/xentrace.8.gz
 %dir /var/lib/xen
 %dir /var/log/xen
@@ -554,11 +569,10 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_unitdir}/xen-watchdog.service
 %{_unitdir}/xenconsoled.service
 %{_unitdir}/xenstored.service
-%{_unitdir}/xenstored.socket
-%{_unitdir}/xenstored_ro.socket
 %exclude %{_prefix}/lib/modules-load.d/xen.conf
 %exclude %{_unitdir}/xen-qemu-dom0-disk-backend.service
 %exclude %{_unitdir}/xendomains.service
+%exclude %{_unitdir}/xendriverdomain.service
 %endif
 
 %files dom0-libs
@@ -573,23 +587,23 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libfsimage.so.1.0
 %{_libdir}/libfsimage.so.1.0.0
 %{_libdir}/libxencall.so.1
-%{_libdir}/libxencall.so.1.0
-%{_libdir}/libxenctrl.so.4.7
-%{_libdir}/libxenctrl.so.4.7.0
+%{_libdir}/libxencall.so.1.1
+%{_libdir}/libxenctrl.so.4.11
+%{_libdir}/libxenctrl.so.4.11.0
 %{_libdir}/libxendevicemodel.so.1
 %{_libdir}/libxendevicemodel.so.1.2
 %{_libdir}/libxenforeignmemory.so.1
-%{_libdir}/libxenforeignmemory.so.1.2
-%{_libdir}/libxenguest.so.4.7
-%{_libdir}/libxenguest.so.4.7.0
-%{_libdir}/libxenlight.so.4.7
-%{_libdir}/libxenlight.so.4.7.0
+%{_libdir}/libxenforeignmemory.so.1.3
+%{_libdir}/libxenguest.so.4.11
+%{_libdir}/libxenguest.so.4.11.0
+%{_libdir}/libxenlight.so.4.11
+%{_libdir}/libxenlight.so.4.11.0
 %{_libdir}/libxenstat.so.0
 %{_libdir}/libxenstat.so.0.0
 %{_libdir}/libxentoollog.so.1
 %{_libdir}/libxentoollog.so.1.0
-%{_libdir}/libxlutil.so.4.7
-%{_libdir}/libxlutil.so.4.7.0
+%{_libdir}/libxlutil.so.4.11
+%{_libdir}/libxlutil.so.4.11.0
 
 %files dom0-libs-devel
 %{_includedir}/fsimage.h
@@ -600,27 +614,33 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/xencall.h
 %{_libdir}/libxencall.a
 %{_libdir}/libxencall.so
+/usr/share/pkgconfig/xencall.pc
 
 %{_includedir}/xenctrl.h
 %{_includedir}/xenctrl_compat.h
 %{_libdir}/libxenctrl.a
 %{_libdir}/libxenctrl.so
+/usr/share/pkgconfig/xencontrol.pc
 
 %{_includedir}/xendevicemodel.h
 %{_libdir}/libxendevicemodel.a
 %{_libdir}/libxendevicemodel.so
+/usr/share/pkgconfig/xendevicemodel.pc
 
 %{_includedir}/xenforeignmemory.h
 %{_libdir}/libxenforeignmemory.a
 %{_libdir}/libxenforeignmemory.so
+/usr/share/pkgconfig/xenforeignmemory.pc
 
 %{_includedir}/xenguest.h
 %{_libdir}/libxenguest.a
 %{_libdir}/libxenguest.so
+/usr/share/pkgconfig/xenguest.pc
 
 %{_includedir}/xentoollog.h
 %{_libdir}/libxentoollog.a
 %{_libdir}/libxentoollog.so
+/usr/share/pkgconfig/xentoollog.pc
 
 %{_includedir}/_libxl_list.h
 %{_includedir}/_libxl_types.h
@@ -641,6 +661,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/xenstat.h
 %{_libdir}/libxenstat.a
 %{_libdir}/libxenstat.so
+/usr/share/pkgconfig/xenstat.pc
 
 %files ocaml-libs
 %{_libdir}/ocaml/stublibs/dllxenbus_stubs.so
@@ -709,10 +730,10 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/ocaml/xentoollog/xentoollog.cmxa
 
 %files installer-files
-%{_libdir}/libxenctrl.so.4.7
-%{_libdir}/libxenctrl.so.4.7.0
-%{_libdir}/libxenguest.so.4.7
-%{_libdir}/libxenguest.so.4.7.0
+%{_libdir}/libxenctrl.so.4.11
+%{_libdir}/libxenctrl.so.4.11.0
+%{_libdir}/libxenguest.so.4.11
+%{_libdir}/libxenguest.so.4.11.0
 %{python_sitearch}/xen/__init__.py*
 %{python_sitearch}/xen/lowlevel/__init__.py*
 %{python_sitearch}/xen/lowlevel/xc.so
@@ -770,8 +791,6 @@ fi
 %systemd_post xen-watchdog.service
 %systemd_post xenconsoled.service
 %systemd_post xenstored.service
-%systemd_post xenstored.socket
-%systemd_post xenstored_ro.socket
 
 %preun dom0-tools
 %systemd_preun proc-xen.mount
@@ -780,8 +799,6 @@ fi
 %systemd_preun xen-watchdog.service
 %systemd_preun xenconsoled.service
 %systemd_preun xenstored.service
-%systemd_preun xenstored.socket
-%systemd_preun xenstored_ro.socket
 
 %postun dom0-tools
 %systemd_postun proc-xen.mount
@@ -790,7 +807,5 @@ fi
 %systemd_postun xen-watchdog.service
 %systemd_postun xenconsoled.service
 %systemd_postun xenstored.service
-%systemd_postun xenstored.socket
-%systemd_postun xenstored_ro.socket
 %endif
 

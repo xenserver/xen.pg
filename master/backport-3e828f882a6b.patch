@@ -1,0 +1,114 @@
+From 3e828f882a6b54d65f062c1e4c7895f3747bc790 Mon Sep 17 00:00:00 2001
+From: Adrian Pop <apop@bitdefender.com>
+Date: Tue, 4 Sep 2018 07:59:22 +0300
+Subject: [PATCH] x86/altp2m: Allow setting the #VE info page for an arbitrary
+ VCPU
+
+In a classic HVI + Xen setup, the introspection engine would monitor
+legacy guest page-tables by marking them read-only inside the EPT; this
+way any modification explicitly made by the guest or implicitly made by
+the CPU page walker would trigger an EPT violation, which would be
+forwarded by Xen to the SVA and thus the HVI agent.  The HVI agent would
+analyse the modification, and act upon it - for example, a virtual page
+may be remapped (its guest physical address changed inside the
+page-table), in which case the introspection logic would update the
+protection accordingly (remove EPT hook on the old gpa, and place a new
+EPT hook on the new gpa).  In other cases, the modification may be of no
+interest to the introspection engine - for example, the accessed/dirty
+bits may be cleared by the operating system or the accessed/dirty bits
+may be set by the CPU page walker.
+
+In our tests we discovered that the vast majority of guest page-table
+modifications fall in the second category (especially on Windows 10 RS4
+x64 - more than 95% of ALL the page-table modifications are irrelevant to
+us) - they are of no interest to the introspection logic, but they
+trigger a very costly EPT violation nonetheless.  Therefore, we decided
+to make use of the new #VE & VMFUNC features in recent Intel CPUs to
+accelerate the guest page-tables monitoring in the following way:
+
+1. Each monitored page-table would be flagged as being convertible
+   inside the EPT, thus enabling the CPU to deliver a virtualization
+   exception to he guest instead of generating a traditional EPT
+   violation.
+2. We inject a small filtering driver inside the protected guest VM,
+   which would intercept the virtualization exception in order to handle
+   guest page-table modifications.
+3. We create a dedicated EPT view (altp2m) for the in-guest agent, which
+   would isolate the agent from the rest of the operating system; the
+   agent will switch in and out of the protected EPT view via the VMFUNC
+   instruction placed inside a trampoline page, thus making the agent
+   immune to malicious code inside the guest.
+
+This way, all the page-table accesses would generate a
+virtualization-exception inside the guest instead of a costly EPT
+violation; the #VE agent would emulate and analyse the modification, and
+decide whether it is relevant for the main introspection logic; if it is
+relevant, it would do a VMCALL and notify the introspection engine
+about the modification; otherwise, it would resume normal instruction
+execution, thus avoiding a very costly VM exit.
+
+Signed-off-by: Adrian Pop <apop@bitdefender.com>
+Reviewed-by: Tamas K Lengyel <tamas@tklengyel.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+diff --git a/tools/libxc/xc_altp2m.c b/tools/libxc/xc_altp2m.c
+index 1c9b572..be5bfd2 100644
+--- a/tools/libxc/xc_altp2m.c
++++ b/tools/libxc/xc_altp2m.c
+@@ -68,7 +68,6 @@ int xc_altp2m_set_domain_state(xc_interface *handle, uint32_t dom, bool state)
+     return rc;
+ }
+ 
+-/* This is a bit odd to me that it acts on current.. */
+ int xc_altp2m_set_vcpu_enable_notify(xc_interface *handle, uint32_t domid,
+                                      uint32_t vcpuid, xen_pfn_t gfn)
+ {
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 091b527..0f910e5 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -4520,8 +4520,7 @@ static int do_altp2m_op(
+         return -EOPNOTSUPP;
+     }
+ 
+-    d = ( a.cmd != HVMOP_altp2m_vcpu_enable_notify ) ?
+-        rcu_lock_domain_by_any_id(a.domain) : rcu_lock_current_domain();
++    d = rcu_lock_domain_by_any_id(a.domain);
+ 
+     if ( d == NULL )
+         return -ESRCH;
+@@ -4592,26 +4591,28 @@ static int do_altp2m_op(
+ 
+     case HVMOP_altp2m_vcpu_enable_notify:
+     {
+-        struct vcpu *curr = current;
++        struct vcpu *v;
+         p2m_type_t p2mt;
+ 
+-        if ( a.u.enable_notify.pad || a.domain != DOMID_SELF ||
+-             a.u.enable_notify.vcpu_id != curr->vcpu_id )
++        if ( a.u.enable_notify.pad ||
++             a.u.enable_notify.vcpu_id >= d->max_vcpus )
+         {
+             rc = -EINVAL;
+             break;
+         }
+ 
+-        if ( !gfn_eq(vcpu_altp2m(curr).veinfo_gfn, INVALID_GFN) ||
+-             mfn_eq(get_gfn_query_unlocked(curr->domain,
++        v = d->vcpu[a.u.enable_notify.vcpu_id];
++
++        if ( !gfn_eq(vcpu_altp2m(v).veinfo_gfn, INVALID_GFN) ||
++             mfn_eq(get_gfn_query_unlocked(v->domain,
+                     a.u.enable_notify.gfn, &p2mt), INVALID_MFN) )
+         {
+             rc = -EINVAL;
+             break;
+         }
+ 
+-        vcpu_altp2m(curr).veinfo_gfn = _gfn(a.u.enable_notify.gfn);
+-        altp2m_vcpu_update_vmfunc_ve(curr);
++        vcpu_altp2m(v).veinfo_gfn = _gfn(a.u.enable_notify.gfn);
++        altp2m_vcpu_update_vmfunc_ve(v);
+         break;
+     }
+ 

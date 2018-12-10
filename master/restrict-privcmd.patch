@@ -1,10 +1,10 @@
 diff --git a/tools/include/xen-sys/Linux/privcmd.h b/tools/include/xen-sys/Linux/privcmd.h
-index 732ff7c..a735809 100644
+index 9531b728f9..a9d378e5b7 100644
 --- a/tools/include/xen-sys/Linux/privcmd.h
 +++ b/tools/include/xen-sys/Linux/privcmd.h
-@@ -86,6 +86,10 @@ typedef struct privcmd_dm_op {
- 	const privcmd_dm_op_buf_t __user *ubufs;
- } privcmd_dm_op_t;
+@@ -95,6 +95,10 @@ typedef struct privcmd_mmap_resource {
+ 	__u64 addr;
+ } privcmd_mmap_resource_t;
  
 +typedef struct privcmd_restrict_domid {
 +	domid_t domid;
@@ -13,19 +13,19 @@ index 732ff7c..a735809 100644
  /*
   * @cmd: IOCTL_PRIVCMD_HYPERCALL
   * @arg: &privcmd_hypercall_t
-@@ -103,5 +107,7 @@ typedef struct privcmd_dm_op {
- 	_IOC(_IOC_NONE, 'P', 5, sizeof(privcmd_dm_op_t))
- #define IOCTL_PRIVCMD_RESTRICT					\
+@@ -114,5 +118,7 @@ typedef struct privcmd_mmap_resource {
  	_IOC(_IOC_NONE, 'P', 6, sizeof(domid_t))
+ #define IOCTL_PRIVCMD_MMAP_RESOURCE				\
+ 	_IOC(_IOC_NONE, 'P', 7, sizeof(privcmd_mmap_resource_t))
 +#define IOCTL_PRIVCMD_RESTRICT_DOMID				\
 +	_IOC(_IOC_NONE, 'P', 100, sizeof(privcmd_restrict_domid_t))
  
  #endif /* __LINUX_PUBLIC_PRIVCMD_H__ */
 diff --git a/tools/libs/call/core.c b/tools/libs/call/core.c
-index 5ca0372..9041116 100644
+index 46ca61529e..842e68e7f3 100644
 --- a/tools/libs/call/core.c
 +++ b/tools/libs/call/core.c
-@@ -72,6 +72,11 @@ int xencall_close(xencall_handle *xcall)
+@@ -91,6 +91,11 @@ int xencall_close(xencall_handle *xcall)
      return rc;
  }
  
@@ -38,7 +38,7 @@ index 5ca0372..9041116 100644
  {
      privcmd_hypercall_t call = {
 diff --git a/tools/libs/call/include/xencall.h b/tools/libs/call/include/xencall.h
-index bafacdd..61891ff 100644
+index 0d09bc8eae..e52b15e205 100644
 --- a/tools/libs/call/include/xencall.h
 +++ b/tools/libs/call/include/xencall.h
 @@ -73,6 +73,8 @@ xencall_handle *xencall_open(struct xentoollog_logger *logger,
@@ -51,7 +51,7 @@ index bafacdd..61891ff 100644
   * Call hypercalls with varying numbers of arguments.
   *
 diff --git a/tools/libs/call/libxencall.map b/tools/libs/call/libxencall.map
-index 2f96144..d9a675c 100644
+index c482195b95..29051f63a0 100644
 --- a/tools/libs/call/libxencall.map
 +++ b/tools/libs/call/libxencall.map
 @@ -2,6 +2,7 @@ VERS_1.0 {
@@ -63,11 +63,11 @@ index 2f96144..d9a675c 100644
  		xencall0;
  		xencall1;
 diff --git a/tools/libs/call/linux.c b/tools/libs/call/linux.c
-index e8e0311..242b82b 100644
+index d8a6306e04..72b0823c00 100644
 --- a/tools/libs/call/linux.c
 +++ b/tools/libs/call/linux.c
-@@ -63,6 +63,12 @@ int osdep_xencall_close(xencall_handle *xcall)
-     return close(fd);
+@@ -80,6 +80,12 @@ int osdep_xencall_close(xencall_handle *xcall)
+     return 0;
  }
  
 +int osdep_xencall_restrict(xencall_handle *xcall, uint32_t dom)
@@ -80,10 +80,10 @@ index e8e0311..242b82b 100644
  {
      return ioctl(xcall->fd, IOCTL_PRIVCMD_HYPERCALL, hypercall);
 diff --git a/tools/libs/call/private.h b/tools/libs/call/private.h
-index 37dd15f..16750e9 100644
+index 21f992b37e..5eb20e34d1 100644
 --- a/tools/libs/call/private.h
 +++ b/tools/libs/call/private.h
-@@ -45,6 +45,7 @@ struct xencall_handle {
+@@ -52,6 +52,7 @@ struct xencall_handle {
  
  int osdep_xencall_open(xencall_handle *xcall);
  int osdep_xencall_close(xencall_handle *xcall);
@@ -92,7 +92,7 @@ index 37dd15f..16750e9 100644
  int osdep_hypercall(xencall_handle *xcall, privcmd_hypercall_t *hypercall);
  
 diff --git a/tools/libs/foreignmemory/linux.c b/tools/libs/foreignmemory/linux.c
-index 374e45a..484f9dc 100644
+index a6b41b0b7f..0bab8590d7 100644
 --- a/tools/libs/foreignmemory/linux.c
 +++ b/tools/libs/foreignmemory/linux.c
 @@ -274,7 +274,8 @@ int osdep_xenforeignmemory_unmap(xenforeignmemory_handle *fmem,
@@ -104,9 +104,9 @@ index 374e45a..484f9dc 100644
 +    return ioctl(fmem->fd, IOCTL_PRIVCMD_RESTRICT_DOMID, &restrict_domid);
  }
  
- /*
+ int osdep_xenforeignmemory_unmap_resource(
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index be7d5eb..20768dc 100644
+index c2f0688940..ff3ef355c8 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
 @@ -183,6 +183,11 @@ enum xc_open_flags {
@@ -122,7 +122,7 @@ index be7d5eb..20768dc 100644
   * HYPERCALL SAFE MEMORY BUFFER
   *
 diff --git a/tools/libxc/xc_private.c b/tools/libxc/xc_private.c
-index f395594..2a8b9bb 100644
+index e6e3d9913c..9907d3abd9 100644
 --- a/tools/libxc/xc_private.c
 +++ b/tools/libxc/xc_private.c
 @@ -104,6 +104,12 @@ int xc_interface_close(xc_interface *xch)

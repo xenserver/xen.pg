@@ -1,0 +1,75 @@
+From 6230dde2ed4fa75a35d09c2b0e260d7566b679ce Mon Sep 17 00:00:00 2001
+From: Christian Lindig <christian.lindig@citrix.com>
+Date: Thu, 1 Nov 2018 09:12:53 +0000
+Subject: [PATCH] tools/ocaml: Re-introduce Xenctrl.with_intf wrapper
+
+Commit 81946a73dc975a7dafe9017a8e61d1e64fdbedbf removed
+Xenctrl.with_intf based on its undesirable behaviour of opening and
+closing a Xenctrl connection with every invocation. This commit
+re-introduces with_intf but with an updated behaviour: it maintains a
+global Xenctrl connection which is opened upon first usage and kept
+open. This handle can be obtained by clients using new functions
+get_handle() and close_handle().
+
+The main motivation of re-introducing with_intf is that otherwise
+clients will have to implement this functionality individually.
+
+Signed-off-by: Christian Lindig <christian.lindig@citrix.com>
+Reviewed-by: Ian Jackson <ian.jackson@eu.citrix.com>
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index d3e2cc8..7f5ffbe 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -129,6 +129,28 @@ type handle
+ external interface_open: unit -> handle = "stub_xc_interface_open"
+ external interface_close: handle -> unit = "stub_xc_interface_close"
+ 
++let handle = ref None
++
++let get_handle () = !handle
++
++let close_handle () =
++	match !handle with
++	| Some h -> handle := None; interface_close h
++	| None -> ()
++
++let with_intf f =
++	match !handle with
++	| Some h -> f h
++	| None ->
++		let h =
++			try interface_open () with
++			| e ->
++				let msg = Printexc.to_string e in
++				failwith ("failed to open xenctrl: "^msg)
++		in
++		handle := Some h;
++		f h
++
+ external _domain_create: handle -> int32 -> domain_create_flag list -> int array -> arch_domainconfig -> domid
+        = "stub_xc_domain_create"
+ 
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index 45ee985..f00c9fb 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -98,6 +98,19 @@ type handle
+ external interface_open : unit -> handle = "stub_xc_interface_open"
+ external interface_close : handle -> unit = "stub_xc_interface_close"
+ 
++(** [with_intf f] runs [f] with a global handle that is opened on demand
++ * and kept open. Conceptually, a client should use either
++ * interface_open and interface_close or with_intf although mixing both
++ * is possible *)
++val with_intf : (handle -> 'a) -> 'a
++(** [get_handle] returns the global handle used by [with_intf] *)
++val get_handle: unit -> handle option
++(** [close handle] closes the handle maintained by [with_intf]. This
++ * should only be closed before process exit. It must not be called from
++ * a function called directly or indirectly by with_intf as this
++ * would invalidate the handle that with_intf passes to its argument. *)
++val close_handle: unit -> unit
++
+ val domain_create : handle -> int32 -> domain_create_flag list -> string -> arch_domainconfig -> domid
+ val domain_sethandle : handle -> domid -> string -> unit
+ external domain_max_vcpus : handle -> domid -> int -> unit

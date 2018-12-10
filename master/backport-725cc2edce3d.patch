@@ -9,12 +9,12 @@ Content-Transfer-Encoding: 8bit
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
 Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
 Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
-diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 2723c00..44e1250 100644
---- a/xen/arch/x86/domain.c
-+++ b/xen/arch/x86/domain.c
-@@ -414,6 +414,12 @@ static void set_domain_xpti(struct domain *d)
-     }
+diff --git a/xen/arch/x86/pv/domain.c b/xen/arch/x86/pv/domain.c
+index b75ff6b..d186403 100644
+--- a/xen/arch/x86/pv/domain.c
++++ b/xen/arch/x86/pv/domain.c
+@@ -293,6 +293,12 @@ int pv_domain_initialise(struct domain *d)
+     return rc;
  }
  
 +bool __init xpti_pcid_enabled(void)
@@ -23,44 +23,53 @@ index 2723c00..44e1250 100644
 +           (opt_pcid == PCID_ALL || opt_pcid == PCID_XPTI);
 +}
 +
- static inline int may_switch_mode(struct domain *d)
+ static void _toggle_guest_pt(struct vcpu *v)
  {
-     return (!is_hvm_domain(d) && (d->tot_pages == 0));
+     const struct domain *d = v->domain;
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index 6145c98..5a1d5e6 100644
+index eb480c1..1228b83 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
-@@ -20,6 +20,7 @@
- #include <xen/init.h>
- #include <xen/lib.h>
- 
-+#include <asm/domain.h>
+@@ -24,6 +24,7 @@
  #include <asm/microcode.h>
  #include <asm/msr.h>
  #include <asm/processor.h>
-@@ -324,9 +325,10 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
++#include <asm/pv/domain.h>
+ #include <asm/pv/shim.h>
+ #include <asm/setup.h>
+ #include <asm/spec_ctrl.h>
+@@ -341,9 +342,10 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
             boot_cpu_has(X86_FEATURE_SC_RSB_HVM)      ? " RSB"           : "",
             opt_eager_fpu                             ? " EAGER_FPU"     : "");
  
 -    printk("  XPTI (64-bit PV only): Dom0 %s, DomU %s\n",
 +    printk("  XPTI (64-bit PV only): Dom0 %s, DomU %s (with%s PCID)\n",
-            opt_xpti & OPT_XPTI_DOM0 ? "enabled" : "disabled",
--           opt_xpti & OPT_XPTI_DOMU ? "enabled" : "disabled");
-+           opt_xpti & OPT_XPTI_DOMU ? "enabled" : "disabled",
+            opt_xpti_hwdom ? "enabled" : "disabled",
+-           opt_xpti_domu  ? "enabled" : "disabled");
++           opt_xpti_domu  ? "enabled" : "disabled",
 +           xpti_pcid_enabled() ? "" : "out");
  
      printk("  PV L1TF shadowing: Dom0 %s, DomU %s\n",
-            opt_pv_l1tf & OPT_PV_L1TF_DOM0  ? "enabled"  : "disabled",
-diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
-index 9a280e1..6e1ab0c 100644
---- a/xen/include/asm-x86/domain.h
-+++ b/xen/include/asm-x86/domain.h
-@@ -644,6 +644,8 @@ bool_t update_secondary_system_time(struct vcpu *,
- void vcpu_show_execution_state(struct vcpu *);
- void vcpu_show_registers(const struct vcpu *);
+            opt_pv_l1tf_hwdom ? "enabled"  : "disabled",
+diff --git a/xen/include/asm-x86/pv/domain.h b/xen/include/asm-x86/pv/domain.h
+index 4fea764..7d9d09d 100644
+--- a/xen/include/asm-x86/pv/domain.h
++++ b/xen/include/asm-x86/pv/domain.h
+@@ -21,6 +21,8 @@
+ #ifndef __X86_PV_DOMAIN_H__
+ #define __X86_PV_DOMAIN_H__
+ 
++#include <xen/sched.h>
++
+ /*
+  * PCID values for the address spaces of 64-bit pv domains:
+  *
+@@ -59,6 +61,8 @@ int pv_vcpu_initialise(struct vcpu *v);
+ void pv_domain_destroy(struct domain *d);
+ int pv_domain_initialise(struct domain *d);
  
 +bool xpti_pcid_enabled(void);
 +
- /* Clean up CR4 bits that are not under guest control. */
- unsigned long pv_guest_cr4_fixup(const struct vcpu *, unsigned long guest_cr4);
+ #else  /* !CONFIG_PV */
  
+ #include <xen/errno.h>

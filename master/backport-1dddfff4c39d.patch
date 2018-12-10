@@ -1,0 +1,52 @@
+From 1dddfff4c39d3db17dfa709b1c57f44e3ed352e3 Mon Sep 17 00:00:00 2001
+From: George Dunlap <george.dunlap@citrix.com>
+Date: Thu, 2 Aug 2018 12:12:43 +0200
+Subject: [PATCH] x86/altp2m: make sure EPTP_INDEX is up-to-date when enabling
+ #VE
+
+vmx_vmexit_handler() assumes that if
+SECONDARY_EXEC_ENABLE_VIRT_EXCEPTIONS is set, that the value in
+EPTP_INDEX is valid.  Unfortunately, the function which sets this bit
+(vmx_vcpu_update_vmfunc_ve) doesn't actually set EPTP_INDEX; it will
+only be set the next time vmx_vcpu_update_eptp() is called.
+
+This means that if a vcpu makes a vmexit between these two points, the
+EPTP_INDEX it reads will be invalid.  The first time this race happens
+for a domain, EPTP_INDEX will most likely be zero, which is the index
+for the "host" p2m -- and thus is often correct.  But the second time
+this race happens, the value will typically be INVALID_ALTP2M, which
+will hit the following BUG:
+
+    BUG_ON(idx >= MAX_ALTP2M);
+
+Worse, if for some reason the current altp2m was *not* `0` during this
+window (say, because a toolstack changed the VM to a different view),
+then the accounting of active vcpus for an altp2m will be thrown off.
+
+Fix this by always updating EPTP_INDEX to the current altp2m index
+when enabling #VE.
+
+Reported-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Signed-off-by: George Dunlap <george.dunlap@citrix.com>
+Reviewed-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Tested-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index a6415f0..ae86e25 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -2160,7 +2160,14 @@ static void vmx_vcpu_update_vmfunc_ve(struct vcpu *v)
+             mfn = get_gfn_query_unlocked(d, gfn_x(vcpu_altp2m(v).veinfo_gfn), &t);
+ 
+             if ( !mfn_eq(mfn, INVALID_MFN) )
++            {
+                 __vmwrite(VIRT_EXCEPTION_INFO, mfn_x(mfn) << PAGE_SHIFT);
++                /*
++                 * Make sure we have an up-to-date EPTP_INDEX when
++                 * setting SECONDARY_EXEC_ENABLE_VIRT_EXCEPTIONS.
++                 */
++                __vmwrite(EPTP_INDEX, vcpu_altp2m(v).p2midx);
++            }
+             else
+                 v->arch.hvm_vmx.secondary_exec_control &=
+                     ~SECONDARY_EXEC_ENABLE_VIRT_EXCEPTIONS;

@@ -1,0 +1,178 @@
+From 8f29f3ead253284ba640e5325febf1c184690bb6 Mon Sep 17 00:00:00 2001
+From: Adrian Pop <apop@bitdefender.com>
+Date: Wed, 12 Sep 2018 10:50:06 +0300
+Subject: [PATCH] x86/altp2m: Add a hvmop for querying the suppress #VE bit
+
+Signed-off-by: Adrian Pop <apop@bitdefender.com>
+Acked-by: Tamas K Lengyel <tamas@tklengyel.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 2bc5d19..4d0b3e7 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1960,6 +1960,8 @@ int xc_altp2m_switch_to_view(xc_interface *handle, uint32_t domid,
+                              uint16_t view_id);
+ int xc_altp2m_set_suppress_ve(xc_interface *handle, uint32_t domid,
+                               uint16_t view_id, xen_pfn_t gfn, bool sve);
++int xc_altp2m_get_suppress_ve(xc_interface *handle, uint32_t domid,
++                              uint16_t view_id, xen_pfn_t gfn, bool *sve);
+ int xc_altp2m_set_mem_access(xc_interface *handle, uint32_t domid,
+                              uint16_t view_id, xen_pfn_t gfn,
+                              xenmem_access_t access);
+diff --git a/tools/libxc/xc_altp2m.c b/tools/libxc/xc_altp2m.c
+index f883d0b..1c9b572 100644
+--- a/tools/libxc/xc_altp2m.c
++++ b/tools/libxc/xc_altp2m.c
+@@ -163,6 +163,32 @@ int xc_altp2m_switch_to_view(xc_interface *handle, uint32_t domid,
+     return rc;
+ }
+ 
++int xc_altp2m_get_suppress_ve(xc_interface *handle, uint32_t domid,
++                              uint16_t view_id, xen_pfn_t gfn, bool *sve)
++{
++    int rc;
++    DECLARE_HYPERCALL_BUFFER(xen_hvm_altp2m_op_t, arg);
++
++    arg = xc_hypercall_buffer_alloc(handle, arg, sizeof(*arg));
++    if ( arg == NULL )
++        return -1;
++
++    arg->version = HVMOP_ALTP2M_INTERFACE_VERSION;
++    arg->cmd = HVMOP_altp2m_get_suppress_ve;
++    arg->domain = domid;
++    arg->u.suppress_ve.view = view_id;
++    arg->u.suppress_ve.gfn = gfn;
++
++    rc = xencall2(handle->xcall, __HYPERVISOR_hvm_op, HVMOP_altp2m,
++                  HYPERCALL_BUFFER_AS_ARG(arg));
++
++    if ( !rc )
++        *sve = arg->u.suppress_ve.suppress_ve;
++
++    xc_hypercall_buffer_free(handle, arg);
++    return rc;
++}
++
+ int xc_altp2m_set_suppress_ve(xc_interface *handle, uint32_t domid,
+                               uint16_t view_id, xen_pfn_t gfn, bool sve)
+ {
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 869d071..091b527 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -4510,6 +4510,7 @@ static int do_altp2m_op(
+     case HVMOP_altp2m_destroy_p2m:
+     case HVMOP_altp2m_switch_p2m:
+     case HVMOP_altp2m_set_suppress_ve:
++    case HVMOP_altp2m_get_suppress_ve:
+     case HVMOP_altp2m_set_mem_access:
+     case HVMOP_altp2m_set_mem_access_multi:
+     case HVMOP_altp2m_change_gfn:
+@@ -4640,6 +4641,24 @@ static int do_altp2m_op(
+         }
+         break;
+ 
++    case HVMOP_altp2m_get_suppress_ve:
++        if ( a.u.suppress_ve.pad1 || a.u.suppress_ve.pad2 )
++            rc = -EINVAL;
++        else
++        {
++            gfn_t gfn = _gfn(a.u.suppress_ve.gfn);
++            unsigned int altp2m_idx = a.u.suppress_ve.view;
++            bool suppress_ve;
++
++            rc = p2m_get_suppress_ve(d, gfn, &suppress_ve, altp2m_idx);
++            if ( !rc )
++            {
++                a.u.suppress_ve.suppress_ve = suppress_ve;
++                rc = __copy_to_guest(arg, &a, 1) ? -EFAULT : 0;
++            }
++        }
++        break;
++
+     case HVMOP_altp2m_set_mem_access:
+         if ( a.u.set_mem_access.pad )
+             rc = -EINVAL;
+diff --git a/xen/arch/x86/mm/mem_access.c b/xen/arch/x86/mm/mem_access.c
+index b5f3fab..400a0b8 100644
+--- a/xen/arch/x86/mm/mem_access.c
++++ b/xen/arch/x86/mm/mem_access.c
+@@ -545,6 +545,51 @@ out:
+     return rc;
+ }
+ 
++int p2m_get_suppress_ve(struct domain *d, gfn_t gfn, bool *suppress_ve,
++                        unsigned int altp2m_idx)
++{
++    struct p2m_domain *host_p2m = p2m_get_hostp2m(d);
++    struct p2m_domain *ap2m = NULL;
++    struct p2m_domain *p2m;
++    mfn_t mfn;
++    p2m_access_t a;
++    p2m_type_t t;
++
++    if ( !cpu_has_vmx_virt_exceptions )
++        return -EOPNOTSUPP;
++
++    /* #VE should be enabled for this vcpu. */
++    if ( gfn_eq(vcpu_altp2m(current).veinfo_gfn, INVALID_GFN) )
++        return -ENXIO;
++
++    if ( altp2m_idx > 0 )
++    {
++        if ( altp2m_idx >= MAX_ALTP2M ||
++             d->arch.altp2m_eptp[altp2m_idx] == mfn_x(INVALID_MFN) )
++            return -EINVAL;
++
++        p2m = ap2m = d->arch.altp2m_p2m[altp2m_idx];
++    }
++    else
++        p2m = host_p2m;
++
++    gfn_lock(host_p2m, gfn, 0);
++
++    if ( ap2m )
++        p2m_lock(ap2m);
++
++    mfn = p2m->get_entry(p2m, gfn, &t, &a, 0, NULL, suppress_ve);
++    if ( !mfn_valid(mfn) )
++        return -ESRCH;
++
++    if ( ap2m )
++        p2m_unlock(ap2m);
++
++    gfn_unlock(host_p2m, gfn, 0);
++
++    return 0;
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/include/public/hvm/hvm_op.h b/xen/include/public/hvm/hvm_op.h
+index 14d29d1..cf00cad 100644
+--- a/xen/include/public/hvm/hvm_op.h
++++ b/xen/include/public/hvm/hvm_op.h
+@@ -306,6 +306,8 @@ struct xen_hvm_altp2m_op {
+ #define HVMOP_altp2m_set_mem_access_multi 9
+ /* Set the "Suppress #VE" bit on a page */
+ #define HVMOP_altp2m_set_suppress_ve      10
++/* Get the "Suppress #VE" bit of a page */
++#define HVMOP_altp2m_get_suppress_ve      11
+     domid_t domain;
+     uint16_t pad1;
+     uint32_t pad2;
+diff --git a/xen/include/xen/mem_access.h b/xen/include/xen/mem_access.h
+index 8057b56..4476f53 100644
+--- a/xen/include/xen/mem_access.h
++++ b/xen/include/xen/mem_access.h
+@@ -75,6 +75,9 @@ long p2m_set_mem_access_multi(struct domain *d,
+ int p2m_set_suppress_ve(struct domain *d, gfn_t gfn, bool suppress_ve,
+                         unsigned int altp2m_idx);
+ 
++int p2m_get_suppress_ve(struct domain *d, gfn_t gfn, bool *suppress_ve,
++                        unsigned int altp2m_idx);
++
+ /*
+  * Get access type for a gfn.
+  * If gfn == INVALID_GFN, gets the default access type.
