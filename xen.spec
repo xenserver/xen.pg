@@ -771,18 +771,6 @@ fi
 mkdir -p %{_rundir}/reboot-required.d/%{name}
 touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
 
-# Update grub.cfg to avoid Dom0 vCPU oversubscription
-
-%triggerin hypervisor -- grub
-if [ -e /boot/grub/grub.cfg ]; then
-    sed -i 's/dom0_max_vcpus=\([0-9a-fA-FxX]\+\)\( \|$\)/dom0_max_vcpus=1-\1\2/g' /boot/grub/grub.cfg
-fi
-
-%triggerin hypervisor -- grub-efi
-if [ -e /boot/efi/EFI/xenserver/grub.cfg ]; then
-    sed -i 's/dom0_max_vcpus=\([0-9a-fA-FxX]\+\)\( \|$\)/dom0_max_vcpus=1-\1\2/g' /boot/efi/EFI/xenserver/grub.cfg
-fi
-
 %if %with_systemd
 %post dom0-tools
 %systemd_post proc-xen.mount
