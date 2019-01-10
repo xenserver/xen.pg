@@ -11,7 +11,7 @@ index c5032f35cc..8359306e5d 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index bc9963c7b5..7e5dcd518c 100644
+index 0d188d9ffe..ea43783960 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
 @@ -480,6 +480,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
@@ -793,10 +793,10 @@ index 0000000000..e357174ad2
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000000..4bdea42cd2
+index 0000000000..0d255e0011
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1452 @@
+@@ -0,0 +1,1478 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -876,6 +876,10 @@ index 0000000000..4bdea42cd2
 +    int viridian;
 +    int viridian_time_ref_count;
 +    int viridian_reference_tsc;
++    int viridian_hcall_remote_tlb_flush;
++    int viridian_apic_assist;
++    int viridian_crash_ctl;
++    int viridian_stimer;
 +    int pae;
 +    int acpi;
 +    int apic;
@@ -1154,15 +1158,20 @@ index 0000000000..4bdea42cd2
 +    f->nx       = xenstore_get("platform/nx");
 +    f->viridian = xenstore_get("platform/viridian");
 +
-+    if ( !opt_vgpu )
-+    {
-+        f->viridian_time_ref_count = xenstore_get("platform/viridian_time_ref_count");
-+        f->viridian_reference_tsc = xenstore_get("platform/viridian_reference_tsc");
-+    }
-+    else
-+    {
-+       f->viridian_reference_tsc = 0;
-+       f->viridian_time_ref_count = 0;
++    f->viridian_time_ref_count = xenstore_get("platform/viridian_time_ref_count");
++    f->viridian_reference_tsc = xenstore_get("platform/viridian_reference_tsc");
++    f->viridian_hcall_remote_tlb_flush = xenstore_get("platform/viridian_hcall_remote_tlb_flush");
++    f->viridian_apic_assist = xenstore_get("platform/viridian_apic_assist");
++    f->viridian_crash_ctl = xenstore_get("platform/viridian_crash_ctl");
++    f->viridian_stimer = xenstore_get("platform/viridian_stimer");
++
++    /*
++     * Squash the timer enlightenments for a vGPU-enabled VM if stimer is
++     * not switched on.
++     */
++    if ( opt_vgpu && !f->viridian_stimer ) {
++        f->viridian_reference_tsc = 0;
++        f->viridian_time_ref_count = 0;
 +    }
 +
 +    f->apic     = xenstore_get("platform/apic");
@@ -1226,12 +1235,13 @@ index 0000000000..4bdea42cd2
 +            f->apic, f->acpi, f->acpi_s4, f->acpi_s3, f->tsc_mode, f->hpet);
 +    xg_info("nomigrate %d, timeoffset %" PRId64 "\n",
 +            f->nomigrate, f->timeoffset);
-+    if ( !opt_vgpu )
-+        xg_info("viridian: %d, time_ref_count: %d, reference_tsc: %d\n",
-+                f->viridian, f->viridian_time_ref_count, f->viridian_reference_tsc);
-+    else
-+        xg_info("viridian: %d, ignoring time_ref_count and reference_tsc due to vgpu.\n",
-+                f->viridian);
++    xg_info("viridian: %d, time_ref_count: %d, reference_tsc: %d "
++            "hcall_remote_tlb_flush: %d apic_assist: %d "
++            "crash_ctl: %d stimer %d\n",
++            f->viridian, f->viridian_time_ref_count, f->viridian_reference_tsc,
++            f->viridian_hcall_remote_tlb_flush, f->viridian_apic_assist,
++            f->viridian_crash_ctl, f->viridian_stimer);
++
 +    for (n = 0; n < f->vcpus; n++){
 +        xg_info("vcpu/%d/affinity:%s\n", n, (f->vcpu_affinity[n])?f->vcpu_affinity[n]:"unset");
 +    }
@@ -1400,8 +1410,28 @@ index 0000000000..4bdea42cd2
 +    }
 +
 +    if (f->viridian_reference_tsc) {
-+        xg_info("+ viridian_reference_tsc\n");
++        xg_info("+ reference_tsc\n");
 +        feature_mask |= HVMPV_reference_tsc;
++    }
++
++    if (f->viridian_hcall_remote_tlb_flush) {
++        xg_info("+ hcall_remote_tlb_flush\n");
++        feature_mask |= HVMPV_hcall_remote_tlb_flush;
++    }
++
++    if (f->viridian_apic_assist) {
++        xg_info("+ apic_assist\n");
++        feature_mask |= HVMPV_apic_assist;
++    }
++
++    if (f->viridian_crash_ctl) {
++        xg_info("+ crash_ctl\n");
++        feature_mask |= HVMPV_crash_ctl;
++    }
++
++    if (f->viridian_stimer) {
++        xg_info("+ stimer\n");
++        feature_mask |= HVMPV_synic | HVMPV_stimer;
 +    }
 +
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_VIRIDIAN, feature_mask);
@@ -2178,12 +2208,8 @@ index 0000000000..4bdea42cd2
 +        /*
 +         * We generally have to do this even in the domain restore case as
 +         * XenServers prior to 6.0.2 did not create a viridian save record.
-+         *
-+         * However, if we're restoring with a VGPU, we know we have the save
-+         * record, but are less sure what the viridian values were when
-+         * started, and so should avoid setting in this case.
 +         */
-+        if (f.viridian && !opt_vgpu)
++        if (f.viridian)
 +            hvm_set_viridian_features(&f);
 +
 +        xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
