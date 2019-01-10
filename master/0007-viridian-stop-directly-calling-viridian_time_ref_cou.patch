@@ -1,0 +1,130 @@
+From 427b415b3dc2eafbd7e5c00d7c9400833f31da3c Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Thu, 20 Dec 2018 12:17:02 +0000
+Subject: [PATCH v3 7/8] viridian: stop directly calling
+ viridian_time_ref_count_freeze/thaw()...
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+...from arch_domain_shutdown/pause/unpause().
+
+A subsequent patch will introduce an implementaion of synthetic timers
+which will also need freeze/thaw hooks, so make the exported hooks more
+generic and call through to (re-named and static) time_ref_count_freeze/thaw
+functions.
+
+NOTE: This patch also introduces a new time_ref_count() helper to return
+      the current counter value. This is currently only used by the MSR
+      read handler but the synthetic timer code will also need to use it.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index d8525fb04f..fcbdf53d2f 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -626,20 +626,20 @@ void arch_domain_destroy(struct domain *d)
+ 
+ void arch_domain_shutdown(struct domain *d)
+ {
+-    if ( has_viridian_time_ref_count(d) )
+-        viridian_time_ref_count_freeze(d);
++    if ( is_viridian_domain(d) )
++        viridian_time_domain_freeze(d);
+ }
+ 
+ void arch_domain_pause(struct domain *d)
+ {
+-    if ( has_viridian_time_ref_count(d) )
+-        viridian_time_ref_count_freeze(d);
++    if ( is_viridian_domain(d) )
++        viridian_time_domain_freeze(d);
+ }
+ 
+ void arch_domain_unpause(struct domain *d)
+ {
+-    if ( has_viridian_time_ref_count(d) )
+-        viridian_time_ref_count_thaw(d);
++    if ( is_viridian_domain(d) )
++        viridian_time_domain_thaw(d);
+ }
+ 
+ int arch_domain_soft_reset(struct domain *d)
+diff --git a/xen/arch/x86/hvm/viridian/time.c b/xen/arch/x86/hvm/viridian/time.c
+index e8924adfa1..26ad9ce727 100644
+--- a/xen/arch/x86/hvm/viridian/time.c
++++ b/xen/arch/x86/hvm/viridian/time.c
+@@ -91,7 +91,7 @@ static int64_t raw_trc_val(struct domain *d)
+     return scale_delta(tsc, &tsc_to_ns) / 100ul;
+ }
+ 
+-void viridian_time_ref_count_freeze(struct domain *d)
++static void time_ref_count_freeze(struct domain *d)
+ {
+     struct viridian_time_ref_count *trc =
+         &d->arch.hvm.viridian->time_ref_count;
+@@ -100,7 +100,7 @@ void viridian_time_ref_count_freeze(struct domain *d)
+         trc->val = raw_trc_val(d) + trc->off;
+ }
+ 
+-void viridian_time_ref_count_thaw(struct domain *d)
++static void time_ref_count_thaw(struct domain *d)
+ {
+     struct viridian_time_ref_count *trc =
+         &d->arch.hvm.viridian->time_ref_count;
+@@ -110,6 +110,30 @@ void viridian_time_ref_count_thaw(struct domain *d)
+         trc->off = (int64_t)trc->val - raw_trc_val(d);
+ }
+ 
++static int64_t time_ref_count(struct domain *d)
++{
++    struct viridian_time_ref_count *trc =
++        &d->arch.hvm.viridian->time_ref_count;
++
++    return raw_trc_val(d) + trc->off;
++}
++
++void viridian_time_domain_freeze(struct domain *d)
++{
++    if ( !d->arch.hvm.viridian )
++        return;
++
++    time_ref_count_freeze(d);
++}
++
++void viridian_time_domain_thaw(struct domain *d)
++{
++    if ( !d->arch.hvm.viridian )
++        return;
++
++    time_ref_count_thaw(d);
++}
++
+ int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
+ {
+     struct domain *d = v->domain;
+@@ -179,7 +203,7 @@ int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
+             printk(XENLOG_G_INFO "d%d: VIRIDIAN MSR_TIME_REF_COUNT: accessed\n",
+                    d->domain_id);
+ 
+-        *val = raw_trc_val(d) + trc->off;
++        *val = time_ref_count(d);
+         break;
+     }
+ 
+diff --git a/xen/include/asm-x86/hvm/viridian.h b/xen/include/asm-x86/hvm/viridian.h
+index 41e81b3662..8f0b3e97eb 100644
+--- a/xen/include/asm-x86/hvm/viridian.h
++++ b/xen/include/asm-x86/hvm/viridian.h
+@@ -104,8 +104,8 @@ rdmsr_viridian_regs(
+ int
+ viridian_hypercall(struct cpu_user_regs *regs);
+ 
+-void viridian_time_ref_count_freeze(struct domain *d);
+-void viridian_time_ref_count_thaw(struct domain *d);
++void viridian_time_domain_freeze(struct domain *d);
++void viridian_time_domain_thaw(struct domain *d);
+ 
+ int viridian_vcpu_init(struct vcpu *v);
+ int viridian_domain_init(struct domain *d);

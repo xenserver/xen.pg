@@ -1,0 +1,96 @@
+From cd9589a53e79b45227d1a031deea144599e5c3ae Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Tue, 18 Dec 2018 15:52:57 +0000
+Subject: [PATCH v3 1/8] viridian: add init hooks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This patch adds domain and vcpu init hooks for viridian features. The init
+hooks do not yet do anything; the functionality will be added to by
+subsequent patches.
+
+NOTE: This patch also removes the call from the domain deinit function to
+      the vcpu deinit function, as this is not necessary.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index ffd1391a68..562634a98b 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -661,12 +661,18 @@ int hvm_domain_initialise(struct domain *d)
+     if ( hvm_tsc_scaling_supported )
+         d->arch.hvm.tsc_scaling_ratio = hvm_default_tsc_scaling_ratio;
+ 
++    rc = viridian_domain_init(d);
++    if ( rc )
++        goto fail2;
++
+     rc = hvm_funcs.domain_initialise(d);
+     if ( rc != 0 )
+-        goto fail2;
++        goto fail3;
+ 
+     return 0;
+ 
++ fail3:
++    viridian_domain_deinit(d);
+  fail2:
+     rtc_deinit(d);
+     stdvga_deinit(d);
+@@ -1560,6 +1566,10 @@ int hvm_vcpu_initialise(struct vcpu *v)
+     if ( rc != 0 )
+         goto fail6;
+ 
++    rc = viridian_vcpu_init(v);
++    if ( rc )
++        goto fail7;
++
+     if ( v->vcpu_id == 0 )
+     {
+         /* NB. All these really belong in hvm_domain_initialise(). */
+@@ -1572,6 +1582,8 @@ int hvm_vcpu_initialise(struct vcpu *v)
+ 
+     return 0;
+ 
++ fail7:
++    hvm_all_ioreq_servers_remove_vcpu(d, v);
+  fail6:
+     nestedhvm_vcpu_destroy(v);
+  fail5:
+diff --git a/xen/arch/x86/hvm/viridian/viridian.c b/xen/arch/x86/hvm/viridian/viridian.c
+index 93cdfda071..f8aef330c7 100644
+--- a/xen/arch/x86/hvm/viridian/viridian.c
++++ b/xen/arch/x86/hvm/viridian/viridian.c
+@@ -448,6 +448,16 @@ int rdmsr_viridian_regs(uint32_t idx, uint64_t *val)
+     return (guest_rdmsr_viridian(v, idx, val) == X86EMUL_OKAY) ? 1 : 0;
+ }
+ 
++int viridian_vcpu_init(struct vcpu *v)
++{
++    return 0;
++}
++
++int viridian_domain_init(struct domain *d)
++{
++    return 0;
++}
++
+ void viridian_vcpu_deinit(struct vcpu *v)
+ {
+     viridian_synic_wrmsr(v, HV_X64_MSR_VP_ASSIST_PAGE, 0);
+diff --git a/xen/include/asm-x86/hvm/viridian.h b/xen/include/asm-x86/hvm/viridian.h
+index 934b7ca3f9..d1cc9ddb1b 100644
+--- a/xen/include/asm-x86/hvm/viridian.h
++++ b/xen/include/asm-x86/hvm/viridian.h
+@@ -87,6 +87,9 @@ viridian_hypercall(struct cpu_user_regs *regs);
+ void viridian_time_ref_count_freeze(struct domain *d);
+ void viridian_time_ref_count_thaw(struct domain *d);
+ 
++int viridian_vcpu_init(struct vcpu *v);
++int viridian_domain_init(struct domain *d);
++
+ void viridian_vcpu_deinit(struct vcpu *v);
+ void viridian_domain_deinit(struct domain *d);
+ 

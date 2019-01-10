@@ -1,0 +1,540 @@
+From 61934801baa4560772364ded86642a06cf3085d6 Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Thu, 20 Dec 2018 11:34:23 +0000
+Subject: [PATCH v3 6/8] viridian: add implementation of synthetic interrupt
+ MSRs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This patch introduces an implementation of the SCONTROL, SVERSION, SIEFP,
+SIMP, EOM and SINT0-15 SynIC MSRs. No message source is added and, as such,
+nothing will yet generate a synthetic interrupt. A subsequent patch will
+add an implementation of synthetic timers which will need the infrastructure
+added by this patch to deliver expiry messages to the guest.
+
+NOTE: A 'synic' option is added to the toolstack viridian enlightenments
+      enumeration but is deliberately not documented as enabling these
+      SynIC registers without a message source is only useful for
+      debugging.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+diff --git a/tools/libxl/libxl.h b/tools/libxl/libxl.h
+index a09d069358..1b6bfef826 100644
+--- a/tools/libxl/libxl.h
++++ b/tools/libxl/libxl.h
+@@ -312,6 +312,12 @@
+  */
+ #define LIBXL_HAVE_VIRIDIAN_CRASH_CTL 1
+ 
++/*
++ * LIBXL_HAVE_VIRIDIAN_SYNIC indicates that the 'synic' value
++ * is present in the viridian enlightenment enumeration.
++ */
++#define LIBXL_HAVE_VIRIDIAN_SYNIC 1
++
+ /*
+  * LIBXL_HAVE_BUILDINFO_HVM_ACPI_LAPTOP_SLATE indicates that
+  * libxl_domain_build_info has the u.hvm.acpi_laptop_slate field.
+diff --git a/tools/libxl/libxl_dom.c b/tools/libxl/libxl_dom.c
+index 3cfe0d4808..8db335f3e0 100644
+--- a/tools/libxl/libxl_dom.c
++++ b/tools/libxl/libxl_dom.c
+@@ -285,6 +285,9 @@ static int hvm_set_viridian_features(libxl__gc *gc, uint32_t domid,
+     if (libxl_bitmap_test(&enlightenments, LIBXL_VIRIDIAN_ENLIGHTENMENT_CRASH_CTL))
+         mask |= HVMPV_crash_ctl;
+ 
++    if (libxl_bitmap_test(&enlightenments, LIBXL_VIRIDIAN_ENLIGHTENMENT_SYNIC))
++        mask |= HVMPV_synic;
++
+     if (mask != 0 &&
+         xc_hvm_param_set(CTX->xch,
+                          domid,
+diff --git a/tools/libxl/libxl_types.idl b/tools/libxl/libxl_types.idl
+index 01ec1d1afa..1489e0ec20 100644
+--- a/tools/libxl/libxl_types.idl
++++ b/tools/libxl/libxl_types.idl
+@@ -228,6 +228,7 @@ libxl_viridian_enlightenment = Enumeration("viridian_enlightenment", [
+     (4, "hcall_remote_tlb_flush"),
+     (5, "apic_assist"),
+     (6, "crash_ctl"),
++    (7, "synic"),
+     ])
+ 
+ libxl_hdtype = Enumeration("hdtype", [
+diff --git a/xen/arch/x86/hvm/viridian/synic.c b/xen/arch/x86/hvm/viridian/synic.c
+index 35bd2125fc..0437c07ce5 100644
+--- a/xen/arch/x86/hvm/viridian/synic.c
++++ b/xen/arch/x86/hvm/viridian/synic.c
+@@ -13,6 +13,7 @@
+ 
+ #include <asm/apic.h>
+ #include <asm/hvm/support.h>
++#include <asm/hvm/vlapic.h>
+ 
+ #include "private.h"
+ 
+@@ -28,6 +29,32 @@ typedef union _HV_VP_ASSIST_PAGE
+     uint8_t ReservedZBytePadding[PAGE_SIZE];
+ } HV_VP_ASSIST_PAGE;
+ 
++typedef enum HV_MESSAGE_TYPE {
++    HvMessageTypeNone,
++    HvMessageTimerExpired = 0x80000010,
++} HV_MESSAGE_TYPE;
++
++typedef struct HV_MESSAGE_FLAGS {
++    uint8_t MessagePending:1;
++    uint8_t Reserved:7;
++} HV_MESSAGE_FLAGS;
++
++typedef struct HV_MESSAGE_HEADER {
++    HV_MESSAGE_TYPE MessageType;
++    uint16_t Reserved1;
++    HV_MESSAGE_FLAGS MessageFlags;
++    uint8_t PayloadSize;
++    uint64_t Reserved2;
++} HV_MESSAGE_HEADER;
++
++#define HV_MESSAGE_SIZE 256
++#define HV_MESSAGE_MAX_PAYLOAD_QWORD_COUNT 30
++
++typedef struct HV_MESSAGE {
++    HV_MESSAGE_HEADER Header;
++    uint64_t Payload[HV_MESSAGE_MAX_PAYLOAD_QWORD_COUNT];
++} HV_MESSAGE;
++
+ void viridian_apic_assist_set(struct vcpu *v)
+ {
+     HV_VP_ASSIST_PAGE *ptr = v->arch.hvm.viridian->vp_assist.ptr;
+@@ -105,6 +132,73 @@ int viridian_synic_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
+             viridian_map_guest_page(d, &v->arch.hvm.viridian->vp_assist);
+         break;
+ 
++    case HV_X64_MSR_SCONTROL:
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        v->arch.hvm.viridian->scontrol = val;
++        break;
++
++    case HV_X64_MSR_SVERSION:
++        return X86EMUL_EXCEPTION;
++
++    case HV_X64_MSR_SIEFP:
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        v->arch.hvm.viridian->siefp = val;
++        break;
++
++    case HV_X64_MSR_SIMP:
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        viridian_unmap_guest_page(&v->arch.hvm.viridian->simp);
++        v->arch.hvm.viridian->simp.msr.raw = val;
++        viridian_dump_guest_page(v, "SIMP", &v->arch.hvm.viridian->simp);
++        if ( v->arch.hvm.viridian->simp.msr.fields.enabled )
++            viridian_map_guest_page(d, &v->arch.hvm.viridian->simp);
++        break;
++
++    case HV_X64_MSR_EOM:
++    {
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        v->arch.hvm.viridian->msg_pending = 0;
++        break;
++    }
++    case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
++    {
++        unsigned int sintx = idx - HV_X64_MSR_SINT0;
++        uint8_t vector = v->arch.hvm.viridian->sint[sintx].fields.vector;
++
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        /*
++         * Invalidate any previous mapping by setting an out-of-range
++         * index.
++         */
++        v->arch.hvm.viridian->vector_to_sintx[vector] =
++            ARRAY_SIZE(v->arch.hvm.viridian->sint);
++
++        v->arch.hvm.viridian->sint[sintx].raw = val;
++
++        /* Vectors must be in the range 16-255 inclusive */
++        vector = v->arch.hvm.viridian->sint[sintx].fields.vector;
++        if ( vector < 16 )
++            return X86EMUL_EXCEPTION;
++
++        printk(XENLOG_G_INFO "%pv: VIRIDIAN SINT%u: vector: %x\n", v, sintx,
++               vector);
++        v->arch.hvm.viridian->vector_to_sintx[vector] = sintx;
++
++        if ( v->arch.hvm.viridian->sint[sintx].fields.polling )
++            clear_bit(sintx, &v->arch.hvm.viridian->msg_pending);
++
++        break;
++    }
+     default:
+         gdprintk(XENLOG_INFO, "%s: unimplemented MSR %#x (%016"PRIx64")\n",
+                  __func__, idx, val);
+@@ -116,6 +210,8 @@ int viridian_synic_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
+ 
+ int viridian_synic_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
+ {
++    struct domain *d = v->domain;
++
+     switch ( idx )
+     {
+     case HV_X64_MSR_EOI:
+@@ -137,6 +233,58 @@ int viridian_synic_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
+         *val = v->arch.hvm.viridian->vp_assist.msr.raw;
+         break;
+ 
++    case HV_X64_MSR_SCONTROL:
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        *val = v->arch.hvm.viridian->scontrol;
++        break;
++
++    case HV_X64_MSR_SVERSION:
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        /*
++         * The specification says that the version number is 0x00000001
++         * and should be in the lower 32-bits of the MSR, while the
++         * upper 32-bits are reserved... but it doesn't say what they
++         * should be set to. Assume everything but the bottom bit
++         * should be zero.
++         */
++        *val = 1ul;
++        break;
++
++    case HV_X64_MSR_SIEFP:
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        *val = v->arch.hvm.viridian->siefp;
++        break;
++
++    case HV_X64_MSR_SIMP:
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        *val = v->arch.hvm.viridian->simp.msr.raw;
++        break;
++
++    case HV_X64_MSR_EOM:
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        *val = 0;
++        break;
++
++    case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
++    {
++        unsigned int sintx = idx - HV_X64_MSR_SINT0;
++
++        if ( !(viridian_feature_mask(d) & HVMPV_synic) )
++            return X86EMUL_EXCEPTION;
++
++        *val = v->arch.hvm.viridian->sint[sintx].raw;
++        break;
++    }
+     default:
+         gdprintk(XENLOG_INFO, "%s: unimplemented MSR %#x\n", __func__, idx);
+         return X86EMUL_EXCEPTION;
+@@ -147,6 +295,20 @@ int viridian_synic_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
+ 
+ int viridian_synic_vcpu_init(struct vcpu *v)
+ {
++    unsigned int i;
++
++    /*
++     * The specification says that all synthetic interrupts must be
++     * initally masked.
++     */
++    for ( i = 0; i < ARRAY_SIZE(v->arch.hvm.viridian->sint); i++ )
++        v->arch.hvm.viridian->sint[i].fields.mask = 1;
++
++    /* Initialize the mapping array with invalid values */
++    for ( i = 0; i < ARRAY_SIZE(v->arch.hvm.viridian->vector_to_sintx); i++ )
++        v->arch.hvm.viridian->vector_to_sintx[i] =
++            ARRAY_SIZE(v->arch.hvm.viridian->sint);
++
+     return 0;
+ }
+ 
+@@ -158,15 +320,49 @@ int viridian_synic_domain_init(struct domain *d)
+ void viridian_synic_vcpu_deinit(struct vcpu *v)
+ {
+     viridian_unmap_guest_page(&v->arch.hvm.viridian->vp_assist);
++    viridian_unmap_guest_page(&v->arch.hvm.viridian->simp);
+ }
+ 
+ void viridian_synic_domain_deinit(struct domain *d)
+ {
+ }
+ 
++void viridian_synic_poll_messages(struct vcpu *v)
++{
++    /* There are currently no message sources */
++}
++
++bool viridian_synic_is_auto_eoi_sint(struct vcpu *v, uint8_t vector)
++{
++    int sintx = v->arch.hvm.viridian->vector_to_sintx[vector];
++
++    if ( sintx >= ARRAY_SIZE(v->arch.hvm.viridian->sint) )
++        return false;
++
++    return v->arch.hvm.viridian->sint[sintx].fields.auto_eoi;
++}
++
++void viridian_synic_ack_sint(struct vcpu *v, uint8_t vector)
++{
++    int sintx = v->arch.hvm.viridian->vector_to_sintx[vector];
++
++    if ( sintx < ARRAY_SIZE(v->arch.hvm.viridian->sint) )
++        clear_bit(sintx, &v->arch.hvm.viridian->msg_pending);
++}
++
+ void viridian_synic_save_vcpu_ctxt(const struct vcpu *v,
+                                    struct hvm_viridian_vcpu_context *ctxt)
+ {
++    unsigned int i;
++
++    BUILD_BUG_ON(ARRAY_SIZE(v->arch.hvm.viridian->sint) !=
++                 ARRAY_SIZE(ctxt->sint_msr));
++
++    for ( i = 0; i < ARRAY_SIZE(v->arch.hvm.viridian->sint); i++ )
++        ctxt->sint_msr[i] = v->arch.hvm.viridian->sint[i].raw;
++
++    ctxt->simp_msr = v->arch.hvm.viridian->simp.msr.raw;
++
+     ctxt->apic_assist_pending = v->arch.hvm.viridian->apic_assist_pending;
+     ctxt->vp_assist_msr = v->arch.hvm.viridian->vp_assist.msr.raw;
+ }
+@@ -175,12 +371,30 @@ void viridian_synic_load_vcpu_ctxt(
+     struct vcpu *v, const struct hvm_viridian_vcpu_context *ctxt)
+ {
+     struct domain *d = v->domain;
++    unsigned int i;
+ 
+     v->arch.hvm.viridian->vp_assist.msr.raw = ctxt->vp_assist_msr;
+     if ( v->arch.hvm.viridian->vp_assist.msr.fields.enabled )
+         viridian_map_guest_page(d, &v->arch.hvm.viridian->vp_assist);
+ 
+     v->arch.hvm.viridian->apic_assist_pending = ctxt->apic_assist_pending;
++
++    v->arch.hvm.viridian->simp.msr.raw = ctxt->simp_msr;
++    if ( v->arch.hvm.viridian->simp.msr.fields.enabled )
++        viridian_map_guest_page(d, &v->arch.hvm.viridian->simp);
++
++    for ( i = 0; i < ARRAY_SIZE(v->arch.hvm.viridian->sint); i++ )
++    {
++        uint8_t vector;
++
++        v->arch.hvm.viridian->sint[i].raw = ctxt->sint_msr[i];
++
++        vector = v->arch.hvm.viridian->sint[i].fields.vector;
++        if ( vector < 16 )
++            continue;
++
++        v->arch.hvm.viridian->vector_to_sintx[vector] = i;
++    }
+ }
+ 
+ void viridian_synic_save_domain_ctxt(
+diff --git a/xen/arch/x86/hvm/viridian/viridian.c b/xen/arch/x86/hvm/viridian/viridian.c
+index e72d4e07fb..2c8d845b26 100644
+--- a/xen/arch/x86/hvm/viridian/viridian.c
++++ b/xen/arch/x86/hvm/viridian/viridian.c
+@@ -180,6 +180,8 @@ void cpuid_viridian_leaves(const struct vcpu *v, uint32_t leaf,
+             mask.AccessPartitionReferenceCounter = 1;
+         if ( viridian_feature_mask(d) & HVMPV_reference_tsc )
+             mask.AccessPartitionReferenceTsc = 1;
++        if ( viridian_feature_mask(d) & HVMPV_synic )
++            mask.AccessSynicRegs = 1;
+ 
+         u.mask = mask;
+ 
+@@ -309,8 +311,16 @@ static int guest_wrmsr_viridian(struct vcpu *v, uint32_t idx, uint64_t val)
+     case HV_X64_MSR_ICR:
+     case HV_X64_MSR_TPR:
+     case HV_X64_MSR_VP_ASSIST_PAGE:
++    case HV_X64_MSR_SCONTROL:
++    case HV_X64_MSR_SVERSION:
++    case HV_X64_MSR_SIEFP:
++    case HV_X64_MSR_SIMP:
++    case HV_X64_MSR_EOM:
++    case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
+         return viridian_synic_wrmsr(v, idx, val);
+ 
++    case HV_X64_MSR_TSC_FREQUENCY:
++    case HV_X64_MSR_APIC_FREQUENCY:
+     case HV_X64_MSR_REFERENCE_TSC:
+         return viridian_time_wrmsr(v, idx, val);
+ 
+@@ -396,6 +406,12 @@ static int guest_rdmsr_viridian(const struct vcpu *v, uint32_t idx,
+     case HV_X64_MSR_ICR:
+     case HV_X64_MSR_TPR:
+     case HV_X64_MSR_VP_ASSIST_PAGE:
++    case HV_X64_MSR_SCONTROL:
++    case HV_X64_MSR_SVERSION:
++    case HV_X64_MSR_SIEFP:
++    case HV_X64_MSR_SIMP:
++    case HV_X64_MSR_EOM:
++    case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
+         return viridian_synic_rdmsr(v, idx, val);
+ 
+     case HV_X64_MSR_TSC_FREQUENCY:
+diff --git a/xen/arch/x86/hvm/vlapic.c b/xen/arch/x86/hvm/vlapic.c
+index c17cb2ca28..3a4276a03c 100644
+--- a/xen/arch/x86/hvm/vlapic.c
++++ b/xen/arch/x86/hvm/vlapic.c
+@@ -461,11 +461,15 @@ void vlapic_EOI_set(struct vlapic *vlapic)
+ 
+ void vlapic_handle_EOI(struct vlapic *vlapic, u8 vector)
+ {
++    struct vcpu *v = vlapic_vcpu(vlapic);
+     struct domain *d = vlapic_domain(vlapic);
+ 
+     if ( vlapic_test_vector(vector, &vlapic->regs->data[APIC_TMR]) )
+         vioapic_update_EOI(d, vector);
+ 
++    if ( has_viridian_synic(v->domain) )
++        viridian_synic_ack_sint(v, vector);
++
+     hvm_dpci_msi_eoi(d, vector);
+ }
+ 
+@@ -1245,6 +1249,13 @@ int vlapic_has_pending_irq(struct vcpu *v)
+     if ( !vlapic_enabled(vlapic) )
+         return -1;
+ 
++    /*
++     * Poll the viridian message queues before checking the IRR since
++     * a sythetic interrupt may be asserted during the poll.
++     */
++    if ( has_viridian_synic(v->domain) )
++        viridian_synic_poll_messages(v);
++
+     irr = vlapic_find_highest_irr(vlapic);
+     if ( irr == -1 )
+         return -1;
+@@ -1307,7 +1318,10 @@ int vlapic_ack_pending_irq(struct vcpu *v, int vector, bool_t force_ack)
+     }
+ 
+  done:
+-    vlapic_set_vector(vector, &vlapic->regs->data[APIC_ISR]);
++    if ( !has_viridian_synic(v->domain) ||
++         !viridian_synic_is_auto_eoi_sint(v, vector) )
++        vlapic_set_vector(vector, &vlapic->regs->data[APIC_ISR]);
++
+     vlapic_clear_irr(vector, vlapic);
+     return 1;
+ }
+diff --git a/xen/include/asm-x86/hvm/hvm.h b/xen/include/asm-x86/hvm/hvm.h
+index 3d28150ad7..2f4ee2130f 100644
+--- a/xen/include/asm-x86/hvm/hvm.h
++++ b/xen/include/asm-x86/hvm/hvm.h
+@@ -404,6 +404,9 @@ bool hvm_set_guest_bndcfgs(struct vcpu *v, u64 val);
+ #define has_viridian_apic_assist(d) \
+     (is_viridian_domain(d) && (viridian_feature_mask(d) & HVMPV_apic_assist))
+ 
++#define has_viridian_synic(d) \
++    (is_viridian_domain(d) && (viridian_feature_mask(d) & HVMPV_synic))
++
+ bool hvm_check_cpuid_faulting(struct vcpu *v);
+ void hvm_migrate_timers(struct vcpu *v);
+ void hvm_do_resume(struct vcpu *v);
+diff --git a/xen/include/asm-x86/hvm/viridian.h b/xen/include/asm-x86/hvm/viridian.h
+index 41c36b5cf2..41e81b3662 100644
+--- a/xen/include/asm-x86/hvm/viridian.h
++++ b/xen/include/asm-x86/hvm/viridian.h
+@@ -26,10 +26,30 @@ struct viridian_page
+     void *ptr;
+ };
+ 
++union viridian_sint_msr
++{
++    uint64_t raw;
++    struct
++    {
++        uint64_t vector:8;
++        uint64_t reserved_preserved1:8;
++        uint64_t mask:1;
++        uint64_t auto_eoi:1;
++        uint64_t polling:1;
++        uint64_t reserved_preserved2:45;
++    } fields;
++};
++
+ struct viridian_vcpu
+ {
+     struct viridian_page vp_assist;
+     bool apic_assist_pending;
++    uint64_t scontrol;
++    uint64_t siefp;
++    struct viridian_page simp;
++    union viridian_sint_msr sint[16];
++    uint8_t vector_to_sintx[256];
++    unsigned long msg_pending;
+     uint64_t crash_param[5];
+ };
+ 
+@@ -97,6 +117,10 @@ void viridian_apic_assist_set(struct vcpu *v);
+ bool viridian_apic_assist_completed(struct vcpu *v);
+ void viridian_apic_assist_clear(struct vcpu *v);
+ 
++bool viridian_synic_is_auto_eoi_sint(struct vcpu *v, uint8_t vector);
++void viridian_synic_poll_messages(struct vcpu *v);
++void viridian_synic_ack_sint(struct vcpu *v, uint8_t vector);
++
+ #endif /* __ASM_X86_HVM_VIRIDIAN_H__ */
+ 
+ /*
+diff --git a/xen/include/public/arch-x86/hvm/save.h b/xen/include/public/arch-x86/hvm/save.h
+index 80e762c335..3ba00923ca 100644
+--- a/xen/include/public/arch-x86/hvm/save.h
++++ b/xen/include/public/arch-x86/hvm/save.h
+@@ -602,6 +602,8 @@ struct hvm_viridian_vcpu_context {
+     uint64_t vp_assist_msr;
+     uint8_t  apic_assist_pending;
+     uint8_t  _pad[7];
++    uint64_t simp_msr;
++    uint64_t sint_msr[16];
+ };
+ 
+ DECLARE_HVM_SAVE_TYPE(VIRIDIAN_VCPU, 17, struct hvm_viridian_vcpu_context);
+diff --git a/xen/include/public/hvm/params.h b/xen/include/public/hvm/params.h
+index 234cc2fa9c..97a12f324d 100644
+--- a/xen/include/public/hvm/params.h
++++ b/xen/include/public/hvm/params.h
+@@ -146,6 +146,10 @@
+ #define _HVMPV_crash_ctl 6
+ #define HVMPV_crash_ctl (1 << _HVMPV_crash_ctl)
+ 
++/* Enable SYNIC MSRs */
++#define _HVMPV_synic 7
++#define HVMPV_synic (1 << _HVMPV_synic)
++
+ #define HVMPV_feature_mask \
+         (HVMPV_base_freq | \
+          HVMPV_no_freq | \
+@@ -153,7 +157,8 @@
+          HVMPV_reference_tsc | \
+          HVMPV_hcall_remote_tlb_flush | \
+          HVMPV_apic_assist | \
+-         HVMPV_crash_ctl)
++         HVMPV_crash_ctl | \
++         HVMPV_synic)
+ 
+ #endif
+ 
