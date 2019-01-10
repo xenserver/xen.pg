@@ -1,0 +1,108 @@
+From 1fea389864bd278305a07a139f5f362db70df495 Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Fri, 7 Dec 2018 17:50:08 +0000
+Subject: [PATCH] x86/hvm/viridian: stop open coding updates to APIC registers
+
+The code in viridian_synic_wrmsr() duplicates logic in vlapic_reg_write()
+to update the ICR, ICR2 and TASKPRI registers. Instead of doing this,
+make vlapic_reg_write() non-static and call it.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+Rename "offset" to "reg" for consistency with the rest of the vlapic API.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+---
+ xen/arch/x86/hvm/viridian/synic.c | 15 +++++----------
+ xen/arch/x86/hvm/vlapic.c         | 15 +++++++--------
+ xen/include/asm-x86/hvm/vlapic.h  |  2 ++
+ 3 files changed, 14 insertions(+), 18 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/viridian/synic.c b/xen/arch/x86/hvm/viridian/synic.c
+index 845029b568..a6ebbbc9f5 100644
+--- a/xen/arch/x86/hvm/viridian/synic.c
++++ b/xen/arch/x86/hvm/viridian/synic.c
+@@ -84,18 +84,13 @@ int viridian_synic_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
+         vlapic_EOI_set(vcpu_vlapic(v));
+         break;
+ 
+-    case HV_X64_MSR_ICR: {
+-        u32 eax = (u32)val, edx = (u32)(val >> 32);
+-        struct vlapic *vlapic = vcpu_vlapic(v);
+-        eax &= ~(1 << 12);
+-        edx &= 0xff000000;
+-        vlapic_set_reg(vlapic, APIC_ICR2, edx);
+-        vlapic_ipi(vlapic, eax, edx);
+-        vlapic_set_reg(vlapic, APIC_ICR, eax);
++    case HV_X64_MSR_ICR:
++        vlapic_reg_write(v, APIC_ICR2, val >> 32);
++        vlapic_reg_write(v, APIC_ICR, val);
+         break;
+-    }
++
+     case HV_X64_MSR_TPR:
+-        vlapic_set_reg(vcpu_vlapic(v), APIC_TASKPRI, (uint8_t)val);
++        vlapic_reg_write(v, APIC_TASKPRI, val);
+         break;
+ 
+     case HV_X64_MSR_VP_ASSIST_PAGE:
+diff --git a/xen/arch/x86/hvm/vlapic.c b/xen/arch/x86/hvm/vlapic.c
+index d318f3441a..d3a5fb5d3f 100644
+--- a/xen/arch/x86/hvm/vlapic.c
++++ b/xen/arch/x86/hvm/vlapic.c
+@@ -775,14 +775,13 @@ static void vlapic_update_timer(struct vlapic *vlapic, uint32_t lvtt,
+     }
+ }
+ 
+-static void vlapic_reg_write(struct vcpu *v,
+-                             unsigned int offset, uint32_t val)
++void vlapic_reg_write(struct vcpu *v, unsigned int reg, uint32_t val)
+ {
+     struct vlapic *vlapic = vcpu_vlapic(v);
+ 
+     memset(&vlapic->loaded, 0, sizeof(vlapic->loaded));
+ 
+-    switch ( offset )
++    switch ( reg )
+     {
+     case APIC_ID:
+         vlapic_set_reg(vlapic, APIC_ID, val);
+@@ -857,16 +856,16 @@ static void vlapic_reg_write(struct vcpu *v,
+     case APIC_LVTERR:       /* LVT Error Reg */
+         if ( vlapic_sw_disabled(vlapic) )
+             val |= APIC_LVT_MASKED;
+-        val &= vlapic_lvt_mask[(offset - APIC_LVTT) >> 4];
+-        vlapic_set_reg(vlapic, offset, val);
+-        if ( offset == APIC_LVT0 )
++        val &= vlapic_lvt_mask[(reg - APIC_LVTT) >> 4];
++        vlapic_set_reg(vlapic, reg, val);
++        if ( reg == APIC_LVT0 )
+         {
+             vlapic_adjust_i8259_target(v->domain);
+             pt_may_unmask_irq(v->domain, NULL);
+         }
+-        if ( (offset == APIC_LVTT) && !(val & APIC_LVT_MASKED) )
++        if ( (reg == APIC_LVTT) && !(val & APIC_LVT_MASKED) )
+             pt_may_unmask_irq(NULL, &vlapic->pt);
+-        if ( offset == APIC_LVTPC )
++        if ( reg == APIC_LVTPC )
+             vpmu_lvtpc_update(val);
+         break;
+ 
+diff --git a/xen/include/asm-x86/hvm/vlapic.h b/xen/include/asm-x86/hvm/vlapic.h
+index 4eb40750bc..5938be2523 100644
+--- a/xen/include/asm-x86/hvm/vlapic.h
++++ b/xen/include/asm-x86/hvm/vlapic.h
+@@ -108,6 +108,8 @@ static inline void vlapic_set_reg(
+     *((uint32_t *)(&vlapic->regs->data[reg])) = val;
+ }
+ 
++void vlapic_reg_write(struct vcpu *v, unsigned int reg, uint32_t val);
++
+ bool_t is_vlapic_lvtpc_enabled(struct vlapic *vlapic);
+ 
+ bool vlapic_test_irq(const struct vlapic *vlapic, uint8_t vec);
+-- 
+2.17.1
+

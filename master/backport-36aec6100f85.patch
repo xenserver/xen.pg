@@ -1,0 +1,573 @@
+From 36aec6100f85b6024730654d5973a3d7c28bd8fe Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Fri, 9 Nov 2018 11:38:03 +0100
+Subject: [PATCH] viridian: separate time related enlightenment
+ implementations...
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+...into new 'time' module.
+
+This patch reduces the size of the main viridian source module by
+moving time related enlightenments into their own source module. This is
+done in anticipation of implementation of more such enightenments and
+a desire to not further lengthen the main source module when this work
+is done.
+
+While moving the code:
+
+- Move the declaration of HV_REFERENCE_TSC_PAGE from the header file into
+  the new source module, since it is only used there.
+- Clean up a bool_t.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+diff --git a/xen/arch/x86/hvm/viridian/Makefile b/xen/arch/x86/hvm/viridian/Makefile
+index fca8e16e20..3ecdffe2f6 100644
+--- a/xen/arch/x86/hvm/viridian/Makefile
++++ b/xen/arch/x86/hvm/viridian/Makefile
+@@ -1,2 +1,3 @@
+ obj-y += synic.o
++obj-y += time.o
+ obj-y += viridian.o
+diff --git a/xen/arch/x86/hvm/viridian/private.h b/xen/arch/x86/hvm/viridian/private.h
+index 5b4992d118..801ebe09b8 100644
+--- a/xen/arch/x86/hvm/viridian/private.h
++++ b/xen/arch/x86/hvm/viridian/private.h
+@@ -74,11 +74,19 @@
+ int viridian_synic_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val);
+ int viridian_synic_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val);
+ 
++int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val);
++int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val);
++
+ void viridian_synic_save_vcpu_ctxt(const struct vcpu *v,
+                                    struct hvm_viridian_vcpu_context *ctxt);
+ void viridian_synic_load_vcpu_ctxt(
+     struct vcpu *v, const struct hvm_viridian_vcpu_context *ctxt);
+ 
++void viridian_time_save_domain_ctxt(
++    const struct domain *d, struct hvm_viridian_domain_context *ctxt);
++void viridian_time_load_domain_ctxt(
++    struct domain *d, const struct hvm_viridian_domain_context *ctxt);
++
+ #endif /* X86_HVM_VIRIDIAN_PRIVATE_H */
+ 
+ /*
+diff --git a/xen/arch/x86/hvm/viridian/time.c b/xen/arch/x86/hvm/viridian/time.c
+new file mode 100644
+index 0000000000..840a82b457
+--- /dev/null
++++ b/xen/arch/x86/hvm/viridian/time.c
+@@ -0,0 +1,244 @@
++/***************************************************************************
++ * time.c
++ *
++ * An implementation of some time related Viridian enlightenments.
++ * See Microsoft's Hypervisor Top Level Functional Specification.
++ * for more information.
++ */
++
++#include <xen/domain_page.h>
++#include <xen/hypercall.h>
++#include <xen/sched.h>
++#include <xen/version.h>
++
++#include <asm/apic.h>
++#include <asm/hvm/support.h>
++
++#include "private.h"
++
++typedef struct _HV_REFERENCE_TSC_PAGE
++{
++    uint32_t TscSequence;
++    uint32_t Reserved1;
++    uint64_t TscScale;
++    int64_t  TscOffset;
++    uint64_t Reserved2[509];
++} HV_REFERENCE_TSC_PAGE, *PHV_REFERENCE_TSC_PAGE;
++
++static void dump_reference_tsc(const struct domain *d)
++{
++    const union viridian_page_msr *rt = &d->arch.hvm.viridian.reference_tsc;
++
++    if ( !rt->fields.enabled )
++        return;
++
++    printk(XENLOG_G_INFO "d%d: VIRIDIAN REFERENCE_TSC: pfn: %lx\n",
++           d->domain_id, (unsigned long)rt->fields.pfn);
++}
++
++static void update_reference_tsc(struct domain *d, bool initialize)
++{
++    unsigned long gmfn = d->arch.hvm.viridian.reference_tsc.fields.pfn;
++    struct page_info *page = get_page_from_gfn(d, gmfn, NULL, P2M_ALLOC);
++    HV_REFERENCE_TSC_PAGE *p;
++
++    if ( !page || !get_page_type(page, PGT_writable_page) )
++    {
++        if ( page )
++            put_page(page);
++        gdprintk(XENLOG_WARNING, "Bad GMFN %#"PRI_gfn" (MFN %#"PRI_mfn")\n",
++                 gmfn, mfn_x(page ? page_to_mfn(page) : INVALID_MFN));
++        return;
++    }
++
++    p = __map_domain_page(page);
++
++    if ( initialize )
++        clear_page(p);
++
++    /*
++     * This enlightenment must be disabled is the host TSC is not invariant.
++     * However it is also disabled if vtsc is true (which means rdtsc is
++     * being emulated). This generally happens when guest TSC freq and host
++     * TSC freq don't match. The TscScale value could be adjusted to cope
++     * with this, allowing vtsc to be turned off, but support for this is
++     * not yet present in the hypervisor. Thus is it is possible that
++     * migrating a Windows VM between hosts of differing TSC frequencies
++     * may result in large differences in guest performance.
++     */
++    if ( !host_tsc_is_safe() || d->arch.vtsc )
++    {
++        /*
++         * The specification states that valid values of TscSequence range
++         * from 0 to 0xFFFFFFFE. The value 0xFFFFFFFF is used to indicate
++         * this mechanism is no longer a reliable source of time and that
++         * the VM should fall back to a different source.
++         *
++         * Server 2012 (6.2 kernel) and 2012 R2 (6.3 kernel) actually
++         * violate the spec. and rely on a value of 0 to indicate that this
++         * enlightenment should no longer be used.
++         */
++        p->TscSequence = 0;
++
++        printk(XENLOG_G_INFO "d%d: VIRIDIAN REFERENCE_TSC: invalidated\n",
++               d->domain_id);
++        goto out;
++    }
++
++    /*
++     * The guest will calculate reference time according to the following
++     * formula:
++     *
++     * ReferenceTime = ((RDTSC() * TscScale) >> 64) + TscOffset
++     *
++     * Windows uses a 100ns tick, so we need a scale which is cpu
++     * ticks per 100ns shifted left by 64.
++     */
++    p->TscScale = ((10000ul << 32) / d->arch.tsc_khz) << 32;
++
++    p->TscSequence++;
++    if ( p->TscSequence == 0xFFFFFFFF ||
++         p->TscSequence == 0 ) /* Avoid both 'invalid' values */
++        p->TscSequence = 1;
++
++ out:
++    unmap_domain_page(p);
++
++    put_page_and_type(page);
++}
++
++static int64_t raw_trc_val(struct domain *d)
++{
++    uint64_t tsc;
++    struct time_scale tsc_to_ns;
++
++    tsc = hvm_get_guest_tsc(pt_global_vcpu_target(d));
++
++    /* convert tsc to count of 100ns periods */
++    set_time_scale(&tsc_to_ns, d->arch.tsc_khz * 1000ul);
++    return scale_delta(tsc, &tsc_to_ns) / 100ul;
++}
++
++void viridian_time_ref_count_freeze(struct domain *d)
++{
++    struct viridian_time_ref_count *trc;
++
++    trc = &d->arch.hvm.viridian.time_ref_count;
++
++    if ( test_and_clear_bit(_TRC_running, &trc->flags) )
++        trc->val = raw_trc_val(d) + trc->off;
++}
++
++void viridian_time_ref_count_thaw(struct domain *d)
++{
++    struct viridian_time_ref_count *trc;
++
++    trc = &d->arch.hvm.viridian.time_ref_count;
++
++    if ( !d->is_shutting_down &&
++         !test_and_set_bit(_TRC_running, &trc->flags) )
++        trc->off = (int64_t)trc->val - raw_trc_val(d);
++}
++
++int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
++{
++    struct domain *d = v->domain;
++
++    switch ( idx )
++    {
++    case HV_X64_MSR_REFERENCE_TSC:
++        if ( !(viridian_feature_mask(d) & HVMPV_reference_tsc) )
++            return X86EMUL_EXCEPTION;
++
++        d->arch.hvm.viridian.reference_tsc.raw = val;
++        dump_reference_tsc(d);
++        if ( d->arch.hvm.viridian.reference_tsc.fields.enabled )
++            update_reference_tsc(d, true);
++        break;
++
++    default:
++        gdprintk(XENLOG_INFO, "%s: unimplemented MSR %#x (%016"PRIx64")\n",
++                 __func__, idx, val);
++        return X86EMUL_EXCEPTION;
++    }
++
++    return X86EMUL_OKAY;
++}
++
++int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
++{
++    struct domain *d = v->domain;
++
++    switch ( idx )
++    {
++    case HV_X64_MSR_TSC_FREQUENCY:
++        if ( viridian_feature_mask(d) & HVMPV_no_freq )
++            return X86EMUL_EXCEPTION;
++
++        *val = (uint64_t)d->arch.tsc_khz * 1000ull;
++        break;
++
++    case HV_X64_MSR_APIC_FREQUENCY:
++        if ( viridian_feature_mask(d) & HVMPV_no_freq )
++            return X86EMUL_EXCEPTION;
++
++        *val = 1000000000ull / APIC_BUS_CYCLE_NS;
++        break;
++
++    case HV_X64_MSR_REFERENCE_TSC:
++        if ( !(viridian_feature_mask(d) & HVMPV_reference_tsc) )
++            return X86EMUL_EXCEPTION;
++
++        *val = d->arch.hvm.viridian.reference_tsc.raw;
++        break;
++
++    case HV_X64_MSR_TIME_REF_COUNT:
++    {
++        struct viridian_time_ref_count *trc =
++            &d->arch.hvm.viridian.time_ref_count;
++
++        if ( !(viridian_feature_mask(d) & HVMPV_time_ref_count) )
++            return X86EMUL_EXCEPTION;
++
++        if ( !test_and_set_bit(_TRC_accessed, &trc->flags) )
++            printk(XENLOG_G_INFO "d%d: VIRIDIAN MSR_TIME_REF_COUNT: accessed\n",
++                   d->domain_id);
++
++        *val = raw_trc_val(d) + trc->off;
++        break;
++    }
++
++    default:
++        gdprintk(XENLOG_INFO, "%s: unimplemented MSR %#x\n", __func__, idx);
++        return X86EMUL_EXCEPTION;
++    }
++
++    return X86EMUL_OKAY;
++}
++
++void viridian_time_save_domain_ctxt(
++    const struct domain *d, struct hvm_viridian_domain_context *ctxt)
++{
++    ctxt->time_ref_count = d->arch.hvm.viridian.time_ref_count.val;
++    ctxt->reference_tsc = d->arch.hvm.viridian.reference_tsc.raw;
++}
++
++void viridian_time_load_domain_ctxt(
++    struct domain *d, const struct hvm_viridian_domain_context *ctxt)
++{
++    d->arch.hvm.viridian.time_ref_count.val = ctxt->time_ref_count;
++    d->arch.hvm.viridian.reference_tsc.raw = ctxt->reference_tsc;
++
++    if ( d->arch.hvm.viridian.reference_tsc.fields.enabled )
++        update_reference_tsc(d, false);
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/xen/arch/x86/hvm/viridian/viridian.c b/xen/arch/x86/hvm/viridian/viridian.c
+index ddaca2cf72..56e05c5c0d 100644
+--- a/xen/arch/x86/hvm/viridian/viridian.c
++++ b/xen/arch/x86/hvm/viridian/viridian.c
+@@ -248,17 +248,6 @@ static void dump_hypercall(const struct domain *d)
+            hg->fields.enabled, (unsigned long)hg->fields.pfn);
+ }
+ 
+-static void dump_reference_tsc(const struct domain *d)
+-{
+-    const union viridian_page_msr *rt;
+-
+-    rt = &d->arch.hvm.viridian.reference_tsc;
+-
+-    printk(XENLOG_G_INFO "d%d: VIRIDIAN REFERENCE_TSC: enabled: %x pfn: %lx\n",
+-           d->domain_id,
+-           rt->fields.enabled, (unsigned long)rt->fields.pfn);
+-}
+-
+ static void enable_hypercall_page(struct domain *d)
+ {
+     unsigned long gmfn = d->arch.hvm.viridian.hypercall_gpa.fields.pfn;
+@@ -293,80 +282,6 @@ static void enable_hypercall_page(struct domain *d)
+     put_page_and_type(page);
+ }
+ 
+-static void update_reference_tsc(struct domain *d, bool_t initialize)
+-{
+-    unsigned long gmfn = d->arch.hvm.viridian.reference_tsc.fields.pfn;
+-    struct page_info *page = get_page_from_gfn(d, gmfn, NULL, P2M_ALLOC);
+-    HV_REFERENCE_TSC_PAGE *p;
+-
+-    if ( !page || !get_page_type(page, PGT_writable_page) )
+-    {
+-        if ( page )
+-            put_page(page);
+-        gdprintk(XENLOG_WARNING, "Bad GMFN %#"PRI_gfn" (MFN %#"PRI_mfn")\n",
+-                 gmfn, mfn_x(page ? page_to_mfn(page) : INVALID_MFN));
+-        return;
+-    }
+-
+-    p = __map_domain_page(page);
+-
+-    if ( initialize )
+-        clear_page(p);
+-
+-    /*
+-     * This enlightenment must be disabled is the host TSC is not
+-     * invariant. However it is also disabled if vtsc is true (which
+-     * means rdtsc is being emulated). This generally happens when guest
+-     * TSC freq and host TSC freq don't match. The TscScale value could be
+-     * adjusted to cope with this, allowing vtsc to be turned off, but
+-     * support for this is not yet present in the hypervisor. Thus is it
+-     * is possible that migrating a Windows VM between hosts of differing
+-     * TSC frequencies may result in large differences in guest
+-     * performance.
+-     */
+-    if ( !host_tsc_is_safe() || d->arch.vtsc )
+-    {
+-        /*
+-         * The specification states that valid values of TscSequence range
+-         * from 0 to 0xFFFFFFFE. The value 0xFFFFFFFF is used to indicate
+-         * this mechanism is no longer a reliable source of time and that
+-         * the VM should fall back to a different source.
+-         *
+-         * Server 2012 (6.2 kernel) and 2012 R2 (6.3 kernel) actually
+-         * violate the specification and rely on a value of 0 to indicate
+-         * that this enlightenment should no longer be used. These two
+-         * kernel versions are currently the only ones to make use of this
+-         * enlightenment, so just use 0 here.
+-         */
+-        p->TscSequence = 0;
+-
+-        printk(XENLOG_G_INFO "d%d: VIRIDIAN REFERENCE_TSC: invalidated\n",
+-               d->domain_id);
+-        goto out;
+-    }
+-
+-    /*
+-     * The guest will calculate reference time according to the following
+-     * formula:
+-     *
+-     * ReferenceTime = ((RDTSC() * TscScale) >> 64) + TscOffset
+-     *
+-     * Windows uses a 100ns tick, so we need a scale which is cpu
+-     * ticks per 100ns shifted left by 64.
+-     */
+-    p->TscScale = ((10000ul << 32) / d->arch.tsc_khz) << 32;
+-
+-    p->TscSequence++;
+-    if ( p->TscSequence == 0xFFFFFFFF ||
+-         p->TscSequence == 0 ) /* Avoid both 'invalid' values */
+-        p->TscSequence = 1;
+-
+- out:
+-    unmap_domain_page(p);
+-
+-    put_page_and_type(page);
+-}
+-
+ static int guest_wrmsr_viridian(struct vcpu *v, uint32_t idx, uint64_t val)
+ {
+     struct domain *d = v->domain;
+@@ -397,14 +312,7 @@ static int guest_wrmsr_viridian(struct vcpu *v, uint32_t idx, uint64_t val)
+         return viridian_synic_wrmsr(v, idx, val);
+ 
+     case HV_X64_MSR_REFERENCE_TSC:
+-        if ( !(viridian_feature_mask(d) & HVMPV_reference_tsc) )
+-            return X86EMUL_EXCEPTION;
+-
+-        d->arch.hvm.viridian.reference_tsc.raw = val;
+-        dump_reference_tsc(d);
+-        if ( d->arch.hvm.viridian.reference_tsc.fields.enabled )
+-            update_reference_tsc(d, 1);
+-        break;
++        return viridian_time_wrmsr(v, idx, val);
+ 
+     case HV_X64_MSR_CRASH_P0:
+     case HV_X64_MSR_CRASH_P1:
+@@ -460,39 +368,6 @@ int wrmsr_viridian_regs(uint32_t idx, uint64_t val)
+     return (guest_wrmsr_viridian(v, idx, val) == X86EMUL_OKAY) ? 1 : 0;
+ }
+ 
+-static int64_t raw_trc_val(struct domain *d)
+-{
+-    uint64_t tsc;
+-    struct time_scale tsc_to_ns;
+-
+-    tsc = hvm_get_guest_tsc(pt_global_vcpu_target(d));
+-
+-    /* convert tsc to count of 100ns periods */
+-    set_time_scale(&tsc_to_ns, d->arch.tsc_khz * 1000ul);
+-    return scale_delta(tsc, &tsc_to_ns) / 100ul;
+-}
+-
+-void viridian_time_ref_count_freeze(struct domain *d)
+-{
+-    struct viridian_time_ref_count *trc;
+-
+-    trc = &d->arch.hvm.viridian.time_ref_count;
+-
+-    if ( test_and_clear_bit(_TRC_running, &trc->flags) )
+-        trc->val = raw_trc_val(d) + trc->off;
+-}
+-
+-void viridian_time_ref_count_thaw(struct domain *d)
+-{
+-    struct viridian_time_ref_count *trc;
+-
+-    trc = &d->arch.hvm.viridian.time_ref_count;
+-
+-    if ( !d->is_shutting_down &&
+-         !test_and_set_bit(_TRC_running, &trc->flags) )
+-        trc->off = (int64_t)trc->val - raw_trc_val(d);
+-}
+-
+ static int guest_rdmsr_viridian(const struct vcpu *v, uint32_t idx,
+                                 uint64_t *val)
+ {
+@@ -514,49 +389,17 @@ static int guest_rdmsr_viridian(const struct vcpu *v, uint32_t idx,
+         *val = v->vcpu_id;
+         break;
+ 
+-    case HV_X64_MSR_TSC_FREQUENCY:
+-        if ( viridian_feature_mask(d) & HVMPV_no_freq )
+-            return X86EMUL_EXCEPTION;
+-
+-        *val = (uint64_t)d->arch.tsc_khz * 1000ull;
+-        break;
+-
+-    case HV_X64_MSR_APIC_FREQUENCY:
+-        if ( viridian_feature_mask(d) & HVMPV_no_freq )
+-            return X86EMUL_EXCEPTION;
+-
+-        *val = 1000000000ull / APIC_BUS_CYCLE_NS;
+-        break;
+-
+     case HV_X64_MSR_EOI:
+     case HV_X64_MSR_ICR:
+     case HV_X64_MSR_TPR:
+     case HV_X64_MSR_VP_ASSIST_PAGE:
+         return viridian_synic_rdmsr(v, idx, val);
+ 
++    case HV_X64_MSR_TSC_FREQUENCY:
++    case HV_X64_MSR_APIC_FREQUENCY:
+     case HV_X64_MSR_REFERENCE_TSC:
+-        if ( !(viridian_feature_mask(d) & HVMPV_reference_tsc) )
+-            return X86EMUL_EXCEPTION;
+-
+-        *val = d->arch.hvm.viridian.reference_tsc.raw;
+-        break;
+-
+     case HV_X64_MSR_TIME_REF_COUNT:
+-    {
+-        struct viridian_time_ref_count *trc;
+-
+-        trc = &d->arch.hvm.viridian.time_ref_count;
+-
+-        if ( !(viridian_feature_mask(d) & HVMPV_time_ref_count) )
+-            return X86EMUL_EXCEPTION;
+-
+-        if ( !test_and_set_bit(_TRC_accessed, &trc->flags) )
+-            printk(XENLOG_G_INFO "d%d: VIRIDIAN MSR_TIME_REF_COUNT: accessed\n",
+-                   d->domain_id);
+-
+-        *val = raw_trc_val(d) + trc->off;
+-        break;
+-    }
++        return viridian_time_rdmsr(v, idx, val);
+ 
+     case HV_X64_MSR_CRASH_P0:
+     case HV_X64_MSR_CRASH_P1:
+@@ -773,15 +616,15 @@ out:
+ static int viridian_save_domain_ctxt(struct domain *d, hvm_domain_context_t *h)
+ {
+     struct hvm_viridian_domain_context ctxt = {
+-        .time_ref_count = d->arch.hvm.viridian.time_ref_count.val,
+         .hypercall_gpa  = d->arch.hvm.viridian.hypercall_gpa.raw,
+         .guest_os_id    = d->arch.hvm.viridian.guest_os_id.raw,
+-        .reference_tsc  = d->arch.hvm.viridian.reference_tsc.raw,
+     };
+ 
+     if ( !is_viridian_domain(d) )
+         return 0;
+ 
++    viridian_time_save_domain_ctxt(d, &ctxt);
++
+     return (hvm_save_entry(VIRIDIAN_DOMAIN, 0, h, &ctxt) != 0);
+ }
+ 
+@@ -793,13 +636,10 @@ static int viridian_load_domain_ctxt(struct domain *d,
+     if ( hvm_load_entry_zeroextend(VIRIDIAN_DOMAIN, h, &ctxt) != 0 )
+         return -EINVAL;
+ 
+-    d->arch.hvm.viridian.time_ref_count.val = ctxt.time_ref_count;
+     d->arch.hvm.viridian.hypercall_gpa.raw  = ctxt.hypercall_gpa;
+     d->arch.hvm.viridian.guest_os_id.raw    = ctxt.guest_os_id;
+-    d->arch.hvm.viridian.reference_tsc.raw  = ctxt.reference_tsc;
+ 
+-    if ( d->arch.hvm.viridian.reference_tsc.fields.enabled )
+-        update_reference_tsc(d, 0);
++    viridian_time_load_domain_ctxt(d, &ctxt);
+ 
+     return 0;
+ }
+diff --git a/xen/include/asm-x86/hvm/viridian.h b/xen/include/asm-x86/hvm/viridian.h
+index 983190a16a..1266440fa1 100644
+--- a/xen/include/asm-x86/hvm/viridian.h
++++ b/xen/include/asm-x86/hvm/viridian.h
+@@ -57,15 +57,6 @@ struct viridian_time_ref_count
+     int64_t off;
+ };
+ 
+-typedef struct _HV_REFERENCE_TSC_PAGE
+-{
+-    uint32_t TscSequence;
+-    uint32_t Reserved1;
+-    uint64_t TscScale;
+-    int64_t  TscOffset;
+-    uint64_t Reserved2[509];
+-} HV_REFERENCE_TSC_PAGE, *PHV_REFERENCE_TSC_PAGE;
+-
+ struct viridian_domain
+ {
+     union viridian_guest_os_id_msr guest_os_id;
