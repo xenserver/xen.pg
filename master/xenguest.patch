@@ -1,5 +1,5 @@
 diff --git a/.gitignore b/.gitignore
-index c5032f35cc..8359306e5d 100644
+index c5032f3..8359306 100644
 --- a/.gitignore
 +++ b/.gitignore
 @@ -262,6 +262,7 @@ tools/xcutils/lsevtchn
@@ -11,7 +11,7 @@ index c5032f35cc..8359306e5d 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index 0d188d9ffe..ea43783960 100644
+index 0d188d9..ea43783 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
 @@ -480,6 +480,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
@@ -23,7 +23,7 @@ index 0d188d9ffe..ea43783960 100644
  %{_libexecdir}/%{name}/bin/xenpvnetboot
  %{_libexecdir}/%{name}/boot/hvmloader
 diff --git a/tools/Makefile b/tools/Makefile
-index bc4a2f32c0..65452c06c6 100644
+index bc4a2f3..65452c0 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
 @@ -24,6 +24,7 @@ SUBDIRS-$(CONFIG_BLKTAP2) += blktap2
@@ -36,7 +36,7 @@ index bc4a2f32c0..65452c06c6 100644
  ifneq "$(MAKECMDGOALS)" "distclean"
 diff --git a/tools/xenguest/Makefile b/tools/xenguest/Makefile
 new file mode 100644
-index 0000000000..0e8c1706de
+index 0000000..0e8c170
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,31 @@
@@ -73,7 +73,7 @@ index 0000000000..0e8c1706de
 +-include $(DEPS)
 diff --git a/tools/xenguest/xenguest.c b/tools/xenguest/xenguest.c
 new file mode 100644
-index 0000000000..e357174ad2
+index 0000000..e357174
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
 @@ -0,0 +1,714 @@
@@ -793,10 +793,10 @@ index 0000000000..e357174ad2
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000000..0d255e0011
+index 0000000..6b30849
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1478 @@
+@@ -0,0 +1,1484 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1696,7 +1696,7 @@ index 0000000000..0d255e0011
 +    return s;
 +}
 +
-+#define MAX_RMRR_DEVICES 16
++#define MAX_RMRR_DEVICES E820MAX
 +#define ALLOW_MEMORY_RELOCATE 1
 +
 +int hvm_build_setup_mem(struct xc_dom_image *dom, uint64_t max_mem_mib,
@@ -1728,13 +1728,17 @@ index 0000000000..0d255e0011
 +            {
 +                if ( !get_rdm(seg, bus, (device << 3) + func,
 +                        &nr_rdm_entries[nr_rmrr_devs], &xrdm[nr_rmrr_devs]) )
-+                    nr_rmrr_devs++;
-+            }
-+            if ( nr_rmrr_devs == MAX_RMRR_DEVICES )
-+            {
-+                xg_err("Error: hit limit of %d RMRR devices for domain\n",
-+                            MAX_RMRR_DEVICES);
-+                exit(1);
++                {
++                    if ( nr_rdm_entries[nr_rmrr_devs] != 0 )
++                        nr_rmrr_devs++;
++
++                    if ( nr_rmrr_devs == MAX_RMRR_DEVICES )
++                    {
++                        xg_err("Error: hit limit of %d RMRR devices for domain\n",
++                                   MAX_RMRR_DEVICES);
++                        exit(1);
++                    }
++                }
 +            }
 +
 +            xg_info("Getting total MMIO space occupied for device '%s'\n",s);
@@ -1815,7 +1819,7 @@ index 0000000000..0d255e0011
 +    /* RDM mapping */
 +    for (i = 0; i < nr_rmrr_devs; i++)
 +    {
-+        for (j = 0; j < nr_rdm_entries[i]; j++)
++        for (j = 0; j < nr_rdm_entries[i] && nr < E820MAX; j++)
 +        {
 +            e820[nr].addr = xrdm[i][j].start_pfn << XC_PAGE_SHIFT;
 +            e820[nr].size = xrdm[i][j].nr_pages << XC_PAGE_SHIFT;
@@ -1827,16 +1831,18 @@ index 0000000000..0d255e0011
 +            }
 +            nr++;
 +        }
++        free(xrdm[i]);
 +    }
++    if ( nr == E820MAX )
++    {
++        xg_err("Error: too many E820 reserved entries for domain\n");
++        exit(1);
++    }
++
 +    e820[0].size -= rmrr_overlapped_ram;
 +    highmem_end += rmrr_overlapped_ram;
 +    mmio_size += rmrr_overlapped_ram;
 +    mmio_start -= rmrr_overlapped_ram;
-+
-+    for (i = 0; i < nr_rmrr_devs; i++)
-+    {
-+        free(xrdm[i]);
-+    }
 +
 +    if ( highmem_end > highmem_start )
 +    {
@@ -2277,7 +2283,7 @@ index 0000000000..0d255e0011
 + */
 diff --git a/tools/xenguest/xg_emu.c b/tools/xenguest/xg_emu.c
 new file mode 100644
-index 0000000000..76cd08107b
+index 0000000..76cd081
 --- /dev/null
 +++ b/tools/xenguest/xg_emu.c
 @@ -0,0 +1,444 @@
@@ -2727,7 +2733,7 @@ index 0000000000..76cd08107b
 +}
 diff --git a/tools/xenguest/xg_internal.h b/tools/xenguest/xg_internal.h
 new file mode 100644
-index 0000000000..9b9984ce6c
+index 0000000..9b9984c
 --- /dev/null
 +++ b/tools/xenguest/xg_internal.h
 @@ -0,0 +1,99 @@
