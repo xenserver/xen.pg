@@ -1,0 +1,39 @@
+From 514dccd049f8338495b6c992b9c6a1ec2ece2932 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 1 Feb 2019 11:35:41 +0100
+Subject: [PATCH] x86/AMD: flush TLB after ucode update
+
+The increased number of messages (spec_ctrl.c:print_details()) within a
+certain time window made me notice some slowness of boot time screen
+output. Experimentally I've narrowed the time window to be from
+immediately after the early ucode update on the BSP to the PAT write in
+cpu_init(), which upon further investigation has an effect because of
+the full TLB flush that's implied by that write.
+
+For that reason, as a workaround, flush the TLB of the mapping of the
+page that holds the blob. Note that flushing just a single page is
+sufficient: As per verify_patch_size() patch size can't exceed 4k, and
+the way xmalloc() works the blob can't be crossing a page boundary.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Brian Woods <brian.woods@amd.com>
+master commit: f19a199281a23725beb73bef61eb8964d8e225ce
+master date: 2019-01-28 17:40:39 +0100
+diff --git a/xen/arch/x86/microcode_amd.c b/xen/arch/x86/microcode_amd.c
+index 53f9f548cd..835d0f9906 100644
+--- a/xen/arch/x86/microcode_amd.c
++++ b/xen/arch/x86/microcode_amd.c
+@@ -218,6 +218,12 @@ static int apply_microcode(unsigned int cpu)
+ 
+     spin_unlock_irqrestore(&microcode_update_lock, flags);
+ 
++    /*
++     * Some processors leave the ucode blob mapping as UC after the update.
++     * Flush the mapping to regain normal cacheability.
++     */
++    flush_area_local(hdr, FLUSH_TLB_GLOBAL | FLUSH_ORDER(0));
++
+     /* check current patch id and patch's id for match */
+     if ( hw_err || (rev != hdr->patch_id) )
+     {
