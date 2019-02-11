@@ -1,0 +1,88 @@
+From 82855aba5bf91e50c81526167c11d4aeaf665e66 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 29 Nov 2018 18:17:01 +0000
+Subject: [PATCH] tools/libxc: Fix error handling in get_cpuid_domain_info()
+
+get_cpuid_domain_info() has two conflicting return styles - either -error for
+local failures, or -1/errno for hypercall failures.  Switch to consistently
+use -error.
+
+While fixing the xc_get_cpu_featureset(), take the opportunity to remove the
+redundancy and move it to be adjacent to the other featureset handling.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
+index 865ef800be..3bdf3c74c7 100644
+--- a/tools/libxc/xc_cpuid_x86.c
++++ b/tools/libxc/xc_cpuid_x86.c
+@@ -266,13 +266,22 @@ static int get_cpuid_domain_info(xc_interface *xch, uint32_t domid,
+             if ( featureset[i] != 0 )
+                 return -EOPNOTSUPP;
+     }
++    else
++    {
++        rc = xc_get_cpu_featureset(xch, (info->hvm
++                                         ? XEN_SYSCTL_cpu_featureset_hvm
++                                         : XEN_SYSCTL_cpu_featureset_pv),
++                                   &host_nr_features, info->featureset);
++        if ( rc )
++            return -errno;
++    }
+ 
+     /* Get xstate information. */
+     domctl.cmd = XEN_DOMCTL_getvcpuextstate;
+     domctl.domain = domid;
+     rc = do_domctl(xch, &domctl);
+     if ( rc )
+-        return rc;
++        return -errno;
+ 
+     info->xfeature_mask = domctl.u.vcpuextstate.xfeature_mask;
+ 
+@@ -282,23 +291,15 @@ static int get_cpuid_domain_info(xc_interface *xch, uint32_t domid,
+ 
+         rc = xc_hvm_param_get(xch, domid, HVM_PARAM_PAE_ENABLED, &val);
+         if ( rc )
+-            return rc;
++            return -errno;
+ 
+         info->pae = !!val;
+ 
+         rc = xc_hvm_param_get(xch, domid, HVM_PARAM_NESTEDHVM, &val);
+         if ( rc )
+-            return rc;
++            return -errno;
+ 
+         info->nestedhvm = !!val;
+-
+-        if ( !featureset )
+-        {
+-            rc = xc_get_cpu_featureset(xch, XEN_SYSCTL_cpu_featureset_hvm,
+-                                       &host_nr_features, info->featureset);
+-            if ( rc )
+-                return rc;
+-        }
+     }
+     else
+     {
+@@ -306,17 +307,9 @@ static int get_cpuid_domain_info(xc_interface *xch, uint32_t domid,
+ 
+         rc = xc_domain_get_guest_width(xch, domid, &width);
+         if ( rc )
+-            return rc;
++            return -errno;
+ 
+         info->pv64 = (width == 8);
+-
+-        if ( !featureset )
+-        {
+-            rc = xc_get_cpu_featureset(xch, XEN_SYSCTL_cpu_featureset_pv,
+-                                       &host_nr_features, info->featureset);
+-            if ( rc )
+-                return rc;
+-        }
+     }
+ 
+     return 0;
