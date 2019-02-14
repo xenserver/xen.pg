@@ -28,7 +28,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.11.1
-Release: 7.0.4
+Release: 7.0.11
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -144,6 +144,7 @@ This package contains the Xen Hypervisor general development for all domains.
 Summary: Xen Hypervisor Domain 0 tools
 Requires: xen-dom0-libs = %{version}
 Requires: xen-tools = %{version}
+Requires: edk2
 Requires: ipxe
 %if %with_systemd
 Requires(post): systemd
@@ -208,10 +209,14 @@ cp %{SOURCE4} .
 # Placate ./configure, but don't pull in external content.
 export WGET=/bin/false FETCHER=/bin/false
 
-%configure \
-        --disable-seabios --disable-stubdom --disable-xsmpolicy --disable-blktap2 \
-	--with-system-qemu=%{_libdir}/xen/bin/qemu-system-i386 --with-xenstored=oxenstored \
-	--enable-systemd --with-system-ipxe=/usr/share/ipxe/ipxe.bin
+%configure --disable-seabios \
+           --disable-stubdom \
+           --disable-xsmpolicy \
+           --enable-systemd \
+           --with-xenstored=oxenstored \
+           --with-system-qemu=%{_libdir}/xen/bin/qemu-system-i386 \
+           --with-system-ipxe=/usr/share/ipxe/ipxe.bin \
+           --with-system-ovmf=/usr/share/edk2/OVMF.fd
 
 %install
 
