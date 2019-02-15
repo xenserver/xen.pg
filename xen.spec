@@ -596,7 +596,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxenctrl.so.4.11
 %{_libdir}/libxenctrl.so.4.11.0
 %{_libdir}/libxendevicemodel.so.1
-%{_libdir}/libxendevicemodel.so.1.2
+%{_libdir}/libxendevicemodel.so.1.3
 %{_libdir}/libxenforeignmemory.so.1
 %{_libdir}/libxenforeignmemory.so.1.3
 %{_libdir}/libxenguest.so.4.11
