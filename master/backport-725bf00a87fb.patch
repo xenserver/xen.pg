@@ -28,25 +28,20 @@ Reviewed-by: Jan Beulich <jbeulich@suse.com>
 Reviewed-by: Kevin Tian <kevin.tian@intel.com>
 Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
 Reviewed-by: George Dunlap <george.dunlap@citrix.com>
----
- xen/arch/x86/mm.c                   |  9 ++---
- xen/arch/x86/mm/p2m-ept.c           | 30 ++---------------
- xen/arch/x86/mm/p2m-pt.c            | 46 +++++--------------------
- xen/arch/x86/mm/p2m.c               | 51 +++++-----------------------
- xen/arch/x86/x86_64/mm.c            |  7 ++--
- xen/common/grant_table.c            | 14 ++++----
- xen/drivers/passthrough/iommu.c     | 52 +++++++++++++++++++++++------
- xen/drivers/passthrough/x86/iommu.c |  4 +--
- xen/include/xen/iommu.h             | 16 +++++++--
- 9 files changed, 92 insertions(+), 137 deletions(-)
-
-RE-BASE.
-
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 6509035a5c..84f47624e6 100644
+index ad8aacad68..94dcee91e6 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -2746,11 +2746,12 @@ static int _get_page_type(struct page_info *page, unsigned long type,
+@@ -2343,7 +2343,7 @@ static int cleanup_page_mappings(struct page_info *page)
+ 
+         if ( d && is_pv_domain(d) && unlikely(need_iommu(d)) )
+         {
+-            int rc2 = iommu_unmap_page(d, mfn);
++            int rc2 = iommu_unmap(d, mfn, PAGE_ORDER_4K);
+ 
+             if ( !rc )
+                 rc = rc2;
+@@ -2822,11 +2822,12 @@ static int _get_page_type(struct page_info *page, unsigned long type,
              gfn_t gfn = _gfn(mfn_to_gmfn(d, mfn_x(page_to_mfn(page))));
  
              if ( (x & PGT_type_mask) == PGT_writable_page )
@@ -148,75 +143,10 @@ index 0a3464a1e1..de48f3a131 100644
  
      /*
 diff --git a/xen/arch/x86/mm/p2m.c b/xen/arch/x86/mm/p2m.c
-index 2766010d20..611bafe862 100644
+index 034f2840e8..4904281158 100644
 --- a/xen/arch/x86/mm/p2m.c
 +++ b/xen/arch/x86/mm/p2m.c
-@@ -695,29 +695,15 @@ static int
- p2m_remove_page(struct p2m_domain *p2m, unsigned long gfn_l, unsigned long mfn,
-                 unsigned int page_order)
- {
-+    struct domain *d = p2m->domain;
-     unsigned long i;
-     gfn_t gfn = _gfn(gfn_l);
-     mfn_t mfn_return;
-     p2m_type_t t;
-     p2m_access_t a;
- 
--    if ( !paging_mode_translate(p2m->domain) )
--    {
--        int rc = 0;
--
--        if ( need_iommu(p2m->domain) )
--        {
--            for ( i = 0; i < (1 << page_order); i++ )
--            {
--                int ret = iommu_unmap_page(p2m->domain, mfn + i);
--
--                if ( !rc )
--                    rc = ret;
--            }
--        }
--
--        return rc;
--    }
-+    if ( !paging_mode_translate(d) )
-+        return need_iommu(d) ? iommu_unmap(d, mfn, page_order) : 0;
- 
-     ASSERT(gfn_locked_by_me(p2m, gfn));
-     P2M_DEBUG("removing gfn=%#lx mfn=%#lx\n", gfn_l, mfn);
-@@ -763,27 +749,10 @@ guest_physmap_add_entry(struct domain *d, gfn_t gfn, mfn_t mfn,
-     int rc = 0;
- 
-     if ( !paging_mode_translate(d) )
--    {
--        if ( need_iommu(d) && t == p2m_ram_rw )
--        {
--            for ( i = 0; i < (1 << page_order); i++ )
--            {
--                rc = iommu_map_page(d, mfn_x(mfn_add(mfn, i)),
--                                    mfn_x(mfn_add(mfn, i)),
--                                    IOMMUF_readable|IOMMUF_writable);
--                if ( rc != 0 )
--                {
--                    while ( i-- > 0 )
--                        /* If statement to satisfy __must_check. */
--                        if ( iommu_unmap_page(d, mfn_x(mfn_add(mfn, i))) )
--                            continue;
--
--                    return rc;
--                }
--            }
--        }
--        return 0;
--    }
-+        return (need_iommu(d) && t == p2m_ram_rw) ?
-+            iommu_map(d, mfn_x(mfn), mfn_x(mfn), page_order,
-+                      IOMMUF_readable | IOMMUF_writable) :
-+            0;
- 
-     /* foreign pages are added thru p2m_add_foreign */
-     if ( p2m_is_foreign(t) )
-@@ -1150,7 +1119,8 @@ int set_identity_p2m_entry(struct domain *d, unsigned long gfn_l,
+@@ -1143,7 +1143,8 @@ int set_identity_p2m_entry(struct domain *d, unsigned long gfn_l,
      {
          if ( !need_iommu(d) )
              return 0;
@@ -226,7 +156,7 @@ index 2766010d20..611bafe862 100644
      }
  
      gfn_lock(p2m, gfn, 0);
-@@ -1240,7 +1210,7 @@ int clear_identity_p2m_entry(struct domain *d, unsigned long gfn_l)
+@@ -1233,7 +1234,7 @@ int clear_identity_p2m_entry(struct domain *d, unsigned long gfn_l)
      {
          if ( !need_iommu(d) )
              return 0;
@@ -257,7 +187,7 @@ index cca4ae926e..4c07fd12c1 100644
  
              goto destroy_m2p;
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index 231ecf509a..7b10e566c8 100644
+index 656fad1b42..8d31a88210 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
 @@ -1148,14 +1148,14 @@ map_grant_ref(
@@ -294,7 +224,7 @@ index 231ecf509a..7b10e566c8 100644
          double_gt_unlock(lgt, rgt);
  
 diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
-index 2c44fabf99..523547d16a 100644
+index f9b13b018c..c372ea1892 100644
 --- a/xen/drivers/passthrough/iommu.c
 +++ b/xen/drivers/passthrough/iommu.c
 @@ -255,48 +255,75 @@ void iommu_domain_destroy(struct domain *d)
