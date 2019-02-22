@@ -1,0 +1,44 @@
+From 448787e16e1457ce4e5f7088140a968fe902adf4 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 22 Jan 2019 18:58:56 +0000
+Subject: [PATCH] x86/p2m: Drop erroneous #VE-enabled check in ept_set_entry()
+
+Code clearing the "Suppress VE" bit in an EPT entry isn't nececsserily running
+in current context.  In ALTP2M_external mode, it definitely is not, and in PV
+context, vcpu_altp2m(current) acts upon the HVM union.
+
+Even if we could sensibly resolve the target vCPU, it may legitimately not be
+fully set up at this point, so rejecting the EPT modification would be buggy.
+
+There is a path in hvm_hap_nested_page_fault() which explicitly emulates #VE
+in the cpu_has_vmx_virt_exceptions case, so the -EOPNOTSUPP part of this
+condition is also wrong.
+
+Drop the !sve check entirely.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Release-acked-by: Juergen Gross <jgross@suse.com>
+diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
+index 80a742a..ca17682 100644
+--- a/xen/arch/x86/mm/p2m-ept.c
++++ b/xen/arch/x86/mm/p2m-ept.c
+@@ -702,16 +702,6 @@ ept_set_entry(struct p2m_domain *p2m, gfn_t gfn_, mfn_t mfn,
+ 
+     ASSERT(ept);
+ 
+-    if ( !sve )
+-    {
+-        if ( !cpu_has_vmx_virt_exceptions )
+-            return -EOPNOTSUPP;
+-
+-        /* #VE should be enabled for this vcpu. */
+-        if ( gfn_eq(vcpu_altp2m(current).veinfo_gfn, INVALID_GFN) )
+-            return -ENXIO;
+-    }
+-
+     /*
+      * the caller must make sure:
+      * 1. passing valid gfn and mfn at order boundary.
