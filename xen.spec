@@ -527,6 +527,8 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_sbindir}/xen-lowmemd
 %{_sbindir}/xen-mceinj
 %{_sbindir}/xen-mfndump
+%{_sbindir}/xen-microcode
+%{_sbindir}/xen-spec-ctrl
 %exclude %{_sbindir}/xen-ringwatch
 %{_sbindir}/xen-vmdebug
 %{_sbindir}/xenbaked

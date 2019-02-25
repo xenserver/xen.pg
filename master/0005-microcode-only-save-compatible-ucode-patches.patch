@@ -1,0 +1,102 @@
+From 3bdc4c0171383ee09043e99f7f586613cc4eec62 Mon Sep 17 00:00:00 2001
+From: Chao Gao <chao.gao@intel.com>
+Date: Mon, 11 Mar 2019 15:57:29 +0800
+Subject: [PATCH 05/12] microcode: only save compatible ucode patches
+
+Intel CPU only allows mixing in stepping or 'pf'. If an ucode patch is
+for other CPU families or models, it won't be compatible to all CPUs on
+current system and even hot-plugged CPUs.  Don't save such patch to
+reduce the size of ucode cache.
+
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
+index 633a3734f9..7e163899d4 100644
+--- a/xen/arch/x86/microcode.c
++++ b/xen/arch/x86/microcode.c
+@@ -243,6 +243,14 @@ bool microcode_save_patch(struct microcode_patch *new)
+         else /* result == MIS_UCODE */
+             continue;
+     }
++
++    if ( microcode_ops->is_patch_compatible &&
++         !microcode_ops->is_patch_compatible(new) )
++    {
++        xfree(new);
++        return false;
++    }
++
+     list_add_tail(&new->list, &microcode_cache);
+ 
+     return true;
+diff --git a/xen/arch/x86/microcode_intel.c b/xen/arch/x86/microcode_intel.c
+index b556d3defc..d973634445 100644
+--- a/xen/arch/x86/microcode_intel.c
++++ b/xen/arch/x86/microcode_intel.c
+@@ -93,6 +93,8 @@ struct extended_sigtable {
+ 
+ #define exttable_size(et) ((et)->count * EXT_SIGNATURE_SIZE + EXT_HEADER_SIZE)
+ 
++#define STEPPING_MASK ~0xfU
++
+ /* serialize access to the physical write to MSR 0x79 */
+ static DEFINE_SPINLOCK(microcode_update_lock);
+ 
+@@ -167,6 +169,38 @@ static bool match_cpu(const struct microcode_patch *patch)
+     return ret == NEW_UCODE;
+ }
+ 
++/*
++ * Make sure the patch is compatible with current system. It depends on
++ * how much difference current CPU and the patch's supported CPUs have.
++ *
++ * For Intel cpu, make sure that the patch can be applied to a cpu which has
++ * the same family and model as current CPU.
++ */
++static bool is_patch_compatible(const struct microcode_patch *patch)
++{
++    struct ucode_cpu_info *uci = &this_cpu(ucode_cpu_info);
++    const struct cpu_signature *csig = &uci->cpu_sig;
++    const struct microcode_header_intel *mc_header = patch->data;
++    const struct extended_sigtable *ext_header;
++    const struct extended_signature *ext_sig;
++    unsigned long data_size = get_datasize(mc_header);
++    unsigned int i;
++
++    if ( (csig->sig & STEPPING_MASK) == (mc_header->sig & STEPPING_MASK) )
++        return true;
++
++    if ( get_totalsize(mc_header) == (data_size + MC_HEADER_SIZE) )
++        return false;
++
++    ext_header = (const void *)(mc_header + 1) + data_size;
++    ext_sig = (const void *)(ext_header + 1);
++    for ( i = 0; i < ext_header->count; i++ )
++        if ( (csig->sig & STEPPING_MASK) == (ext_sig[i].sig & STEPPING_MASK) )
++            return true;
++
++    return false;
++}
++
+ static int microcode_sanity_check(void *mc)
+ {
+     struct microcode_header_intel *mc_header = mc;
+@@ -456,6 +490,7 @@ static const struct microcode_ops microcode_intel_ops = {
+     .compare_patch                    = compare_patch,
+     .free_patch                       = free_patch,
+     .match_cpu                        = match_cpu,
++    .is_patch_compatible              = is_patch_compatible,
+ };
+ 
+ int __init microcode_init_intel(void)
+diff --git a/xen/include/asm-x86/microcode.h b/xen/include/asm-x86/microcode.h
+index 7ff42fe8c9..92631b4b56 100644
+--- a/xen/include/asm-x86/microcode.h
++++ b/xen/include/asm-x86/microcode.h
+@@ -29,6 +29,7 @@ struct microcode_ops {
+         const struct microcode_patch *new, const struct microcode_patch *old);
+     void (*free_patch)(struct microcode_patch *patch);
+     bool (*match_cpu)(const struct microcode_patch *patch);
++    bool (*is_patch_compatible)(const struct microcode_patch *patch);
+ };
+ 
+ struct cpu_signature {

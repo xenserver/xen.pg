@@ -1,0 +1,168 @@
+From a98f35a8ad12f04452358dc1a064fcd577aba4ba Mon Sep 17 00:00:00 2001
+From: Chao Gao <chao.gao@intel.com>
+Date: Mon, 11 Mar 2019 15:57:25 +0800
+Subject: [PATCH 01/12] misc/xenmicrocode: Upload a microcode blob to the
+ hypervisor
+
+This patch provides a tool for late microcode update.
+
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index a0a300b26b..3e86bdc4d3 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1262,6 +1262,7 @@ typedef uint32_t xc_node_to_node_dist_t;
+ int xc_physinfo(xc_interface *xch, xc_physinfo_t *info);
+ int xc_cputopoinfo(xc_interface *xch, unsigned *max_cpus,
+                    xc_cputopo_t *cputopo);
++int xc_platform_op(xc_interface *xch, struct xen_platform_op *op);
+ int xc_numainfo(xc_interface *xch, unsigned *max_nodes,
+                 xc_meminfo_t *meminfo, uint32_t *distance);
+ int xc_pcitopoinfo(xc_interface *xch, unsigned num_devs,
+diff --git a/tools/libxc/xc_misc.c b/tools/libxc/xc_misc.c
+index 5e6714ae2b..061c7a5f9e 100644
+--- a/tools/libxc/xc_misc.c
++++ b/tools/libxc/xc_misc.c
+@@ -226,6 +226,26 @@ int xc_physinfo(xc_interface *xch,
+     return 0;
+ }
+ 
++int xc_platform_op(xc_interface *xch, struct xen_platform_op *op)
++{
++    int ret = 0;
++    DECLARE_PLATFORM_OP;
++    DECLARE_HYPERCALL_BOUNCE(op, sizeof(*op), XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
++
++    if ( xc_hypercall_bounce_pre(xch, op) )
++    {
++        PERROR("Could not bounce xen_platform_op memory buffer");
++        return -1;
++    }
++    op->interface_version = XENPF_INTERFACE_VERSION;
++
++    platform_op = *op;
++    ret = do_platform_op(xch, &platform_op);
++    xc_hypercall_bounce_post(xch, op);
++
++    return ret;
++}
++
+ int xc_cputopoinfo(xc_interface *xch, unsigned *max_cpus,
+                    xc_cputopo_t *cputopo)
+ {
+diff --git a/tools/misc/Makefile b/tools/misc/Makefile
+index eaa28793ef..d522101414 100644
+--- a/tools/misc/Makefile
++++ b/tools/misc/Makefile
+@@ -23,6 +23,7 @@ INSTALL_SBIN-$(CONFIG_X86)     += xen-hvmcrash
+ INSTALL_SBIN-$(CONFIG_X86)     += xen-hvmctx
+ INSTALL_SBIN-$(CONFIG_X86)     += xen-lowmemd
+ INSTALL_SBIN-$(CONFIG_X86)     += xen-mfndump
++INSTALL_SBIN-$(CONFIG_X86)     += xenmicrocode
+ INSTALL_SBIN                   += xen-ringwatch
+ INSTALL_SBIN                   += xen-tmem-list-parse
+ INSTALL_SBIN                   += xencov
+@@ -118,4 +119,7 @@ xen-lowmemd: xen-lowmemd.o
+ xencov: xencov.o
+ 	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS_libxenctrl) $(APPEND_LDFLAGS)
+ 
++xenmicrocode: xenmicrocode.o
++	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS_libxenctrl) $(APPEND_LDFLAGS)
++
+ -include $(DEPS_INCLUDE)
+diff --git a/tools/misc/xenmicrocode.c b/tools/misc/xenmicrocode.c
+new file mode 100644
+index 0000000000..e6c8a3d748
+--- /dev/null
++++ b/tools/misc/xenmicrocode.c
+@@ -0,0 +1,89 @@
++#define _GNU_SOURCE
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++#include <errno.h>
++#include <string.h>
++#include <inttypes.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <xenctrl.h>
++
++void show_help(void)
++{
++    fprintf(stderr,
++            "xenmicrocode: Xen microcode updating tool\n"
++            "Usage: xenmicrocode <microcode blob>\n");
++}
++
++int main(int argc, char *argv[])
++{
++    int fd, len, ret;
++    char *filename, *buf;
++    struct stat st;
++    struct xen_platform_op op;
++    xc_interface *xch;
++    DECLARE_HYPERCALL_BUFFER(struct xenpf_microcode_update, uc);
++
++    if (argc < 2)
++    {
++        show_help();
++        return 0;
++    }
++
++    filename = argv[1];
++    fd = open(filename, O_RDONLY);
++    if (fd < 0) {
++        fprintf(stderr, "Could not open %s. (err: %s)\n",
++                filename, strerror(errno));
++        return errno;
++    }
++
++    if (stat(filename, &st) != 0) {
++        fprintf(stderr, "Could not get the size of %s. (err: %s)\n",
++                filename, strerror(errno));
++        return errno;
++    }
++
++    len = st.st_size;
++    buf = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
++    if (buf == MAP_FAILED) {
++        fprintf(stderr, "mmap failed. (error: %s)\n", strerror(errno));
++        return errno;
++    }
++
++    xch = xc_interface_open(0,0,0);
++    if (xch == NULL)
++    {
++        fprintf(stderr, "Error opening xc interface. (err: %s)\n",
++                strerror(errno));
++        return errno;
++    }
++
++    uc = xc_hypercall_buffer_alloc(xch, uc, len);
++    if (uc == NULL)
++        return -1;
++
++    memcpy(uc, buf, len);
++    set_xen_guest_handle(op.u.microcode.data, uc);
++    op.cmd = XENPF_microcode_update;
++    op.interface_version = XENPF_INTERFACE_VERSION;
++    op.u.microcode.length = len;
++    ret = xc_platform_op(xch, &op);
++    if ( ret )
++        fprintf(stderr, "Failed to update microcode. (err: %d)\n", ret);
++
++    xc_hypercall_buffer_free(xch, uc);
++    xc_interface_close(xch);
++
++    if (munmap(buf, len)) {
++        printf("Could not unmap: %d(%s)\n", errno, strerror(errno));
++        return errno;
++    }
++    close(fd);
++
++    return 0;
++}

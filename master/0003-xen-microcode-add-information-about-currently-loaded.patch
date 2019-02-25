@@ -1,0 +1,163 @@
+From 04582c404ba55149bfe12a6e3e4532b1c34b1c12 Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Wed, 20 Mar 2019 11:42:00 +0000
+Subject: [PATCH 3/8] xen-microcode: add information about currently loaded
+ ucode
+
+To be upstreamed.
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+diff --git a/tools/libxc/xc_misc.c b/tools/libxc/xc_misc.c
+index 061c7a5f9e..8064a08ef9 100644
+--- a/tools/libxc/xc_misc.c
++++ b/tools/libxc/xc_misc.c
+@@ -228,22 +228,7 @@ int xc_physinfo(xc_interface *xch,
+ 
+ int xc_platform_op(xc_interface *xch, struct xen_platform_op *op)
+ {
+-    int ret = 0;
+-    DECLARE_PLATFORM_OP;
+-    DECLARE_HYPERCALL_BOUNCE(op, sizeof(*op), XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
+-
+-    if ( xc_hypercall_bounce_pre(xch, op) )
+-    {
+-        PERROR("Could not bounce xen_platform_op memory buffer");
+-        return -1;
+-    }
+-    op->interface_version = XENPF_INTERFACE_VERSION;
+-
+-    platform_op = *op;
+-    ret = do_platform_op(xch, &platform_op);
+-    xc_hypercall_bounce_post(xch, op);
+-
+-    return ret;
++    return do_platform_op(xch, op);
+ }
+ 
+ int xc_cputopoinfo(xc_interface *xch, unsigned *max_cpus,
+diff --git a/tools/misc/xen-microcode.c b/tools/misc/xen-microcode.c
+index 21084111a0..4d9e11aa1f 100644
+--- a/tools/misc/xen-microcode.c
++++ b/tools/misc/xen-microcode.c
+@@ -12,11 +12,59 @@
+ #include <fcntl.h>
+ #include <xenctrl.h>
+ 
++static const char *intel_id = "GenuineIntel";
++static const char *amd_id   = "AuthenticAMD";
++
++void show_curr_cpu(void)
++{
++    int ret;
++    xc_interface *xch;
++    struct xen_platform_op op = {0};
++    struct xenpf_pcpu_version *ver = &op.u.pcpu_version;
++    bool intel = false, amd = false;
++
++    xch = xc_interface_open(0, 0, 0);
++    if ( xch == NULL )
++        return;
++
++    op.cmd = XENPF_get_cpu_version;
++    op.interface_version = XENPF_INTERFACE_VERSION;
++    op.u.pcpu_version.xen_cpuid = 0;
++
++    ret = xc_platform_op(xch, &op);
++    if ( ret )
++        return;
++
++    if ( memcmp(ver->vendor_id, intel_id, sizeof(ver->vendor_id)) == 0 )
++        intel = true;
++    else if ( memcmp(ver->vendor_id, amd_id, sizeof(ver->vendor_id)) == 0 )
++        amd = true;
++
++    if ( intel || amd )
++    {
++        fprintf(stderr,
++                "Current CPU signature is: %02x-%02x-%02x (raw %#x)\n",
++                 ver->family, ver->model, ver->stepping, ver->cpu_signature);
++        fprintf(stderr,
++                "Current CPU microcode revision is: %#x\n",
++                ver->ucode_revision);
++    }
++
++    if ( intel )
++        fprintf(stderr,
++                "Current CPU processor flag is: %#x\n",
++                ver->pf);
++
++    xc_interface_close(xch);
++}
++
+ void show_help(void)
+ {
+     fprintf(stderr,
+             "xen-microcode: Xen microcode updating tool\n"
+             "Usage: xen-microcode <microcode blob>\n");
++
++    show_curr_cpu();
+ }
+ 
+ int main(int argc, char *argv[])
+diff --git a/xen/arch/x86/microcode_amd.c b/xen/arch/x86/microcode_amd.c
+index 7128146162..008291f8fa 100644
+--- a/xen/arch/x86/microcode_amd.c
++++ b/xen/arch/x86/microcode_amd.c
+@@ -89,6 +89,8 @@ static int collect_cpu_info(struct cpu_signature *csig)
+         return -EINVAL;
+     }
+ 
++    csig->sig = cpuid_eax(0x00000001);
++
+     rdmsrl(MSR_AMD_PATCHLEVEL, csig->rev);
+ 
+     pr_debug("microcode: CPU%d collect_cpu_info: patch_id=%#x\n",
+diff --git a/xen/arch/x86/platform_hypercall.c b/xen/arch/x86/platform_hypercall.c
+index ea18c3215a..4d7398ef63 100644
+--- a/xen/arch/x86/platform_hypercall.c
++++ b/xen/arch/x86/platform_hypercall.c
+@@ -27,6 +27,7 @@
+ #include <public/platform.h>
+ #include <acpi/cpufreq/processor_perf.h>
+ #include <asm/edd.h>
++#include <asm/microcode.h>
+ #include <asm/mtrr.h>
+ #include <asm/io_apic.h>
+ #include <asm/setup.h>
+@@ -604,15 +605,22 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
+             ver->family = 0;
+             ver->model = 0;
+             ver->stepping = 0;
++            ver->cpu_signature = 0;
++            ver->pf = 0;
++            ver->ucode_revision = 0;
+         }
+         else
+         {
+             const struct cpuinfo_x86 *c = &cpu_data[ver->xen_cpuid];
++            const struct cpu_signature *sig = &per_cpu(cpu_sig, ver->xen_cpuid);
+ 
+             memcpy(ver->vendor_id, c->x86_vendor_id, sizeof(ver->vendor_id));
+             ver->family = c->x86;
+             ver->model = c->x86_model;
+             ver->stepping = c->x86_mask;
++            ver->cpu_signature = sig->sig;
++            ver->pf = sig->pf;
++            ver->ucode_revision = sig->rev;
+         }
+ 
+         ver->max_present = cpumask_last(&cpu_present_map);
+diff --git a/xen/include/public/platform.h b/xen/include/public/platform.h
+index 94dbc3feb4..e858872ca5 100644
+--- a/xen/include/public/platform.h
++++ b/xen/include/public/platform.h
+@@ -509,6 +509,9 @@ struct xenpf_pcpu_version {
+     uint32_t family;
+     uint32_t model;
+     uint32_t stepping;
++    uint32_t cpu_signature;
++    uint32_t pf;
++    uint32_t ucode_revision;
+ };
+ typedef struct xenpf_pcpu_version xenpf_pcpu_version_t;
+ DEFINE_XEN_GUEST_HANDLE(xenpf_pcpu_version_t);
