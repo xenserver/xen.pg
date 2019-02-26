@@ -11,7 +11,7 @@ index c5032f3..8359306 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index 0d188d9..ea43783 100644
+index 2eca8b2..0096091 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
 @@ -480,6 +480,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
@@ -793,10 +793,10 @@ index 0000000..e357174
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..70dd1d6
+index 0000000..015cc76
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1417 @@
+@@ -0,0 +1,1463 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -822,6 +822,7 @@ index 0000000..70dd1d6
 +#include <sys/mman.h>
 +#include <sys/types.h>
 +#include <sys/stat.h>
++#include <fcntl.h>
 +#include <unistd.h>
 +
 +#include <xenctrl.h>
@@ -1253,6 +1254,45 @@ index 0000000..70dd1d6
 +    for ( n = 0; n < f->vcpus; ++n )
 +        free(f->vcpu_affinity[n]);
 +    free(f->vcpu_affinity);
++}
++
++/* Wait for IOMMU setup to complete */
++static void wait_for_pv_iommu(void)
++{
++    int fd;
++
++    fd = open("/sys/kernel/pv_iommu_ready", O_RDONLY);
++    if ( fd < 0 )
++    {
++        xg_err("Error: unable to check PV-IOMMU state\n");
++        exit(1);
++    }
++
++    /*
++     * The node does not have poll support, so we need to keep
++     * reading it.
++     */
++    for (;;)
++    {
++        char buf;
++        int rc = read(fd, &buf, sizeof(buf));
++
++        if ( rc < 0 )
++        {
++            xg_err("Error: failed to get PV-IOMMU state\n");
++            exit(1);
++        }
++
++        if ( buf == '1' )
++            break;
++
++        xg_info("Waiting for PV-IOMMU...\n");
++        sleep(1);
++    }
++
++    xg_info("PV-IOMMU is ready\n");
++
++    close(fd);
 +}
 +
 +static void configure_vcpus(struct flags *f){
@@ -1927,6 +1967,9 @@ index 0000000..70dd1d6
 +    struct flags f = {};
 +    struct xc_dom_image *dom;
 +
++    if (opt_vgpu)
++        wait_for_pv_iommu();
++
 +    get_flags(&f);
 +
 +    hvm_safety_check(&f, mem_start_mib < mem_max_mib);
@@ -2135,6 +2178,9 @@ index 0000000..70dd1d6
 +{
 +    int r = 0;
 +    struct flags f = {};
++
++    if (opt_vgpu)
++        wait_for_pv_iommu();
 +
 +    get_flags(&f);
 +
