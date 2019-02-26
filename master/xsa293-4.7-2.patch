@@ -45,11 +45,11 @@ Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
 
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 3f3c6b5c14..a672ad3f1f 100644
+index 3f3c6b5..7de343f 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -333,6 +333,61 @@ static void release_compat_l4(struct vcpu *v)
-     v->arch.guest_table_user = pagetable_null();
+@@ -338,6 +338,53 @@ static inline int may_switch_mode(struct domain *d)
+     return (!is_hvm_domain(d) && (d->tot_pages == 0));
  }
  
 +unsigned long pv_fixup_guest_cr4(const struct vcpu *v, unsigned long cr4)
@@ -87,15 +87,7 @@ index 3f3c6b5c14..a672ad3f1f 100644
 +unsigned long pv_make_cr4(const struct vcpu *v)
 +{
 +    const struct domain *d = v->domain;
-+    unsigned long cr4 = mmu_cr4_features &
-+        ~(X86_CR4_PCIDE | X86_CR4_PGE | X86_CR4_TSD);
-+
-+    /*
-+     * PCIDE or PGE depends on the PCID/XPTI settings, but must not both be
-+     * set, as it impacts the safety of TLB flushing.
-+     */
-+    if ( !d->arch.pv_domain.xpti )
-+        cr4 |= X86_CR4_PGE;
++    unsigned long cr4 = mmu_cr4_features & ~X86_CR4_TSD;
 +
 +    /*
 +     * TSD is needed if either the guest has elected to use it, or Xen is
@@ -107,19 +99,28 @@ index 3f3c6b5c14..a672ad3f1f 100644
 +    return cr4;
 +}
 +
- static inline int may_switch_mode(struct domain *d)
+ static void set_domain_xpti(struct domain *d)
  {
-     return (!is_hvm_domain(d) && (d->tot_pages == 0));
-@@ -501,7 +556,7 @@ int vcpu_initialise(struct vcpu *v)
+     if ( !is_pv_domain(d) )
+@@ -488,6 +535,8 @@ int vcpu_initialise(struct vcpu *v)
+ 
+         /* PV guests by default have a 100Hz ticker. */
+         v->periodic_period = MILLISECS(10);
++
++        v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, 0);
+     }
+ 
+     v->arch.schedule_tail = continue_nonidle_domain;
+@@ -501,8 +550,6 @@ int vcpu_initialise(struct vcpu *v)
          v->arch.msr = ZERO_BLOCK_PTR; /* Catch stray misuses */
      }
  
 -    v->arch.pv_vcpu.ctrlreg[4] = real_cr4_to_pv_guest_cr4(mmu_cr4_features);
-+    v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, 0);
- 
+-
      if ( is_pv_32bit_domain(d) )
      {
-@@ -887,49 +942,6 @@ int arch_domain_soft_reset(struct domain *d)
+         if ( (rc = setup_compat_arg_xlat(v)) )
+@@ -887,49 +934,6 @@ int arch_domain_soft_reset(struct domain *d)
      return ret;
  }
  
@@ -169,7 +170,7 @@ index 3f3c6b5c14..a672ad3f1f 100644
  #define xen_vcpu_guest_context vcpu_guest_context
  #define fpu_ctxt fpu_ctxt.x
  CHECK_FIELD_(struct, vcpu_guest_context, fpu_ctxt);
-@@ -943,7 +955,7 @@ int arch_set_info_guest(
+@@ -943,7 +947,7 @@ int arch_set_info_guest(
      struct domain *d = v->domain;
      unsigned long cr3_gfn;
      struct page_info *cr3_page;
@@ -178,7 +179,7 @@ index 3f3c6b5c14..a672ad3f1f 100644
      unsigned int i;
      int rc = 0, compat;
  
-@@ -1160,9 +1172,8 @@ int arch_set_info_guest(
+@@ -1160,9 +1164,8 @@ int arch_set_info_guest(
      v->arch.pv_vcpu.ctrlreg[0] &= X86_CR0_TS;
      v->arch.pv_vcpu.ctrlreg[0] |= read_cr0() & ~X86_CR0_TS;
  
@@ -190,7 +191,7 @@ index 3f3c6b5c14..a672ad3f1f 100644
  
      memset(v->arch.debugreg, 0, sizeof(v->arch.debugreg));
      for ( i = 0; i < 8; i++ )
-@@ -2016,7 +2027,7 @@ static void paravirt_ctxt_switch_to(struct vcpu *v)
+@@ -2016,7 +2019,7 @@ static void paravirt_ctxt_switch_to(struct vcpu *v)
              l4e_from_page(v->domain->arch.perdomain_l3_pg,
                            __PAGE_HYPERVISOR_RW);
  
@@ -200,22 +201,32 @@ index 3f3c6b5c14..a672ad3f1f 100644
          write_cr4(cr4);
  
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index b45247f46d..d2087dc3f3 100644
+index 7294b25..d6f0952 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
-@@ -2739,8 +2739,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -915,7 +915,8 @@ static void _domain_cpuid(struct domain *currd,
+                           unsigned int *eax, unsigned int *ebx,
+                           unsigned int *ecx, unsigned int *edx)
+ {
+-    if ( !is_control_domain(currd) && !is_hardware_domain(currd) )
++    if ( !is_control_domain(currd) && !is_hardware_domain(currd) &&
++         !is_idle_domain(currd) )
+         domain_cpuid(currd, leaf, subleaf, eax, ebx, ecx, edx);
+     else
+         cpuid_count(leaf, subleaf, eax, ebx, ecx, edx);
+@@ -2734,8 +2735,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
          }
  
          case 4: /* Write CR4 */
 -            v->arch.pv_vcpu.ctrlreg[4] = pv_guest_cr4_fixup(v, *reg);
 -            write_cr4(pv_guest_cr4_to_real_cr4(v));
-+            v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, val);
++            v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, *reg);
 +            write_cr4(pv_make_cr4(v));
              ctxt_switch_levelling(v);
              break;
  
 diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
-index 1a1b63fe6b..25049a1f8b 100644
+index 1a1b63f..25049a1 100644
 --- a/xen/include/asm-x86/domain.h
 +++ b/xen/include/asm-x86/domain.h
 @@ -638,22 +638,22 @@ bool_t update_secondary_system_time(struct vcpu *,
