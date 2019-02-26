@@ -45,7 +45,7 @@ Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
 
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 727932111a..23ebf9e1a8 100644
+index 7279321..8ed1945 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
 @@ -377,6 +377,63 @@ static void release_compat_l4(struct vcpu *v)
@@ -112,15 +112,24 @@ index 727932111a..23ebf9e1a8 100644
  static void set_domain_xpti(struct domain *d)
  {
      if ( is_pv_32bit_domain(d) )
-@@ -568,7 +625,7 @@ int vcpu_initialise(struct vcpu *v)
+@@ -555,6 +612,8 @@ int vcpu_initialise(struct vcpu *v)
+ 
+         /* PV guests by default have a 100Hz ticker. */
+         v->periodic_period = MILLISECS(10);
++
++        v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, 0);
+     }
+ 
+     v->arch.schedule_tail = continue_nonidle_domain;
+@@ -568,8 +627,6 @@ int vcpu_initialise(struct vcpu *v)
          v->arch.msr = ZERO_BLOCK_PTR; /* Catch stray misuses */
      }
  
 -    v->arch.pv_vcpu.ctrlreg[4] = real_cr4_to_pv_guest_cr4(mmu_cr4_features);
-+    v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, 0);
- 
+-
      if ( is_pv_32bit_domain(d) )
      {
+         if ( (rc = setup_compat_arg_xlat(v)) )
 @@ -956,49 +1013,6 @@ int arch_domain_soft_reset(struct domain *d)
      return ret;
  }
@@ -193,7 +202,7 @@ index 727932111a..23ebf9e1a8 100644
      memset(v->arch.debugreg, 0, sizeof(v->arch.debugreg));
      for ( i = 0; i < 8; i++ )
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 62e4a57568..c507e87ed1 100644
+index 62e4a57..c507e87 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
 @@ -521,33 +521,13 @@ void make_cr3(struct vcpu *v, unsigned long mfn)
@@ -241,22 +250,32 @@ index 62e4a57568..c507e87ed1 100644
  
  /*
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 3820b0c95d..4b2705a5b8 100644
+index 3820b0c..720c9c8 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
-@@ -2749,8 +2749,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -915,7 +915,8 @@ static void _domain_cpuid(struct domain *currd,
+                           unsigned int *eax, unsigned int *ebx,
+                           unsigned int *ecx, unsigned int *edx)
+ {
+-    if ( !is_control_domain(currd) && !is_hardware_domain(currd) )
++    if ( !is_control_domain(currd) && !is_hardware_domain(currd) &&
++         !is_idle_domain(currd) )
+         domain_cpuid(currd, leaf, subleaf, eax, ebx, ecx, edx);
+     else
+         cpuid_count(leaf, subleaf, eax, ebx, ecx, edx);
+@@ -2749,8 +2750,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
          }
  
          case 4: /* Write CR4 */
 -            v->arch.pv_vcpu.ctrlreg[4] = pv_guest_cr4_fixup(v, *reg);
 -            write_cr4(pv_guest_cr4_to_real_cr4(v));
-+            v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, val);
++            v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, *reg);
 +            write_cr4(pv_make_cr4(v));
              ctxt_switch_levelling(v);
              break;
  
 diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
-index 6876e43cd6..6358dbf79e 100644
+index 6876e43..6358dbf 100644
 --- a/xen/include/asm-x86/domain.h
 +++ b/xen/include/asm-x86/domain.h
 @@ -668,16 +668,22 @@ bool_t update_secondary_system_time(struct vcpu *,

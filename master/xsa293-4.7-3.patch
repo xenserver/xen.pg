@@ -36,7 +36,7 @@ Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
 
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 6a0c094..d764b4b 100644
+index 8ed1945..c6ad720 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
 @@ -431,6 +431,16 @@ unsigned long pv_make_cr4(const struct vcpu *v)
@@ -56,7 +56,7 @@ index 6a0c094..d764b4b 100644
      return cr4;
  }
  
-@@ -2012,7 +2022,8 @@ static void save_segments(struct vcpu *v)
+@@ -2031,7 +2041,8 @@ static void save_segments(struct vcpu *v)
      regs->fs = read_sreg(fs);
      regs->gs = read_sreg(gs);
  
@@ -67,10 +67,10 @@ index 6a0c094..d764b4b 100644
          v->arch.pv_vcpu.fs_base = __rdfsbase();
          if ( v->arch.flags & TF_kernel_mode )
 diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
-index 0072de7..9eca57a 100644
+index 30ad19d..cabcd25 100644
 --- a/xen/arch/x86/setup.c
 +++ b/xen/arch/x86/setup.c
-@@ -1442,7 +1442,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+@@ -1466,7 +1466,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
  
      cr4_pv32_mask = mmu_cr4_features & XEN_CR4_PV32_BITS;
  
@@ -80,10 +80,10 @@ index 0072de7..9eca57a 100644
  
      if ( opt_invpcid && cpu_has_invpcid )
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 2c73de4..cb7b1dc 100644
+index 720c9c8..02c1964 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
-@@ -2721,6 +2721,17 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -2750,6 +2750,17 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
          }
  
          case 4: /* Write CR4 */
@@ -92,16 +92,16 @@ index 2c73de4..cb7b1dc 100644
 +             * guest bases now that they can no longer change.
 +             */
 +            if ( (v->arch.pv_vcpu.ctrlreg[4] & X86_CR4_FSGSBASE) &&
-+                 !(val & X86_CR4_FSGSBASE) )
++                 !(*reg & X86_CR4_FSGSBASE) )
 +            {
 +                v->arch.pv_vcpu.fs_base = __rdfsbase();
 +                v->arch.pv_vcpu.gs_base_kernel = __rdgsbase();
 +            }
 +
-             v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, val);
+             v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, *reg);
              write_cr4(pv_make_cr4(v));
              ctxt_switch_levelling(v);
-@@ -2992,13 +3003,14 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -3040,13 +3051,14 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
          case MSR_FS_BASE:
              if ( is_pv_32bit_domain(currd) )
                  goto fail;
@@ -120,10 +120,10 @@ index 2c73de4..cb7b1dc 100644
          case MSR_SHADOW_GS_BASE:
              if ( is_pv_32bit_domain(currd) )
 diff --git a/xen/arch/x86/x86_64/traps.c b/xen/arch/x86/x86_64/traps.c
-index 56ed156..04cc60d 100644
+index 0a94056..7481533 100644
 --- a/xen/arch/x86/x86_64/traps.c
 +++ b/xen/arch/x86/x86_64/traps.c
-@@ -265,7 +265,9 @@ void toggle_guest_mode(struct vcpu *v)
+@@ -267,7 +267,9 @@ void toggle_guest_mode(struct vcpu *v)
  {
      if ( is_pv_32bit_vcpu(v) )
          return;
@@ -135,10 +135,10 @@ index 56ed156..04cc60d 100644
          if ( v->arch.flags & TF_kernel_mode )
              v->arch.pv_vcpu.gs_base_kernel = __rdgsbase();
 diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
-index 04d9e28..f9c8335 100644
+index 92b73a5..b461f5e 100644
 --- a/xen/include/asm-x86/cpufeature.h
 +++ b/xen/include/asm-x86/cpufeature.h
-@@ -72,7 +72,6 @@
+@@ -74,7 +74,6 @@
  #define cpu_has_nx		boot_cpu_has(X86_FEATURE_NX)
  #define cpu_has_clflush		boot_cpu_has(X86_FEATURE_CLFLUSH)
  #define cpu_has_page1gb		boot_cpu_has(X86_FEATURE_PAGE1GB)
@@ -147,10 +147,10 @@ index 04d9e28..f9c8335 100644
  #define cpu_has_smep            boot_cpu_has(X86_FEATURE_SMEP)
  #define cpu_has_invpcid         boot_cpu_has(X86_FEATURE_INVPCID)
 diff --git a/xen/include/asm-x86/msr.h b/xen/include/asm-x86/msr.h
-index 4b4c156..252cbdc 100644
+index f28928a..1b73778 100644
 --- a/xen/include/asm-x86/msr.h
 +++ b/xen/include/asm-x86/msr.h
-@@ -93,6 +93,14 @@ static inline uint64_t rdtsc(void)
+@@ -109,6 +109,14 @@ static inline uint64_t rdtsc_ordered(void)
  			  : "=a" (low), "=d" (high) \
  			  : "c" (counter))
  
@@ -165,7 +165,7 @@ index 4b4c156..252cbdc 100644
  static inline unsigned long __rdfsbase(void)
  {
      unsigned long base;
-@@ -123,7 +131,7 @@ static inline unsigned long rdfsbase(void)
+@@ -139,7 +147,7 @@ static inline unsigned long rdfsbase(void)
  {
      unsigned long base;
  
@@ -174,7 +174,7 @@ index 4b4c156..252cbdc 100644
          return __rdfsbase();
  
      rdmsrl(MSR_FS_BASE, base);
-@@ -135,7 +143,7 @@ static inline unsigned long rdgsbase(void)
+@@ -151,7 +159,7 @@ static inline unsigned long rdgsbase(void)
  {
      unsigned long base;
  
@@ -183,7 +183,7 @@ index 4b4c156..252cbdc 100644
          return __rdgsbase();
  
      rdmsrl(MSR_GS_BASE, base);
-@@ -145,7 +153,7 @@ static inline unsigned long rdgsbase(void)
+@@ -161,7 +169,7 @@ static inline unsigned long rdgsbase(void)
  
  static inline void wrfsbase(unsigned long base)
  {
@@ -192,7 +192,7 @@ index 4b4c156..252cbdc 100644
  #ifdef HAVE_GAS_FSGSBASE
          asm volatile ( "wrfsbase %0" :: "r" (base) );
  #else
-@@ -157,7 +165,7 @@ static inline void wrfsbase(unsigned long base)
+@@ -173,7 +181,7 @@ static inline void wrfsbase(unsigned long base)
  
  static inline void wrgsbase(unsigned long base)
  {
@@ -202,10 +202,10 @@ index 4b4c156..252cbdc 100644
          asm volatile ( "wrgsbase %0" :: "r" (base) );
  #else
 diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
-index 6a35b89..610b6f3 100644
+index 615e890..6b0e641 100644
 --- a/xen/include/asm-x86/processor.h
 +++ b/xen/include/asm-x86/processor.h
-@@ -363,11 +363,31 @@ static inline unsigned long read_cr4(void)
+@@ -357,11 +357,31 @@ static inline unsigned long read_cr4(void)
  
  static inline void write_cr4(unsigned long val)
  {
