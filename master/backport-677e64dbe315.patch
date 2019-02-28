@@ -1,0 +1,38 @@
+From 677e64dbe315343620c3b266e9eb16623b118038 Mon Sep 17 00:00:00 2001
+From: Christian Lindig <christian.lindig@citrix.com>
+Date: Wed, 27 Feb 2019 10:33:42 +0000
+Subject: [PATCH] tools/ocaml: Dup2 /dev/null to stdin in daemonize()
+
+Don't close stdin in daemonize() but dup2 /dev/null instead.  Otherwise, fd 0
+gets reused later:
+
+  [root@idol ~]# ls -lav /proc/`pgrep xenstored`/fd
+  total 0
+  dr-x------ 2 root root  0 Feb 28 11:02 .
+  dr-xr-xr-x 9 root root  0 Feb 27 15:59 ..
+  lrwx------ 1 root root 64 Feb 28 11:02 0 -> /dev/xen/evtchn
+  l-wx------ 1 root root 64 Feb 28 11:02 1 -> /dev/null
+  l-wx------ 1 root root 64 Feb 28 11:02 2 -> /dev/null
+  lrwx------ 1 root root 64 Feb 28 11:02 3 -> /dev/xen/privcmd
+  ...
+
+Signed-off-by: Christian Lindig <christian.lindig@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+Release-acked-by: Juergen Gross <jgross@suse.com>
+diff --git a/tools/ocaml/xenstored/stdext.ml b/tools/ocaml/xenstored/stdext.ml
+index 305a330..e21a01a 100644
+--- a/tools/ocaml/xenstored/stdext.ml
++++ b/tools/ocaml/xenstored/stdext.ml
+@@ -100,9 +100,9 @@ let daemonize () =
+ 
+ 		begin match Unix.fork () with
+ 		| 0 ->
+-			let nullfd = Unix.openfile "/dev/null" [ Unix.O_WRONLY ] 0 in
++			let nullfd = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 in
+ 			begin try
+-				Unix.close Unix.stdin;
++				Unix.dup2 nullfd Unix.stdin;
+ 				Unix.dup2 nullfd Unix.stdout;
+ 				Unix.dup2 nullfd Unix.stderr;
+ 			with exn -> Unix.close nullfd; raise exn
