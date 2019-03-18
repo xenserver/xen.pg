@@ -1,0 +1,128 @@
+From 2d527ba310dc6695bba2df118ff9e053f7e40c82 Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Mon, 18 Mar 2019 16:28:45 +0100
+Subject: [PATCH] x86/hvm: split all linear reads and writes at page boundary
+
+Ruling out page straddling at linear level makes it easier to
+distinguish chunks that require proper handling as MMIO access
+and not complete them as page straddling memory transactions
+prematurely. This doesn't change the general behavior.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+---
+ xen/arch/x86/hvm/emulate.c | 70 +++++++++++++++++++++++++---------------------
+ 1 file changed, 38 insertions(+), 32 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 754baf6..c236e7d 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -1089,12 +1089,25 @@ static int linear_read(unsigned long addr, unsigned int bytes, void *p_data,
+                        uint32_t pfec, struct hvm_emulate_ctxt *hvmemul_ctxt)
+ {
+     pagefault_info_t pfinfo;
+-    int rc = hvm_copy_from_guest_linear(p_data, addr, bytes, pfec, &pfinfo);
++    unsigned int offset = addr & ~PAGE_MASK;
++    int rc;
+ 
+-    switch ( rc )
++    if ( offset + bytes > PAGE_SIZE )
+     {
+-        unsigned int offset, part1;
++        unsigned int part1 = PAGE_SIZE - offset;
++
++        /* Split the access at the page boundary. */
++        rc = linear_read(addr, part1, p_data, pfec, hvmemul_ctxt);
++        if ( rc == X86EMUL_OKAY )
++            rc = linear_read(addr + part1, bytes - part1, p_data + part1,
++                             pfec, hvmemul_ctxt);
++        return rc;
++    }
++
++    rc = hvm_copy_from_guest_linear(p_data, addr, bytes, pfec, &pfinfo);
+ 
++    switch ( rc )
++    {
+     case HVMTRANS_okay:
+         return X86EMUL_OKAY;
+ 
+@@ -1106,19 +1119,9 @@ static int linear_read(unsigned long addr, unsigned int bytes, void *p_data,
+         if ( pfec & PFEC_insn_fetch )
+             return X86EMUL_UNHANDLEABLE;
+ 
+-        offset = addr & ~PAGE_MASK;
+-        if ( offset + bytes <= PAGE_SIZE )
+-            return hvmemul_linear_mmio_read(addr, bytes, p_data, pfec,
+-                                            hvmemul_ctxt,
+-                                            known_gla(addr, bytes, pfec));
+-
+-        /* Split the access at the page boundary. */
+-        part1 = PAGE_SIZE - offset;
+-        rc = linear_read(addr, part1, p_data, pfec, hvmemul_ctxt);
+-        if ( rc == X86EMUL_OKAY )
+-            rc = linear_read(addr + part1, bytes - part1, p_data + part1,
+-                             pfec, hvmemul_ctxt);
+-        return rc;
++        return hvmemul_linear_mmio_read(addr, bytes, p_data, pfec,
++                                        hvmemul_ctxt,
++                                        known_gla(addr, bytes, pfec));
+ 
+     case HVMTRANS_gfn_paged_out:
+     case HVMTRANS_gfn_shared:
+@@ -1132,12 +1135,25 @@ static int linear_write(unsigned long addr, unsigned int bytes, void *p_data,
+                         uint32_t pfec, struct hvm_emulate_ctxt *hvmemul_ctxt)
+ {
+     pagefault_info_t pfinfo;
+-    int rc = hvm_copy_to_guest_linear(addr, p_data, bytes, pfec, &pfinfo);
++    unsigned int offset = addr & ~PAGE_MASK;
++    int rc;
+ 
+-    switch ( rc )
++    if ( offset + bytes > PAGE_SIZE )
+     {
+-        unsigned int offset, part1;
++        unsigned int part1 = PAGE_SIZE - offset;
++
++        /* Split the access at the page boundary. */
++        rc = linear_write(addr, part1, p_data, pfec, hvmemul_ctxt);
++        if ( rc == X86EMUL_OKAY )
++            rc = linear_write(addr + part1, bytes - part1, p_data + part1,
++                              pfec, hvmemul_ctxt);
++        return rc;
++    }
++
++    rc = hvm_copy_to_guest_linear(addr, p_data, bytes, pfec, &pfinfo);
+ 
++    switch ( rc )
++    {
+     case HVMTRANS_okay:
+         return X86EMUL_OKAY;
+ 
+@@ -1146,19 +1162,9 @@ static int linear_write(unsigned long addr, unsigned int bytes, void *p_data,
+         return X86EMUL_EXCEPTION;
+ 
+     case HVMTRANS_bad_gfn_to_mfn:
+-        offset = addr & ~PAGE_MASK;
+-        if ( offset + bytes <= PAGE_SIZE )
+-            return hvmemul_linear_mmio_write(addr, bytes, p_data, pfec,
+-                                             hvmemul_ctxt,
+-                                             known_gla(addr, bytes, pfec));
+-
+-        /* Split the access at the page boundary. */
+-        part1 = PAGE_SIZE - offset;
+-        rc = linear_write(addr, part1, p_data, pfec, hvmemul_ctxt);
+-        if ( rc == X86EMUL_OKAY )
+-            rc = linear_write(addr + part1, bytes - part1, p_data + part1,
+-                              pfec, hvmemul_ctxt);
+-        return rc;
++        return hvmemul_linear_mmio_write(addr, bytes, p_data, pfec,
++                                         hvmemul_ctxt,
++                                         known_gla(addr, bytes, pfec));
+ 
+     case HVMTRANS_gfn_paged_out:
+     case HVMTRANS_gfn_shared:
+-- 
+2.7.4
+
