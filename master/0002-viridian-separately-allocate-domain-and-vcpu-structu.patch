@@ -1,7 +1,7 @@
-From c357425da7107226e6fe21394f4b65a5434169a6 Mon Sep 17 00:00:00 2001
+From 30b6a2aae25ea55e7fc441db67abf25c62a91d00 Mon Sep 17 00:00:00 2001
 From: Paul Durrant <paul.durrant@citrix.com>
 Date: Tue, 18 Dec 2018 16:33:36 +0000
-Subject: [PATCH v3 2/8] viridian: separately allocate domain and vcpu
+Subject: [PATCH v8 02/11] viridian: separately allocate domain and vcpu
  structures
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -13,7 +13,8 @@ will need to add sizable extra fields to the viridian structures which
 will cause the PAGE_SIZE limit of the overall vcpu structure to be
 exceeded. This patch, therefore, uses the new init hooks to separately
 allocate the structures and converts the 'viridian' fields in hvm_domain
-and hvm_cpu to be pointers to these allocations.
+and hvm_cpu to be pointers to these allocations. These separate allocations
+also allow some vcpu and domain pointers to become const.
 
 Ideally, now that they are no longer inline, the allocations of the
 viridian structures could be made conditional on whether the toolstack
@@ -28,20 +29,37 @@ NOTE: The patch also introduced the 'is_viridian_vcpu' macro to avoid
 
 Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
 Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/arch/x86/hvm/viridian/private.h b/xen/arch/x86/hvm/viridian/private.h
+index f73036e..30248de 100644
+--- a/xen/arch/x86/hvm/viridian/private.h
++++ b/xen/arch/x86/hvm/viridian/private.h
+@@ -89,7 +89,7 @@ void viridian_time_load_domain_ctxt(
+ 
+ void viridian_dump_guest_page(const struct vcpu *v, const char *name,
+                               const struct viridian_page *vp);
+-void viridian_map_guest_page(struct vcpu *v, struct viridian_page *vp);
++void viridian_map_guest_page(const struct vcpu *v, struct viridian_page *vp);
+ void viridian_unmap_guest_page(struct viridian_page *vp);
+ 
+ #endif /* X86_HVM_VIRIDIAN_PRIVATE_H */
 diff --git a/xen/arch/x86/hvm/viridian/synic.c b/xen/arch/x86/hvm/viridian/synic.c
-index a6ebbbc9f5..20731c2379 100644
+index a6ebbbc..28eda77 100644
 --- a/xen/arch/x86/hvm/viridian/synic.c
 +++ b/xen/arch/x86/hvm/viridian/synic.c
-@@ -30,7 +30,7 @@ typedef union _HV_VP_ASSIST_PAGE
+@@ -28,9 +28,9 @@ typedef union _HV_VP_ASSIST_PAGE
+     uint8_t ReservedZBytePadding[PAGE_SIZE];
+ } HV_VP_ASSIST_PAGE;
  
- void viridian_apic_assist_set(struct vcpu *v)
+-void viridian_apic_assist_set(struct vcpu *v)
++void viridian_apic_assist_set(const struct vcpu *v)
  {
 -    HV_VP_ASSIST_PAGE *ptr = v->arch.hvm.viridian.vp_assist.ptr;
 +    HV_VP_ASSIST_PAGE *ptr = v->arch.hvm.viridian->vp_assist.ptr;
  
      if ( !ptr )
          return;
-@@ -40,25 +40,25 @@ void viridian_apic_assist_set(struct vcpu *v)
+@@ -40,40 +40,40 @@ void viridian_apic_assist_set(struct vcpu *v)
       * wrong and the VM will most likely hang so force a crash now
       * to make the problem clear.
       */
@@ -54,7 +72,8 @@ index a6ebbbc9f5..20731c2379 100644
      ptr->ApicAssist.no_eoi = 1;
  }
  
- bool viridian_apic_assist_completed(struct vcpu *v)
+-bool viridian_apic_assist_completed(struct vcpu *v)
++bool viridian_apic_assist_completed(const struct vcpu *v)
  {
 -    HV_VP_ASSIST_PAGE *ptr = v->arch.hvm.viridian.vp_assist.ptr;
 +    HV_VP_ASSIST_PAGE *ptr = v->arch.hvm.viridian->vp_assist.ptr;
@@ -72,9 +91,11 @@ index a6ebbbc9f5..20731c2379 100644
          return true;
      }
  
-@@ -67,13 +67,13 @@ bool viridian_apic_assist_completed(struct vcpu *v)
+     return false;
+ }
  
- void viridian_apic_assist_clear(struct vcpu *v)
+-void viridian_apic_assist_clear(struct vcpu *v)
++void viridian_apic_assist_clear(const struct vcpu *v)
  {
 -    HV_VP_ASSIST_PAGE *ptr = v->arch.hvm.viridian.vp_assist.ptr;
 +    HV_VP_ASSIST_PAGE *ptr = v->arch.hvm.viridian->vp_assist.ptr;
@@ -141,7 +162,7 @@ index a6ebbbc9f5..20731c2379 100644
  
  /*
 diff --git a/xen/arch/x86/hvm/viridian/time.c b/xen/arch/x86/hvm/viridian/time.c
-index 840a82b457..42367f6460 100644
+index 840a82b..a7e94aa 100644
 --- a/xen/arch/x86/hvm/viridian/time.c
 +++ b/xen/arch/x86/hvm/viridian/time.c
 @@ -27,7 +27,7 @@ typedef struct _HV_REFERENCE_TSC_PAGE
@@ -162,9 +183,21 @@ index 840a82b457..42367f6460 100644
      struct page_info *page = get_page_from_gfn(d, gmfn, NULL, P2M_ALLOC);
      HV_REFERENCE_TSC_PAGE *p;
  
-@@ -121,9 +121,8 @@ static int64_t raw_trc_val(struct domain *d)
+@@ -107,7 +107,7 @@ static void update_reference_tsc(struct domain *d, bool initialize)
+     put_page_and_type(page);
+ }
  
- void viridian_time_ref_count_freeze(struct domain *d)
+-static int64_t raw_trc_val(struct domain *d)
++static int64_t raw_trc_val(const struct domain *d)
+ {
+     uint64_t tsc;
+     struct time_scale tsc_to_ns;
+@@ -119,21 +119,19 @@ static int64_t raw_trc_val(struct domain *d)
+     return scale_delta(tsc, &tsc_to_ns) / 100ul;
+ }
+ 
+-void viridian_time_ref_count_freeze(struct domain *d)
++void viridian_time_ref_count_freeze(const struct domain *d)
  {
 -    struct viridian_time_ref_count *trc;
 -
@@ -174,9 +207,10 @@ index 840a82b457..42367f6460 100644
  
      if ( test_and_clear_bit(_TRC_running, &trc->flags) )
          trc->val = raw_trc_val(d) + trc->off;
-@@ -131,9 +130,8 @@ void viridian_time_ref_count_freeze(struct domain *d)
+ }
  
- void viridian_time_ref_count_thaw(struct domain *d)
+-void viridian_time_ref_count_thaw(struct domain *d)
++void viridian_time_ref_count_thaw(const struct domain *d)
  {
 -    struct viridian_time_ref_count *trc;
 -
@@ -238,7 +272,7 @@ index 840a82b457..42367f6460 100644
  }
  
 diff --git a/xen/arch/x86/hvm/viridian/viridian.c b/xen/arch/x86/hvm/viridian/viridian.c
-index f8aef330c7..da1e0600c8 100644
+index f8aef33..79b41ad 100644
 --- a/xen/arch/x86/hvm/viridian/viridian.c
 +++ b/xen/arch/x86/hvm/viridian/viridian.c
 @@ -149,7 +149,7 @@ void cpuid_viridian_leaves(const struct vcpu *v, uint32_t leaf,
@@ -410,14 +444,23 @@ index f8aef330c7..da1e0600c8 100644
  }
  
  static DEFINE_PER_CPU(cpumask_t, ipi_cpumask);
+@@ -639,7 +660,7 @@ void viridian_dump_guest_page(const struct vcpu *v, const char *name,
+            v, name, (unsigned long)vp->msr.fields.pfn);
+ }
+ 
+-void viridian_map_guest_page(struct vcpu *v, struct viridian_page *vp)
++void viridian_map_guest_page(const struct vcpu *v, struct viridian_page *vp)
+ {
+     struct domain *d = v->domain;
+     unsigned long gmfn = vp->msr.fields.pfn;
 @@ -691,8 +712,8 @@ void viridian_unmap_guest_page(struct viridian_page *vp)
  static int viridian_save_domain_ctxt(struct domain *d, hvm_domain_context_t *h)
  {
      struct hvm_viridian_domain_context ctxt = {
 -        .hypercall_gpa  = d->arch.hvm.viridian.hypercall_gpa.raw,
 -        .guest_os_id    = d->arch.hvm.viridian.guest_os_id.raw,
-+        .hypercall_gpa  = d->arch.hvm.viridian->hypercall_gpa.raw,
-+        .guest_os_id    = d->arch.hvm.viridian->guest_os_id.raw,
++        .hypercall_gpa = d->arch.hvm.viridian->hypercall_gpa.raw,
++        .guest_os_id = d->arch.hvm.viridian->guest_os_id.raw,
      };
  
      if ( !is_viridian_domain(d) )
@@ -433,7 +476,7 @@ index f8aef330c7..da1e0600c8 100644
      viridian_time_load_domain_ctxt(d, &ctxt);
  
 diff --git a/xen/include/asm-x86/hvm/domain.h b/xen/include/asm-x86/hvm/domain.h
-index fc192348e5..586d55bb78 100644
+index fc19234..586d55b 100644
 --- a/xen/include/asm-x86/hvm/domain.h
 +++ b/xen/include/asm-x86/hvm/domain.h
 @@ -161,7 +161,7 @@ struct hvm_domain {
@@ -446,7 +489,7 @@ index fc192348e5..586d55bb78 100644
      bool_t                 hap_enabled;
      bool_t                 mem_sharing_enabled;
 diff --git a/xen/include/asm-x86/hvm/hvm.h b/xen/include/asm-x86/hvm/hvm.h
-index 09a0d4d318..3d28150ad7 100644
+index b5f11ae..c914004 100644
 --- a/xen/include/asm-x86/hvm/hvm.h
 +++ b/xen/include/asm-x86/hvm/hvm.h
 @@ -395,6 +395,9 @@ bool hvm_set_guest_bndcfgs(struct vcpu *v, u64 val);
@@ -460,10 +503,10 @@ index 09a0d4d318..3d28150ad7 100644
      (is_viridian_domain(d) && (viridian_feature_mask(d) & HVMPV_time_ref_count))
  
 diff --git a/xen/include/asm-x86/hvm/vcpu.h b/xen/include/asm-x86/hvm/vcpu.h
-index 955a8db6a4..8adbb05185 100644
+index 450ae39..a4d7709 100644
 --- a/xen/include/asm-x86/hvm/vcpu.h
 +++ b/xen/include/asm-x86/hvm/vcpu.h
-@@ -203,7 +203,7 @@ struct hvm_vcpu {
+@@ -208,7 +208,7 @@ struct hvm_vcpu {
      /* Pending hw/sw interrupt (.vector = -1 means nothing pending). */
      struct x86_event     inject_event;
  
@@ -472,3 +515,31 @@ index 955a8db6a4..8adbb05185 100644
  };
  
  #endif /* __ASM_X86_HVM_VCPU_H__ */
+diff --git a/xen/include/asm-x86/hvm/viridian.h b/xen/include/asm-x86/hvm/viridian.h
+index d1cc9dd..6519b34 100644
+--- a/xen/include/asm-x86/hvm/viridian.h
++++ b/xen/include/asm-x86/hvm/viridian.h
+@@ -84,8 +84,8 @@ rdmsr_viridian_regs(
+ int
+ viridian_hypercall(struct cpu_user_regs *regs);
+ 
+-void viridian_time_ref_count_freeze(struct domain *d);
+-void viridian_time_ref_count_thaw(struct domain *d);
++void viridian_time_ref_count_freeze(const struct domain *d);
++void viridian_time_ref_count_thaw(const struct domain *d);
+ 
+ int viridian_vcpu_init(struct vcpu *v);
+ int viridian_domain_init(struct domain *d);
+@@ -93,9 +93,9 @@ int viridian_domain_init(struct domain *d);
+ void viridian_vcpu_deinit(struct vcpu *v);
+ void viridian_domain_deinit(struct domain *d);
+ 
+-void viridian_apic_assist_set(struct vcpu *v);
+-bool viridian_apic_assist_completed(struct vcpu *v);
+-void viridian_apic_assist_clear(struct vcpu *v);
++void viridian_apic_assist_set(const struct vcpu *v);
++bool viridian_apic_assist_completed(const struct vcpu *v);
++void viridian_apic_assist_clear(const struct vcpu *v);
+ 
+ #endif /* __ASM_X86_HVM_VIRIDIAN_H__ */
+ 

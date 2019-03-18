@@ -1,7 +1,7 @@
-From 427b415b3dc2eafbd7e5c00d7c9400833f31da3c Mon Sep 17 00:00:00 2001
+From c7c54a3fcf27aecf83edca0dae6f790bb3efded1 Mon Sep 17 00:00:00 2001
 From: Paul Durrant <paul.durrant@citrix.com>
 Date: Thu, 20 Dec 2018 12:17:02 +0000
-Subject: [PATCH v3 7/8] viridian: stop directly calling
+Subject: [PATCH v8 08/11] viridian: stop directly calling
  viridian_time_ref_count_freeze/thaw()...
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -20,11 +20,21 @@ NOTE: This patch also introduces a new time_ref_count() helper to return
 
 Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
 Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+---
+Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+Cc: "Roger Pau Monné" <roger.pau@citrix.com>
+---
+ xen/arch/x86/domain.c              | 12 ++++++------
+ xen/arch/x86/hvm/viridian/time.c   | 24 +++++++++++++++++++++---
+ xen/include/asm-x86/hvm/viridian.h |  4 ++--
+ 3 files changed, 29 insertions(+), 11 deletions(-)
+
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index d8525fb04f..fcbdf53d2f 100644
+index 8d579e2cf9..02afa7518e 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -626,20 +626,20 @@ void arch_domain_destroy(struct domain *d)
+@@ -657,20 +657,20 @@ void arch_domain_destroy(struct domain *d)
  
  void arch_domain_shutdown(struct domain *d)
  {
@@ -52,32 +62,32 @@ index d8525fb04f..fcbdf53d2f 100644
  
  int arch_domain_soft_reset(struct domain *d)
 diff --git a/xen/arch/x86/hvm/viridian/time.c b/xen/arch/x86/hvm/viridian/time.c
-index e8924adfa1..26ad9ce727 100644
+index 16fe41d411..71291d921c 100644
 --- a/xen/arch/x86/hvm/viridian/time.c
 +++ b/xen/arch/x86/hvm/viridian/time.c
-@@ -91,7 +91,7 @@ static int64_t raw_trc_val(struct domain *d)
+@@ -91,7 +91,7 @@ static int64_t raw_trc_val(const struct domain *d)
      return scale_delta(tsc, &tsc_to_ns) / 100ul;
  }
  
--void viridian_time_ref_count_freeze(struct domain *d)
-+static void time_ref_count_freeze(struct domain *d)
+-void viridian_time_ref_count_freeze(const struct domain *d)
++static void time_ref_count_freeze(const struct domain *d)
  {
      struct viridian_time_ref_count *trc =
          &d->arch.hvm.viridian->time_ref_count;
-@@ -100,7 +100,7 @@ void viridian_time_ref_count_freeze(struct domain *d)
+@@ -100,7 +100,7 @@ void viridian_time_ref_count_freeze(const struct domain *d)
          trc->val = raw_trc_val(d) + trc->off;
  }
  
--void viridian_time_ref_count_thaw(struct domain *d)
-+static void time_ref_count_thaw(struct domain *d)
+-void viridian_time_ref_count_thaw(const struct domain *d)
++static void time_ref_count_thaw(const struct domain *d)
  {
      struct viridian_time_ref_count *trc =
          &d->arch.hvm.viridian->time_ref_count;
-@@ -110,6 +110,30 @@ void viridian_time_ref_count_thaw(struct domain *d)
+@@ -110,6 +110,24 @@ void viridian_time_ref_count_thaw(const struct domain *d)
          trc->off = (int64_t)trc->val - raw_trc_val(d);
  }
  
-+static int64_t time_ref_count(struct domain *d)
++static int64_t time_ref_count(const struct domain *d)
 +{
 +    struct viridian_time_ref_count *trc =
 +        &d->arch.hvm.viridian->time_ref_count;
@@ -85,26 +95,20 @@ index e8924adfa1..26ad9ce727 100644
 +    return raw_trc_val(d) + trc->off;
 +}
 +
-+void viridian_time_domain_freeze(struct domain *d)
++void viridian_time_domain_freeze(const struct domain *d)
 +{
-+    if ( !d->arch.hvm.viridian )
-+        return;
-+
 +    time_ref_count_freeze(d);
 +}
 +
-+void viridian_time_domain_thaw(struct domain *d)
++void viridian_time_domain_thaw(const struct domain *d)
 +{
-+    if ( !d->arch.hvm.viridian )
-+        return;
-+
 +    time_ref_count_thaw(d);
 +}
 +
  int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
  {
      struct domain *d = v->domain;
-@@ -179,7 +203,7 @@ int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
+@@ -179,7 +197,7 @@ int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
              printk(XENLOG_G_INFO "d%d: VIRIDIAN MSR_TIME_REF_COUNT: accessed\n",
                     d->domain_id);
  
@@ -114,17 +118,20 @@ index e8924adfa1..26ad9ce727 100644
      }
  
 diff --git a/xen/include/asm-x86/hvm/viridian.h b/xen/include/asm-x86/hvm/viridian.h
-index 41e81b3662..8f0b3e97eb 100644
+index c65c044191..8146e2fc46 100644
 --- a/xen/include/asm-x86/hvm/viridian.h
 +++ b/xen/include/asm-x86/hvm/viridian.h
-@@ -104,8 +104,8 @@ rdmsr_viridian_regs(
+@@ -77,8 +77,8 @@ int guest_rdmsr_viridian(const struct vcpu *v, uint32_t idx, uint64_t *val);
  int
  viridian_hypercall(struct cpu_user_regs *regs);
  
--void viridian_time_ref_count_freeze(struct domain *d);
--void viridian_time_ref_count_thaw(struct domain *d);
-+void viridian_time_domain_freeze(struct domain *d);
-+void viridian_time_domain_thaw(struct domain *d);
+-void viridian_time_ref_count_freeze(const struct domain *d);
+-void viridian_time_ref_count_thaw(const struct domain *d);
++void viridian_time_domain_freeze(const struct domain *d);
++void viridian_time_domain_thaw(const struct domain *d);
  
  int viridian_vcpu_init(struct vcpu *v);
  int viridian_domain_init(struct domain *d);
+-- 
+2.20.1
+
