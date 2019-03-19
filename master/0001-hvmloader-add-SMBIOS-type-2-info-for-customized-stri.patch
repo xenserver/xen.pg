@@ -1,0 +1,136 @@
+commit c185d25cd2f0200d573ff05ac674f6eec75da1d4
+Author: Xin Li <xin.li@citrix.com>
+Date:   Mon Mar 25 05:29:14 2019 +0000
+
+hvmloader: add SMBIOS type 2 info for customized string
+
+Extend smbios type 2 struct to match specification, add support to
+write it when customized string provided and no smbios passed in.
+
+Signed-off-by: Xin Li <xin.li@citrix.com>
+
+diff --git a/tools/firmware/hvmloader/smbios.c b/tools/firmware/hvmloader/smbios.c
+index 0e61bd1950..342915f377 100644
+--- a/tools/firmware/hvmloader/smbios.c
++++ b/tools/firmware/hvmloader/smbios.c
+@@ -499,9 +499,11 @@ static void *
+ smbios_type_2_init(void *start)
+ {
+     struct smbios_type_2 *p = (struct smbios_type_2 *)start;
++    const char *s;
+     uint8_t *ptr;
+     void *pts;
+     uint32_t length;
++    unsigned int counter = 0;
+ 
+     pts = get_smbios_pt_struct(2, &length);
+     if ( (pts != NULL)&&(length > 0) )
+@@ -520,8 +522,71 @@ smbios_type_2_init(void *start)
+         return (start + length);
+     }
+ 
+-    /* Only present when passed in */
+-    return start;
++    memset(p, 0, sizeof(*p));
++    p->header.type = 2;
++    p->header.length = sizeof(struct smbios_type_2);
++    p->header.handle = SMBIOS_HANDLE_TYPE2;
++    p->feature_flags = 0x09; /* Board is a hosting board and replaceable */
++    p->chassis_handle = SMBIOS_HANDLE_TYPE3;
++    p->board_type = 0x0a; /* Motherboard */
++    start += sizeof(*p);
++
++    s = xenstore_read(HVM_XS_BASEBOARD_MANUFACTURER, NULL);
++    if ( (s != NULL) && (*s != '\0') )
++    {
++        strcpy(start, s);
++        start += strlen(s) + 1;
++        p->manufacturer_str = ++counter;
++    }
++
++    s = xenstore_read(HVM_XS_BASEBOARD_PRODUCT_NAME, NULL);
++    if ( (s != NULL) && (*s != '\0') )
++    {
++        strcpy(start, s);
++        start += strlen(s) + 1;
++        p->product_name_str = ++counter;
++    }
++
++    s = xenstore_read(HVM_XS_BASEBOARD_VERSION, NULL);
++    if ( (s != NULL) && (*s != '\0') )
++    {
++        strcpy(start, s);
++        start += strlen(s) + 1;
++        p->version_str = ++counter;
++    }
++
++    s = xenstore_read(HVM_XS_BASEBOARD_SERIAL_NUMBER, NULL);
++    if ( (s != NULL) && (*s != '\0') )
++    {
++        strcpy(start, s);
++        start += strlen(s) + 1;
++        p->serial_number_str = ++counter;
++    }
++
++    s = xenstore_read(HVM_XS_BASEBOARD_ASSET_TAG, NULL);
++    if ( (s != NULL) && (*s != '\0') )
++    {
++        strcpy(start, s);
++        start += strlen(s) + 1;
++        p->asset_tag_str = ++counter;
++    }
++
++    s = xenstore_read(HVM_XS_BASEBOARD_LOCATION_IN_CHASSIS, NULL);
++    if ( (s != NULL) && (*s != '\0') )
++    {
++        strcpy(start, s);
++        start += strlen(s) + 1;
++        p->location_in_chassis_str = ++counter;
++    }
++
++    if ( counter )
++    {
++        *(uint8_t *)start = 0;
++        return start + 1;
++    }
++
++    /* Only present when passed in or with customized string */
++    return start - sizeof(*p);
+ }
+ 
+ /* Type 3 -- System Enclosure */
+diff --git a/tools/firmware/hvmloader/smbios_types.h b/tools/firmware/hvmloader/smbios_types.h
+index e924f819b3..371e7cf166 100644
+--- a/tools/firmware/hvmloader/smbios_types.h
++++ b/tools/firmware/hvmloader/smbios_types.h
+@@ -90,6 +90,13 @@ struct smbios_type_2 {
+     uint8_t product_name_str;
+     uint8_t version_str;
+     uint8_t serial_number_str;
++    uint8_t asset_tag_str;
++    uint8_t feature_flags;
++    uint8_t location_in_chassis_str;
++    uint16_t chassis_handle;
++    uint8_t board_type;
++    uint8_t contained_handle_count;
++    uint16_t contained_handles[];
+ } __attribute__ ((packed));
+ 
+ /* SMBIOS type 3 - System Enclosure */
+diff --git a/xen/include/public/hvm/hvm_xs_strings.h b/xen/include/public/hvm/hvm_xs_strings.h
+index 146b0b0582..166fe826a9 100644
+--- a/xen/include/public/hvm/hvm_xs_strings.h
++++ b/xen/include/public/hvm/hvm_xs_strings.h
+@@ -69,6 +69,12 @@
+ #define HVM_XS_SYSTEM_PRODUCT_NAME     "bios-strings/system-product-name"
+ #define HVM_XS_SYSTEM_VERSION          "bios-strings/system-version"
+ #define HVM_XS_SYSTEM_SERIAL_NUMBER    "bios-strings/system-serial-number"
++#define HVM_XS_BASEBOARD_MANUFACTURER  "bios-strings/baseboard-manufacturer"
++#define HVM_XS_BASEBOARD_PRODUCT_NAME  "bios-strings/baseboard-product-name"
++#define HVM_XS_BASEBOARD_VERSION       "bios-strings/baseboard-version"
++#define HVM_XS_BASEBOARD_SERIAL_NUMBER "bios-strings/baseboard-serial-number"
++#define HVM_XS_BASEBOARD_ASSET_TAG     "bios-strings/baseboard-asset-tag"
++#define HVM_XS_BASEBOARD_LOCATION_IN_CHASSIS "bios-strings/baseboard-location-in-chassis"
+ #define HVM_XS_ENCLOSURE_MANUFACTURER  "bios-strings/enclosure-manufacturer"
+ #define HVM_XS_ENCLOSURE_SERIAL_NUMBER "bios-strings/enclosure-serial-number"
+ #define HVM_XS_BATTERY_MANUFACTURER    "bios-strings/battery-manufacturer"
