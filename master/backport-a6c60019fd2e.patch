@@ -1,0 +1,201 @@
+From a6c60019fd2efa4b9a60ee1114114fe853d1aad5 Mon Sep 17 00:00:00 2001
+From: Len Brown <len.brown@intel.com>
+Date: Thu, 9 Jun 2016 15:52:27 +0200
+Subject: [PATCH] mwait-idle: add BXT support
+
+Broxton has all the HSW C-states, except C3.
+BXT C-state timing is slightly different.
+
+Here we trust the IRTL MSRs as authority
+on maximum C-state latency, and override the driver's tables
+with the values found in the associated IRTL MSRs.
+Further we set the target_residency to 1x maximum latency,
+trusting the hardware demotion logic.
+
+Signed-off-by: Len Brown <len.brown@intel.com>
+[Linux commit: 5dcef694860100fd16885f052591b1268b764d21]
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+diff --git a/xen/arch/x86/cpu/mwait-idle.c b/xen/arch/x86/cpu/mwait-idle.c
+index 9c3b2f9c8f..dcf6c9a879 100644
+--- a/xen/arch/x86/cpu/mwait-idle.c
++++ b/xen/arch/x86/cpu/mwait-idle.c
+@@ -613,6 +613,52 @@ static const struct cpuidle_state knl_cstates[] = {
+ 	{}
+ };
+ 
++static struct cpuidle_state bxt_cstates[] = {
++	{
++		.name = "C1-BXT",
++		.flags = MWAIT2flg(0x00),
++		.exit_latency = 2,
++		.target_residency = 2,
++	},
++	{
++		.name = "C1E-BXT",
++		.flags = MWAIT2flg(0x01),
++		.exit_latency = 10,
++		.target_residency = 20,
++	},
++	{
++		.name = "C6-BXT",
++		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.exit_latency = 133,
++		.target_residency = 133,
++	},
++	{
++		.name = "C7s-BXT",
++		.flags = MWAIT2flg(0x31) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.exit_latency = 155,
++		.target_residency = 155,
++	},
++	{
++		.name = "C8-BXT",
++		.flags = MWAIT2flg(0x40) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.exit_latency = 1000,
++		.target_residency = 1000,
++	},
++	{
++		.name = "C9-BXT",
++		.flags = MWAIT2flg(0x50) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.exit_latency = 2000,
++		.target_residency = 2000,
++	},
++	{
++		.name = "C10-BXT",
++		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.exit_latency = 10000,
++		.target_residency = 10000,
++	},
++	{}
++};
++
+ static void mwait_idle(void)
+ {
+ 	unsigned int cpu = smp_processor_id();
+@@ -800,11 +846,16 @@ static const struct idle_cpu idle_cpu_knl = {
+ 	.state_table = knl_cstates,
+ };
+ 
++static const struct idle_cpu idle_cpu_bxt = {
++	.state_table = bxt_cstates,
++	.disable_promotion_to_c1e = 1,
++};
++
+ #define ICPU(model, cpu) \
+     { X86_VENDOR_INTEL, 6, model, X86_FEATURE_MONITOR, \
+         &idle_cpu_##cpu}
+ 
+-static const struct x86_cpu_id intel_idle_ids[] __initconst = {
++static const struct x86_cpu_id intel_idle_ids[] __initconstrel = {
+ 	ICPU(0x1a, nehalem),
+ 	ICPU(0x1e, nehalem),
+ 	ICPU(0x1f, nehalem),
+@@ -836,6 +887,7 @@ static const struct x86_cpu_id intel_idle_ids[] __initconst = {
+ 	ICPU(0x9e, skl),
+ 	ICPU(0x55, skx),
+ 	ICPU(0x57, knl),
++	ICPU(0x5c, bxt),
+ 	{}
+ };
+ 
+@@ -866,6 +918,72 @@ static void __init ivt_idle_state_table_update(void)
+ 	}
+ }
+ 
++/*
++ * Translate IRTL (Interrupt Response Time Limit) MSR to usec
++ */
++
++static const unsigned int __initconst irtl_ns_units[] = {
++	1, 32, 1024, 32768, 1048576, 33554432, 0, 0 };
++
++static unsigned long long __init irtl_2_usec(unsigned long long irtl)
++{
++	unsigned long long ns;
++
++	ns = irtl_ns_units[(irtl >> 10) & 0x3];
++
++	return (irtl & 0x3FF) * ns / 1000;
++}
++/*
++ * bxt_idle_state_table_update(void)
++ *
++ * On BXT, we trust the IRTL to show the definitive maximum latency
++ * We use the same value for target_residency.
++ */
++static void __init bxt_idle_state_table_update(void)
++{
++	unsigned long long msr;
++
++	rdmsrl(MSR_PKGC6_IRTL, msr);
++	if (msr) {
++		unsigned int usec = irtl_2_usec(msr);
++
++		bxt_cstates[2].exit_latency = usec;
++		bxt_cstates[2].target_residency = usec;
++	}
++
++	rdmsrl(MSR_PKGC7_IRTL, msr);
++	if (msr) {
++		unsigned int usec = irtl_2_usec(msr);
++
++		bxt_cstates[3].exit_latency = usec;
++		bxt_cstates[3].target_residency = usec;
++	}
++
++	rdmsrl(MSR_PKGC8_IRTL, msr);
++	if (msr) {
++		unsigned int usec = irtl_2_usec(msr);
++
++		bxt_cstates[4].exit_latency = usec;
++		bxt_cstates[4].target_residency = usec;
++	}
++
++	rdmsrl(MSR_PKGC9_IRTL, msr);
++	if (msr) {
++		unsigned int usec = irtl_2_usec(msr);
++
++		bxt_cstates[5].exit_latency = usec;
++		bxt_cstates[5].target_residency = usec;
++	}
++
++	rdmsrl(MSR_PKGC10_IRTL, msr);
++	if (msr) {
++		unsigned int usec = irtl_2_usec(msr);
++
++		bxt_cstates[6].exit_latency = usec;
++		bxt_cstates[6].target_residency = usec;
++	}
++}
++
+ /*
+  * sklh_idle_state_table_update(void)
+  *
+@@ -914,6 +1032,9 @@ static void __init mwait_idle_state_table_update(void)
+ 	case 0x3e: /* IVT */
+ 		ivt_idle_state_table_update();
+ 		break;
++	case 0x5c: /* BXT */
++		bxt_idle_state_table_update();
++		break;
+ 	case 0x5e: /* SKL-H */
+ 		sklh_idle_state_table_update();
+ 		break;
+diff --git a/xen/include/asm-x86/msr-index.h b/xen/include/asm-x86/msr-index.h
+index 2b54369490..fa181d1100 100644
+--- a/xen/include/asm-x86/msr-index.h
++++ b/xen/include/asm-x86/msr-index.h
+@@ -533,4 +533,12 @@
+ #define MSR_IA_ELLCOS_WAYS_2		0xd02
+ #define MSR_IA_ELLCOS_WAYS_3		0xd03
+ 
++/* Interrupt Response Limit */
++#define MSR_PKGC3_IRTL			0x0000060a
++#define MSR_PKGC6_IRTL			0x0000060b
++#define MSR_PKGC7_IRTL			0x0000060c
++#define MSR_PKGC8_IRTL			0x00000633
++#define MSR_PKGC9_IRTL			0x00000634
++#define MSR_PKGC10_IRTL			0x00000635
++
+ #endif /* __ASM_MSR_INDEX_H */
