@@ -1,0 +1,195 @@
+From 92d16c30d15388f63c05326f2eb2c10a1a0e2c8d Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Wed, 13 Mar 2019 15:40:24 +0000
+Subject: [PATCH 4/8] microcode: add sequential application policy
+
+This patch was sent upstream to Chao. I expect it to be included in v7.
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+diff --git a/tools/misc/xen-microcode.c b/tools/misc/xen-microcode.c
+index 33b1498092..1c07712c68 100644
+--- a/tools/misc/xen-microcode.c
++++ b/tools/misc/xen-microcode.c
+@@ -48,7 +48,7 @@ void show_help(void)
+ {
+     fprintf(stderr,
+             "xen-microcode: Xen microcode updating tool\n"
+-            "Usage: xen-microcode <microcode blob>\n");
++            "Usage: xen-microcode <microcode blob> <parallel|sequential>\n");
+ 
+     show_curr_cpu();
+ }
+@@ -61,13 +61,25 @@ int main(int argc, char *argv[])
+     struct xen_platform_op op;
+     xc_interface *xch;
+     DECLARE_HYPERCALL_BUFFER(struct xenpf_microcode_update, uc);
++    uint32_t strategy;
+ 
+-    if (argc < 2)
++    if (argc < 3)
+     {
+         show_help();
+         return 0;
+     }
+ 
++    if (!strcmp(argv[2], "parallel"))
++        strategy = XENPF_microcode_parallel;
++    else if (!strcmp(argv[2], "sequential"))
++        strategy = XENPF_microcode_sequential;
++    else
++    {
++        show_help();
++        return 0;
++    }
++
++
+     filename = argv[1];
+     fd = open(filename, O_RDONLY);
+     if (fd < 0) {
+@@ -106,6 +118,7 @@ int main(int argc, char *argv[])
+     op.cmd = XENPF_microcode_update;
+     op.interface_version = XENPF_INTERFACE_VERSION;
+     op.u.microcode.length = len;
++    op.u.microcode.strategy = strategy;
+     ret = xc_platform_op(xch, &op);
+     if ( ret )
+         fprintf(stderr, "Failed to update microcode. (err: %d)\n", ret);
+diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
+index 95e39c33bc..e69f4acded 100644
+--- a/xen/arch/x86/microcode.c
++++ b/xen/arch/x86/microcode.c
+@@ -37,6 +37,8 @@
+ #include <xen/earlycpio.h>
+ #include <xen/watchdog.h>
+ 
++#include <public/platform.h>
++
+ #include <asm/delay.h>
+ #include <asm/msr.h>
+ #include <asm/processor.h>
+@@ -216,6 +218,10 @@ DEFINE_PER_CPU(struct cpu_signature, cpu_sig);
+  */
+ static atomic_t cpu_in, cpu_out;
+ 
++static uint32_t application_strategy;
++/* The next CPU to perform a ucode update */
++static atomic_t next_cpu;
++
+ /*
+  * Save an ucode patch to the global cache list.
+  *
+@@ -351,6 +357,19 @@ static int do_microcode_update(void *unused)
+     if ( ret )
+         return ret;
+ 
++    while ( application_strategy == XENPF_microcode_sequential &&
++            cpu != atomic_read(&next_cpu) )
++    {
++        finished = atomic_read(&cpu_out);
++        if ( wait_for_cpus(&next_cpu, cpu, MICROCODE_UPDATE_TIMEOUT_US) )
++        {
++            if ( atomic_read(&cpu_out) > finished )
++                continue;
++            panic("Timeout during sequential microcode update (finished %d/%d)",
++                  finished, cpu_nr);
++        }
++    }
++
+     /*
+      * Initiate an update on all processors which don't have an online sibling
+      * thread with a lower thread id. Other sibling threads just await the
+@@ -358,6 +377,10 @@ static int do_microcode_update(void *unused)
+      */
+     if ( cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
+         ret = microcode_update_cpu();
++
++    if ( application_strategy == XENPF_microcode_sequential )
++        atomic_set(&next_cpu, cpumask_next(cpu, &cpu_online_map));
++
+     /*
+      * Increase the wait timeout to a safe value here since we're serializing
+      * the microcode update and that could take a while on a large number of
+@@ -393,7 +416,8 @@ static int do_microcode_update(void *unused)
+     return ret;
+ }
+ 
+-int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
++int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len,
++                     uint32_t strategy)
+ {
+     int ret;
+     void *buffer;
+@@ -405,6 +429,10 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+     if ( microcode_ops == NULL )
+         return -EINVAL;
+ 
++    if ( strategy != XENPF_microcode_parallel &&
++         strategy != XENPF_microcode_sequential )
++        return -EINVAL;
++
+     buffer = xmalloc_bytes(len);
+     if ( !buffer )
+     {
+@@ -449,13 +477,19 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+         if ( cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
+             nr_cores++;
+ 
+-    printk(XENLOG_INFO "%d cores are to update their microcode\n", nr_cores);
++    printk(XENLOG_INFO "%d cores are to update their microcode %s\n", nr_cores,
++           strategy == XENPF_microcode_parallel ? "in parallel" :
++                                                  "sequentially");
+ 
+     /*
+      * We intend to disable interrupt for long time, which may lead to
+      * watchdog timeout.
+      */
+     watchdog_disable();
++
++    application_strategy = strategy;
++    if ( strategy == XENPF_microcode_sequential )
++        atomic_set(&next_cpu, cpumask_first(&cpu_online_map));
+     /*
+      * Late loading dance. Why the heavy-handed stop_machine effort?
+      *
+diff --git a/xen/arch/x86/platform_hypercall.c b/xen/arch/x86/platform_hypercall.c
+index 4d7398ef63..7f7818f6bf 100644
+--- a/xen/arch/x86/platform_hypercall.c
++++ b/xen/arch/x86/platform_hypercall.c
+@@ -297,7 +297,8 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
+ 
+         ret = microcode_update(
+                 guest_handle_to_param(data, const_void),
+-                op->u.microcode.length);
++                op->u.microcode.length,
++                op->u.microcode.strategy);
+         spin_unlock(&vcpu_alloc_lock);
+     }
+     break;
+diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
+index 0a62dfa0a3..612b786e81 100644
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -573,7 +573,8 @@ int rdmsr_hypervisor_regs(uint32_t idx, uint64_t *val);
+ int wrmsr_hypervisor_regs(uint32_t idx, uint64_t val);
+ 
+ void microcode_set_module(unsigned int);
+-int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void), unsigned long len);
++int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void), unsigned long len,
++                     uint32_t strategy);
+ int early_microcode_update_cpu(void);
+ int early_microcode_init(void);
+ int microcode_init_intel(void);
+diff --git a/xen/include/public/platform.h b/xen/include/public/platform.h
+index e858872ca5..07e3cf1bb8 100644
+--- a/xen/include/public/platform.h
++++ b/xen/include/public/platform.h
+@@ -114,6 +114,9 @@ struct xenpf_microcode_update {
+     /* IN variables. */
+     XEN_GUEST_HANDLE(const_void) data;/* Pointer to microcode data */
+     uint32_t length;                  /* Length of microcode data. */
++#define XENPF_microcode_parallel   0
++#define XENPF_microcode_sequential 1
++    uint32_t strategy;                /* Application strategy.     */
+ };
+ typedef struct xenpf_microcode_update xenpf_microcode_update_t;
+ DEFINE_XEN_GUEST_HANDLE(xenpf_microcode_update_t);

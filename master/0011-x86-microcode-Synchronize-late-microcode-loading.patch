@@ -1,0 +1,248 @@
+From 3d4e77242768a68768fac184888034e786b81629 Mon Sep 17 00:00:00 2001
+From: Chao Gao <chao.gao@intel.com>
+Date: Mon, 11 Mar 2019 15:57:35 +0800
+Subject: [PATCH 11/12] x86/microcode: Synchronize late microcode loading
+
+This patch ports microcode improvement patches from linux kernel.
+
+Before you read any further: the early loading method is still the
+preferred one and you should always do that. The following patch is
+improving the late loading mechanism for long running jobs and cloud use
+cases.
+
+Gather all cores and serialize the microcode update on them by doing it
+one-by-one to make the late update process as reliable as possible and
+avoid potential issues caused by the microcode update.
+
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Tested-by: Chao Gao <chao.gao@intel.com>
+[linux commit: a5321aec6412b20b5ad15db2d6b916c05349dbff]
+[linux commit: bb8c13d61a629276a162c1d2b1a20a815cbcfbb7]
+Cc: Kevin Tian <kevin.tian@intel.com>
+Cc: Jun Nakajima <jun.nakajima@intel.com>
+Cc: Ashok Raj <ashok.raj@intel.com>
+Cc: Borislav Petkov <bp@suse.de>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+Cc: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
+index 450a3646f6..014be466c5 100644
+--- a/xen/arch/x86/microcode.c
++++ b/xen/arch/x86/microcode.c
+@@ -23,6 +23,7 @@
+ 
+ #include <xen/config.h>
+ #include <xen/cpu.h>
++#include <xen/cpumask.h>
+ #include <xen/lib.h>
+ #include <xen/kernel.h>
+ #include <xen/init.h>
+@@ -31,15 +32,34 @@
+ #include <xen/smp.h>
+ #include <xen/softirq.h>
+ #include <xen/spinlock.h>
++#include <xen/stop_machine.h>
+ #include <xen/tasklet.h>
+ #include <xen/guest_access.h>
+ #include <xen/earlycpio.h>
++#include <xen/watchdog.h>
+ 
++#include <asm/delay.h>
+ #include <asm/msr.h>
+ #include <asm/processor.h>
+ #include <asm/setup.h>
+ #include <asm/microcode.h>
+ 
++/*
++ * Before performing a late microcode update on any thread, we
++ * rendezvous all cpus in stop_machine context. The timeout for
++ * waiting for cpu rendezvous is 30ms. It is the timeout used by
++ * live patching
++ */
++#define MICROCODE_CALLIN_TIMEOUT_US 30000
++
++/*
++ * Timeout for each thread to complete update is set to 1s. It is a
++ * conservative choice considering all possible interference (for
++ * instance, sometimes wbinvd takes relative long time). And a perfect
++ * timeout doesn't help a lot except an early shutdown.
++ */
++#define MICROCODE_UPDATE_TIMEOUT_US 1000000
++
+ static module_t __initdata ucode_mod;
+ static void *(*__initdata ucode_mod_map)(const module_t *);
+ static signed int __initdata ucode_mod_idx;
+@@ -189,6 +209,12 @@ static DEFINE_SPINLOCK(microcode_mutex);
+ 
+ DEFINE_PER_CPU(struct cpu_signature, cpu_sig);
+ 
++/*
++ * Count the CPUs that have entered and exited the rendezvous
++ * during late microcode update.
++ */
++static atomic_t cpu_in, cpu_out;
++
+ /*
+  * Save an ucode patch to the global cache list.
+  *
+@@ -285,25 +311,86 @@ static int microcode_update_cpu(void)
+     return ret;
+ }
+ 
+-static long do_microcode_update(void *unused)
++/* Wait for CPUs to rendezvous with a timeout (us) */
++static int wait_for_cpus(atomic_t *cnt, unsigned int expect,
++                         unsigned int timeout)
+ {
+-    int error, cpu;
++    while ( atomic_read(cnt) < expect )
++    {
++        if ( timeout <= 0 )
++        {
++            printk("CPU%d: Timeout when waiting for CPUs calling in\n",
++                   smp_processor_id());
++            return -EBUSY;
++        }
++        udelay(1);
++        timeout--;
++    }
++
++    return 0;
++}
+ 
+-    error = microcode_update_cpu();
+-    if ( error )
+-        return error;
++static int do_microcode_update(void *unused)
++{
++    unsigned int cpu = smp_processor_id();
++    unsigned int cpu_nr = num_online_cpus();
++    unsigned int finished;
++    int ret;
++    static bool error;
+ 
+-    cpu = cpumask_next(smp_processor_id(), &cpu_online_map);
+-    if ( cpu < nr_cpu_ids )
+-        return continue_hypercall_on_cpu(cpu, do_microcode_update, NULL);
+ 
+-    return error;
++    atomic_inc(&cpu_in);
++    ret = wait_for_cpus(&cpu_in, cpu_nr, MICROCODE_CALLIN_TIMEOUT_US);
++    if ( ret )
++        return ret;
++
++    /*
++     * Initiate an update on all processors which don't have an online sibling
++     * thread with a lower thread id. Other sibling threads just await the
++     * completion of microcode update.
++     */
++    if ( cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
++        ret = microcode_update_cpu();
++    /*
++     * Increase the wait timeout to a safe value here since we're serializing
++     * the microcode update and that could take a while on a large number of
++     * CPUs. And that is fine as the *actual* timeout will be determined by
++     * the last CPU finished updating and thus cut short
++     */
++    atomic_inc(&cpu_out);
++    finished = atomic_read(&cpu_out);
++    while ( !error && finished != cpu_nr )
++    {
++        /*
++         * During each timeout interval, at least a CPU is expected to
++         * finish its update. Otherwise, something goes wrong.
++         */
++        if ( wait_for_cpus(&cpu_out, finished + 1,
++                           MICROCODE_UPDATE_TIMEOUT_US) && !error )
++        {
++            error = true;
++            panic("Timeout when finishing updating microcode (finished %d/%d)",
++                  finished, cpu_nr);
++        }
++
++        finished = atomic_read(&cpu_out);
++    }
++
++    /*
++     * Refresh CPU signature (revision) on threads which didn't call
++     * apply_microcode().
++     */
++    if ( cpu != cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
++        ret = microcode_ops->collect_cpu_info(&this_cpu(cpu_sig));
++
++    return ret;
+ }
+ 
+ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+ {
+     int ret;
+     void *buffer;
++    unsigned int cpu, nr_cores;
+ 
+     if ( len != (uint32_t)len )
+         return -E2BIG;
+@@ -324,11 +411,18 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+         goto free;
+     }
+ 
++    /* cpu_online_map must not change during update */
++    if ( !get_cpu_maps() )
++    {
++        ret = -EBUSY;
++        goto free;
++    }
++
+     if ( microcode_ops->start_update )
+     {
+         ret = microcode_ops->start_update();
+         if ( ret != 0 )
+-            goto free;
++            goto put;
+     }
+ 
+     ret = microcode_parse_blob(buffer, len);
+@@ -336,12 +430,41 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+     {
+         printk(XENLOG_ERR "No valid or newer ucode found. Update abort!\n");
+         ret = -EINVAL;
+-        goto free;
++        goto put;
+     }
+ 
+-    return continue_hypercall_on_cpu(cpumask_first(&cpu_online_map),
+-                                     do_microcode_update, NULL);
++    atomic_set(&cpu_in, 0);
++    atomic_set(&cpu_out, 0);
++
++    /* Calculate the number of online CPU core */
++    nr_cores = 0;
++    for_each_online_cpu(cpu)
++        if ( cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
++            nr_cores++;
++
++    printk(XENLOG_INFO "%d cores are to update their microcode\n", nr_cores);
++
++    /*
++     * We intend to disable interrupt for long time, which may lead to
++     * watchdog timeout.
++     */
++    watchdog_disable();
++    /*
++     * Late loading dance. Why the heavy-handed stop_machine effort?
++     *
++     * - HT siblings must be idle and not execute other code while the other
++     *   sibling is loading microcode in order to avoid any negative
++     *   interactions cause by the loading.
++     *
++     * - In addition, microcode update on the cores must be serialized until
++     *   this requirement can be relaxed in the future. Right now, this is
++     *   conservative and good.
++     */
++    ret = stop_machine_run(do_microcode_update, NULL, NR_CPUS);
++    watchdog_enable();
+ 
++ put:
++    put_cpu_maps();
+  free:
+     xfree(buffer);
+     return ret;

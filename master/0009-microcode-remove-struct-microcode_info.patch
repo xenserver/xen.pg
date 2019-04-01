@@ -1,0 +1,136 @@
+From 6f6f3c1543fd7719bf17526f1c3a02972ad42c12 Mon Sep 17 00:00:00 2001
+From: Chao Gao <chao.gao@intel.com>
+Date: Mon, 11 Mar 2019 15:57:33 +0800
+Subject: [PATCH 09/12] microcode: remove struct microcode_info
+
+Struct microcode_info is useless now. microcode pointer and size inside
+it were passed to other CPUs to parse microcode locally. Now, parsing
+microcode blob is done on one of CPUs. Other CPUs needn't parse the
+microcode blob; the pointer and size can be removed.
+
+The 'cpu' field is also redundent because it always can be inferred from
+current cpu id.
+
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+---
+ xen/arch/x86/microcode.c | 62 ++++++++++++++++------------------------
+ 1 file changed, 25 insertions(+), 37 deletions(-)
+
+diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
+index f0ee8d9399..1b7e79e496 100644
+--- a/xen/arch/x86/microcode.c
++++ b/xen/arch/x86/microcode.c
+@@ -188,13 +188,6 @@ static DEFINE_SPINLOCK(microcode_mutex);
+ 
+ DEFINE_PER_CPU(struct cpu_signature, cpu_sig);
+ 
+-struct microcode_info {
+-    unsigned int cpu;
+-    uint32_t buffer_size;
+-    int error;
+-    char buffer[1];
+-};
+-
+ /*
+  * Save an ucode patch to the global cache list.
+  *
+@@ -291,30 +284,25 @@ static int microcode_update_cpu(void)
+     return ret;
+ }
+ 
+-static long do_microcode_update(void *_info)
++static long do_microcode_update(void *unused)
+ {
+-    struct microcode_info *info = _info;
+-    int error;
+-
+-    BUG_ON(info->cpu != smp_processor_id());
++    int error, cpu;
+ 
+     error = microcode_update_cpu();
+     if ( error )
+-        info->error = error;
++        return error;
+ 
+-    info->cpu = cpumask_next(info->cpu, &cpu_online_map);
+-    if ( info->cpu < nr_cpu_ids )
+-        return continue_hypercall_on_cpu(info->cpu, do_microcode_update, info);
++    cpu = cpumask_next(smp_processor_id(), &cpu_online_map);
++    if ( cpu < nr_cpu_ids )
++        return continue_hypercall_on_cpu(cpu, do_microcode_update, NULL);
+ 
+-    error = info->error;
+-    xfree(info);
+     return error;
+ }
+ 
+ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+ {
+     int ret;
+-    struct microcode_info *info;
++    void *buffer;
+ 
+     if ( len != (uint32_t)len )
+         return -E2BIG;
+@@ -322,40 +310,40 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+     if ( microcode_ops == NULL )
+         return -EINVAL;
+ 
+-    info = xmalloc_bytes(sizeof(*info) + len);
+-    if ( info == NULL )
+-        return -ENOMEM;
++    buffer = xmalloc_bytes(len);
++    if ( !buffer )
++    {
++        ret = -ENOMEM;
++        goto free;
++    }
+ 
+-    ret = copy_from_guest(info->buffer, buf, len);
+-    if ( ret != 0 )
++    if ( copy_from_guest(buffer, buf, len) )
+     {
+-        xfree(info);
+-        return ret;
++        ret = -EFAULT;
++        goto free;
+     }
+ 
+     if ( microcode_ops->start_update )
+     {
+         ret = microcode_ops->start_update();
+         if ( ret != 0 )
+-        {
+-            xfree(info);
+-            return ret;
+-        }
++            goto free;
+     }
+ 
+-    ret = microcode_parse_blob(info->buffer, len);
++    ret = microcode_parse_blob(buffer, len);
+     if ( ret <= 0 )
+     {
+         printk(XENLOG_ERR "No valid or newer ucode found. Update abort!\n");
+-        xfree(info);
+-        return -EINVAL;
++        ret = -EINVAL;
++        goto free;
+     }
+ 
+-    info->buffer_size = len;
+-    info->error = 0;
+-    info->cpu = cpumask_first(&cpu_online_map);
++    return continue_hypercall_on_cpu(cpumask_first(&cpu_online_map),
++                                     do_microcode_update, NULL);
+ 
+-    return continue_hypercall_on_cpu(info->cpu, do_microcode_update, info);
++ free:
++    xfree(buffer);
++    return ret;
+ }
+ 
+ static int __init microcode_init(void)
+-- 
+2.17.1
+

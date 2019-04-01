@@ -1,0 +1,539 @@
+From 7aa5493c922764a747019f54b8144c1324e7e2f3 Mon Sep 17 00:00:00 2001
+From: Chao Gao <chao.gao@intel.com>
+Date: Mon, 11 Mar 2019 15:57:30 +0800
+Subject: [PATCH 06/12] microcode: remove struct ucode_cpu_info
+
+We can remove the per-cpu cache field in struct ucode_cpu_info since
+it has been replaced by a global cache. It would leads to only one field
+remaining in ucode_cpu_info. Then, this struct is removed and the
+remaining field (cpu signature) is stored in per-cpu area.
+
+Also remove 'microcode_resume_match' from microcode_ops because the
+check is done in find_patch(). The cpu status notifier is also
+removed. It was used to free the "mc" field to avoid memory leak.
+
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
+index 995e986a41..9b1e84ccb3 100644
+--- a/xen/arch/x86/microcode.c
++++ b/xen/arch/x86/microcode.c
+@@ -187,7 +187,7 @@ const struct microcode_ops *microcode_ops;
+ 
+ static DEFINE_SPINLOCK(microcode_mutex);
+ 
+-DEFINE_PER_CPU(struct ucode_cpu_info, ucode_cpu_info);
++DEFINE_PER_CPU(struct cpu_signature, cpu_sig);
+ 
+ struct microcode_info {
+     unsigned int cpu;
+@@ -196,21 +196,6 @@ struct microcode_info {
+     char buffer[1];
+ };
+ 
+-static void __microcode_fini_cpu(unsigned int cpu)
+-{
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu);
+-
+-    xfree(uci->mc.mc_valid);
+-    memset(uci, 0, sizeof(*uci));
+-}
+-
+-static void microcode_fini_cpu(unsigned int cpu)
+-{
+-    spin_lock(&microcode_mutex);
+-    __microcode_fini_cpu(cpu);
+-    spin_unlock(&microcode_mutex);
+-}
+-
+ /*
+  * Save an ucode patch to the global cache list.
+  *
+@@ -280,52 +265,16 @@ const struct microcode_patch *microcode_find_patch(void)
+ int microcode_resume_cpu(unsigned int cpu)
+ {
+     int err;
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu);
+-    struct cpu_signature nsig;
+-    unsigned int cpu2;
++    struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+ 
+     if ( !microcode_ops )
+         return 0;
+ 
+     spin_lock(&microcode_mutex);
+ 
+-    err = microcode_ops->collect_cpu_info(cpu, &uci->cpu_sig);
+-    if ( err )
+-    {
+-        __microcode_fini_cpu(cpu);
+-        spin_unlock(&microcode_mutex);
+-        return err;
+-    }
+-
+-    if ( uci->mc.mc_valid )
+-    {
+-        err = microcode_ops->microcode_resume_match(cpu, uci->mc.mc_valid);
+-        if ( err >= 0 )
+-        {
+-            if ( err )
+-                err = microcode_ops->apply_microcode(cpu);
+-            spin_unlock(&microcode_mutex);
+-            return err;
+-        }
+-    }
+-
+-    nsig = uci->cpu_sig;
+-    __microcode_fini_cpu(cpu);
+-    uci->cpu_sig = nsig;
+-
+-    err = -EIO;
+-    for_each_online_cpu ( cpu2 )
+-    {
+-        uci = &per_cpu(ucode_cpu_info, cpu2);
+-        if ( uci->mc.mc_valid &&
+-             microcode_ops->microcode_resume_match(cpu, uci->mc.mc_valid) > 0 )
+-        {
+-            err = microcode_ops->apply_microcode(cpu);
+-            break;
+-        }
+-    }
+-
+-    __microcode_fini_cpu(cpu);
++    err = microcode_ops->collect_cpu_info(cpu, sig);
++    if ( likely(!err) )
++        err = microcode_ops->apply_microcode(cpu);
+     spin_unlock(&microcode_mutex);
+ 
+     return err;
+@@ -335,16 +284,13 @@ static int microcode_update_cpu(const void *buf, size_t size)
+ {
+     int err;
+     unsigned int cpu = smp_processor_id();
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu);
++    struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+ 
+     spin_lock(&microcode_mutex);
+ 
+-    err = microcode_ops->collect_cpu_info(cpu, &uci->cpu_sig);
++    err = microcode_ops->collect_cpu_info(cpu, sig);
+     if ( likely(!err) )
+         err = microcode_ops->cpu_request_microcode(cpu, buf, size);
+-    else
+-        __microcode_fini_cpu(cpu);
+-
+     spin_unlock(&microcode_mutex);
+ 
+     return err;
+@@ -431,25 +377,6 @@ static int __init microcode_init(void)
+ }
+ __initcall(microcode_init);
+ 
+-static int microcode_percpu_callback(
+-    struct notifier_block *nfb, unsigned long action, void *hcpu)
+-{
+-    unsigned int cpu = (unsigned long)hcpu;
+-
+-    switch ( action )
+-    {
+-    case CPU_DEAD:
+-        microcode_fini_cpu(cpu);
+-        break;
+-    }
+-
+-    return NOTIFY_DONE;
+-}
+-
+-static struct notifier_block microcode_percpu_nfb = {
+-    .notifier_call = microcode_percpu_callback,
+-};
+-
+ int __init early_microcode_update_cpu(bool_t start_update)
+ {
+     int rc = 0;
+@@ -493,12 +420,8 @@ int __init early_microcode_init(void)
+         return rc;
+ 
+     if ( microcode_ops )
+-    {
+         if ( ucode_mod.mod_end || ucode_blob.size )
+             rc = early_microcode_update_cpu(1);
+ 
+-        register_cpu_notifier(&microcode_percpu_nfb);
+-    }
+-
+     return 0;
+ }
+diff --git a/xen/arch/x86/microcode_amd.c b/xen/arch/x86/microcode_amd.c
+index 5b41ad45cc..f60a98c0c2 100644
+--- a/xen/arch/x86/microcode_amd.c
++++ b/xen/arch/x86/microcode_amd.c
+@@ -156,7 +156,7 @@ static bool_t find_equiv_cpu_id(const struct equiv_cpu_entry *equiv_cpu_table,
+ static bool_t microcode_fits(const struct microcode_amd *mc_amd,
+                              unsigned int cpu)
+ {
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu);
++    const struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+     const struct microcode_header_amd *mc_header = mc_amd->mpb;
+     const struct equiv_cpu_entry *equiv_cpu_table = mc_amd->equiv_cpu_table;
+     unsigned int current_cpu_id;
+@@ -179,14 +179,14 @@ static bool_t microcode_fits(const struct microcode_amd *mc_amd,
+         return 0;
+     }
+ 
+-    if ( mc_header->patch_id <= uci->cpu_sig.rev )
++    if ( mc_header->patch_id <= sig->rev )
+     {
+         pr_debug("microcode: patch is already at required level or greater.\n");
+         return 0;
+     }
+ 
+     pr_debug("microcode: CPU%d found a matching microcode update with version %#x (current=%#x)\n",
+-             cpu, mc_header->patch_id, uci->cpu_sig.rev);
++             cpu, mc_header->patch_id, sig->rev);
+ 
+     return 1;
+ }
+@@ -255,11 +255,11 @@ static enum microcode_match_result compare_patch(
+ static int apply_microcode(unsigned int cpu)
+ {
+     unsigned long flags;
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu);
+     uint32_t rev;
+     const struct microcode_header_amd *hdr;
+     const struct microcode_patch *patch;
+     int hw_err;
++    struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+ 
+     /* We should bind the task to the CPU */
+     BUG_ON(raw_smp_processor_id() != cpu);
+@@ -288,9 +288,9 @@ static int apply_microcode(unsigned int cpu)
+     }
+ 
+     printk(KERN_WARNING "microcode: CPU%d updated from revision %#x to %#x\n",
+-           cpu, uci->cpu_sig.rev, hdr->patch_id);
++           cpu, sig->rev, hdr->patch_id);
+ 
+-    uci->cpu_sig.rev = rev;
++    sig->rev = rev;
+ 
+     return 0;
+ }
+@@ -436,14 +436,14 @@ static bool_t check_final_patch_levels(unsigned int cpu)
+      * any of the 'final_levels', then we should not update the microcode
+      * patch on the cpu as system will hang otherwise.
+      */
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu);
++    const struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+     unsigned int i;
+ 
+     if ( boot_cpu_data.x86 != 0x10 )
+         return 0;
+ 
+     for ( i = 0; i < ARRAY_SIZE(final_levels); i++ )
+-        if ( uci->cpu_sig.rev == final_levels[i] )
++        if ( sig->rev == final_levels[i] )
+             return 1;
+ 
+     return 0;
+@@ -452,13 +452,12 @@ static bool_t check_final_patch_levels(unsigned int cpu)
+ static int cpu_request_microcode(unsigned int cpu, const void *buf,
+                                  size_t bufsize)
+ {
+-    struct microcode_amd *mc_amd, *mc_old;
++    struct microcode_amd *mc_amd;
+     size_t offset = 0;
+-    size_t last_offset, applied_offset = 0;
+-    int error = 0, save_error = 1;
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu);
++    int error = 0;
+     unsigned int current_cpu_id;
+     unsigned int equiv_cpu_id;
++    const struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+ 
+     /* We should bind the task to the CPU */
+     BUG_ON(cpu != raw_smp_processor_id());
+@@ -527,7 +526,7 @@ static int cpu_request_microcode(unsigned int cpu, const void *buf,
+         {
+             printk(KERN_ERR "microcode: CPU%d incorrect or corrupt container file\n"
+                    "microcode: Failed to update patch level. "
+-                   "Current lvl:%#x\n", cpu, uci->cpu_sig.rev);
++                   "Current lvl:%#x\n", cpu, sig->rev);
+             break;
+         }
+     }
+@@ -538,17 +537,12 @@ static int cpu_request_microcode(unsigned int cpu, const void *buf,
+         goto out;
+     }
+ 
+-    mc_old = uci->mc.mc_amd;
+-    /* implicitely validates uci->mc.mc_valid */
+-    uci->mc.mc_amd = mc_amd;
+-
+     /*
+      * It's possible the data file has multiple matching ucode,
+      * lets keep searching till the latest version
+      */
+     mc_amd->mpb = NULL;
+     mc_amd->mpb_size = 0;
+-    last_offset = offset;
+     while ( (error = get_ucode_from_buffer_amd(mc_amd, buf, bufsize,
+                                                &offset)) == 0 )
+     {
+@@ -571,11 +565,8 @@ static int cpu_request_microcode(unsigned int cpu, const void *buf,
+             error = apply_microcode(cpu);
+             if ( error )
+                 break;
+-            applied_offset = last_offset;
+         }
+ 
+-        last_offset = offset;
+-
+         if ( offset >= bufsize )
+             break;
+ 
+@@ -604,26 +595,6 @@ static int cpu_request_microcode(unsigned int cpu, const void *buf,
+             break;
+     }
+ 
+-    /* On success keep the microcode patch for
+-     * re-apply on resume.
+-     */
+-    if ( applied_offset )
+-    {
+-        save_error = get_ucode_from_buffer_amd(
+-            mc_amd, buf, bufsize, &applied_offset);
+-
+-        if ( save_error )
+-            error = save_error;
+-    }
+-
+-    if ( save_error )
+-    {
+-        xfree(mc_amd);
+-        uci->mc.mc_amd = mc_old;
+-    }
+-    else
+-        xfree(mc_old);
+-
+   out:
+     svm_host_osvw_init();
+ 
+@@ -636,52 +607,6 @@ static int cpu_request_microcode(unsigned int cpu, const void *buf,
+     return error;
+ }
+ 
+-static int microcode_resume_match(unsigned int cpu, const void *mc)
+-{
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu);
+-    struct microcode_amd *mc_amd = uci->mc.mc_amd;
+-    const struct microcode_amd *src = mc;
+-
+-    if ( !microcode_fits(src, cpu) )
+-        return 0;
+-
+-    if ( src != mc_amd )
+-    {
+-        if ( mc_amd )
+-        {
+-            xfree(mc_amd->equiv_cpu_table);
+-            xfree(mc_amd->mpb);
+-            xfree(mc_amd);
+-        }
+-
+-        mc_amd = xmalloc(struct microcode_amd);
+-        uci->mc.mc_amd = mc_amd;
+-        if ( !mc_amd )
+-            return -ENOMEM;
+-        mc_amd->equiv_cpu_table = xmalloc_bytes(src->equiv_cpu_table_size);
+-        if ( !mc_amd->equiv_cpu_table )
+-            goto err1;
+-        mc_amd->mpb = xmalloc_bytes(src->mpb_size);
+-        if ( !mc_amd->mpb )
+-            goto err2;
+-
+-        mc_amd->equiv_cpu_table_size = src->equiv_cpu_table_size;
+-        mc_amd->mpb_size = src->mpb_size;
+-        memcpy(mc_amd->mpb, src->mpb, src->mpb_size);
+-        memcpy(mc_amd->equiv_cpu_table, src->equiv_cpu_table,
+-               src->equiv_cpu_table_size);
+-    }
+-
+-    return 1;
+-
+-err2:
+-    xfree(mc_amd->equiv_cpu_table);
+-err1:
+-    xfree(mc_amd);
+-    uci->mc.mc_amd = NULL;
+-    return -ENOMEM;
+-}
+-
+ static int start_update(void)
+ {
+     /*
+@@ -699,7 +624,6 @@ static int start_update(void)
+ }
+ 
+ static const struct microcode_ops microcode_amd_ops = {
+-    .microcode_resume_match           = microcode_resume_match,
+     .cpu_request_microcode            = cpu_request_microcode,
+     .collect_cpu_info                 = collect_cpu_info,
+     .apply_microcode                  = apply_microcode,
+diff --git a/xen/arch/x86/microcode_intel.c b/xen/arch/x86/microcode_intel.c
+index 98b599d9c3..f6f29ffaf5 100644
+--- a/xen/arch/x86/microcode_intel.c
++++ b/xen/arch/x86/microcode_intel.c
+@@ -163,11 +163,10 @@ static enum microcode_match_result microcode_update_match(
+ 
+ static bool match_cpu(const struct microcode_patch *patch)
+ {
+-    struct ucode_cpu_info *uci = &this_cpu(ucode_cpu_info);
+-    int ret = microcode_update_match(patch->data, uci->cpu_sig.sig,
+-                                     uci->cpu_sig.pf, uci->cpu_sig.rev);
++    const struct cpu_signature *sig = &this_cpu(cpu_sig);
+ 
+-    return ret == NEW_UCODE;
++    return microcode_update_match(patch->data, sig->sig, sig->pf, sig->rev) ==
++               NEW_UCODE;
+ }
+ 
+ /*
+@@ -179,8 +178,7 @@ static bool match_cpu(const struct microcode_patch *patch)
+  */
+ static bool is_patch_compatible(const struct microcode_patch *patch)
+ {
+-    struct ucode_cpu_info *uci = &this_cpu(ucode_cpu_info);
+-    const struct cpu_signature *csig = &uci->cpu_sig;
++    const struct cpu_signature *csig = &this_cpu(cpu_sig);
+     const struct microcode_header_intel *mc_header = patch->data;
+     const struct extended_sigtable *ext_header;
+     const struct extended_signature *ext_sig;
+@@ -314,7 +312,7 @@ static enum microcode_match_result compare_patch(
+  */
+ static int get_matching_microcode(const void *mc, unsigned int cpu)
+ {
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu);
++    const struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+     const struct microcode_header_intel *mc_header = mc;
+     unsigned long total_size = get_totalsize(mc_header);
+     void *new_mc = xmalloc_bytes(total_size);
+@@ -337,23 +335,12 @@ static int get_matching_microcode(const void *mc, unsigned int cpu)
+     if ( !microcode_save_patch(microcode_patch) )
+         return 0;
+ 
+-    if ( microcode_update_match(mc, uci->cpu_sig.sig, uci->cpu_sig.pf,
+-                                uci->cpu_sig.rev) != NEW_UCODE )
++    if ( microcode_update_match(mc, sig->sig, sig->pf, sig->rev) != NEW_UCODE )
+         return 0;
+ 
+     pr_debug("microcode: CPU%d found a matching microcode update with"
+              " version %#x (current=%#x)\n",
+-             cpu, mc_header->rev, uci->cpu_sig.rev);
+-    new_mc = xmalloc_bytes(total_size);
+-    if ( new_mc == NULL )
+-    {
+-        printk(KERN_ERR "microcode: error! Can not allocate memory\n");
+-        return -ENOMEM;
+-    }
+-
+-    memcpy(new_mc, mc, total_size);
+-    xfree(uci->mc.mc_intel);
+-    uci->mc.mc_intel = new_mc;
++             cpu, mc_header->rev, sig->rev);
+     return 1;
+ }
+ 
+@@ -363,7 +350,7 @@ static int apply_microcode(unsigned int cpu)
+     uint64_t msr_content;
+     unsigned int val[2];
+     unsigned int cpu_num = raw_smp_processor_id();
+-    struct ucode_cpu_info *uci = &per_cpu(ucode_cpu_info, cpu_num);
++    struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+     const struct microcode_intel *mc_intel;
+     const struct microcode_patch *patch;
+ 
+@@ -395,16 +382,16 @@ static int apply_microcode(unsigned int cpu)
+     {
+         printk(KERN_ERR "microcode: CPU%d update from revision "
+                "%#x to %#x failed. Resulting revision is %#x.\n", cpu_num,
+-               uci->cpu_sig.rev, mc_intel->hdr.rev, val[1]);
++               sig->rev, mc_intel->hdr.rev, val[1]);
+         return -EIO;
+     }
+     printk(KERN_INFO "microcode: CPU%d updated from revision "
+            "%#x to %#x, date = %04x-%02x-%02x \n",
+-           cpu_num, uci->cpu_sig.rev, val[1],
++           cpu_num, sig->rev, val[1],
+            mc_intel->hdr.year,
+            mc_intel->hdr.month,
+            mc_intel->hdr.day);
+-    uci->cpu_sig.rev = val[1];
++    sig->rev = val[1];
+ 
+     return 0;
+ }
+@@ -478,13 +465,7 @@ static int cpu_request_microcode(unsigned int cpu, const void *buf,
+     return error;
+ }
+ 
+-static int microcode_resume_match(unsigned int cpu, const void *mc)
+-{
+-    return get_matching_microcode(mc, cpu);
+-}
+-
+ static const struct microcode_ops microcode_intel_ops = {
+-    .microcode_resume_match           = microcode_resume_match,
+     .cpu_request_microcode            = cpu_request_microcode,
+     .collect_cpu_info                 = collect_cpu_info,
+     .apply_microcode                  = apply_microcode,
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index 5a1d5e6d35..fbac5ab904 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -338,7 +338,7 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+ /* Calculate whether Retpoline is known-safe on this CPU. */
+ static bool_t __init retpoline_safe(uint64_t caps)
+ {
+-    unsigned int ucode_rev = this_cpu(ucode_cpu_info).cpu_sig.rev;
++    unsigned int ucode_rev = this_cpu(cpu_sig).rev;
+ 
+     if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
+         return 1;
+diff --git a/xen/include/asm-x86/microcode.h b/xen/include/asm-x86/microcode.h
+index 92631b4b56..23fc19b639 100644
+--- a/xen/include/asm-x86/microcode.h
++++ b/xen/include/asm-x86/microcode.h
+@@ -11,7 +11,6 @@ enum microcode_match_result {
+ };
+ 
+ struct cpu_signature;
+-struct ucode_cpu_info;
+ 
+ struct microcode_patch {
+     struct list_head list;
+@@ -19,7 +18,6 @@ struct microcode_patch {
+ };
+ 
+ struct microcode_ops {
+-    int (*microcode_resume_match)(unsigned int cpu, const void *mc);
+     int (*cpu_request_microcode)(unsigned int cpu, const void *buf,
+                                  size_t size);
+     int (*collect_cpu_info)(unsigned int cpu, struct cpu_signature *csig);
+@@ -38,16 +36,7 @@ struct cpu_signature {
+     unsigned int rev;
+ };
+ 
+-struct ucode_cpu_info {
+-    struct cpu_signature cpu_sig;
+-    union {
+-        struct microcode_intel *mc_intel;
+-        struct microcode_amd *mc_amd;
+-        void *mc_valid;
+-    } mc;
+-};
+-
+-DECLARE_PER_CPU(struct ucode_cpu_info, ucode_cpu_info);
++DECLARE_PER_CPU(struct cpu_signature, cpu_sig);
+ extern const struct microcode_ops *microcode_ops;
+ 
+ bool microcode_save_patch(struct microcode_patch *new_patch);
