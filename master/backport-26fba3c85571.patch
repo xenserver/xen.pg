@@ -1,10 +1,7 @@
-From 2610f5c07490a38f1b9d22752ecb392f275abdc0 Mon Sep 17 00:00:00 2001
+From 26fba3c85571354ecb1a1a3dde77fb38633515d3 Mon Sep 17 00:00:00 2001
 From: Paul Durrant <paul.durrant@citrix.com>
-Date: Thu, 20 Dec 2018 13:57:24 +0000
-Subject: [PATCH v9 10/11] viridian: add implementation of synthetic timers
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Tue, 19 Mar 2019 16:29:00 +0100
+Subject: [PATCH] viridian: add implementation of synthetic timers
 
 This patch introduces an implementation of the STIMER0-15_CONFIG/COUNT MSRs
 and hence a the first SynIC message source.
@@ -27,6 +24,7 @@ NOTE: It is necessary for correct operation that timer expiration and
 
 Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
 Acked-by: Wei Liu <wei.liu2@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
 diff --git a/tools/libxl/libxl.h b/tools/libxl/libxl.h
 index 1b6bfef..d20faae 100644
 --- a/tools/libxl/libxl.h
@@ -173,7 +171,7 @@ index 7409f22..34310df 100644
  
  bool viridian_synic_is_auto_eoi_sint(const struct vcpu *v,
 diff --git a/xen/arch/x86/hvm/viridian/time.c b/xen/arch/x86/hvm/viridian/time.c
-index 71291d9..8b1a392 100644
+index 71291d9..ef7035c 100644
 --- a/xen/arch/x86/hvm/viridian/time.c
 +++ b/xen/arch/x86/hvm/viridian/time.c
 @@ -8,10 +8,12 @@
@@ -201,22 +199,16 @@ index 71291d9..8b1a392 100644
  
      if ( initialize )
          clear_page(p);
-@@ -57,8 +61,12 @@ static void update_reference_tsc(struct domain *d, bool initialize)
-          */
-         p->TscSequence = 0;
+@@ -59,6 +63,8 @@ static void update_reference_tsc(struct domain *d, bool initialize)
  
--        printk(XENLOG_G_INFO "d%d: VIRIDIAN REFERENCE_TSC: invalidated\n",
--               d->domain_id);
-+        printk(XENLOG_G_INFO "d%d: VIRIDIAN REFERENCE_TSC: invalidated %s%s\n",
-+               d->domain_id,
-+               host_tsc_is_safe() ? "[host tsc not safe]" : "",
-+               d->arch.vtsc ? "[guest tsc is emulated]" : "");
+         printk(XENLOG_G_INFO "d%d: VIRIDIAN REFERENCE_TSC: invalidated\n",
+                d->domain_id);
 +
 +        vd->reference_tsc_valid = false;
          return;
      }
  
-@@ -72,11 +80,14 @@ static void update_reference_tsc(struct domain *d, bool initialize)
+@@ -72,11 +78,14 @@ static void update_reference_tsc(struct domain *d, bool initialize)
       * ticks per 100ns shifted left by 64.
       */
      p->TscScale = ((10000ul << 32) / d->arch.tsc_khz) << 32;
@@ -235,7 +227,7 @@ index 71291d9..8b1a392 100644
  }
  
  static int64_t raw_trc_val(const struct domain *d)
-@@ -118,18 +129,253 @@ static int64_t time_ref_count(const struct domain *d)
+@@ -118,18 +127,253 @@ static int64_t time_ref_count(const struct domain *d)
      return raw_trc_val(d) + trc->off;
  }
  
@@ -489,7 +481,7 @@ index 71291d9..8b1a392 100644
      struct domain *d = v->domain;
      struct viridian_domain *vd = d->arch.hvm.viridian;
  
-@@ -149,6 +395,61 @@ int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
+@@ -149,6 +393,61 @@ int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
          }
          break;
  
@@ -551,7 +543,7 @@ index 71291d9..8b1a392 100644
      default:
          gdprintk(XENLOG_INFO, "%s: unimplemented MSR %#x (%016"PRIx64")\n",
                   __func__, idx, val);
-@@ -160,6 +461,7 @@ int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
+@@ -160,6 +459,7 @@ int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
  
  int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
  {
@@ -559,7 +551,7 @@ index 71291d9..8b1a392 100644
      const struct domain *d = v->domain;
      struct viridian_domain *vd = d->arch.hvm.viridian;
  
-@@ -201,6 +503,38 @@ int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
+@@ -201,6 +501,46 @@ int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
          break;
      }
  
@@ -571,11 +563,19 @@ index 71291d9..8b1a392 100644
 +        unsigned int stimerx = (idx - HV_X64_MSR_STIMER0_CONFIG) / 2;
 +        const struct viridian_stimer *vs =
 +            &array_access_nospec(vv->stimer, stimerx);
++        union viridian_stimer_config_msr config = vs->config;
 +
 +        if ( !(viridian_feature_mask(d) & HVMPV_stimer) )
 +            return X86EMUL_EXCEPTION;
 +
-+        *val = vs->config.raw;
++        /*
++         * If the timer is single-shot and it has expired, make sure
++         * the enabled flag is clear.
++         */
++        if ( !config.periodic && test_bit(stimerx, &vv->stimer_pending) )
++            config.enabled = 0;
++
++        *val = config.raw;
 +        break;
 +    }
 +
@@ -598,7 +598,7 @@ index 71291d9..8b1a392 100644
      default:
          gdprintk(XENLOG_INFO, "%s: unimplemented MSR %#x\n", __func__, idx);
          return X86EMUL_EXCEPTION;
-@@ -209,8 +543,19 @@ int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
+@@ -209,8 +549,19 @@ int viridian_time_rdmsr(const struct vcpu *v, uint32_t idx, uint64_t *val)
      return X86EMUL_OKAY;
  }
  
@@ -619,7 +619,7 @@ index 71291d9..8b1a392 100644
      return 0;
  }
  
-@@ -221,6 +566,16 @@ int viridian_time_domain_init(const struct domain *d)
+@@ -221,6 +572,16 @@ int viridian_time_domain_init(const struct domain *d)
  
  void viridian_time_vcpu_deinit(const struct vcpu *v)
  {
@@ -636,7 +636,7 @@ index 71291d9..8b1a392 100644
  }
  
  void viridian_time_domain_deinit(const struct domain *d)
-@@ -231,11 +586,36 @@ void viridian_time_domain_deinit(const struct domain *d)
+@@ -231,11 +592,36 @@ void viridian_time_domain_deinit(const struct domain *d)
  void viridian_time_save_vcpu_ctxt(
      const struct vcpu *v, struct hvm_viridian_vcpu_context *ctxt)
  {
