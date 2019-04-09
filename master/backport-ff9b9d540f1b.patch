@@ -1,0 +1,214 @@
+From ff9b9d540f1bddab278daa103291a217270cc587 Mon Sep 17 00:00:00 2001
+From: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Date: Mon, 21 Jan 2019 12:13:22 +0100
+Subject: [PATCH] x86/vm_event: block interrupt injection for sync vm_events
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Block interrupts (in vmx_intr_assist()) for the duration of
+processing a sync vm_event (similarly to the strategy
+currently used for single-stepping). Otherwise, attempting
+to emulate an instruction when requested by a vm_event
+reply may legitimately need to call e.g.
+hvm_inject_page_fault(), which then overwrites the active
+interrupt in the VMCS.
+
+The sync vm_event handling path on x86/VMX is (roughly):
+monitor_traps() -> process vm_event -> vmx_intr_assist()
+(possibly writing VM_ENTRY_INTR_INFO) ->
+hvm_vm_event_do_resume() -> hvm_emulate_one_vm_event()
+(possibly overwriting the VM_ENTRY_INTR_INFO value).
+
+This patch may also be helpful for the future removal
+of may_defer in hvm_set_cr{0,3,4} and hvm_set_msr().
+
+Signed-off-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Acked-by: Tamas K Lengyel <tamas@tklengyel.com>
+Release-acked-by: Juergen Gross <jgross@suse.com>
+diff --git a/config/Paths.mk b/config/Paths.mk
+index 1952bb0..a8339ab 100644
+--- a/config/Paths.mk
++++ b/config/Paths.mk
+@@ -13,11 +13,11 @@
+ # http://wiki.xen.org/wiki/Category:Host_Configuration#System_wide_xen_configuration
+ 
+ PACKAGE_TARNAME          := xen
+-prefix                   := /usr
+-bindir                   := /usr/bin
+-sbindir                  := /usr/sbin
+-libdir                   := /usr/lib64
+-libexecdir               := /usr/libexec
++prefix                   := /usr/local
++bindir                   := /usr/local/bin
++sbindir                  := /usr/local/sbin
++libdir                   := /usr/local/lib
++libexecdir               := ${exec_prefix}/lib
+ datarootdir              := ${prefix}/share
+ mandir                   := ${datarootdir}/man
+ docdir                   := ${datarootdir}/doc/${PACKAGE_TARNAME}
+@@ -29,12 +29,12 @@ includedir               := ${prefix}/include
+ localstatedir            := /var
+ sysconfdir               := /etc
+ 
+-LIBEXEC                  := /usr/libexec/xen
+-LIBEXEC_BIN              := /usr/libexec/xen/bin
+-LIBEXEC_LIB              := /usr/libexec/xen/lib
+-LIBEXEC_INC              := /usr/libexec/xen/include
++LIBEXEC                  := /usr/local/lib/xen
++LIBEXEC_BIN              := /usr/local/lib/xen/bin
++LIBEXEC_LIB              := /usr/local/lib/xen/lib
++LIBEXEC_INC              := /usr/local/lib/xen/include
+ 
+-SHAREDIR                 := /usr/share
++SHAREDIR                 := /usr/local/share
+ MAN1DIR                  := $(mandir)/man1
+ MAN8DIR                  := $(mandir)/man8
+ 
+@@ -50,7 +50,7 @@ XEN_LOCK_DIR             := /var/lock
+ XEN_PAGING_DIR           := /var/lib/xen/xenpaging
+ XEN_DUMP_DIR             := /var/lib/xen/dump
+ 
+-XENFIRMWAREDIR           := /usr/libexec/xen/boot
++XENFIRMWAREDIR           := /usr/local/lib/xen/boot
+ 
+ XEN_CONFIG_DIR           := /etc/xen
+ XEN_SCRIPT_DIR           := /etc/xen/scripts
+diff --git a/config/Tools.mk b/config/Tools.mk
+index 130672b..5b845b5 100644
+--- a/config/Tools.mk
++++ b/config/Tools.mk
+@@ -21,7 +21,7 @@ LD86                := /usr/bin/ld86
+ BCC                 := /usr/bin/bcc
+ IASL                := /usr/bin/iasl
+ AWK                 := /usr/bin/awk
+-FETCHER             := /bin/false -c -O
++FETCHER             := /usr/bin/wget -c -O
+ SEABIOS_PATH        := 
+ OVMF_PATH           := 
+ 
+diff --git a/xen/arch/x86/hvm/svm/intr.c b/xen/arch/x86/hvm/svm/intr.c
+index bd94731..30171f3 100644
+--- a/xen/arch/x86/hvm/svm/intr.c
++++ b/xen/arch/x86/hvm/svm/intr.c
+@@ -33,6 +33,7 @@
+ #include <asm/hvm/svm/svm.h>
+ #include <asm/hvm/svm/intr.h>
+ #include <asm/hvm/nestedhvm.h> /* for nestedhvm_vcpu_in_guestmode */
++#include <asm/vm_event.h>
+ #include <xen/event.h>
+ #include <xen/kernel.h>
+ #include <public/hvm/ioreq.h>
+@@ -138,6 +139,10 @@ void svm_intr_assist(void)
+     struct hvm_intack intack;
+     enum hvm_intblk intblk;
+ 
++    /* Block event injection while handling a sync vm_event. */
++    if ( unlikely(v->arch.vm_event) && v->arch.vm_event->sync_event )
++        return;
++
+     /* Crank the handle on interrupt state. */
+     pt_update_irq(v);
+ 
+diff --git a/xen/arch/x86/hvm/vm_event.c b/xen/arch/x86/hvm/vm_event.c
+index d80b162..af10612 100644
+--- a/xen/arch/x86/hvm/vm_event.c
++++ b/xen/arch/x86/hvm/vm_event.c
+@@ -121,6 +121,8 @@ void hvm_vm_event_do_resume(struct vcpu *v)
+         hvm_set_cr3(w->cr3, 0);
+         w->do_write.cr3 = 0;
+     }
++
++    vm_event_sync_event(v, false);
+ }
+ 
+ /*
+diff --git a/xen/arch/x86/hvm/vmx/intr.c b/xen/arch/x86/hvm/vmx/intr.c
+index 893bd39..82616f1 100644
+--- a/xen/arch/x86/hvm/vmx/intr.c
++++ b/xen/arch/x86/hvm/vmx/intr.c
+@@ -37,6 +37,7 @@
+ #include <asm/hvm/nestedhvm.h>
+ #include <public/hvm/ioreq.h>
+ #include <asm/hvm/trace.h>
++#include <asm/vm_event.h>
+ 
+ /*
+  * A few notes on virtual NMI and INTR delivery, and interactions with
+@@ -239,6 +240,10 @@ void vmx_intr_assist(void)
+         return;
+     }
+ 
++    /* Block event injection while handling a sync vm_event. */
++    if ( unlikely(v->arch.vm_event) && v->arch.vm_event->sync_event )
++        return;
++
+     /* Crank the handle on interrupt state. */
+     if ( is_hvm_vcpu(v) )
+         pt_vector = pt_update_irq(v);
+diff --git a/xen/arch/x86/vm_event.c b/xen/arch/x86/vm_event.c
+index c65933f..4153f87 100644
+--- a/xen/arch/x86/vm_event.c
++++ b/xen/arch/x86/vm_event.c
+@@ -111,6 +111,11 @@ void vm_event_monitor_next_interrupt(struct vcpu *v)
+     v->arch.monitor.next_interrupt_enabled = 1;
+ }
+ 
++void vm_event_sync_event(struct vcpu *v, bool value)
++{
++    v->arch.vm_event->sync_event = value;
++}
++
+ void vm_event_fill_regs(vm_event_request_t *req)
+ {
+     const struct cpu_user_regs *regs = guest_cpu_user_regs();
+diff --git a/xen/common/vm_event.c b/xen/common/vm_event.c
+index 3d293c3..0da2960 100644
+--- a/xen/common/vm_event.c
++++ b/xen/common/vm_event.c
+@@ -816,6 +816,7 @@ int vm_event_monitor_traps(struct vcpu *v, uint8_t sync,
+     if ( sync )
+     {
+         req->flags |= VM_EVENT_FLAG_VCPU_PAUSED;
++        vm_event_sync_event(v, true);
+         vm_event_vcpu_pause(v);
+     }
+ 
+diff --git a/xen/include/asm-arm/vm_event.h b/xen/include/asm-arm/vm_event.h
+index cc16811..3bcdf84 100644
+--- a/xen/include/asm-arm/vm_event.h
++++ b/xen/include/asm-arm/vm_event.h
+@@ -74,4 +74,10 @@ void vm_event_monitor_next_interrupt(struct vcpu *v)
+     /* Not supported on ARM. */
+ }
+ 
++static inline
++void vm_event_sync_event(struct vcpu *v, bool value)
++{
++    /* Not supported on ARM. */
++}
++
+ #endif /* __ASM_ARM_VM_EVENT_H__ */
+diff --git a/xen/include/asm-x86/vm_event.h b/xen/include/asm-x86/vm_event.h
+index 5618b7c..38165cc 100644
+--- a/xen/include/asm-x86/vm_event.h
++++ b/xen/include/asm-x86/vm_event.h
+@@ -34,6 +34,8 @@ struct arch_vm_event {
+     struct monitor_write_data write_data;
+     struct vm_event_regs_x86 gprs;
+     bool_t set_gprs;
++    /* A sync vm_event has been sent and we're not done handling it. */
++    bool sync_event;
+ };
+ 
+ int vm_event_init_domain(struct domain *d);
+@@ -72,4 +74,6 @@ static inline uint32_t vm_event_monitor_get_capabilities(struct domain *d)
+     return capabilities;
+ }
+ 
++void vm_event_sync_event(struct vcpu *v, bool value);
++
+ #endif /* __ASM_X86_VM_EVENT_H__ */
