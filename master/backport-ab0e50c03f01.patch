@@ -1,0 +1,75 @@
+From ab0e50c03f01c51c091f232d1a096a90085c2a24 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 2 Apr 2019 14:21:56 +0100
+Subject: [PATCH] xen/cpu: Distinguish "cpu already in that state" in
+ cpu_{up,down}()
+
+All methods of querying the online state of a CPU are racy without the hotplug
+lock held, which can lead to a TOCTOU race trying to online or offline CPUs.
+
+Distinguish this case with -EEXIST rather than -EINVAL, so the caller can take
+other actions if necessary.
+
+While adjusting this, rework the code slightly to fold the exit paths, which
+results in a minor reduction in compiled code size.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/common/cpu.c b/xen/common/cpu.c
+index 653a56b..740cf49 100644
+--- a/xen/common/cpu.c
++++ b/xen/common/cpu.c
+@@ -90,11 +90,13 @@ int cpu_down(unsigned int cpu)
+     if ( !cpu_hotplug_begin() )
+         return -EBUSY;
+ 
+-    if ( (cpu >= nr_cpu_ids) || (cpu == 0) || !cpu_online(cpu) )
+-    {
+-        cpu_hotplug_done();
+-        return -EINVAL;
+-    }
++    err = -EINVAL;
++    if ( (cpu >= nr_cpu_ids) || (cpu == 0) )
++        goto out;
++
++    err = -EEXIST;
++    if ( !cpu_online(cpu) )
++        goto out;
+ 
+     notifier_rc = notifier_call_chain(&cpu_chain, CPU_DOWN_PREPARE, hcpu, &nb);
+     if ( notifier_rc != NOTIFY_DONE )
+@@ -121,6 +123,7 @@ int cpu_down(unsigned int cpu)
+  fail:
+     notifier_rc = notifier_call_chain(&cpu_chain, CPU_DOWN_FAILED, hcpu, &nb);
+     BUG_ON(notifier_rc != NOTIFY_DONE);
++ out:
+     cpu_hotplug_done();
+     return err;
+ }
+@@ -134,11 +137,13 @@ int cpu_up(unsigned int cpu)
+     if ( !cpu_hotplug_begin() )
+         return -EBUSY;
+ 
+-    if ( (cpu >= nr_cpu_ids) || cpu_online(cpu) || !cpu_present(cpu) )
+-    {
+-        cpu_hotplug_done();
+-        return -EINVAL;
+-    }
++    err = -EINVAL;
++    if ( (cpu >= nr_cpu_ids) || !cpu_present(cpu) )
++        goto out;
++
++    err = -EEXIST;
++    if ( cpu_online(cpu) )
++        goto out;
+ 
+     notifier_rc = notifier_call_chain(&cpu_chain, CPU_UP_PREPARE, hcpu, &nb);
+     if ( notifier_rc != NOTIFY_DONE )
+@@ -162,6 +167,7 @@ int cpu_up(unsigned int cpu)
+  fail:
+     notifier_rc = notifier_call_chain(&cpu_chain, CPU_UP_CANCELED, hcpu, &nb);
+     BUG_ON(notifier_rc != NOTIFY_DONE);
++ out:
+     cpu_hotplug_done();
+     return err;
+ }
