@@ -1,0 +1,204 @@
+From 350bc1a9d4ebc03b18a43cdafcb626618caace55 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 4 Aug 2016 10:52:49 +0200
+Subject: [PATCH] x86: support newer Intel CPU models
+
+... as per the June 2016 edition of the SDM.
+
+Also remove a couple of dead break statements as well as unused
+*MSR_PM_LASTBRANCH* #define-s.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Kevin Tian <kevin.tian@intel.com>
+diff --git a/xen/arch/x86/acpi/cpu_idle.c b/xen/arch/x86/acpi/cpu_idle.c
+index e76c675f72..450bbbcdc4 100644
+--- a/xen/arch/x86/acpi/cpu_idle.c
++++ b/xen/arch/x86/acpi/cpu_idle.c
+@@ -62,14 +62,14 @@
+ 
+ #define GET_HW_RES_IN_NS(msr, val) \
+     do { rdmsrl(msr, val); val = tsc_ticks2ns(val); } while( 0 )
+-#define GET_MC6_RES(val)  GET_HW_RES_IN_NS(0x664, val) /* Atom E3000 only */
++#define GET_MC6_RES(val)  GET_HW_RES_IN_NS(0x664, val)
+ #define GET_PC2_RES(val)  GET_HW_RES_IN_NS(0x60D, val) /* SNB onwards */
+ #define GET_PC3_RES(val)  GET_HW_RES_IN_NS(0x3F8, val)
+ #define GET_PC6_RES(val)  GET_HW_RES_IN_NS(0x3F9, val)
+ #define GET_PC7_RES(val)  GET_HW_RES_IN_NS(0x3FA, val)
+-#define GET_PC8_RES(val)  GET_HW_RES_IN_NS(0x630, val) /* some Haswells only */
+-#define GET_PC9_RES(val)  GET_HW_RES_IN_NS(0x631, val) /* some Haswells only */
+-#define GET_PC10_RES(val) GET_HW_RES_IN_NS(0x632, val) /* some Haswells only */
++#define GET_PC8_RES(val)  GET_HW_RES_IN_NS(0x630, val)
++#define GET_PC9_RES(val)  GET_HW_RES_IN_NS(0x631, val)
++#define GET_PC10_RES(val) GET_HW_RES_IN_NS(0x632, val)
+ #define GET_CC1_RES(val)  GET_HW_RES_IN_NS(0x660, val) /* Silvermont only */
+ #define GET_CC3_RES(val)  GET_HW_RES_IN_NS(0x3FC, val)
+ #define GET_CC6_RES(val)  GET_HW_RES_IN_NS(0x3FD, val)
+@@ -143,6 +143,8 @@ static void do_get_hw_residencies(void *arg)
+     {
+     /* 4th generation Intel Core (Haswell) */
+     case 0x45:
++    /* Xeon E5/E7 v4 (Broadwell) */
++    case 0x4F:
+         GET_PC8_RES(hw_res->pc8);
+         GET_PC9_RES(hw_res->pc9);
+         GET_PC10_RES(hw_res->pc10);
+@@ -159,10 +161,11 @@ static void do_get_hw_residencies(void *arg)
+     case 0x46:
+     /* Broadwell */
+     case 0x3D:
+-    case 0x4F:
++    case 0x47:
+     case 0x56:
+-    /* future */
++    /* Skylake */
+     case 0x4E:
++    case 0x5E:
+         GET_PC2_RES(hw_res->pc2);
+         GET_CC7_RES(hw_res->cc7);
+         /* fall through */
+@@ -199,18 +202,28 @@ static void do_get_hw_residencies(void *arg)
+         break;
+     /* Silvermont */
+     case 0x37:
+-        GET_MC6_RES(hw_res->mc6);
+-        /* fall through */
+     case 0x4A:
+     case 0x4D:
+     case 0x5A:
+     case 0x5D:
+     /* Airmont */
+     case 0x4C:
++        GET_MC6_RES(hw_res->mc6);
+         GET_PC7_RES(hw_res->pc6); /* abusing GET_PC7_RES */
+         GET_CC1_RES(hw_res->cc1);
+         GET_CC6_RES(hw_res->cc6);
+         break;
++    /* Goldmont */
++    case 0x5C:
++    case 0x5F:
++        GET_PC2_RES(hw_res->pc2);
++        GET_PC3_RES(hw_res->pc3);
++        GET_PC6_RES(hw_res->pc6);
++        GET_PC10_RES(hw_res->pc10);
++        GET_CC1_RES(hw_res->cc1);
++        GET_CC3_RES(hw_res->cc3);
++        GET_CC6_RES(hw_res->cc6);
++        break;
+     }
+ }
+ 
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index e3163b37e0..4ee76feeee 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -2657,6 +2657,14 @@ static const struct lbr_info {
+     { MSR_P4_LASTBRANCH_0_FROM_LIP, NUM_MSR_P4_LASTBRANCH_FROM_TO },
+     { MSR_P4_LASTBRANCH_0_TO_LIP,   NUM_MSR_P4_LASTBRANCH_FROM_TO },
+     { 0, 0 }
++}, sk_lbr[] = {
++    { MSR_IA32_LASTINTFROMIP,       1 },
++    { MSR_IA32_LASTINTTOIP,         1 },
++    { MSR_SKL_LASTBRANCH_TOS,       1 },
++    { MSR_SKL_LASTBRANCH_0_FROM_IP, NUM_MSR_SKL_LASTBRANCH },
++    { MSR_SKL_LASTBRANCH_0_TO_IP,   NUM_MSR_SKL_LASTBRANCH },
++    { MSR_SKL_LASTBRANCH_0_INFO,    NUM_MSR_SKL_LASTBRANCH },
++    { 0, 0 }
+ }, at_lbr[] = {
+     { MSR_IA32_LASTINTFROMIP,       1 },
+     { MSR_IA32_LASTINTTOIP,         1 },
+@@ -2664,6 +2672,13 @@ static const struct lbr_info {
+     { MSR_C2_LASTBRANCH_0_FROM_IP,  NUM_MSR_ATOM_LASTBRANCH_FROM_TO },
+     { MSR_C2_LASTBRANCH_0_TO_IP,    NUM_MSR_ATOM_LASTBRANCH_FROM_TO },
+     { 0, 0 }
++}, gm_lbr[] = {
++    { MSR_IA32_LASTINTFROMIP,       1 },
++    { MSR_IA32_LASTINTTOIP,         1 },
++    { MSR_GM_LASTBRANCH_TOS,        1 },
++    { MSR_GM_LASTBRANCH_0_FROM_IP,  NUM_MSR_GM_LASTBRANCH_FROM_TO },
++    { MSR_GM_LASTBRANCH_0_TO_IP,    NUM_MSR_GM_LASTBRANCH_FROM_TO },
++    { 0, 0 }
+ };
+ 
+ static const struct lbr_info *last_branch_msr_get(void)
+@@ -2678,7 +2693,6 @@ static const struct lbr_info *last_branch_msr_get(void)
+         /* Enhanced Core */
+         case 23:
+             return c2_lbr;
+-            break;
+         /* Nehalem */
+         case 26: case 30: case 31: case 46:
+         /* Westmere */
+@@ -2690,11 +2704,13 @@ static const struct lbr_info *last_branch_msr_get(void)
+         /* Haswell */
+         case 60: case 63: case 69: case 70:
+         /* Broadwell */
+-        case 61: case 79: case 86:
+-        /* future */
+-        case 78:
++        case 61: case 71: case 79: case 86:
+             return nh_lbr;
+-            break;
++        /* Skylake */
++        case 78: case 94:
++        /* future */
++        case 142: case 158:
++            return sk_lbr;
+         /* Atom */
+         case 28: case 38: case 39: case 53: case 54:
+         /* Silvermont */
+@@ -2704,7 +2720,9 @@ static const struct lbr_info *last_branch_msr_get(void)
+         /* Airmont */
+         case 76:
+             return at_lbr;
+-            break;
++        /* Goldmont */
++        case 92: case 95:
++            return gm_lbr;
+         }
+         break;
+ 
+@@ -2714,7 +2732,6 @@ static const struct lbr_info *last_branch_msr_get(void)
+         /* Pentium4/Xeon with em64t */
+         case 3: case 4: case 6:
+             return p4_lbr;
+-            break;
+         }
+         break;
+     }
+diff --git a/xen/include/asm-x86/msr-index.h b/xen/include/asm-x86/msr-index.h
+index c79ce7e537..600c927968 100644
+--- a/xen/include/asm-x86/msr-index.h
++++ b/xen/include/asm-x86/msr-index.h
+@@ -478,11 +478,6 @@
+ #define MSR_P4_LASTBRANCH_0_TO_LIP	0x000006c0
+ #define NUM_MSR_P4_LASTBRANCH_FROM_TO	16
+ 
+-/* Pentium M (and Core) last-branch recording */
+-#define MSR_PM_LASTBRANCH_TOS		0x000001c9
+-#define MSR_PM_LASTBRANCH_0		0x00000040
+-#define NUM_MSR_PM_LASTBRANCH		8
+-
+ /* Core 2 and Atom last-branch recording */
+ #define MSR_C2_LASTBRANCH_TOS		0x000001c9
+ #define MSR_C2_LASTBRANCH_0_FROM_IP	0x00000040
+@@ -490,6 +485,19 @@
+ #define NUM_MSR_C2_LASTBRANCH_FROM_TO	4
+ #define NUM_MSR_ATOM_LASTBRANCH_FROM_TO	8
+ 
++/* Skylake (and newer) last-branch recording */
++#define MSR_SKL_LASTBRANCH_TOS		0x000001c9
++#define MSR_SKL_LASTBRANCH_0_FROM_IP	0x00000680
++#define MSR_SKL_LASTBRANCH_0_TO_IP	0x000006c0
++#define MSR_SKL_LASTBRANCH_0_INFO	0x00000dc0
++#define NUM_MSR_SKL_LASTBRANCH		32
++
++/* Goldmont last-branch recording */
++#define MSR_GM_LASTBRANCH_TOS		0x000001c9
++#define MSR_GM_LASTBRANCH_0_FROM_IP	0x00000680
++#define MSR_GM_LASTBRANCH_0_TO_IP	0x000006c0
++#define NUM_MSR_GM_LASTBRANCH_FROM_TO	32
++
+ /* Intel Core-based CPU performance counters */
+ #define MSR_CORE_PERF_FIXED_CTR0	0x00000309
+ #define MSR_CORE_PERF_FIXED_CTR1	0x0000030a
