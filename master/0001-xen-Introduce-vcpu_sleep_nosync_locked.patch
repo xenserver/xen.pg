@@ -1,0 +1,57 @@
+From 4677ea3b2e0c0c7e79386dfe57af53a53147154a Mon Sep 17 00:00:00 2001
+From: George Dunlap <george.dunlap@citrix.com>
+Date: Wed, 2 May 2018 11:09:18 +0100
+Subject: [PATCH 1/2] xen: Introduce vcpu_sleep_nosync_locked()
+
+There are a lot of places which release a lock before calling
+vcpu_sleep_nosync(), which then just grabs the lock again.  This is
+not only a waste of time, but leads to more code duplication (since
+you have to copy-and-paste recipes rather than calling a unified
+function), which in turn leads to an increased chance of bugs.
+
+Introduce vcpu_sleep_nosync_locked(), which can be called if you
+already hold the schedule lock.
+
+Signed-off-by: George Dunlap <george.dunlap@citrix.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+Release-acked-by: Juergen Gross <jgross@suse.com>
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 74fb45c..4eef5a7 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -498,14 +498,9 @@ void sched_destroy_domain(struct domain *d)
+     cpupool_rm_domain(d);
+ }
+ 
+-void vcpu_sleep_nosync(struct vcpu *v)
++void vcpu_sleep_nosync_locked(struct vcpu *v)
+ {
+-    unsigned long flags;
+-    spinlock_t *lock;
+-
+-    TRACE_2D(TRC_SCHED_SLEEP, v->domain->domain_id, v->vcpu_id);
+-
+-    lock = vcpu_schedule_lock_irqsave(v, &flags);
++    ASSERT(spin_is_locked(per_cpu(schedule_data,v->processor).schedule_lock));
+ 
+     if ( likely(!vcpu_runnable(v)) )
+     {
+@@ -514,6 +509,18 @@ void vcpu_sleep_nosync(struct vcpu *v)
+ 
+         SCHED_OP(VCPU2OP(v), sleep, v);
+     }
++}
++
++void vcpu_sleep_nosync(struct vcpu *v)
++{
++    unsigned long flags;
++    spinlock_t *lock;
++
++    TRACE_2D(TRC_SCHED_SLEEP, v->domain->domain_id, v->vcpu_id);
++
++    lock = vcpu_schedule_lock_irqsave(v, &flags);
++
++    vcpu_sleep_nosync_locked(v);
+ 
+     vcpu_schedule_unlock_irqrestore(lock, flags, v);
+ }
