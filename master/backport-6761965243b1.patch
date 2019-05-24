@@ -1,0 +1,59 @@
+From 6761965243b113230bed900d6105be05b28f5cea Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Fri, 24 May 2019 10:30:21 +0200
+Subject: [PATCH] libacpi: report PCI slots as enabled only for hotpluggable
+ devices
+
+DSDT for qemu-xen lacks _STA method of PCI slot object. If _STA method
+doesn't exist then the slot is assumed to be always present and active
+which in conjunction with _EJ0 method makes every device ejectable for
+an OS even if it's not the case.
+
+qemu-kvm is able to dynamically add _EJ0 method only to those slots
+that either have hotpluggable devices or free for PCI passthrough.
+As Xen lacks this capability we cannot use their way.
+
+qemu-xen-traditional DSDT has _STA method which only reports that
+the slot is present if there is a PCI devices hotplugged there.
+This is done through querying of its PCI hotplug controller.
+qemu-xen has similar capability that reports if device is "hotpluggable
+or absent" which we can use to achieve the same result.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+---
+ tools/libacpi/mk_dsdt.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/tools/libacpi/mk_dsdt.c b/tools/libacpi/mk_dsdt.c
+index 2daf32c..c5ba4c0 100644
+--- a/tools/libacpi/mk_dsdt.c
++++ b/tools/libacpi/mk_dsdt.c
+@@ -439,9 +439,10 @@ int main(int argc, char **argv)
+             pop_block();
+         }
+     } else {
+-        stmt("OperationRegion", "SEJ, SystemIO, 0xae08, 0x04");
++        stmt("OperationRegion", "SEJ, SystemIO, 0xae08, 0x08");
+         push_block("Field", "SEJ, DWordAcc, NoLock, WriteAsZeros");
+         indent(); printf("B0EJ, 32,\n");
++        indent(); printf("B0RM, 32,\n");
+         pop_block();
+ 
+         /* hotplug_slot */
+@@ -452,6 +453,12 @@ int main(int argc, char **argv)
+                     stmt("Store", "%#010x, B0EJ", 1 << slot);
+                 } pop_block();
+                 stmt("Name", "_SUN, %i", slot);
++                push_block("Method", "_STA, 0"); {
++                    push_block("If", "And(B0RM, ShiftLeft(1, %i))", slot);
++                    stmt("Return", "0xF");
++                    pop_block();
++                    stmt("Return", "0x0");
++                } pop_block();
+             } pop_block();
+         }
+     }
+-- 
+2.7.4
+
