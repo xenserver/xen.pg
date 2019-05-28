@@ -1,0 +1,615 @@
+From 2eb32ce30fd1fb15c7bd0d137b64e592fb06bfe9 Mon Sep 17 00:00:00 2001
+From: Chao Gao <chao.gao@intel.com>
+Date: Mon, 27 May 2019 16:31:27 +0800
+Subject: [PATCH 06/10] microcode: split out apply_microcode() from
+ cpu_request_microcode()
+
+During late microcode update, apply_microcode() is invoked in
+cpu_request_microcode(). To make late microcode update more reliable,
+we want to put the apply_microcode() into stop_machine context. So
+we split out it from cpu_request_microcode(). As a consequence,
+apply_microcode() should be invoked explicitly in the common code.
+
+Previously, apply_microcode() gets the microcode patch to be applied from
+the microcode cache. Now, the patch is passed as a function argument and
+a patch is cached for cpu-hotplug and cpu resuming, only after it has
+been loaded to a cpu without any error. As a consequence, the
+'match_cpu' check in microcode_update_cache is removed, which otherwise
+would fail.
+
+Assuming that all CPUs have the same signature, one patch matching with
+current CPU should match with others. Then parsing microcode only needs
+to be done once; cpu_request_microcode() is also moved out of
+microcode_update_cpu().
+
+On AMD side, svm_host_osvw_init() is supposed to be called after
+microcode update. As apply_micrcode() won't be called by
+cpu_request_microcode() now, svm_host_osvw_init() is moved to the
+end of apply_microcode().
+
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+diff --git a/xen/arch/x86/acpi/power.c b/xen/arch/x86/acpi/power.c
+index 097e8848b8..09b754efeb 100644
+--- a/xen/arch/x86/acpi/power.c
++++ b/xen/arch/x86/acpi/power.c
+@@ -253,7 +253,7 @@ static int enter_state(u32 state)
+ 
+     console_end_sync();
+ 
+-    microcode_resume_cpu();
++    early_microcode_update_cpu();
+ 
+     if ( !recheck_cpu_features(0) )
+         panic("Missing previously available feature(s).");
+diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
+index 16a6d50540..23cf550a1e 100644
+--- a/xen/arch/x86/microcode.c
++++ b/xen/arch/x86/microcode.c
+@@ -189,36 +189,62 @@ static DEFINE_SPINLOCK(microcode_mutex);
+ 
+ DEFINE_PER_CPU(struct cpu_signature, cpu_sig);
+ 
+-struct microcode_info {
+-    unsigned int cpu;
+-    uint32_t buffer_size;
+-    int error;
+-    char buffer[1];
+-};
++/*
++ * Return the patch with the highest revision id among all matching
++ * patches in the blob. Return NULL if no suitable patch.
++ */
++static struct microcode_patch *microcode_parse_blob(const char *buf,
++                                                    uint32_t len)
++{
++    if ( likely(!microcode_ops->collect_cpu_info(&this_cpu(cpu_sig))) )
++        return microcode_ops->cpu_request_microcode(buf, len);
+ 
+-int microcode_resume_cpu(void)
++    return NULL;
++}
++
++/*
++ * Load a microcode update to current CPU.
++ *
++ * If no patch is provided, the cached patch will be loaded. Microcode update
++ * during APs bringup and CPU resuming falls into this case.
++ */
++static int microcode_update_cpu(struct microcode_patch *patch)
+ {
+-    int err;
+-    struct cpu_signature *sig = &this_cpu(cpu_sig);
++    int ret = microcode_ops->collect_cpu_info(&this_cpu(cpu_sig));
+ 
+-    if ( !microcode_ops )
+-        return 0;
++    if ( unlikely(ret) )
++        return ret;
+ 
+     spin_lock(&microcode_mutex);
+ 
+-    err = microcode_ops->collect_cpu_info(sig);
+-    if ( likely(!err) )
+-        err = microcode_ops->apply_microcode();
+-    spin_unlock(&microcode_mutex);
++    if ( patch )
++    {
++        /*
++         * If a patch is specified, it should has newer revision than
++         * that of the patch cached.
++         */
++        if ( microcode_cache &&
++             microcode_ops->compare_patch(patch, microcode_cache) != NEW_UCODE )
++        {
++            spin_unlock(&microcode_mutex);
++            return -EINVAL;
++        }
+ 
+-    return err;
+-}
++        ret = microcode_ops->apply_microcode(patch);
++    }
++    else if ( microcode_cache )
++    {
++        ret = microcode_ops->apply_microcode(microcode_cache);
++        if ( ret == -EIO )
++            printk("Update failed. Reboot needed\n");
++    }
++    else
++        /* No patch to update */
++        ret = -EINVAL;
+ 
+-const struct microcode_patch *microcode_get_cache(void)
+-{
+-    ASSERT(spin_is_locked(&microcode_mutex));
++    spin_unlock(&microcode_mutex);
+ 
+-    return microcode_cache;
++    return ret;
+ }
+ 
+ /* Return true if cache gets updated. Otherwise, return false */
+@@ -227,9 +253,6 @@ bool microcode_update_cache(struct microcode_patch *patch)
+ 
+     ASSERT(spin_is_locked(&microcode_mutex));
+ 
+-    if ( !microcode_ops->match_cpu(patch) )
+-        return false;
+-
+     if ( !microcode_cache )
+         microcode_cache = patch;
+     else if ( microcode_ops->compare_patch(patch, microcode_cache) ==
+@@ -247,46 +270,32 @@ bool microcode_update_cache(struct microcode_patch *patch)
+     return true;
+ }
+ 
+-static int microcode_update_cpu(const void *buf, size_t size)
++static long do_microcode_update(void *patch)
+ {
+-    int err;
+-    unsigned int cpu = smp_processor_id();
+-    struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+-
+-    spin_lock(&microcode_mutex);
++    int error, cpu;
+ 
+-    err = microcode_ops->collect_cpu_info(sig);
+-    if ( likely(!err) )
+-        err = microcode_ops->cpu_request_microcode(buf, size);
+-    spin_unlock(&microcode_mutex);
+-
+-    return err;
+-}
+-
+-static long do_microcode_update(void *_info)
+-{
+-    struct microcode_info *info = _info;
+-    int error;
++    error = microcode_update_cpu(patch);
++    if ( error )
++    {
++        microcode_ops->free_patch(microcode_cache);
++        return error;
++    }
+ 
+-    BUG_ON(info->cpu != smp_processor_id());
+ 
+-    error = microcode_update_cpu(info->buffer, info->buffer_size);
+-    if ( error )
+-        info->error = error;
++    cpu = cpumask_next(smp_processor_id(), &cpu_online_map);
++    if ( cpu < nr_cpu_ids )
++        return continue_hypercall_on_cpu(cpu, do_microcode_update, patch);
+ 
+-    info->cpu = cpumask_next(info->cpu, &cpu_online_map);
+-    if ( info->cpu < nr_cpu_ids )
+-        return continue_hypercall_on_cpu(info->cpu, do_microcode_update, info);
++    microcode_update_cache(patch);
+ 
+-    error = info->error;
+-    xfree(info);
+     return error;
+ }
+ 
+ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+ {
+     int ret;
+-    struct microcode_info *info;
++    void *buffer;
++    struct microcode_patch *patch;
+ 
+     if ( len != (uint32_t)len )
+         return -E2BIG;
+@@ -294,32 +303,49 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+     if ( microcode_ops == NULL )
+         return -EINVAL;
+ 
+-    info = xmalloc_bytes(sizeof(*info) + len);
+-    if ( info == NULL )
+-        return -ENOMEM;
+-
+-    ret = copy_from_guest(info->buffer, buf, len);
+-    if ( ret != 0 )
++    buffer = xmalloc_bytes(len);
++    if ( !buffer )
+     {
+-        xfree(info);
+-        return ret;
++        ret = -ENOMEM;
++        goto free;
+     }
+ 
+-    info->buffer_size = len;
+-    info->error = 0;
+-    info->cpu = cpumask_first(&cpu_online_map);
++    if ( copy_from_guest(buffer, buf, len) )
++    {
++        ret = -EFAULT;
++        goto free;
++    }
+ 
+     if ( microcode_ops->start_update )
+     {
+         ret = microcode_ops->start_update();
+         if ( ret != 0 )
+-        {
+-            xfree(info);
+-            return ret;
+-        }
++            goto free;
+     }
+ 
+-    return continue_hypercall_on_cpu(info->cpu, do_microcode_update, info);
++    patch = microcode_parse_blob(buffer, len);
++    if ( IS_ERR(patch) )
++    {
++        printk(XENLOG_ERR "Parsing microcode blob error %ld\n", PTR_ERR(patch));
++        ret = PTR_ERR(patch);
++        goto free;
++    }
++
++    if ( !microcode_ops->match_cpu(patch) )
++    {
++        printk(XENLOG_ERR "No matching or newer ucode found. Update aborted!\n");
++        if ( patch )
++            microcode_ops->free_patch(patch);
++        ret = -EINVAL;
++        goto free;
++    }
++
++    ret = continue_hypercall_on_cpu(cpumask_first(&cpu_online_map),
++                                    do_microcode_update, patch);
++
++ free:
++    xfree(buffer);
++    return ret;
+ }
+ 
+ static int __init microcode_init(void)
+@@ -344,7 +370,16 @@ static int __init microcode_init(void)
+ }
+ __initcall(microcode_init);
+ 
+-int __init early_microcode_update_cpu(bool start_update)
++int early_microcode_update_cpu(void)
++{
++    return microcode_ops ? microcode_update_cpu(NULL) : 0;
++}
++
++/*
++ * BSP needs to parse the ucode blob and then apply an update.
++ * APs just apply an update by calling early_microcode_update_cpu().
++ */
++static int __init early_microcode_parse_and_update_cpu(void)
+ {
+     int rc = 0;
+     void *data = NULL;
+@@ -362,13 +397,41 @@ int __init early_microcode_update_cpu(bool start_update)
+     }
+     if ( data )
+     {
+-        if ( start_update && microcode_ops->start_update )
++        struct microcode_patch *patch;
++
++        if ( microcode_ops->start_update )
+             rc = microcode_ops->start_update();
+ 
+         if ( rc )
+             return rc;
+ 
+-        return microcode_update_cpu(data, len);
++        patch = microcode_parse_blob(data, len);
++        if ( IS_ERR(patch) )
++        {
++            printk(XENLOG_ERR "Parsing microcode blob error %ld\n",
++                   PTR_ERR(patch));
++            return PTR_ERR(patch);
++        }
++
++        if ( !microcode_ops->match_cpu(patch) )
++        {
++            printk(XENLOG_ERR "No matching or newer ucode found. Update aborted!\n");
++            if ( patch )
++                microcode_ops->free_patch(patch);
++            return -EINVAL;
++        }
++
++        rc = microcode_update_cpu(patch);
++        if ( !rc )
++        {
++            spin_lock(&microcode_mutex);
++            microcode_update_cache(patch);
++            spin_unlock(&microcode_mutex);
++        }
++        else
++            microcode_ops->free_patch(patch);
++
++        return rc;
+     }
+     else
+         return -ENOMEM;
+@@ -387,8 +450,10 @@ int __init early_microcode_init(void)
+         return rc;
+ 
+     if ( microcode_ops )
++    {
+         if ( ucode_mod.mod_end || ucode_blob.size )
+-            rc = early_microcode_update_cpu(true);
++            rc = early_microcode_parse_and_update_cpu();
++    }
+ 
+     return rc;
+ }
+diff --git a/xen/arch/x86/microcode_amd.c b/xen/arch/x86/microcode_amd.c
+index 9faf83b743..f867c00c9a 100644
+--- a/xen/arch/x86/microcode_amd.c
++++ b/xen/arch/x86/microcode_amd.c
+@@ -249,7 +249,7 @@ static enum microcode_match_result compare_patch(
+     return MIS_UCODE;
+ }
+ 
+-static int apply_microcode(void)
++static int apply_microcode(const struct microcode_patch *patch)
+ {
+     unsigned long flags;
+     uint32_t rev;
+@@ -257,7 +257,6 @@ static int apply_microcode(void)
+     unsigned int cpu = smp_processor_id();
+     struct cpu_signature *sig = &per_cpu(cpu_sig, cpu);
+     const struct microcode_header_amd *hdr;
+-    const struct microcode_patch *patch = microcode_get_cache();
+ 
+     if ( !match_cpu(patch) )
+         return -EINVAL;
+@@ -292,6 +291,10 @@ static int apply_microcode(void)
+ 
+     sig->rev = rev;
+ 
++#ifdef CONFIG_HVM
++    svm_host_osvw_init();
++#endif
++
+     return 0;
+ }
+ 
+@@ -449,9 +452,11 @@ static bool check_final_patch_levels(void)
+     return 0;
+ }
+ 
+-static int cpu_request_microcode(const void *buf, size_t bufsize)
++static struct microcode_patch *cpu_request_microcode(const void *buf,
++                                                     size_t bufsize)
+ {
+     struct microcode_amd *mc_amd;
++    struct microcode_patch *patch = NULL;
+     size_t offset = 0;
+     int error = 0;
+     unsigned int current_cpu_id;
+@@ -551,17 +556,16 @@ static int cpu_request_microcode(const void *buf, size_t bufsize)
+             break;
+         }
+ 
+-        if ( match_cpu(new_patch) )
+-            microcode_update_cache(new_patch);
+-        else
+-            free_patch(new_patch);
+-
+-        if ( match_cpu(microcode_get_cache()) )
++        /* Compare patches and store the one with higher revision */
++        if ( !patch && match_cpu(new_patch) )
++            patch = new_patch;
++        else if ( patch && (compare_patch(new_patch, patch) == NEW_UCODE) )
+         {
+-            error = apply_microcode();
+-            if ( error )
+-                break;
++            free_patch(patch);
++            patch = new_patch;
+         }
++        else
++            free_patch(new_patch);
+ 
+         if ( offset >= bufsize )
+             break;
+@@ -592,15 +596,10 @@ static int cpu_request_microcode(const void *buf, size_t bufsize)
+     }
+ 
+   out:
+-    svm_host_osvw_init();
++    if ( error && !patch )
++        patch = ERR_PTR(error);
+ 
+-    /*
+-     * In some cases we may return an error even if processor's microcode has
+-     * been updated. For example, the first patch in a container file is loaded
+-     * successfully but subsequent container file processing encounters a
+-     * failure.
+-     */
+-    return error;
++    return patch;
+ }
+ 
+ static int start_update(void)
+diff --git a/xen/arch/x86/microcode_intel.c b/xen/arch/x86/microcode_intel.c
+index b66844da82..650495d176 100644
+--- a/xen/arch/x86/microcode_intel.c
++++ b/xen/arch/x86/microcode_intel.c
+@@ -273,46 +273,27 @@ static enum microcode_match_result compare_patch(
+                                   old_header->pf, old_header->rev);
+ }
+ 
+-/*
+- * return 0 - no update found
+- * return 1 - found update
+- * return < 0 - error
+- */
+-static int get_matching_microcode(const void *mc)
++static struct microcode_patch *allow_microcode_patch(
++    const struct microcode_header_intel *mc_header)
+ {
+-    const struct microcode_header_intel *mc_header = mc;
+     unsigned long total_size = get_totalsize(mc_header);
+     void *new_mc = xmalloc_bytes(total_size);
+     struct microcode_patch *new_patch = xmalloc(struct microcode_patch);
+-    unsigned int __maybe_unused cpu = smp_processor_id();
+ 
+     if ( !new_patch || !new_mc )
+     {
+         xfree(new_patch);
+         xfree(new_mc);
+         printk(XENLOG_ERR "microcode: Can not allocate memory\n");
+-        return -ENOMEM;
++        return ERR_PTR(-ENOMEM);
+     }
+-    memcpy(new_mc, mc, total_size);
++    memcpy(new_mc, mc_header, total_size);
+     new_patch->mc_intel = new_mc;
+ 
+-    if ( !match_cpu(new_patch) )
+-    {
+-        free_patch(new_patch);
+-        return 0;
+-    }
+-
+-    if ( !microcode_update_cache(new_patch) )
+-        return 0;
+-
+-    pr_debug("microcode: CPU%d found a matching microcode update with"
+-             " version %#x (current=%#x)\n",
+-             cpu, mc_header->rev, this_cpu(cpu_sig).rev);
+-
+-    return 1;
++    return new_patch;
+ }
+ 
+-static int apply_microcode(void)
++static int apply_microcode(const struct microcode_patch *patch)
+ {
+     unsigned long flags;
+     uint64_t msr_content;
+@@ -320,7 +301,6 @@ static int apply_microcode(void)
+     unsigned int cpu_num = raw_smp_processor_id();
+     struct cpu_signature *sig = &this_cpu(cpu_sig);
+     const struct microcode_intel *mc_intel;
+-    const struct microcode_patch *patch = microcode_get_cache();
+ 
+     if ( !match_cpu(patch) )
+         return -EINVAL;
+@@ -388,26 +368,39 @@ static long get_next_ucode_from_buffer(void **mc, const u8 *buf,
+     return offset + total_size;
+ }
+ 
+-static int cpu_request_microcode(const void *buf, size_t size)
++static struct microcode_patch *cpu_request_microcode(const void *buf,
++                                                     size_t size)
+ {
+     long offset = 0;
+     int error = 0;
+     void *mc;
++    struct microcode_patch *patch = NULL;
+ 
+     while ( (offset = get_next_ucode_from_buffer(&mc, buf, size, offset)) > 0 )
+     {
++        struct microcode_patch *new_patch;
++
+         error = microcode_sanity_check(mc);
+         if ( error )
+             break;
+-        error = get_matching_microcode(mc);
+-        if ( error < 0 )
++
++        new_patch = allow_microcode_patch(mc);
++        if ( IS_ERR(new_patch) )
++        {
++            error = PTR_ERR(new_patch);
+             break;
+-        /*
+-         * It's possible the data file has multiple matching ucode,
+-         * lets keep searching till the latest version
+-         */
+-        if ( error == 1 )
+-            error = 0;
++        }
++
++        /* Compare patches and store the one with higher revision */
++        if ( !patch && match_cpu(new_patch) )
++            patch = new_patch;
++        else if ( patch && (compare_patch(new_patch, patch) == NEW_UCODE) )
++        {
++            free_patch(patch);
++            patch = new_patch;
++        }
++        else
++            free_patch(new_patch);
+ 
+         xfree(mc);
+     }
+@@ -416,10 +409,10 @@ static int cpu_request_microcode(const void *buf, size_t size)
+     if ( offset < 0 )
+         error = offset;
+ 
+-    if ( !error && match_cpu(microcode_get_cache()) )
+-        error = apply_microcode();
++    if ( error && !patch )
++        patch = ERR_PTR(error);
+ 
+-    return error;
++    return patch;
+ }
+ 
+ static const struct microcode_ops microcode_intel_ops = {
+diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
+index 3cd8ed71b6..8a2a808b47 100644
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -363,10 +363,7 @@ void start_secondary(void *unused)
+ 
+     initialize_cpu_data(cpu);
+ 
+-    if ( system_state <= SYS_STATE_smp_boot )
+-        early_microcode_update_cpu(false);
+-    else
+-        microcode_resume_cpu();
++    early_microcode_update_cpu();
+ 
+     /*
+      * If MSR_SPEC_CTRL is available, apply Xen's default setting and discard
+diff --git a/xen/include/asm-x86/microcode.h b/xen/include/asm-x86/microcode.h
+index e6842d46ca..3fa3acdd8b 100644
+--- a/xen/include/asm-x86/microcode.h
++++ b/xen/include/asm-x86/microcode.h
+@@ -19,9 +19,10 @@ struct microcode_patch {
+ };
+ 
+ struct microcode_ops {
+-    int (*cpu_request_microcode)(const void *buf, size_t size);
++    struct microcode_patch *(*cpu_request_microcode)(const void *buf,
++                                                     size_t size);
+     int (*collect_cpu_info)(struct cpu_signature *csig);
+-    int (*apply_microcode)(void);
++    int (*apply_microcode)(const struct microcode_patch *patch);
+     int (*start_update)(void);
+     void (*free_patch)(struct microcode_patch *patch);
+     bool (*match_cpu)(const struct microcode_patch *patch);
+@@ -39,7 +40,4 @@ struct cpu_signature {
+ DECLARE_PER_CPU(struct cpu_signature, cpu_sig);
+ extern const struct microcode_ops *microcode_ops;
+ 
+-const struct microcode_patch *microcode_get_cache(void);
+-bool microcode_update_cache(struct microcode_patch *patch);
+-
+ #endif /* ASM_X86__MICROCODE_H */
+diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
+index 98ddac7f0f..0a62dfa0a3 100644
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -574,8 +574,7 @@ int wrmsr_hypervisor_regs(uint32_t idx, uint64_t val);
+ 
+ void microcode_set_module(unsigned int);
+ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void), unsigned long len);
+-int microcode_resume_cpu(void);
+-int early_microcode_update_cpu(bool start_update);
++int early_microcode_update_cpu(void);
+ int early_microcode_init(void);
+ int microcode_init_intel(void);
+ int microcode_init_amd(void);

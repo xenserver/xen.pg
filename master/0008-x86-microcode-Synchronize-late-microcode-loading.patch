@@ -1,7 +1,7 @@
-From 3d4e77242768a68768fac184888034e786b81629 Mon Sep 17 00:00:00 2001
+From edca0b8669355de9da37eddf194245ca2e2b67e8 Mon Sep 17 00:00:00 2001
 From: Chao Gao <chao.gao@intel.com>
-Date: Mon, 11 Mar 2019 15:57:35 +0800
-Subject: [PATCH 11/12] x86/microcode: Synchronize late microcode loading
+Date: Mon, 27 May 2019 16:31:29 +0800
+Subject: [PATCH 08/10] x86/microcode: Synchronize late microcode loading
 
 This patch ports microcode improvement patches from linux kernel.
 
@@ -26,7 +26,7 @@ Cc: Thomas Gleixner <tglx@linutronix.de>
 Cc: Andrew Cooper <andrew.cooper3@citrix.com>
 Cc: Jan Beulich <jbeulich@suse.com>
 diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
-index 1b7e79e496..ba0a708069 100644
+index 23cf550a1e..f4a417eefd 100644
 --- a/xen/arch/x86/microcode.c
 +++ b/xen/arch/x86/microcode.c
 @@ -22,6 +22,7 @@
@@ -72,32 +72,37 @@ index 1b7e79e496..ba0a708069 100644
  static module_t __initdata ucode_mod;
  static signed int __initdata ucode_mod_idx;
  static bool_t __initdata ucode_mod_forced;
-@@ -188,6 +208,12 @@ static DEFINE_SPINLOCK(microcode_mutex);
+@@ -189,6 +209,12 @@ static DEFINE_SPINLOCK(microcode_mutex);
  
  DEFINE_PER_CPU(struct cpu_signature, cpu_sig);
  
 +/*
-+ * Count the CPUs that have entered and exited the rendezvous
-+ * during late microcode update.
++ * Count the CPUs that have entered, exited the rendezvous and succeeded in
++ * microcode update during late microcode update respectively.
 + */
-+static atomic_t cpu_in, cpu_out;
++static atomic_t cpu_in, cpu_out, cpu_updated;
 +
  /*
-  * Save an ucode patch to the global cache list.
-  *
-@@ -284,25 +310,86 @@ static int microcode_update_cpu(void)
-     return ret;
+  * Return the patch with the highest revision id among all matching
+  * patches in the blob. Return NULL if no suitable patch.
+@@ -270,31 +296,90 @@ bool microcode_update_cache(struct microcode_patch *patch)
+     return true;
  }
  
--static long do_microcode_update(void *unused)
+-static long do_microcode_update(void *patch)
 +/* Wait for CPUs to rendezvous with a timeout (us) */
 +static int wait_for_cpus(atomic_t *cnt, unsigned int expect,
 +                         unsigned int timeout)
  {
 -    int error, cpu;
+-
+-    error = microcode_update_cpu(patch);
+-    if ( error )
 +    while ( atomic_read(cnt) < expect )
-+    {
-+        if ( timeout <= 0 )
+     {
+-        microcode_ops->free_patch(microcode_cache);
+-        return error;
++        if ( !timeout )
 +        {
 +            printk("CPU%d: Timeout when waiting for CPUs calling in\n",
 +                   smp_processor_id());
@@ -105,15 +110,15 @@ index 1b7e79e496..ba0a708069 100644
 +        }
 +        udelay(1);
 +        timeout--;
-+    }
-+
+     }
+ 
 +    return 0;
 +}
  
--    error = microcode_update_cpu();
--    if ( error )
--        return error;
-+static int do_microcode_update(void *unused)
+-    cpu = cpumask_next(smp_processor_id(), &cpu_online_map);
+-    if ( cpu < nr_cpu_ids )
+-        return continue_hypercall_on_cpu(cpu, do_microcode_update, patch);
++static int do_microcode_update(void *patch)
 +{
 +    unsigned int cpu = smp_processor_id();
 +    unsigned int cpu_nr = num_online_cpus();
@@ -121,23 +126,25 @@ index 1b7e79e496..ba0a708069 100644
 +    int ret;
 +    static bool error;
  
--    cpu = cpumask_next(smp_processor_id(), &cpu_online_map);
--    if ( cpu < nr_cpu_ids )
--        return continue_hypercall_on_cpu(cpu, do_microcode_update, NULL);
- 
--    return error;
+-    microcode_update_cache(patch);
 +    atomic_inc(&cpu_in);
 +    ret = wait_for_cpus(&cpu_in, cpu_nr, MICROCODE_CALLIN_TIMEOUT_US);
 +    if ( ret )
 +        return ret;
-+
+ 
+-    return error;
++    ret = microcode_ops->collect_cpu_info(&this_cpu(cpu_sig));
 +    /*
-+     * Initiate an update on all processors which don't have an online sibling
-+     * thread with a lower thread id. Other sibling threads just await the
-+     * completion of microcode update.
++     * Load microcode update on only one logical processor per core.
++     * Here, among logical processors of a core, the one with the
++     * lowest thread id is chosen to perform the loading.
 +     */
-+    if ( cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
-+        ret = microcode_update_cpu();
++    if ( !ret && (cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu))) )
++    {
++        ret = microcode_ops->apply_microcode(patch);
++        if ( !ret )
++            atomic_inc(&cpu_updated);
++    }
 +    /*
 +     * Increase the wait timeout to a safe value here since we're serializing
 +     * the microcode update and that could take a while on a large number of
@@ -178,10 +185,10 @@ index 1b7e79e496..ba0a708069 100644
      int ret;
      void *buffer;
 +    unsigned int cpu, nr_cores;
+     struct microcode_patch *patch;
  
      if ( len != (uint32_t)len )
-         return -E2BIG;
-@@ -323,11 +410,18 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+@@ -316,11 +401,18 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
          goto free;
      }
  
@@ -200,19 +207,20 @@ index 1b7e79e496..ba0a708069 100644
 +            goto put;
      }
  
-     ret = microcode_parse_blob(buffer, len);
-@@ -335,12 +429,41 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
-     {
-         printk(XENLOG_ERR "No valid or newer ucode found. Update abort!\n");
+     patch = microcode_parse_blob(buffer, len);
+@@ -337,12 +429,59 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+         if ( patch )
+             microcode_ops->free_patch(patch);
          ret = -EINVAL;
 -        goto free;
 +        goto put;
      }
  
--    return continue_hypercall_on_cpu(cpumask_first(&cpu_online_map),
--                                     do_microcode_update, NULL);
+-    ret = continue_hypercall_on_cpu(cpumask_first(&cpu_online_map),
+-                                    do_microcode_update, patch);
 +    atomic_set(&cpu_in, 0);
 +    atomic_set(&cpu_out, 0);
++    atomic_set(&cpu_updated, 0);
 +
 +    /* Calculate the number of online CPU core */
 +    nr_cores = 0;
@@ -238,8 +246,25 @@ index 1b7e79e496..ba0a708069 100644
 +     *   this requirement can be relaxed in the future. Right now, this is
 +     *   conservative and good.
 +     */
-+    ret = stop_machine_run(do_microcode_update, NULL, NR_CPUS);
++    ret = stop_machine_run(do_microcode_update, patch, NR_CPUS);
 +    watchdog_enable();
++
++    if ( atomic_read(&cpu_updated) == nr_cores )
++    {
++        spin_lock(&microcode_mutex);
++        microcode_update_cache(patch);
++        spin_unlock(&microcode_mutex);
++    }
++    else if ( atomic_read(&cpu_updated) == 0 )
++        microcode_ops->free_patch(patch);
++    else
++    {
++        printk("Updating microcode succeeded on part of CPUs and failed on\n"
++               "others due to an unknown reason. A system with different\n"
++               "microcode revisions is considered unstable. Please reboot and\n"
++               "do not load the microcode that triggers this warning\n");
++        microcode_ops->free_patch(patch);
++    }
  
 + put:
 +    put_cpu_maps();

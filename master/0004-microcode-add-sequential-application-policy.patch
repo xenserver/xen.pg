@@ -6,28 +6,64 @@ Subject: [PATCH 4/8] microcode: add sequential application policy
 This patch was sent upstream to Chao. I expect it to be included in v7.
 
 Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
-diff --git a/tools/misc/xen-microcode.c b/tools/misc/xen-microcode.c
-index 26325c2b88..59182646cc 100644
---- a/tools/misc/xen-microcode.c
-+++ b/tools/misc/xen-microcode.c
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 5b912f6bfc..50d68ebc62 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1263,7 +1263,8 @@ int xc_physinfo(xc_interface *xch, xc_physinfo_t *info);
+ int xc_cputopoinfo(xc_interface *xch, unsigned *max_cpus,
+                    xc_cputopo_t *cputopo);
+ int xc_platform_op(xc_interface *xch, struct xen_platform_op *op);
+-int xc_microcode_update(xc_interface *xch, const void *buf, size_t len);
++int xc_microcode_update(xc_interface *xch, const void *buf, size_t len,
++                        uint32_t strategy);
+ int xc_numainfo(xc_interface *xch, unsigned *max_nodes,
+                 xc_meminfo_t *meminfo, uint32_t *distance);
+ int xc_pcitopoinfo(xc_interface *xch, unsigned num_devs,
+diff --git a/tools/libxc/xc_misc.c b/tools/libxc/xc_misc.c
+index 89437b9d42..9e9eabfb0d 100644
+--- a/tools/libxc/xc_misc.c
++++ b/tools/libxc/xc_misc.c
+@@ -226,7 +226,8 @@ int xc_physinfo(xc_interface *xch,
+     return 0;
+ }
+ 
+-int xc_microcode_update(xc_interface *xch, const void *buf, size_t len)
++int xc_microcode_update(xc_interface *xch, const void *buf, size_t len,
++                        uint32_t strategy)
+ {
+     int ret;
+     DECLARE_PLATFORM_OP;
+@@ -240,6 +241,7 @@ int xc_microcode_update(xc_interface *xch, const void *buf, size_t len)
+ 
+     platform_op.cmd = XENPF_microcode_update;
+     platform_op.u.microcode.length = len;
++    platform_op.u.microcode.strategy = strategy;
+     set_xen_guest_handle(platform_op.u.microcode.data, uc);
+ 
+     ret = do_platform_op(xch, &platform_op);
+diff --git a/tools/misc/xen-ucode.c b/tools/misc/xen-ucode.c
+index 2f8306fe29..28c652e6c1 100644
+--- a/tools/misc/xen-ucode.c
++++ b/tools/misc/xen-ucode.c
 @@ -62,7 +62,7 @@ void show_help(void)
  {
      fprintf(stderr,
-             "xen-microcode: Xen microcode updating tool\n"
--            "Usage: xen-microcode <microcode blob>\n");
-+            "Usage: xen-microcode <microcode blob> <parallel|sequential>\n");
+             "xen-ucode: Xen microcode updating tool\n"
+-            "Usage: xen-ucode <microcode blob>\n");
++            "Usage: xen-ucode <microcode blob> <parallel|sequential>\n");
  
      show_curr_cpu(stderr);
  }
-@@ -75,6 +75,7 @@ int main(int argc, char *argv[])
-     struct xen_platform_op op;
+@@ -73,6 +73,7 @@ int main(int argc, char *argv[])
+     char *filename, *buf;
+     struct stat st;
      xc_interface *xch;
-     DECLARE_HYPERCALL_BUFFER(struct xenpf_microcode_update, uc);
 +    uint32_t strategy;
  
      if ( argc >= 2 && !strcmp(argv[1], "show-cpu-info") )
      {
-@@ -82,7 +83,17 @@ int main(int argc, char *argv[])
+@@ -80,7 +81,17 @@ int main(int argc, char *argv[])
          return 0;
      }
  
@@ -46,16 +82,17 @@ index 26325c2b88..59182646cc 100644
      {
          show_help();
          return 0;
-@@ -126,6 +137,7 @@ int main(int argc, char *argv[])
-     op.cmd = XENPF_microcode_update;
-     op.interface_version = XENPF_INTERFACE_VERSION;
-     op.u.microcode.length = len;
-+    op.u.microcode.strategy = strategy;
-     ret = xc_platform_op(xch, &op);
-     if ( ret )
-         fprintf(stderr, "Failed to update microcode. (err: %d)\n", ret);
+@@ -115,7 +126,7 @@ int main(int argc, char *argv[])
+         return errno;
+     }
+ 
+-    ret = xc_microcode_update(xch, buf, len);
++    ret = xc_microcode_update(xch, buf, len, strategy);
+     if (ret)
+         fprintf(stderr, "Failed to update microcode. (err: %s)\n",
+                 strerror(errno));
 diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
-index 95e39c33bc..e69f4acded 100644
+index 8aeb152317..fad8054384 100644
 --- a/xen/arch/x86/microcode.c
 +++ b/xen/arch/x86/microcode.c
 @@ -37,6 +37,8 @@
@@ -67,18 +104,18 @@ index 95e39c33bc..e69f4acded 100644
  #include <asm/delay.h>
  #include <asm/msr.h>
  #include <asm/processor.h>
-@@ -216,6 +218,10 @@ DEFINE_PER_CPU(struct cpu_signature, cpu_sig);
+@@ -215,6 +217,10 @@ DEFINE_PER_CPU(struct cpu_signature, cpu_sig);
   */
- static atomic_t cpu_in, cpu_out;
+ static atomic_t cpu_in, cpu_out, cpu_updated;
  
 +static uint32_t application_strategy;
 +/* The next CPU to perform a ucode update */
 +static atomic_t next_cpu;
 +
  /*
-  * Save an ucode patch to the global cache list.
-  *
-@@ -351,6 +357,19 @@ static int do_microcode_update(void *unused)
+  * Return the patch with the highest revision id among all matching
+  * patches in the blob. Return NULL if no suitable patch.
+@@ -328,6 +334,19 @@ static int do_microcode_update(void *patch)
      if ( ret )
          return ret;
  
@@ -95,13 +132,13 @@ index 95e39c33bc..e69f4acded 100644
 +        }
 +    }
 +
+     ret = microcode_ops->collect_cpu_info(&this_cpu(cpu_sig));
      /*
-      * Initiate an update on all processors which don't have an online sibling
-      * thread with a lower thread id. Other sibling threads just await the
-@@ -358,6 +377,10 @@ static int do_microcode_update(void *unused)
-      */
-     if ( cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
-         ret = microcode_update_cpu();
+      * Load microcode update on only one logical processor per core.
+@@ -340,6 +359,10 @@ static int do_microcode_update(void *patch)
+         if ( !ret )
+             atomic_inc(&cpu_updated);
+     }
 +
 +    if ( application_strategy == XENPF_microcode_sequential )
 +        atomic_set(&next_cpu, cpumask_next(cpu, &cpu_online_map));
@@ -109,7 +146,7 @@ index 95e39c33bc..e69f4acded 100644
      /*
       * Increase the wait timeout to a safe value here since we're serializing
       * the microcode update and that could take a while on a large number of
-@@ -393,7 +416,8 @@ static int do_microcode_update(void *unused)
+@@ -375,7 +398,8 @@ static int do_microcode_update(void *patch)
      return ret;
  }
  
@@ -119,7 +156,7 @@ index 95e39c33bc..e69f4acded 100644
  {
      int ret;
      void *buffer;
-@@ -405,6 +429,10 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+@@ -388,6 +412,10 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
      if ( microcode_ops == NULL )
          return -EINVAL;
  
@@ -130,7 +167,7 @@ index 95e39c33bc..e69f4acded 100644
      buffer = xmalloc_bytes(len);
      if ( !buffer )
      {
-@@ -449,13 +477,19 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+@@ -442,13 +470,19 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
          if ( cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
              nr_cores++;
  
