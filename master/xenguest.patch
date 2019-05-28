@@ -1,5 +1,5 @@
 diff --git a/.gitignore b/.gitignore
-index c5032f3..8359306 100644
+index c5032f35cc..8359306e5d 100644
 --- a/.gitignore
 +++ b/.gitignore
 @@ -262,6 +262,7 @@ tools/xcutils/lsevtchn
@@ -11,7 +11,7 @@ index c5032f3..8359306 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/mk/xen.spec.in b/mk/xen.spec.in
-index 2eca8b2..0096091 100644
+index 2eca8b2c35..0096091835 100644
 --- a/mk/xen.spec.in
 +++ b/mk/xen.spec.in
 @@ -480,6 +480,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
@@ -23,7 +23,7 @@ index 2eca8b2..0096091 100644
  %{_libexecdir}/%{name}/bin/xenpvnetboot
  %{_libexecdir}/%{name}/boot/hvmloader
 diff --git a/tools/Makefile b/tools/Makefile
-index bc4a2f3..65452c0 100644
+index bc4a2f32c0..65452c06c6 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
 @@ -24,6 +24,7 @@ SUBDIRS-$(CONFIG_BLKTAP2) += blktap2
@@ -36,7 +36,7 @@ index bc4a2f3..65452c0 100644
  ifneq "$(MAKECMDGOALS)" "distclean"
 diff --git a/tools/xenguest/Makefile b/tools/xenguest/Makefile
 new file mode 100644
-index 0000000..0e8c170
+index 0000000000..0e8c1706de
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,31 @@
@@ -73,7 +73,7 @@ index 0000000..0e8c170
 +-include $(DEPS)
 diff --git a/tools/xenguest/xenguest.c b/tools/xenguest/xenguest.c
 new file mode 100644
-index 0000000..e357174
+index 0000000000..e357174ad2
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
 @@ -0,0 +1,714 @@
@@ -793,10 +793,10 @@ index 0000000..e357174
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..811b315
+index 0000000000..ccd806ccb2
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1462 @@
+@@ -0,0 +1,1485 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -894,6 +894,8 @@ index 0000000..811b315
 +    unsigned cores_per_socket;
 +    unsigned x87_fip_width;
 +    int64_t timeoffset;
++    uint32_t max_grant_frames;
++    uint32_t max_maptrack_frames;
 +};
 +
 +char *xenstore_getsv(const char *fmt, va_list ap)
@@ -1225,6 +1227,22 @@ index 0000000..811b315
 +        free(tmp);
 +    }
 +
++    tmp = xenstore_gets("platform/max_grant_frames");
++    if ( tmp )
++    {
++        sscanf(tmp, "%" PRIu32, &f->max_grant_frames);
++        free(tmp);
++    } else
++        f->max_grant_frames = 64;
++
++    tmp = xenstore_gets("platform/max_maptrack_frames");
++    if ( tmp )
++    {
++        sscanf(tmp, "%" PRIu32, &f->max_maptrack_frames);
++        free(tmp);
++    } else
++        f->max_maptrack_frames = 1024;
++
 +    xg_info("Domain Properties: Type %s, hap %u\n",
 +            f->dominfo.hvm ? "HVM" : "PV", f->dominfo.hap);
 +
@@ -1243,6 +1261,8 @@ index 0000000..811b315
 +            f->viridian, f->viridian_time_ref_count, f->viridian_reference_tsc,
 +            f->viridian_hcall_remote_tlb_flush, f->viridian_apic_assist,
 +            f->viridian_crash_ctl, f->viridian_stimer, f->viridian_hcall_ipi);
++    xg_info("max_grant_frames %" PRIu32", max_maptrack_frames %" PRIu32 "\n",
++            f->max_grant_frames, f->max_maptrack_frames);
 +
 +    for (n = 0; n < f->vcpus; n++){
 +        xg_info("vcpu/%d/affinity:%s\n", n, (f->vcpu_affinity[n])?f->vcpu_affinity[n]:"unset");
@@ -1380,7 +1400,8 @@ index 0000000..811b315
 +    struct flags f = {};
 +    get_flags(&f);
 +
-+    if ( xc_domain_set_gnttab_limits(xch, domid, 32, 1024) )
++    if ( xc_domain_set_gnttab_limits(xch, domid, f.max_grant_frames,
++                                     f.max_maptrack_frames) )
 +        failwith_oss_xc("xc_domain_set_gnttab_limits");
 +
 +    dom = xc_dom_allocate(xch, cmdline, features);
@@ -1980,7 +2001,8 @@ index 0000000..811b315
 +
 +    hvm_safety_check(&f, mem_start_mib < mem_max_mib);
 +
-+    r = xc_domain_set_gnttab_limits(xch, domid, 32, 1024);
++    r = xc_domain_set_gnttab_limits(xch, domid, f.max_grant_frames,
++                                    f.max_maptrack_frames);
 +    if ( r )
 +        failwith_oss_xc("xc_domain_set_gnttab_limits");
 +
@@ -2190,7 +2212,8 @@ index 0000000..811b315
 +
 +    get_flags(&f);
 +
-+    r = xc_domain_set_gnttab_limits(xch, domid, 32, 1024);
++    r = xc_domain_set_gnttab_limits(xch, domid, f.max_grant_frames,
++                                    f.max_maptrack_frames);
 +    if ( r )
 +        failwith_oss_xc("xc_domain_set_gnttab_limits");
 +
@@ -2261,7 +2284,7 @@ index 0000000..811b315
 + */
 diff --git a/tools/xenguest/xg_emu.c b/tools/xenguest/xg_emu.c
 new file mode 100644
-index 0000000..76cd081
+index 0000000000..76cd08107b
 --- /dev/null
 +++ b/tools/xenguest/xg_emu.c
 @@ -0,0 +1,444 @@
@@ -2711,7 +2734,7 @@ index 0000000..76cd081
 +}
 diff --git a/tools/xenguest/xg_internal.h b/tools/xenguest/xg_internal.h
 new file mode 100644
-index 0000000..9b9984c
+index 0000000000..9b9984ce6c
 --- /dev/null
 +++ b/tools/xenguest/xg_internal.h
 @@ -0,0 +1,99 @@
