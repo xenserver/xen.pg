@@ -22,7 +22,7 @@ Subject: [PATCH] Allocate space in structs pre-emptively to increase chances
 
 Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index 7cdea51375..89f1818380 100644
+index 281ca2e..64a905c 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
 @@ -80,6 +80,9 @@ struct grant_table {
@@ -34,12 +34,12 @@ index 7cdea51375..89f1818380 100644
 +    uint64_t _rsvd_livepatch[2];
  };
  
- #ifndef DEFAULT_MAX_NR_GRANT_FRAMES /* to allow arch to override */
+ unsigned int __read_mostly opt_max_grant_frames = 64;
 diff --git a/xen/drivers/passthrough/vtd/iommu.h b/xen/drivers/passthrough/vtd/iommu.h
-index 72c1a2e3cd..cf14397bc9 100644
+index 1a992f7..d34cb14 100644
 --- a/xen/drivers/passthrough/vtd/iommu.h
 +++ b/xen/drivers/passthrough/vtd/iommu.h
-@@ -528,6 +528,9 @@ struct intel_iommu {
+@@ -531,6 +531,9 @@ struct intel_iommu {
      struct ir_ctrl ir_ctrl;
      struct iommu_flush flush;
      struct acpi_drhd_unit *drhd;
@@ -49,7 +49,7 @@ index 72c1a2e3cd..cf14397bc9 100644
  };
  
  struct iommu {
-@@ -545,6 +548,9 @@ struct iommu {
+@@ -548,6 +551,9 @@ struct iommu {
      struct list_head ats_devices;
      unsigned long *domid_bitmap;  /* domain id bitmap */
      u16 *domid_map;               /* domain id mapping array */
@@ -60,7 +60,7 @@ index 72c1a2e3cd..cf14397bc9 100644
  
  static inline struct qi_ctrl *iommu_qi_ctrl(struct iommu *iommu)
 diff --git a/xen/include/asm-x86/amd-iommu.h b/xen/include/asm-x86/amd-iommu.h
-index 02715b482b..c4b5d70418 100644
+index 02715b4..c4b5d70 100644
 --- a/xen/include/asm-x86/amd-iommu.h
 +++ b/xen/include/asm-x86/amd-iommu.h
 @@ -106,6 +106,9 @@ struct amd_iommu {
@@ -83,41 +83,8 @@ index 02715b482b..c4b5d70418 100644
  };
  
  extern bool_t iommuv2_enabled;
-diff --git a/xen/include/asm-x86/cpuid.h b/xen/include/asm-x86/cpuid.h
-index 4113a5edee..ba8aa1daf7 100644
---- a/xen/include/asm-x86/cpuid.h
-+++ b/xen/include/asm-x86/cpuid.h
-@@ -59,7 +59,7 @@ DECLARE_PER_CPU(struct cpuidmasks, cpuidmasks);
- extern struct cpuidmasks cpuidmask_defaults;
- 
- #define CPUID_GUEST_NR_BASIC      (0xdu + 1)
--#define CPUID_GUEST_NR_FEAT       (0u + 1)
-+#define CPUID_GUEST_NR_FEAT       (0u + 2)
- #define CPUID_GUEST_NR_CACHE      (5u + 1)
- #define CPUID_GUEST_NR_TOPO       (1u + 1)
- #define CPUID_GUEST_NR_XSTATE     (62u + 1)
-@@ -238,6 +238,8 @@ struct cpuid_policy
- static inline void cpuid_policy_to_featureset(
-     const struct cpuid_policy *p, uint32_t fs[FSCAPINTS])
- {
-+    unsigned int i;
-+
-     fs[FEATURESET_1d]  = p->basic._1d;
-     fs[FEATURESET_1c]  = p->basic._1c;
-     fs[FEATURESET_e1d] = p->extd.e1d;
-@@ -248,6 +250,10 @@ static inline void cpuid_policy_to_featureset(
-     fs[FEATURESET_e7d] = p->extd.e7d;
-     fs[FEATURESET_e8b] = p->extd.e8b;
-     fs[FEATURESET_7d0] = p->feat._7d0;
-+
-+    /* Zero reserved featureset words */
-+    for ( i = FEATURESET_7d0 + 1; i < FSCAPINTS; i++ )
-+        fs[i] = 0;
- }
- 
- /* Fill in a CPUID policy from a featureset bitmap. */
 diff --git a/xen/include/asm-x86/hvm/domain.h b/xen/include/asm-x86/hvm/domain.h
-index 697a9f9210..1c0d9e36e5 100644
+index 3e73318..5e035d3 100644
 --- a/xen/include/asm-x86/hvm/domain.h
 +++ b/xen/include/asm-x86/hvm/domain.h
 @@ -46,6 +46,9 @@ struct hvm_ioreq_vcpu {
@@ -141,23 +108,13 @@ index 697a9f9210..1c0d9e36e5 100644
  
  /*
 diff --git a/xen/include/asm-x86/msr.h b/xen/include/asm-x86/msr.h
-index afbeb7f155..d4e30ac11e 100644
+index 51d1bed..34acfd6 100644
 --- a/xen/include/asm-x86/msr.h
 +++ b/xen/include/asm-x86/msr.h
-@@ -265,6 +265,9 @@ struct msr_domain_policy
-         bool available; /* This MSR is non-architectural */
-         bool cpuid_faulting;
-     } plaform_info;
-+
-+    /* Reserved space */
-+    uint64_t _rsvd_livepatch[2];
- };
- 
- /* RAW msr domain policy: contains the actual values from H/W MSRs */
-@@ -293,6 +296,9 @@ struct msr_vcpu_policy
-         bool available; /* This MSR is non-architectural */
-         bool cpuid_faulting;
-     } misc_features_enables;
+@@ -305,6 +305,9 @@ struct vcpu_msrs
+      * values here may be stale in current context.
+      */
+     uint32_t dr_mask[4];
 +
 +    /* Reserved space */
 +    uint64_t _rsvd_livepatch[2];
@@ -165,10 +122,10 @@ index afbeb7f155..d4e30ac11e 100644
  
  void init_guest_msr_policy(void);
 diff --git a/xen/include/asm-x86/p2m.h b/xen/include/asm-x86/p2m.h
-index 3f41deaeea..8f2e674294 100644
+index 3304921..05f51e9 100644
 --- a/xen/include/asm-x86/p2m.h
 +++ b/xen/include/asm-x86/p2m.h
-@@ -356,6 +356,9 @@ struct p2m_domain {
+@@ -362,6 +362,9 @@ struct p2m_domain {
           unsigned int flags;
           unsigned long entry_count;
       } ioreq;
@@ -178,11 +135,58 @@ index 3f41deaeea..8f2e674294 100644
  };
  
  /* get host p2m table */
+diff --git a/xen/include/xen/lib/x86/cpuid.h b/xen/include/xen/lib/x86/cpuid.h
+index 22d43ef..7fcc63b 100644
+--- a/xen/include/xen/lib/x86/cpuid.h
++++ b/xen/include/xen/lib/x86/cpuid.h
+@@ -66,7 +66,7 @@ static inline void cpuid_count_leaf(
+ #undef XCHG
+ 
+ #define CPUID_GUEST_NR_BASIC      (0xdu + 1)
+-#define CPUID_GUEST_NR_FEAT       (0u + 1)
++#define CPUID_GUEST_NR_FEAT       (1u + 1)
+ #define CPUID_GUEST_NR_CACHE      (5u + 1)
+ #define CPUID_GUEST_NR_TOPO       (1u + 1)
+ #define CPUID_GUEST_NR_XSTATE     (62u + 1)
+@@ -258,6 +258,8 @@ struct cpuid_policy
+ static inline void cpuid_policy_to_featureset(
+     const struct cpuid_policy *p, uint32_t fs[FEATURESET_NR_ENTRIES])
+ {
++    unsigned int i;
++
+     fs[FEATURESET_1d]  = p->basic._1d;
+     fs[FEATURESET_1c]  = p->basic._1c;
+     fs[FEATURESET_e1d] = p->extd.e1d;
+@@ -268,6 +270,10 @@ static inline void cpuid_policy_to_featureset(
+     fs[FEATURESET_e7d] = p->extd.e7d;
+     fs[FEATURESET_e8b] = p->extd.e8b;
+     fs[FEATURESET_7d0] = p->feat._7d0;
++
++    /* Zero reserved featureset words */
++    for ( i = FEATURESET_7d0 + 1; i < FEATURESET_NR_ENTRIES; i++ )
++        fs[i] = 0;
+ }
+ 
+ /* Fill in a CPUID policy from a featureset bitmap. */
+diff --git a/xen/include/xen/lib/x86/msr.h b/xen/include/xen/lib/x86/msr.h
+index e2cfbb1..d5a1290 100644
+--- a/xen/include/xen/lib/x86/msr.h
++++ b/xen/include/xen/lib/x86/msr.h
+@@ -23,6 +23,9 @@ struct msr_policy
+             bool cpuid_faulting:1;
+         };
+     } plaform_info;
++
++    /* Reserved space */
++    uint64_t _rsvd_livepatch[2];
+ };
+ 
+ #ifdef __XEN__
 diff --git a/xen/tools/gen-cpuid.py b/xen/tools/gen-cpuid.py
-index 02d7928052..47632c513b 100755
+index 1eea4c3..afeca52 100755
 --- a/xen/tools/gen-cpuid.py
 +++ b/xen/tools/gen-cpuid.py
-@@ -128,6 +128,8 @@ def crunch_numbers(state):
+@@ -130,6 +130,8 @@ def crunch_numbers(state):
  
      # Size of bitmaps
      state.nr_entries = nr_entries = (max(state.names.keys()) >> 5) + 1

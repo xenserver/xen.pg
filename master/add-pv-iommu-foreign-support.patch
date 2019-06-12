@@ -1,8 +1,8 @@
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 5a0f64feaf..e0fc46dbdb 100644
+index 0ff80b1..45ce325 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -1873,6 +1873,9 @@ static int relinquish_memory(
+@@ -1839,6 +1839,9 @@ static int relinquish_memory(
              continue;
          }
  
@@ -13,7 +13,7 @@ index 5a0f64feaf..e0fc46dbdb 100644
              ret = put_page_and_type_preemptible(page);
          switch ( ret )
 diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
-index e6ede8566c..80bd251b91 100644
+index 952614f..f1c4cfa 100644
 --- a/xen/common/pv_iommu.c
 +++ b/xen/common/pv_iommu.c
 @@ -21,7 +21,11 @@
@@ -27,16 +27,16 @@ index e6ede8566c..80bd251b91 100644
 +#endif
  #define ret_t long
  
- static int get_paged_frame(unsigned long gfn, unsigned long *frame,
-@@ -182,7 +186,222 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
+ static int get_paged_frame(unsigned long gfn, mfn_t *mfn,
+@@ -187,7 +191,226 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
              op->status = 0;
              break;
          }
 +#ifdef CONFIG_X86
 +        case IOMMUOP_map_foreign_page:
 +        {
-+            unsigned long mfn, tmp;
-+            unsigned int flags = 0;
++            mfn_t mfn, tmp;
++            unsigned int flags;
 +            struct page_info *page = NULL;
 +
 +            /* Check if calling domain is Dom0 and can create IOMMU mappings */
@@ -52,7 +52,7 @@ index e6ede8566c..80bd251b91 100644
 +                op->status = -ENXIO;
 +                goto finish;
 +            }
- 
++
 +            /* Only HVM domains can have their pages foreign mapped */
 +            if ( is_pv_domain(rd) )
 +            {
@@ -90,7 +90,7 @@ index e6ede8566c..80bd251b91 100644
 +                goto finish;
 +            }
 +
-+            if ( !mfn_valid(_mfn(mfn)) || xen_in_range(mfn) ||
++            if ( !mfn_valid(mfn) || xen_in_range(mfn_x(mfn)) ||
 +                 is_xen_heap_page(page)  ||
 +                 (page->count_info & PGC_allocated) ||
 +                 ( (page->count_info & PGC_count_mask) < 2 ))
@@ -101,12 +101,14 @@ index e6ede8566c..80bd251b91 100644
 +            }
 +
 +            /* Check for conflict with existing BFN mapping */
-+            if ( !iommu_lookup_page(d, op->u.map_foreign_page.bfn, &tmp) )
++            if ( !iommu_lookup_page(d, _dfn(op->u.map_foreign_page.bfn), &tmp, &flags) )
 +            {
 +                put_page(page);
 +                op->status = -EPERM;
 +                goto finish;
 +            }
++
++            flags = 0;
 +
 +            if ( op->flags & IOMMU_OP_readable )
 +                flags |= IOMMUF_readable;
@@ -114,8 +116,8 @@ index e6ede8566c..80bd251b91 100644
 +            if ( op->flags & IOMMU_OP_writeable )
 +                flags |= IOMMUF_writable;
 +
-+            if ( iommu_legacy_map(d, op->u.map_foreign_page.bfn, mfn, 0,
-+                                  flags) )
++            if ( iommu_legacy_map(d, _dfn(op->u.map_foreign_page.bfn), mfn,
++                                  PAGE_ORDER_4K, flags) )
 +            {
 +                put_page(page);
 +                op->status = -EIO;
@@ -128,7 +130,7 @@ index e6ede8566c..80bd251b91 100644
 +        }
 +        case IOMMUOP_lookup_foreign_page:
 +        {
-+            unsigned long mfn;
++            mfn_t mfn;
 +            struct page_info *page = NULL;
 +            int rc;
 +
@@ -190,7 +192,7 @@ index e6ede8566c..80bd251b91 100644
 +                if ( test_and_set_bit(_PGC_foreign_map, &page->count_info) )
 +                    put_page(page);
 +
-+                op->u.lookup_foreign_page.bfn = mfn;
++                op->u.lookup_foreign_page.bfn = mfn_x(mfn);
 +            }
 +
 +            op->status = 0;
@@ -199,8 +201,9 @@ index e6ede8566c..80bd251b91 100644
 +        case IOMMUOP_unmap_foreign_page:
 +        {
 +            struct page_info *page;
-+            unsigned long mfn;
-+
++            mfn_t mfn;
++            unsigned int flags;
+ 
 +            /* Check if calling domain is Dom0 */
 +            if ( !is_hardware_domain(d) )
 +            {
@@ -215,13 +218,13 @@ index e6ede8566c..80bd251b91 100644
 +            else
 +            {
 +                /* Check if there is a valid BFN mapping for this domain */
-+                if ( iommu_lookup_page(d, op->u.unmap_foreign_page.bfn, &mfn) )
++                if ( iommu_lookup_page(d, _dfn(op->u.unmap_foreign_page.bfn), &mfn, &flags) )
 +                {
 +                   op->status = -ENOENT;
 +                   goto finish;
 +                }
 +                /* Use MFN from B2M mapping to lookup page */
-+                page = mfn_to_page(_mfn(mfn));
++                page = mfn_to_page(mfn);
 +            }
 +
 +            if ( !page )
@@ -239,7 +242,8 @@ index e6ede8566c..80bd251b91 100644
 +            if ( !can_use_iommu_check(d) )
 +                goto foreign_unmap_done;
 +
-+            if ( iommu_legacy_unmap(d, op->u.unmap_foreign_page.bfn, 0) )
++            if ( iommu_legacy_unmap(d, _dfn(op->u.unmap_foreign_page.bfn),
++                                    PAGE_ORDER_4K) )
 +                domain_crash(d);
 +foreign_unmap_done:
 +            /* Remove the reference to the page */
@@ -252,7 +256,7 @@ index e6ede8566c..80bd251b91 100644
              op->status = -ENODEV;
              break;
 diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
-index 1ea173c555..dd5c60b5e4 100644
+index 6faa563..23a5411 100644
 --- a/xen/include/asm-x86/mm.h
 +++ b/xen/include/asm-x86/mm.h
 @@ -78,8 +78,12 @@
@@ -270,7 +274,7 @@ index 1ea173c555..dd5c60b5e4 100644
  
  /*
 diff --git a/xen/include/public/pv-iommu.h b/xen/include/public/pv-iommu.h
-index 0f19f96c16..366037ccaf 100644
+index 0f19f96..366037c 100644
 --- a/xen/include/public/pv-iommu.h
 +++ b/xen/include/public/pv-iommu.h
 @@ -26,6 +26,9 @@
@@ -310,10 +314,10 @@ index 0f19f96c16..366037ccaf 100644
  };
  
 diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
-index ff6b2dbf39..0def7ae96e 100644
+index a29d1ef..67808f6 100644
 --- a/xen/include/xsm/dummy.h
 +++ b/xen/include/xsm/dummy.h
-@@ -584,6 +584,12 @@ static XSM_INLINE int xsm_vm_event_control(XSM_DEFAULT_ARG struct domain *d, int
+@@ -587,6 +587,12 @@ static XSM_INLINE int xsm_vm_event_control(XSM_DEFAULT_ARG struct domain *d, int
      return xsm_default_action(action, current->domain, d);
  }
  
@@ -323,11 +327,11 @@ index ff6b2dbf39..0def7ae96e 100644
 +    return xsm_default_action(action, current->domain, d);
 +}
 +
- #ifdef CONFIG_HAS_MEM_ACCESS
+ #ifdef CONFIG_MEM_ACCESS
  static XSM_INLINE int xsm_mem_access(XSM_DEFAULT_ARG struct domain *d)
  {
 diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
-index aacfd5d49a..83843dd02a 100644
+index 3b192b5..0670953 100644
 --- a/xen/include/xsm/xsm.h
 +++ b/xen/include/xsm/xsm.h
 @@ -106,6 +106,7 @@ struct xsm_operations {
@@ -347,14 +351,14 @@ index aacfd5d49a..83843dd02a 100644
 +    return xsm_ops->iommu_control(d, op);
 +}
 +
- #ifdef CONFIG_HAS_MEM_ACCESS
+ #ifdef CONFIG_MEM_ACCESS
  static inline int xsm_mem_access (xsm_default_t def, struct domain *d)
  {
 diff --git a/xen/xsm/dummy.c b/xen/xsm/dummy.c
-index 6e751199ee..462353810c 100644
+index 5701047..4819566 100644
 --- a/xen/xsm/dummy.c
 +++ b/xen/xsm/dummy.c
-@@ -117,6 +117,7 @@ void __init xsm_fixup_ops (struct xsm_operations *ops)
+@@ -111,6 +111,7 @@ void __init xsm_fixup_ops (struct xsm_operations *ops)
      set_to_dummy_if_null(ops, hvm_altp2mhvm_op);
  
      set_to_dummy_if_null(ops, do_xsm_op);

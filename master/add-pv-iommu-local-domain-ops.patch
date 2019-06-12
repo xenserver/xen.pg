@@ -1,8 +1,8 @@
 diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
-index 304fccf349..e6ede8566c 100644
+index 304fccf..952614f 100644
 --- a/xen/common/pv_iommu.c
 +++ b/xen/common/pv_iommu.c
-@@ -17,13 +17,244 @@
+@@ -17,13 +17,249 @@
   * along with this program; If not, see <http://www.gnu.org/licenses/>.
   */
  
@@ -13,7 +13,7 @@ index 304fccf349..e6ede8566c 100644
  
  #define ret_t long
  
-+static int get_paged_frame(unsigned long gfn, unsigned long *frame,
++static int get_paged_frame(unsigned long gfn, mfn_t *mfn,
 +                           struct page_info **page, int readonly,
 +                           struct domain *rd)
 +{
@@ -25,7 +25,7 @@ index 304fccf349..e6ede8566c 100644
 +                             (readonly) ? P2M_ALLOC : P2M_UNSHARE);
 +    if ( !(*page) )
 +    {
-+        *frame = mfn_x(INVALID_MFN);
++        *mfn = INVALID_MFN;
 +        if ( p2m_is_shared(p2mt) )
 +            return -EIO;
 +        if ( p2m_is_paging(p2mt) )
@@ -35,7 +35,7 @@ index 304fccf349..e6ede8566c 100644
 +        }
 +        return -EIO;
 +    }
-+    *frame = mfn_x(page_to_mfn(*page));
++    *mfn = page_to_mfn(*page);
 +#else
 +    *frame = gmfn_to_mfn(rd, gfn);
 +    *page = mfn_valid(_mfn(*frame)) ? mfn_to_page(*frame) : NULL;
@@ -52,10 +52,10 @@ index 304fccf349..e6ede8566c 100644
 +
 +int can_use_iommu_check(struct domain *d)
 +{
-+    if ( !iommu_enabled || (!is_hardware_domain(d) && !need_iommu(d)) )
++    if ( !iommu_enabled || (!is_hardware_domain(d) && !has_iommu_pt(d)) )
 +        return 0;
 +
-+    if ( is_hardware_domain(d) && iommu_passthrough )
++    if ( is_hardware_domain(d) && iommu_hwdom_passthrough )
 +        return 0;
 +
 +    if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
@@ -89,8 +89,8 @@ index 304fccf349..e6ede8566c 100644
 +        }
 +        case IOMMUOP_map_page:
 +        {
-+            unsigned long mfn, tmp;
-+            unsigned int flags = 0;
++            mfn_t mfn, tmp;
++            unsigned int flags;
 +            struct page_info *page = NULL;
 +
 +            /* Check if calling domain can create IOMMU mappings */
@@ -111,8 +111,8 @@ index 304fccf349..e6ede8566c 100644
 +            /* Lookup page struct backing gfn */
 +            if ( (op->flags & IOMMU_MAP_OP_no_ref_cnt) )
 +            {
-+                mfn = op->u.map_page.gfn;
-+                page = mfn_to_page(_mfn(mfn));
++                mfn = _mfn(op->u.map_page.gfn);
++                page = mfn_to_page(mfn);
 +                if (!page)
 +                {
 +                    op->status = -EPERM; // Should this be something else?
@@ -125,7 +125,7 @@ index 304fccf349..e6ede8566c 100644
 +            }
 +
 +            /* Check for conflict with existing BFN mappings */
-+            if ( !iommu_lookup_page(d, op->u.map_page.bfn, &tmp) )
++            if ( !iommu_lookup_page(d, _dfn(op->u.map_page.bfn), &tmp, &flags) )
 +            {
 +                if ( !(op->flags & IOMMU_MAP_OP_no_ref_cnt) )
 +                    put_page(page);
@@ -133,13 +133,16 @@ index 304fccf349..e6ede8566c 100644
 +                goto finish;
 +            }
 +
++            flags = 0;
++
 +            if ( op->flags & IOMMU_OP_readable )
 +                flags |= IOMMUF_readable;
 +
 +            if ( op->flags & IOMMU_OP_writeable )
 +                flags |= IOMMUF_writable;
 +
-+            if ( iommu_legacy_map(d, op->u.map_page.bfn, mfn, 0, flags) )
++            if ( iommu_legacy_map(d, _dfn(op->u.map_page.bfn), mfn,
++                                  PAGE_ORDER_4K, flags) )
 +            {
 +                if ( !(op->flags & IOMMU_MAP_OP_no_ref_cnt) )
 +                    put_page(page);
@@ -153,16 +156,18 @@ index 304fccf349..e6ede8566c 100644
 +
 +        case IOMMUOP_unmap_page:
 +        {
-+            unsigned long mfn;
++            mfn_t mfn;
++            unsigned int flags;
 +
 +            /* Check if there is a valid BFN mapping for this domain */
-+            if ( iommu_lookup_page(d, op->u.unmap_page.bfn, &mfn) )
++            if ( iommu_lookup_page(d, _dfn(op->u.unmap_page.bfn), &mfn, &flags) )
 +            {
 +                op->status = -ENOENT;
 +                goto finish;
 +            }
 +
-+            if ( iommu_legacy_unmap(d, op->u.unmap_page.bfn, 0) )
++            if ( iommu_legacy_unmap(d, _dfn(op->u.unmap_page.bfn),
++                                    PAGE_ORDER_4K) )
 +            {
 +                op->status = -EIO;
 +                goto finish;
@@ -228,8 +233,8 @@ index 304fccf349..e6ede8566c 100644
 +
 +        this_cpu(iommu_dont_flush_iotlb) = 0;
 +        if ( i )
-+            rc = iommu_iotlb_flush_all(
-+                d, IOMMU_FLUSHF_added | IOMMU_FLUSHF_modified);
++            rc = iommu_iotlb_flush_all(d, IOMMU_FLUSHF_added |
++                                       IOMMU_FLUSHF_modified);
 +
 +        if ( rc < 0 )
 +            ret = rc;
@@ -250,7 +255,7 @@ index 304fccf349..e6ede8566c 100644
  /*
 diff --git a/xen/include/public/pv-iommu.h b/xen/include/public/pv-iommu.h
 new file mode 100644
-index 0000000000..0f19f96c16
+index 0000000..0f19f96
 --- /dev/null
 +++ b/xen/include/public/pv-iommu.h
 @@ -0,0 +1,69 @@

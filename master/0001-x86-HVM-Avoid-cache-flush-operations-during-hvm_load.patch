@@ -16,7 +16,7 @@ seconds.
 
 Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
 diff --git a/xen/arch/x86/hvm/mtrr.c b/xen/arch/x86/hvm/mtrr.c
-index 2d4cd84..381254c 100644
+index 7ccd85b..4790742 100644
 --- a/xen/arch/x86/hvm/mtrr.c
 +++ b/xen/arch/x86/hvm/mtrr.c
 @@ -62,6 +62,8 @@ static const uint8_t mm_type_tbl[MTRR_NUM_TYPES][PAT_TYPE_NUMS] = {
@@ -28,21 +28,21 @@ index 2d4cd84..381254c 100644
  /*
   * Reverse lookup table, to find a pat type according to MTRR and effective
   * memory type. This table is dynamically generated.
-@@ -755,6 +757,9 @@ HVM_REGISTER_SAVE_RESTORE(MTRR, hvm_save_mtrr_msr, hvm_load_mtrr_msr,
+@@ -783,6 +785,9 @@ HVM_REGISTER_SAVE_RESTORE(MTRR, hvm_save_mtrr_msr, hvm_load_mtrr_msr, 1,
  
  void memory_type_changed(struct domain *d)
  {
 +    if ( this_cpu(memory_type_changed_ignore) )
 +        return;
 +
-     if ( (need_iommu(d) || cache_flush_permitted(d)) && d->vcpu && d->vcpu[0] )
+     if ( (has_iommu_pt(d) || cache_flush_permitted(d)) && d->vcpu && d->vcpu[0] )
      {
          p2m_memory_type_changed(d);
 diff --git a/xen/arch/x86/hvm/save.c b/xen/arch/x86/hvm/save.c
-index 17c8094..6f9f817 100644
+index 0fc59d3..4d202e7 100644
 --- a/xen/arch/x86/hvm/save.c
 +++ b/xen/arch/x86/hvm/save.c
-@@ -255,6 +255,7 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
+@@ -291,6 +291,7 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
      struct hvm_save_descriptor *desc;
      hvm_load_handler handler;
      struct vcpu *v;
@@ -50,8 +50,8 @@ index 17c8094..6f9f817 100644
  
      if ( d->is_dying )
          return -EINVAL;
-@@ -271,6 +272,8 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
-         if ( test_and_set_bit(_VPF_down, &v->pause_flags) )
+@@ -307,6 +308,8 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
+         if ( !test_and_set_bit(_VPF_down, &v->pause_flags) )
              vcpu_sleep_nosync(v);
  
 +    this_cpu(memory_type_changed_ignore) = 1;
@@ -59,7 +59,7 @@ index 17c8094..6f9f817 100644
      for ( ; ; )
      {
          if ( h->size - h->cur < sizeof(struct hvm_save_descriptor) )
-@@ -279,13 +282,14 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
+@@ -315,13 +318,14 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
              printk(XENLOG_G_ERR
                     "HVM%d restore: save did not end with a null entry\n",
                     d->domain_id);
@@ -76,7 +76,7 @@ index 17c8094..6f9f817 100644
  
          /* Find the handler for this entry */
          if ( (desc->typecode > HVM_SAVE_CODE_MAX) ||
-@@ -293,7 +297,8 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
+@@ -329,7 +333,8 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
          {
              printk(XENLOG_G_ERR "HVM%d restore: unknown entry typecode %u\n",
                     d->domain_id, desc->typecode);
@@ -86,7 +86,7 @@ index 17c8094..6f9f817 100644
          }
  
          /* Load the entry */
-@@ -303,11 +308,17 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
+@@ -339,11 +344,17 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
          {
              printk(XENLOG_G_ERR "HVM%d restore: failed to load entry %u/%u\n",
                     d->domain_id, desc->typecode, desc->instance);
@@ -107,10 +107,10 @@ index 17c8094..6f9f817 100644
  
  int _hvm_init_entry(struct hvm_domain_context *h, uint16_t tc, uint16_t inst,
 diff --git a/xen/include/asm-x86/mtrr.h b/xen/include/asm-x86/mtrr.h
-index 5cdc5d4..15009d6 100644
+index 4be704c..7cd71a6 100644
 --- a/xen/include/asm-x86/mtrr.h
 +++ b/xen/include/asm-x86/mtrr.h
-@@ -60,6 +60,15 @@ struct mtrr_state {
+@@ -64,6 +64,15 @@ struct mtrr_state {
  };
  extern struct mtrr_state mtrr_state;
  

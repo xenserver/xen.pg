@@ -28,10 +28,10 @@ Signed-off-by: Andrei Lutas <vlutas@bitdefender.com>
 Signed-off-by: Mihai Donțu <mdontu@bitdefender.com>
 Signed-off-by: Anshul Makkar <anshul.makkar@citrix.com>
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index a06ad96..c81a1e6 100644
+index b937fd7..cba314d 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -341,6 +341,7 @@ int vcpu_initialise(struct vcpu *v)
+@@ -343,6 +343,7 @@ int arch_vcpu_create(struct vcpu *v)
      int rc;
  
      v->arch.flags = TF_kernel_mode;
@@ -40,7 +40,7 @@ index a06ad96..c81a1e6 100644
      rc = mapcache_vcpu_init(v);
      if ( rc )
 diff --git a/xen/arch/x86/hvm/vm_event.c b/xen/arch/x86/hvm/vm_event.c
-index 3d0e6b9..227b2f9 100644
+index 121de23..9821cd5 100644
 --- a/xen/arch/x86/hvm/vm_event.c
 +++ b/xen/arch/x86/hvm/vm_event.c
 @@ -23,6 +23,7 @@
@@ -68,10 +68,10 @@ index 3d0e6b9..227b2f9 100644
          v->arch.vm_event->emulate_flags = 0;
      }
 diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
-index b53b6aa..207342b 100644
+index 24def93..ed4f592 100644
 --- a/xen/arch/x86/hvm/vmx/vmx.c
 +++ b/xen/arch/x86/hvm/vmx/vmx.c
-@@ -2235,6 +2235,22 @@ static bool_t vmx_vcpu_emulate_ve(struct vcpu *v)
+@@ -2270,6 +2270,22 @@ static bool_t vmx_vcpu_emulate_ve(struct vcpu *v)
      return rc;
  }
  
@@ -94,15 +94,15 @@ index b53b6aa..207342b 100644
  static bool vmx_get_pending_event(struct vcpu *v, struct x86_event *info)
  {
      unsigned long intr_info, error_code;
-@@ -2320,6 +2336,7 @@ static struct hvm_function_table __initdata vmx_function_table = {
+@@ -2353,6 +2369,7 @@ static struct hvm_function_table __initdata vmx_function_table = {
      .altp2m_vcpu_update_vmfunc_ve = vmx_vcpu_update_vmfunc_ve,
      .altp2m_vcpu_emulate_ve = vmx_vcpu_emulate_ve,
      .altp2m_vcpu_emulate_vmfunc = vmx_vcpu_emulate_vmfunc,
 +    .exited_by_nested_pagefault = vmx_exited_by_nested_pagefault,
      .tsc_scaling = {
          .max_ratio = VMX_TSC_MULTIPLIER_MAX,
-         .setup     = vmx_setup_tsc_scaling,
-@@ -3567,6 +3584,57 @@ static int vmx_handle_apic_write(void)
+     },
+@@ -3584,6 +3601,57 @@ static int vmx_handle_apic_write(void)
      return vlapic_apicv_write(current, exit_qualification & 0xfff);
  }
  
@@ -160,7 +160,7 @@ index b53b6aa..207342b 100644
  void vmx_vmexit_handler(struct cpu_user_regs *regs)
  {
      unsigned long exit_qualification, exit_reason, idtv_info, intr_info = 0;
-@@ -3574,6 +3642,8 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+@@ -3591,6 +3659,8 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
      struct vcpu *v = current;
      struct domain *currd = v->domain;
  
@@ -169,17 +169,17 @@ index b53b6aa..207342b 100644
      __vmread(GUEST_RIP,    &regs->rip);
      __vmread(GUEST_RSP,    &regs->rsp);
      __vmread(GUEST_RFLAGS, &regs->rflags);
-@@ -4103,6 +4173,8 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+@@ -4119,6 +4189,8 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
      case EXIT_REASON_MONITOR_TRAP_FLAG:
-         v->arch.hvm_vmx.exec_control &= ~CPU_BASED_MONITOR_TRAP_FLAG;
+         v->arch.hvm.vmx.exec_control &= ~CPU_BASED_MONITOR_TRAP_FLAG;
          vmx_update_cpu_exec_control(v);
 +        if ( opt_introspection_extn )
 +            vmx_stop_reexecute_instruction(v);
          if ( v->arch.hvm.single_step )
          {
              hvm_monitor_debug(regs->rip,
-@@ -4352,6 +4424,8 @@ bool vmx_vmenter_helper(const struct cpu_user_regs *regs)
-     if ( unlikely(curr->arch.hvm_vmx.lbr_flags & LBR_FIXUP_MASK) )
+@@ -4337,6 +4409,8 @@ bool vmx_vmenter_helper(const struct cpu_user_regs *regs)
+     if ( unlikely(curr->arch.hvm.vmx.lbr_flags & LBR_FIXUP_MASK) )
          lbr_fixup();
  
 +    curr->arch.in_host = 0;
@@ -188,10 +188,10 @@ index b53b6aa..207342b 100644
  
      __vmwrite(GUEST_RIP,    regs->rip);
 diff --git a/xen/arch/x86/mm/mem_access.c b/xen/arch/x86/mm/mem_access.c
-index 5110882..8916436 100644
+index 56c06a4..5dd9642 100644
 --- a/xen/arch/x86/mm/mem_access.c
 +++ b/xen/arch/x86/mm/mem_access.c
-@@ -26,10 +26,12 @@
+@@ -26,11 +26,13 @@
  #include <xen/nospec.h>
  #include <xen/vm_event.h>
  #include <xen/event.h>
@@ -199,37 +199,16 @@ index 5110882..8916436 100644
  #include <public/vm_event.h>
  #include <asm/p2m.h>
  #include <asm/altp2m.h>
+ #include <asm/hvm/emulate.h>
  #include <asm/vm_event.h>
 +#include <asm/hvm/hvm.h>
  
  #include "mm-locks.h"
  
-@@ -138,6 +140,204 @@ bool p2m_mem_access_emulate_check(struct vcpu *v,
+@@ -139,7 +141,205 @@ bool p2m_mem_access_emulate_check(struct vcpu *v,
      return violation;
  }
  
-+static void p2m_set_ad_bits(struct vcpu *v, struct p2m_domain *p2m,
-+                            paddr_t ga)
-+{
-+    struct hvm_hw_cpu ctxt;
-+    uint32_t pfec = 0;
-+    const struct paging_mode *pg_mode = v->arch.paging.mode;
-+
-+    hvm_funcs.save_cpu_ctxt(v, &ctxt);
-+
-+    if ( guest_cpu_user_regs()->rip == v->arch.sse_pg_dirty.eip
-+         && ga == v->arch.sse_pg_dirty.gla )
-+    {
-+        pfec = 2;
-+        pg_mode->p2m_ga_to_gfn(v, p2m, ctxt.cr3, ga, &pfec, NULL);
-+    }
-+    else
-+        pg_mode->p2m_ga_to_gfn(v, p2m, ctxt.cr3, ga, &pfec, NULL);
-+
-+    v->arch.sse_pg_dirty.eip = guest_cpu_user_regs()->rip;
-+    v->arch.sse_pg_dirty.gla = ga;
-+}
-+
 +int vmx_start_reexecute_instruction(struct vcpu *v,
 +                                    unsigned long gpa,
 +                                    xenmem_access_t required_access)
@@ -406,11 +385,34 @@ index 5110882..8916436 100644
 +    return ret;
 +}
 +
+ #ifdef CONFIG_HVM
++static void p2m_set_ad_bits(struct vcpu *v, struct p2m_domain *p2m,
++                            paddr_t ga)
++{
++    struct hvm_hw_cpu ctxt;
++    uint32_t pfec = 0;
++    const struct paging_mode *pg_mode = v->arch.paging.mode;
++
++    hvm_funcs.save_cpu_ctxt(v, &ctxt);
++
++    if ( guest_cpu_user_regs()->rip == v->arch.sse_pg_dirty.eip
++         && ga == v->arch.sse_pg_dirty.gla )
++    {
++        pfec = 2;
++        pg_mode->p2m_ga_to_gfn(v, p2m, ctxt.cr3, ga, &pfec, NULL);
++    }
++    else
++        pg_mode->p2m_ga_to_gfn(v, p2m, ctxt.cr3, ga, &pfec, NULL);
++
++    v->arch.sse_pg_dirty.eip = guest_cpu_user_regs()->rip;
++    v->arch.sse_pg_dirty.gla = ga;
++}
++
  bool p2m_mem_access_check(paddr_t gpa, unsigned long gla,
                            struct npfec npfec,
                            vm_event_request_t **req_ptr)
-@@ -209,6 +409,19 @@ bool p2m_mem_access_check(paddr_t gpa, unsigned long gla,
-         }
+@@ -219,6 +419,19 @@ bool p2m_mem_access_check(paddr_t gpa, unsigned long gla,
+         return true;
      }
  
 +    if ( opt_introspection_extn &&
@@ -429,7 +431,7 @@ index 5110882..8916436 100644
      *req_ptr = NULL;
      req = xzalloc(vm_event_request_t);
      if ( req )
-@@ -216,6 +429,10 @@ bool p2m_mem_access_check(paddr_t gpa, unsigned long gla,
+@@ -226,6 +439,10 @@ bool p2m_mem_access_check(paddr_t gpa, unsigned long gla,
          *req_ptr = req;
  
          req->reason = VM_EVENT_REASON_MEM_ACCESS;
@@ -439,12 +441,12 @@ index 5110882..8916436 100644
 +
          req->u.mem_access.gfn = gfn_x(gfn);
          req->u.mem_access.offset = gpa & ((1 << PAGE_SHIFT) - 1);
-         if ( npfec.gla_valid )
+ 
 diff --git a/xen/arch/x86/vm_event.c b/xen/arch/x86/vm_event.c
-index 189e56d..39d3606 100644
+index 51c3493..9a98325 100644
 --- a/xen/arch/x86/vm_event.c
 +++ b/xen/arch/x86/vm_event.c
-@@ -220,6 +220,7 @@ void vm_event_emulate_check(struct vcpu *v, vm_event_response_t *rsp)
+@@ -280,6 +280,7 @@ void vm_event_emulate_check(struct vcpu *v, vm_event_response_t *rsp)
          if ( rsp->flags & VM_EVENT_FLAG_SET_EMUL_READ_DATA )
              v->arch.vm_event->emul.read = rsp->data.emul.read;
          v->arch.vm_event->emulate_flags = rsp->flags;
@@ -453,12 +455,12 @@ index 189e56d..39d3606 100644
  
      default:
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index f9a56fc..dc92414 100644
+index 1b68a75..3b3e12a 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -278,6 +278,8 @@ struct domain *domain_create(domid_t domid,
- 
-     TRACE_1D(TRC_DOM0_DOM_ADD, d->domain_id);
+@@ -442,6 +442,8 @@ struct domain *domain_create(domid_t domid,
+         d->max_vcpus = config->max_vcpus;
+     }
  
 +    spin_lock_init(&d->arch.rexec_lock);
 +
@@ -466,10 +468,10 @@ index f9a56fc..dc92414 100644
  
      if ( (err = xsm_alloc_security_domain(d)) != 0 )
 diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
-index b9e9ea9..e7bdf8d 100644
+index 58ade0b..0a7388e 100644
 --- a/xen/include/asm-x86/domain.h
 +++ b/xen/include/asm-x86/domain.h
-@@ -425,6 +425,8 @@ struct arch_domain
+@@ -430,6 +430,8 @@ struct arch_domain
  
      /* Emulated devices enabled bitmap. */
      uint32_t emulation_flags;
@@ -477,8 +479,8 @@ index b9e9ea9..e7bdf8d 100644
 +    spinlock_t rexec_lock;
  } __cacheline_aligned;
  
- #define has_vlapic(d)      (!!((d)->arch.emulation_flags & XEN_X86_EMU_LAPIC))
-@@ -574,6 +576,25 @@ struct arch_vcpu
+ #ifdef CONFIG_HVM
+@@ -621,6 +623,25 @@ struct arch_vcpu
      /* A secondary copy of the vcpu time info. */
      XEN_GUEST_HANDLE(vcpu_time_info_t) time_info_guest;
  
@@ -503,12 +505,12 @@ index b9e9ea9..e7bdf8d 100644
 +
      struct arch_vm_event *vm_event;
  
-     struct msr_vcpu_policy *msr;
+     struct vcpu_msrs *msrs;
 diff --git a/xen/include/asm-x86/hvm/hvm.h b/xen/include/asm-x86/hvm/hvm.h
-index 1dcd3a6..0d5638b 100644
+index 88cd391..e8758d2 100644
 --- a/xen/include/asm-x86/hvm/hvm.h
 +++ b/xen/include/asm-x86/hvm/hvm.h
-@@ -218,6 +218,8 @@ struct hvm_function_table {
+@@ -232,6 +232,8 @@ struct hvm_function_table {
      bool_t (*altp2m_vcpu_emulate_ve)(struct vcpu *v);
      int (*altp2m_vcpu_emulate_vmfunc)(const struct cpu_user_regs *regs);
  
@@ -518,10 +520,10 @@ index 1dcd3a6..0d5638b 100644
       * Parameters and callbacks for hardware-assisted TSC scaling,
       * which are valid only when the hardware feature is available.
 diff --git a/xen/include/asm-x86/p2m.h b/xen/include/asm-x86/p2m.h
-index 3bedd5e..432324e 100644
+index 98ba91b..2b08afe 100644
 --- a/xen/include/asm-x86/p2m.h
 +++ b/xen/include/asm-x86/p2m.h
-@@ -871,6 +871,10 @@ static inline unsigned int p2m_get_iommu_flags(p2m_type_t p2mt, mfn_t mfn)
+@@ -931,6 +931,10 @@ static inline unsigned int p2m_get_iommu_flags(p2m_type_t p2mt, mfn_t mfn)
      return flags;
  }
  

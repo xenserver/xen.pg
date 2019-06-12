@@ -1,5 +1,5 @@
 diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
-index 80bd251b91..7c6057ca26 100644
+index f1c4cfa..a01e94b 100644
 --- a/xen/common/pv_iommu.c
 +++ b/xen/common/pv_iommu.c
 @@ -28,6 +28,12 @@
@@ -8,18 +8,18 @@ index 80bd251b91..7c6057ca26 100644
  
 +static uint64_t **hwdom_premap_m2b;
 +
-+#define PREMAP_M2B_PAGE(x) ( pfn_to_pdx(x) / (PAGE_SIZE/sizeof(uint64_t) ) )
-+#define PREMAP_M2B_IDX(x) ( pfn_to_pdx(x) % (PAGE_SIZE/sizeof(uint64_t) ) )
++#define PREMAP_M2B_PAGE(x) ( pfn_to_pdx(mfn_x(x)) / (PAGE_SIZE/sizeof(uint64_t) ) )
++#define PREMAP_M2B_IDX(x) ( pfn_to_pdx(mfn_x(x)) % (PAGE_SIZE/sizeof(uint64_t) ) )
 +#define PREMAP_M2B(x) hwdom_premap_m2b[PREMAP_M2B_PAGE(x)][PREMAP_M2B_IDX(x)]
 +
- static int get_paged_frame(unsigned long gfn, unsigned long *frame,
+ static int get_paged_frame(unsigned long gfn, mfn_t *mfn,
                             struct page_info **page, int readonly,
                             struct domain *rd)
 @@ -100,6 +106,15 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
              if ( can_use_iommu_check(d) )
                  op->flags |= IOMMU_QUERY_map_cap;
  
-+            if ( is_hardware_domain(d) && !d->need_iommu )
++            if ( is_hardware_domain(d) )
 +            {
 +                op->flags |= IOMMU_QUERY_map_all_mfns;
 +
@@ -31,7 +31,7 @@ index 80bd251b91..7c6057ca26 100644
              break;
          }
          case IOMMUOP_map_page:
-@@ -162,12 +177,40 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
+@@ -165,12 +180,40 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
                  goto finish;
              }
  
@@ -69,15 +69,15 @@ index 80bd251b91..7c6057ca26 100644
          case IOMMUOP_unmap_page:
          {
 +            struct page_info *page;
-             unsigned long mfn;
+             mfn_t mfn;
+             unsigned int flags;
  
-             /* Check if there is a valid BFN mapping for this domain */
-@@ -183,6 +226,22 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
+@@ -188,6 +231,22 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
                  goto finish;
              }
  
 +            /* Use MFN from B2M mapping to lookup page */
-+            page = mfn_to_page(_mfn(mfn));
++            page = mfn_to_page(mfn);
 +
 +            /* Remove wildcard M2B mapping */
 +            if ( is_hardware_domain(d) &&
@@ -95,9 +95,9 @@ index 80bd251b91..7c6057ca26 100644
              op->status = 0;
              break;
          }
-@@ -346,6 +405,33 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
+@@ -353,6 +412,33 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
  
-                 op->u.lookup_foreign_page.bfn = mfn;
+                 op->u.lookup_foreign_page.bfn = mfn_x(mfn);
              }
 +            else
 +            {
@@ -129,7 +129,7 @@ index 80bd251b91..7c6057ca26 100644
  
              op->status = 0;
              break;
-@@ -393,6 +479,11 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
+@@ -401,6 +487,11 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
              if ( !can_use_iommu_check(d) )
                  goto foreign_unmap_done;
  
@@ -138,11 +138,11 @@ index 80bd251b91..7c6057ca26 100644
 +                 (read_atomic(&PREMAP_M2B(mfn)) == op->u.unmap_foreign_page.bfn) )
 +                goto foreign_unmap_done;
 +
-             if ( iommu_legacy_unmap(d, op->u.unmap_foreign_page.bfn, 0) )
+             if ( iommu_legacy_unmap(d, _dfn(op->u.unmap_foreign_page.bfn),
+                                     PAGE_ORDER_4K) )
                  domain_crash(d);
- foreign_unmap_done:
 diff --git a/xen/include/public/pv-iommu.h b/xen/include/public/pv-iommu.h
-index 366037ccaf..4505f3e581 100644
+index 366037c..4505f3e 100644
 --- a/xen/include/public/pv-iommu.h
 +++ b/xen/include/public/pv-iommu.h
 @@ -40,6 +40,8 @@ struct pv_iommu_op {
