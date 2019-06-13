@@ -209,9 +209,11 @@ cp %{SOURCE4} .
 # Placate ./configure, but don't pull in external content.
 export WGET=/bin/false FETCHER=/bin/false
 
-%configure --disable-seabios \
+%configure --disable-qemu-traditional \
+           --disable-seabios \
            --disable-stubdom \
            --disable-xsmpolicy \
+           --enable-rombios \
            --enable-systemd \
            --with-xenstored=oxenstored \
            --with-system-qemu=%{_libdir}/xen/bin/qemu-system-i386 \
@@ -528,8 +530,8 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_sbindir}/xen-lowmemd
 %{_sbindir}/xen-mceinj
 %{_sbindir}/xen-mfndump
-%{_sbindir}/xen-ucode
 %{_sbindir}/xen-spec-ctrl
+%{_sbindir}/xen-ucode
 %{_sbindir}/xen-vmdebug
 %{_sbindir}/xenbaked
 %{_sbindir}/xenconsoled
