@@ -1,0 +1,102 @@
+From 62b8949e9ddefa3191688ccc56e69aa6331b0da1 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 25 Jun 2019 17:34:11 +0200
+Subject: x86: replace remaining uses of __get_cpu_var()
+
+this_cpu() is shorter, and when there are multiple uses in a function
+per_cpu() it's also more efficient.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/acpi/cpuidle_menu.c b/xen/arch/x86/acpi/cpuidle_menu.c
+index 20f4f5fcf4..f6ff2320f2 100644
+--- a/xen/arch/x86/acpi/cpuidle_menu.c
++++ b/xen/arch/x86/acpi/cpuidle_menu.c
+@@ -146,7 +146,7 @@ static inline int which_bucket(unsigned int duration)
+ 
+ static inline s_time_t avg_intr_interval_us(void)
+ {
+-    struct menu_device *data = &__get_cpu_var(menu_devices);
++    struct menu_device *data = &this_cpu(menu_devices);
+     s_time_t    duration, now;
+     s_time_t    avg_interval;
+     unsigned int irq_sum;
+@@ -187,7 +187,7 @@ static unsigned int get_sleep_length_us(void)
+ 
+ static int menu_select(struct acpi_processor_power *power)
+ {
+-    struct menu_device *data = &__get_cpu_var(menu_devices);
++    struct menu_device *data = &this_cpu(menu_devices);
+     int i;
+     s_time_t    io_interval;
+ 
+@@ -239,7 +239,7 @@ static int menu_select(struct acpi_processor_power *power)
+ 
+ static void menu_reflect(struct acpi_processor_power *power)
+ {
+-    struct menu_device *data = &__get_cpu_var(menu_devices);
++    struct menu_device *data = &this_cpu(menu_devices);
+     u64 new_factor;
+ 
+     data->measured_us = power->last_residency;
+@@ -297,7 +297,8 @@ static struct cpuidle_governor menu_governor =
+ struct cpuidle_governor *cpuidle_current_governor = &menu_governor;
+ void menu_get_trace_data(u32 *expected, u32 *pred)
+ {
+-    struct menu_device *data = &__get_cpu_var(menu_devices);
++    const struct menu_device *data = &this_cpu(menu_devices);
++
+     *expected = data->expected_us;
+     *pred = data->predicted_us;
+ }
+diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
+index 0035174d1f..bef4e3e7d5 100644
+--- a/xen/arch/x86/irq.c
++++ b/xen/arch/x86/irq.c
+@@ -651,7 +651,7 @@ void irq_move_cleanup_interrupt(struct cpu_user_regs *regs)
+         unsigned int irq;
+         unsigned int irr;
+         struct irq_desc *desc;
+-        irq = __get_cpu_var(vector_irq)[vector];
++        irq = per_cpu(vector_irq, me)[vector];
+ 
+         if ((int)irq < 0)
+             continue;
+@@ -689,7 +689,7 @@ void irq_move_cleanup_interrupt(struct cpu_user_regs *regs)
+         TRACE_3D(TRC_HW_IRQ_MOVE_CLEANUP,
+                  irq, vector, smp_processor_id());
+ 
+-        __get_cpu_var(vector_irq)[vector] = ~irq;
++        per_cpu(vector_irq, me)[vector] = ~irq;
+         desc->arch.move_cleanup_count--;
+ 
+         if ( desc->arch.move_cleanup_count == 0 )
+@@ -821,7 +821,7 @@ void do_IRQ(struct cpu_user_regs *regs)
+     uint32_t          tsc_in;
+     struct irq_desc  *desc;
+     unsigned int      vector = (u8)regs->entry_vector;
+-    int irq = __get_cpu_var(vector_irq[vector]);
++    int               irq = this_cpu(vector_irq)[vector];
+     struct cpu_user_regs *old_regs = set_irq_regs(regs);
+     
+     perfc_incr(irqs);
+diff --git a/xen/include/asm-x86/irq.h b/xen/include/asm-x86/irq.h
+index 4b39997f09..9c28d87e6e 100644
+--- a/xen/include/asm-x86/irq.h
++++ b/xen/include/asm-x86/irq.h
+@@ -68,12 +68,12 @@ DECLARE_PER_CPU(struct cpu_user_regs *, __irq_regs);
+ 
+ static inline struct cpu_user_regs *get_irq_regs(void)
+ {
+-	return __get_cpu_var(__irq_regs);
++	return this_cpu(__irq_regs);
+ }
+ 
+ static inline struct cpu_user_regs *set_irq_regs(struct cpu_user_regs *new_regs)
+ {
+-	struct cpu_user_regs *old_regs, **pp_regs = &__get_cpu_var(__irq_regs);
++	struct cpu_user_regs *old_regs, **pp_regs = &this_cpu(__irq_regs);
+ 
+ 	old_regs = *pp_regs;
+ 	*pp_regs = new_regs;

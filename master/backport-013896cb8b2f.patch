@@ -1,0 +1,120 @@
+From 013896cb8b2f070dc452bd1b91fc5b842a538367 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 1 Apr 2019 11:08:28 +0100
+Subject: x86/msr: Fix handling of MSR_AMD_PATCHLEVEL/MSR_IA32_UCODE_REV
+
+There are a number of bugs.  There are no read/write hooks on the HVM side, so
+guest accesses fall into the "read/write-discard" defaults, which bypass the
+correct faulting behaviour and the Intel special case.
+
+For the PV side, writes are discarded (again, bypassing proper faulting),
+except for a pinned dom0, which is permitted to actually write the values
+other than 0.  This is pointless with read hook implementing the Intel special
+case.
+
+However, implementing the Intel special case is itself pointless.  First of
+all, OS software can't guarentee to read back 0 in the first place, because a)
+this behaviour isn't guarenteed in the SDM, and b) there are SMM handlers
+which use the CPUID instruction.  Secondly, when a guest executes CPUID, this
+doesn't typically result in Xen executing a CPUID instruction in practice.
+
+With the dom0 special case removed, there are now no writes to this MSR other
+than Xen's microcode loading facilities, which means that the value held in
+the MSR will be properly up-to-date.  Forward it directly, without jumping
+through any hoops.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/msr.c b/xen/arch/x86/msr.c
+index a7f67d97e6..30563ad110 100644
+--- a/xen/arch/x86/msr.c
++++ b/xen/arch/x86/msr.c
+@@ -135,6 +135,27 @@ int guest_rdmsr(const struct vcpu *v, uint32_t msr, uint64_t *val)
+         /* Not offered to guests. */
+         goto gp_fault;
+ 
++    case MSR_AMD_PATCHLEVEL:
++        BUILD_BUG_ON(MSR_IA32_UCODE_REV != MSR_AMD_PATCHLEVEL);
++        /*
++         * AMD and Intel use the same MSR for the current microcode version.
++         *
++         * There is no need to jump through the SDM-provided hoops for Intel.
++         * A guest might itself perform the "write 0, CPUID, read" sequence,
++         * but servicing the CPUID for the guest typically wont result in
++         * actually executing a CPUID instruction.
++         *
++         * As a guest can't influence the value of this MSR, the value will be
++         * from Xen's last microcode load, which can be forwarded straight to
++         * the guest.
++         */
++        if ( !(cp->x86_vendor & (X86_VENDOR_INTEL | X86_VENDOR_AMD)) ||
++             !(boot_cpu_data.x86_vendor &
++               (X86_VENDOR_INTEL | X86_VENDOR_AMD)) ||
++             rdmsr_safe(MSR_AMD_PATCHLEVEL, *val) )
++            goto gp_fault;
++        break;
++
+     case MSR_SPEC_CTRL:
+         if ( !cp->feat.ibrsb )
+             goto gp_fault;
+@@ -241,6 +262,19 @@ int guest_wrmsr(struct vcpu *v, uint32_t msr, uint64_t val)
+         /* Not offered to guests. */
+         goto gp_fault;
+ 
++    case MSR_AMD_PATCHLEVEL:
++        BUILD_BUG_ON(MSR_IA32_UCODE_REV != MSR_AMD_PATCHLEVEL);
++        /*
++         * AMD and Intel use the same MSR for the current microcode version.
++         *
++         * Both document it as read-only.  However Intel also document that,
++         * for backwards compatiblity, the OS should write 0 to it before
++         * trying to access the current microcode version.
++         */
++        if ( d->arch.cpuid->x86_vendor != X86_VENDOR_INTEL || val != 0 )
++            goto gp_fault;
++        break;
++
+     case MSR_AMD_PATCHLOADER:
+         /*
+          * See note on MSR_IA32_UCODE_WRITE below, which may or may not apply
+diff --git a/xen/arch/x86/pv/emul-priv-op.c b/xen/arch/x86/pv/emul-priv-op.c
+index 84ce67c641..a4f3ffcd57 100644
+--- a/xen/arch/x86/pv/emul-priv-op.c
++++ b/xen/arch/x86/pv/emul-priv-op.c
+@@ -893,17 +893,6 @@ static int read_msr(unsigned int reg, uint64_t *val,
+         *val = 0;
+         return X86EMUL_OKAY;
+ 
+-    case MSR_IA32_UCODE_REV:
+-        BUILD_BUG_ON(MSR_IA32_UCODE_REV != MSR_AMD_PATCHLEVEL);
+-        if ( boot_cpu_data.x86_vendor == X86_VENDOR_INTEL )
+-        {
+-            if ( wrmsr_safe(MSR_IA32_UCODE_REV, 0) )
+-                break;
+-            /* As documented in the SDM: Do a CPUID 1 here */
+-            cpuid_eax(1);
+-        }
+-        goto normal;
+-
+     case MSR_IA32_MISC_ENABLE:
+         rdmsrl(reg, *val);
+         *val = guest_misc_enable(*val);
+@@ -1047,17 +1036,6 @@ static int write_msr(unsigned int reg, uint64_t val,
+             return X86EMUL_OKAY;
+         break;
+ 
+-    case MSR_IA32_UCODE_REV:
+-        if ( boot_cpu_data.x86_vendor != X86_VENDOR_INTEL )
+-            break;
+-        if ( !is_hwdom_pinned_vcpu(curr) )
+-            return X86EMUL_OKAY;
+-        if ( rdmsr_safe(reg, temp) )
+-            break;
+-        if ( val )
+-            goto invalid;
+-        return X86EMUL_OKAY;
+-
+     case MSR_IA32_MISC_ENABLE:
+         rdmsrl(reg, temp);
+         if ( val != guest_misc_enable(temp) )

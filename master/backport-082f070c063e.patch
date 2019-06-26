@@ -1,0 +1,116 @@
+From 082f070c063e2f4e215388fa3f803ec947c999cb Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 11 Jun 2019 17:21:34 +0200
+Subject: x86/AMD: make use of CPUID leaf 0xb when available
+
+Initially I did simply stumble across a backport of Linux commit
+e0ceeae708 ("x86/CPU/hygon: Fix phys_proc_id calculation logic for
+multi-die processors") to our kernels. There I got puzzled by the claim
+that a similar change isn't needed on the AMD side. As per the web page
+cited [1], there aren't supposed to be affected AMD processors, but
+according to my reading there are: The EPYC 7000 series comes with 8,
+16, 24, or 32 cores, which I imply to be 1, 2, 3, or 4 die processors.
+And many of them have "1P/2P" in the "socket count" column. Therefore
+our calculation, being based on CPUID.80000008.EBX[15:12], would be
+similarly wrong on such 2-socket 1- or 2-die systems.
+
+Checking Linux code I then found that they don't even rely on the
+calculation we currently use anymore, at least not in the case when
+leaf 0xb is available (which is the case on Fam17). Let's follow
+Suravee's Linux commit 3986a0a805 ("x86/CPU/AMD: Derive CPU topology
+from CPUID function 0xB when available") in this regard to address this.
+
+To avoid logging duplicate information, make the function return bool.
+Move its and detect_ht()'s declaration to a private header at the same
+time.
+
+[1] https://www.amd.com/en/products/specifications/processors
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index b1debac1af..ad4643b22b 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -515,6 +515,13 @@ static void amd_get_topology(struct cpuinfo_x86 *c)
+                         c->cpu_core_id = ebx & 0xFF;
+                         c->x86_max_cores /= c->x86_num_siblings;
+                 }
++
++                /*
++                 * In case leaf B is available, use it to derive
++                 * topology information.
++                 */
++                if (detect_extended_topology(c))
++                        return;
+         }
+         
+         if (opt_cpu_info)
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 53bb0a9e7c..ed0904d3a0 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -536,7 +536,7 @@ void identify_cpu(struct cpuinfo_x86 *c)
+  * Check for extended topology enumeration cpuid leaf 0xb and if it
+  * exists, use it for cpu topology detection.
+  */
+-void detect_extended_topology(struct cpuinfo_x86 *c)
++bool detect_extended_topology(struct cpuinfo_x86 *c)
+ {
+ 	unsigned int eax, ebx, ecx, edx, sub_index;
+ 	unsigned int ht_mask_width, core_plus_mask_width;
+@@ -544,13 +544,13 @@ void detect_extended_topology(struct cpuinfo_x86 *c)
+ 	unsigned int initial_apicid;
+ 
+ 	if ( c->cpuid_level < 0xb )
+-		return;
++		return false;
+ 
+ 	cpuid_count(0xb, SMT_LEVEL, &eax, &ebx, &ecx, &edx);
+ 
+ 	/* Check if the cpuid leaf 0xb is actually implemented */
+ 	if ( ebx == 0 || (LEAFB_SUBTYPE(ecx) != SMT_TYPE) )
+-		return;
++		return false;
+ 
+ 	__set_bit(X86_FEATURE_XTOPOLOGY, c->x86_capability);
+ 
+@@ -591,6 +591,8 @@ void detect_extended_topology(struct cpuinfo_x86 *c)
+ 			printk("CPU: Processor Core ID: %d\n",
+ 			       c->cpu_core_id);
+ 	}
++
++	return true;
+ }
+ 
+ void detect_ht(struct cpuinfo_x86 *c)
+diff --git a/xen/arch/x86/cpu/cpu.h b/xen/arch/x86/cpu/cpu.h
+index 2fcb931388..5ddfa5e768 100644
+--- a/xen/arch/x86/cpu/cpu.h
++++ b/xen/arch/x86/cpu/cpu.h
+@@ -17,6 +17,9 @@ extern unsigned int opt_cpuid_mask_ext_ecx, opt_cpuid_mask_ext_edx;
+ extern int get_model_name(struct cpuinfo_x86 *c);
+ extern void display_cacheinfo(struct cpuinfo_x86 *c);
+ 
++extern void detect_ht(struct cpuinfo_x86 *c);
++extern bool detect_extended_topology(struct cpuinfo_x86 *c);
++
+ int intel_cpu_init(void);
+ int amd_init_cpu(void);
+ int centaur_init_cpu(void);
+diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
+index f3275ca5d3..f9b5fe5dde 100644
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -170,10 +170,6 @@ extern void setup_force_cpu_cap(unsigned int);
+ extern void print_cpu_info(unsigned int cpu);
+ extern unsigned int init_intel_cacheinfo(struct cpuinfo_x86 *c);
+ 
+-extern void detect_extended_topology(struct cpuinfo_x86 *c);
+-
+-extern void detect_ht(struct cpuinfo_x86 *c);
+-
+ #define cpu_to_core(_cpu)   (cpu_data[_cpu].cpu_core_id)
+ #define cpu_to_socket(_cpu) (cpu_data[_cpu].phys_proc_id)
+ 

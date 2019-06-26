@@ -1,0 +1,54 @@
+From 8228577ad1ba9f4b49370b76c90b75fb9243ee2f Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 5 Apr 2019 15:59:27 +0100
+Subject: x86/hvm: Fix altp2m_op hypercall continuations
+
+c/s 9383de210 "x86/altp2m: support for setting restrictions for an array of
+pages" introduced this logic, but do_hvm_op() was already capable of handling
+-ERESTART correctly.
+
+More problematic however is a continuation from compat_altp2m_op().  The arg
+written back into register state points into the hypercall XLAT area, not at
+the original parameter passed by the guest.  It may be truncated by the
+vmentry, but definitely won't be correct on the next invocation.
+
+Delete the hypercall_create_continuation() call, and return -ERESTART, which
+will cause the compat case to start working correctly.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 11ce21fc08..e13c390d21 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -4723,12 +4723,10 @@ static int do_altp2m_op(
+         if ( rc > 0 )
+         {
+             a.u.set_mem_access_multi.opaque = rc;
++            rc = -ERESTART;
+             if ( __copy_field_to_guest(guest_handle_cast(arg, xen_hvm_altp2m_op_t),
+                                        &a, u.set_mem_access_multi.opaque) )
+                 rc = -EFAULT;
+-            else
+-                rc = hypercall_create_continuation(__HYPERVISOR_hvm_op, "lh",
+-                                                   HVMOP_altp2m, arg);
+         }
+         break;
+ 
+@@ -4847,14 +4845,8 @@ static int compat_altp2m_op(
+     switch ( a.cmd )
+     {
+     case HVMOP_altp2m_set_mem_access_multi:
+-        /*
+-         * The return code can be positive only if it is the return value
+-         * of hypercall_create_continuation. In this case, the opaque value
+-         * must be copied back to the guest.
+-         */
+-        if ( rc > 0 )
++        if ( rc == -ERESTART )
+         {
+-            ASSERT(rc == __HYPERVISOR_hvm_op);
+             a.u.set_mem_access_multi.opaque =
+                 nat.altp2m_op->u.set_mem_access_multi.opaque;
+             if ( __copy_field_to_guest(guest_handle_cast(arg,

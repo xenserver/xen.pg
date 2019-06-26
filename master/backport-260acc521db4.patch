@@ -1,0 +1,57 @@
+From 260acc521db4c29df4aa9b7a67f42cf967871fd3 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 17 Jun 2019 19:56:11 +0100
+Subject: x86/clear_page: Update clear_page_sse2() after dropping 32bit Xen
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This code was never updated when the 32bit build of Xen was dropped.
+
+ * Expand the now-redundant ptr_reg macro.
+ * The number of iterations in the loop can be halfed by using 64bit writes,
+   without consuming any extra execution resource in the pipeline.  Adjust all
+   numbers/offsets appropriately.
+ * Replace dec with sub to avoid a eflags stall, and position it to be
+   macro-fused with the related jmp.
+ * With no need to preserve eflags across the body of the loop, replace lea
+   with add which has 1/3'rd the latency on basically all 64bit hardware.
+
+A quick userspace perf test on my Haswell dev box indicates that the old
+version takes ~1385 cycles on average (ignoring outliers), and the new version
+takes ~1060 cyles, or about 77% of the time.
+
+Reported-by: Edwin Török <edvin.torok@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/clear_page.S b/xen/arch/x86/clear_page.S
+index 243a7679c8..d9d524c79e 100644
+--- a/xen/arch/x86/clear_page.S
++++ b/xen/arch/x86/clear_page.S
+@@ -2,18 +2,16 @@
+ 
+ #include <asm/page.h>
+ 
+-#define ptr_reg %rdi
+-
+ ENTRY(clear_page_sse2)
+-        mov     $PAGE_SIZE/16, %ecx
++        mov     $PAGE_SIZE/32, %ecx
+         xor     %eax,%eax
+ 
+-0:      dec     %ecx
+-        movnti  %eax, (ptr_reg)
+-        movnti  %eax, 4(ptr_reg)
+-        movnti  %eax, 8(ptr_reg)
+-        movnti  %eax, 12(ptr_reg)
+-        lea     16(ptr_reg), ptr_reg
++0:      movnti  %rax,   (%rdi)
++        movnti  %rax,  8(%rdi)
++        movnti  %rax, 16(%rdi)
++        movnti  %rax, 24(%rdi)
++        add     $32, %rdi
++        sub     $1, %ecx
+         jnz     0b
+ 
+         sfence

@@ -1,0 +1,89 @@
+From e0fbf3bf9871b00fa526c4ed893604e7ad6c3090 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 18 Jun 2019 16:33:53 +0200
+Subject: x86/AMD: correct certain Fam17 checks
+
+Commit 3157bb4e13 ("Add MSR support for various feature AMD processor
+families") converted certain checks for Fam11 to include families all
+the way up to Fam17. The commit having no description, it is hard to
+tell whether this was a mechanical dec->hex conversion mistake, or
+indeed intended. In any event the NB_CFG handling needs to be restricted
+to Fam16 and below: Fam17 doesn't really have such an MSR anymore. As
+per observation it's read-zero / write-discard now, so make PV uniformly
+(with the exception of pinned Dom0 vCPU-s) behave so, just like HVM
+already does.
+
+Mirror the NB_CFG behavior to MSR_FAM10H_MMIO_CONF_BASE as well, except
+that here the vendor/model check is kept in place (for now at least).
+
+A non-MMCFG extended config space access mechanism still appears to
+exist, but code to deal with it will need to be written down the road,
+when it can actually be tested.
+
+Reported-by: Pu Wen <puwen@hygon.cn>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/hvm/ioreq.c b/xen/arch/x86/hvm/ioreq.c
+index 71f23227e6..7a80cfb28b 100644
+--- a/xen/arch/x86/hvm/ioreq.c
++++ b/xen/arch/x86/hvm/ioreq.c
+@@ -1288,7 +1288,7 @@ struct hvm_ioreq_server *hvm_select_ioreq_server(struct domain *d,
+              d->arch.cpuid->x86_vendor == X86_VENDOR_AMD &&
+              (x86_fam = get_cpu_family(
+                  d->arch.cpuid->basic.raw_fms, NULL, NULL)) > 0x10 &&
+-             x86_fam <= 0x17 )
++             x86_fam < 0x17 )
+         {
+             uint64_t msr_val;
+ 
+diff --git a/xen/arch/x86/pv/emul-priv-op.c b/xen/arch/x86/pv/emul-priv-op.c
+index a4f3ffcd57..ee7b19f780 100644
+--- a/xen/arch/x86/pv/emul-priv-op.c
++++ b/xen/arch/x86/pv/emul-priv-op.c
+@@ -195,7 +195,7 @@ static bool pci_cfg_ok(struct domain *currd, unsigned int start,
+     /* AMD extended configuration space access? */
+     if ( CF8_ADDR_HI(currd->arch.pci_cf8) &&
+          boot_cpu_data.x86_vendor == X86_VENDOR_AMD &&
+-         boot_cpu_data.x86 >= 0x10 && boot_cpu_data.x86 <= 0x17 )
++         boot_cpu_data.x86 >= 0x10 && boot_cpu_data.x86 < 0x17 )
+     {
+         uint64_t msr_val;
+ 
+@@ -893,6 +893,17 @@ static int read_msr(unsigned int reg, uint64_t *val,
+         *val = 0;
+         return X86EMUL_OKAY;
+ 
++    case MSR_FAM10H_MMIO_CONF_BASE:
++        if ( boot_cpu_data.x86_vendor != X86_VENDOR_AMD ||
++             boot_cpu_data.x86 < 0x10 || boot_cpu_data.x86 >= 0x17 )
++            break;
++        /* fall through */
++    case MSR_AMD64_NB_CFG:
++        if ( is_hwdom_pinned_vcpu(curr) )
++            goto normal;
++        *val = 0;
++        return X86EMUL_OKAY;
++
+     case MSR_IA32_MISC_ENABLE:
+         rdmsrl(reg, *val);
+         *val = guest_misc_enable(*val);
+@@ -1003,9 +1014,6 @@ static int write_msr(unsigned int reg, uint64_t val,
+         break;
+ 
+     case MSR_AMD64_NB_CFG:
+-        if ( boot_cpu_data.x86_vendor != X86_VENDOR_AMD ||
+-             boot_cpu_data.x86 < 0x10 || boot_cpu_data.x86 > 0x17 )
+-            break;
+         if ( !is_hwdom_pinned_vcpu(curr) )
+             return X86EMUL_OKAY;
+         if ( (rdmsr_safe(MSR_AMD64_NB_CFG, temp) != 0) ||
+@@ -1017,7 +1025,7 @@ static int write_msr(unsigned int reg, uint64_t val,
+ 
+     case MSR_FAM10H_MMIO_CONF_BASE:
+         if ( boot_cpu_data.x86_vendor != X86_VENDOR_AMD ||
+-             boot_cpu_data.x86 < 0x10 || boot_cpu_data.x86 > 0x17 )
++             boot_cpu_data.x86 < 0x10 || boot_cpu_data.x86 >= 0x17 )
+             break;
+         if ( !is_hwdom_pinned_vcpu(curr) )
+             return X86EMUL_OKAY;

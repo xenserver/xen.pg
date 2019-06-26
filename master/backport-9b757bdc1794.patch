@@ -1,0 +1,62 @@
+From 9b757bdc1794d012f5d784de54d5884e425622e0 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 5 Apr 2019 15:58:44 +0000
+Subject: x86/boot: Don't leak the module_map allocation in __start_xen()
+
+Ever since its introducion in c/s 436fb462 "x86/microcode: enable boot
+time (pre-Dom0) loading", the allocation has gone un-freed, and has its final
+use as part of constructing dom0.
+
+Xen already consideres it an error to have more than a single unaccounted-for
+module (again, logic from the same change), and will only pass the first one
+to dom0 as the initrd.
+
+Instead of having an 8 byte pointer to a bitmap which won't exceed 4 bits wide
+in any production scenario (dom0 kernel, initrd, XSM blob and microcode blob),
+allocate module_map[] on the stack and add a sanity bound for mbi->mods_count.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 3440794275..7f7877ac24 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -680,7 +680,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+     unsigned int initrdidx, num_parked = 0;
+     multiboot_info_t *mbi;
+     module_t *mod;
+-    unsigned long nr_pages, raw_max_page, modules_headroom, *module_map;
++    unsigned long nr_pages, raw_max_page, modules_headroom, module_map[1];
+     int i, j, e820_warn = 0, bytes = 0;
+     bool acpi_boot_table_init_done = false, relocated = false;
+     int ret;
+@@ -840,6 +840,17 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+     if ( !(mbi->flags & MBI_MODULES) || (mbi->mods_count == 0) )
+         panic("dom0 kernel not specified. Check bootloader configuration\n");
+ 
++    /* Check that we don't have a silly number of modules. */
++    if ( mbi->mods_count > sizeof(module_map) * 8 )
++    {
++        mbi->mods_count = sizeof(module_map) * 8;
++        printk("Excessive multiboot modules - using the first %u only\n",
++               mbi->mods_count);
++    }
++
++    bitmap_fill(module_map, mbi->mods_count);
++    __clear_bit(0, module_map); /* Dom0 kernel is always first */
++
+     if ( pvh_boot )
+     {
+         /* pvh_init() already filled in e820_raw */
+@@ -1578,10 +1589,6 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+ 
+     init_IRQ();
+ 
+-    module_map = xmalloc_array(unsigned long, BITS_TO_LONGS(mbi->mods_count));
+-    bitmap_fill(module_map, mbi->mods_count);
+-    __clear_bit(0, module_map); /* Dom0 kernel is always first */
+-
+     xsm_multiboot_init(module_map, mbi);
+ 
+     microcode_grab_module(module_map, mbi);
