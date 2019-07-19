@@ -781,10 +781,10 @@ index 0000000..e357174
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000..13fc28e
+index 0000000..7a2d16b
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1476 @@
+@@ -0,0 +1,1499 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -913,26 +913,45 @@ index 0000000..13fc28e
 +    return s;
 +}
 +
-+uint64_t xenstore_get(const char *fmt, ...)
++uint64_t xenstore_get_value(bool *valid, const char *fmt, ...)
 +{
 +    char *s;
 +    uint64_t value = 0;
 +    va_list ap;
++    bool got_value = true;
 +
 +    va_start(ap, fmt);
 +    s = xenstore_getsv(fmt, ap);
 +    if (s) {
-+        if (!strcasecmp(s, "true"))
++        if ( !strcasecmp(s, "true") )
 +            value = 1;
-+        else
-+        {
++        else if ( !strcasecmp(s, "false") )
++            value = 0;
++        else {
 +            errno = 0;
 +            value = strtoull(s, NULL, 0);
-+            if ( errno )
++            if ( errno ) {
 +                value = 0;
++                got_value = false;
++            }
 +        }
 +        free(s);
-+    }
++    } else
++        got_value = false;
++
++    if ( valid )
++        *valid = got_value;
++    va_end(ap);
++    return value;
++}
++
++uint64_t xenstore_get(const char *fmt, ...)
++{
++    uint64_t value;
++    va_list ap;
++
++    va_start(ap, fmt);
++    value = xenstore_get_value(NULL, fmt, ap);
 +    va_end(ap);
 +    return value;
 +}
@@ -1131,6 +1150,7 @@ index 0000000..13fc28e
 +{
 +    char * tmp;
 +    int n;
++    bool stimer_set;
 +
 +    if ( xc_domain_getinfo(xch, domid, 1, &f->dominfo) != 1 ||
 +         f->dominfo.domid != domid )
@@ -1153,16 +1173,19 @@ index 0000000..13fc28e
 +    f->viridian_hcall_remote_tlb_flush = xenstore_get("platform/viridian_hcall_remote_tlb_flush");
 +    f->viridian_apic_assist = xenstore_get("platform/viridian_apic_assist");
 +    f->viridian_crash_ctl = xenstore_get("platform/viridian_crash_ctl");
-+    f->viridian_stimer = xenstore_get("platform/viridian_stimer");
++    f->viridian_stimer = xenstore_get_value(&stimer_set, "platform/viridian_stimer");
 +
 +    /*
-+     * Squash the timer enlightenments for a vGPU-enabled VM if stimer is
-+     * not switched on.
++     * For vGPU-enabled VMs, it is unsafe to migrate VMs with time_ref_count
++     * or reference_tsc enabled, but not stimer.
++     * If stimer has not been explicitly set, but one of the other two
++     * have been enabled, default stimer to enabled.
 +     */
-+    if ( opt_vgpu && !f->viridian_stimer ) {
-+        f->viridian_reference_tsc = 0;
-+        f->viridian_time_ref_count = 0;
-+    }
++     if ( opt_vgpu && !stimer_set &&
++         (f->viridian_reference_tsc || f->viridian_time_ref_count) ) {
++         xg_info("vgpu attached and stimer not set - defaulting to enabled.\n");
++         f->viridian_stimer = 1;
++     }
 +
 +    f->apic     = xenstore_get("platform/apic");
 +    f->pae      = xenstore_get("platform/pae");
