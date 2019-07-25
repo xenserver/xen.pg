@@ -1,0 +1,191 @@
+From c1681c394348636c5a7fbaa949623cef5eb9e9d5 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 24 Jul 2019 15:08:16 +0100
+Subject: x86/dmi: Constify quirks data
+
+All DMI quirks tables are mutable, but are only ever read.
+
+Update dmi_check_system() and dmi_system_id.callback to pass a const pointer,
+and move all quirks tables into __initconstrel.
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/dmi_scan.c b/xen/arch/x86/dmi_scan.c
+index cf881c1de0..ab01e68e41 100644
+--- a/xen/arch/x86/dmi_scan.c
++++ b/xen/arch/x86/dmi_scan.c
+@@ -455,7 +455,7 @@ static void __init dmi_save_ident(struct dmi_header *dm, int slot, int string)
+ #define NO_MATCH	{ DMI_NONE, NULL}
+ #define MATCH		DMI_MATCH
+ 
+-static int __init ich10_bios_quirk(struct dmi_system_id *d)
++static int __init ich10_bios_quirk(const struct dmi_system_id *d)
+ {
+     u32 port, smictl;
+ 
+@@ -479,7 +479,7 @@ static int __init ich10_bios_quirk(struct dmi_system_id *d)
+ }
+ 
+ #ifdef CONFIG_ACPI_SLEEP
+-static __init int reset_videomode_after_s3(struct dmi_blacklist *d)
++static __init int reset_videomode_after_s3(const struct dmi_blacklist *d)
+ {
+ 	/* See acpi_wakeup.S */
+ 	acpi_video_flags |= 2;
+@@ -487,7 +487,7 @@ static __init int reset_videomode_after_s3(struct dmi_blacklist *d)
+ }
+ #endif
+ 
+-static __init int dmi_disable_acpi(struct dmi_blacklist *d) 
++static __init int dmi_disable_acpi(const struct dmi_blacklist *d)
+ { 
+ 	if (!acpi_force) { 
+ 		printk(KERN_NOTICE "%s detected: acpi off\n",d->ident);
+@@ -502,7 +502,7 @@ static __init int dmi_disable_acpi(struct dmi_blacklist *d)
+ /*
+  * Limit ACPI to CPU enumeration for HT
+  */
+-static __init int force_acpi_ht(struct dmi_blacklist *d) 
++static __init int force_acpi_ht(const struct dmi_blacklist *d)
+ { 
+ 	if (!acpi_force) { 
+ 		printk(KERN_NOTICE "%s detected: force use of acpi=ht\n", d->ident);
+@@ -525,7 +525,7 @@ static __init int force_acpi_ht(struct dmi_blacklist *d)
+  *	interrupt mask settings according to the laptop
+  */
+  
+-static __initdata struct dmi_blacklist dmi_blacklist[]={
++static const struct dmi_blacklist __initconstrel dmi_blacklist[] = {
+ 
+ #ifdef CONFIG_ACPI_SLEEP
+ 	{ reset_videomode_after_s3, "Toshiba Satellite 4030cdt", { /* Reset video mode after returning from ACPI S3 sleep */
+@@ -697,10 +697,10 @@ void __init dmi_scan_machine(void)
+  *	returns non zero or we hit the end. Callback function is called for
+  *	each successfull match. Returns the number of matches.
+  */
+-int __init dmi_check_system(struct dmi_system_id *list)
++int __init dmi_check_system(const struct dmi_system_id *list)
+ {
+ 	int i, count = 0;
+-	struct dmi_system_id *d = list;
++	const struct dmi_system_id *d = list;
+ 
+ 	while (d->ident) {
+ 		for (i = 0; i < ARRAY_SIZE(d->matches); i++) {
+diff --git a/xen/arch/x86/genapic/bigsmp.c b/xen/arch/x86/genapic/bigsmp.c
+index 91a973ac16..6808d61d9c 100644
+--- a/xen/arch/x86/genapic/bigsmp.c
++++ b/xen/arch/x86/genapic/bigsmp.c
+@@ -11,7 +11,7 @@
+ #include <asm/mach-default/mach_mpparse.h>
+ #include <asm/io_apic.h>
+ 
+-static __init int force_bigsmp(struct dmi_system_id *d)
++static __init int force_bigsmp(const struct dmi_system_id *d)
+ {
+ 	printk(KERN_NOTICE "%s detected: force use of apic=bigsmp\n", d->ident);
+ 	def_to_bigsmp = true;
+@@ -19,7 +19,7 @@ static __init int force_bigsmp(struct dmi_system_id *d)
+ }
+ 
+ 
+-static struct dmi_system_id __initdata bigsmp_dmi_table[] = {
++static const struct dmi_system_id __initconstrel bigsmp_dmi_table[] = {
+ 	{ force_bigsmp, "UNISYS ES7000-ONE", {
+ 		DMI_MATCH(DMI_PRODUCT_NAME, "ES7000-ONE")
+ 	 }},
+diff --git a/xen/arch/x86/hvm/quirks.c b/xen/arch/x86/hvm/quirks.c
+index a298ccdbb9..881c6b99d2 100644
+--- a/xen/arch/x86/hvm/quirks.c
++++ b/xen/arch/x86/hvm/quirks.c
+@@ -24,7 +24,7 @@
+ s8 __read_mostly hvm_port80_allowed = -1;
+ boolean_param("hvm_port80", hvm_port80_allowed);
+ 
+-static int __init dmi_hvm_deny_port80(/*const*/ struct dmi_system_id *id)
++static int __init dmi_hvm_deny_port80(const struct dmi_system_id *id)
+ {
+     printk(XENLOG_WARNING "%s: port 0x80 access %s allowed for HVM guests\n",
+            id->ident, hvm_port80_allowed > 0 ? "forcibly" : "not");
+@@ -41,7 +41,7 @@ static int __init check_port80(void)
+      * Quirk table for systems that misbehave (lock up, etc.) if port
+      * 0x80 is used:
+      */
+-    static struct dmi_system_id __initdata hvm_no_port80_dmi_table[] =
++    static const struct dmi_system_id __initconstrel hvm_no_port80_dmi_table[] =
+     {
+         {
+             .callback = dmi_hvm_deny_port80,
+diff --git a/xen/arch/x86/ioport_emulate.c b/xen/arch/x86/ioport_emulate.c
+index 504bc513e2..499c1f6056 100644
+--- a/xen/arch/x86/ioport_emulate.c
++++ b/xen/arch/x86/ioport_emulate.c
+@@ -34,7 +34,7 @@ static bool ioemul_handle_proliant_quirk(
+ }
+ 
+ /* This table is the set of system-specific I/O emulation hooks. */
+-static struct dmi_system_id __initdata ioport_quirks_tbl[] = {
++static const struct dmi_system_id __initconstrel ioport_quirks_tbl[] = {
+     /*
+      * I/O emulation hook for certain HP ProLiant servers with
+      * 'special' SMM goodness.
+diff --git a/xen/arch/x86/shutdown.c b/xen/arch/x86/shutdown.c
+index 69b82542b3..005c0bf4fa 100644
+--- a/xen/arch/x86/shutdown.c
++++ b/xen/arch/x86/shutdown.c
+@@ -157,7 +157,7 @@ static void default_reboot_type(void)
+         reboot_type = BOOT_ACPI;
+ }
+ 
+-static int __init override_reboot(struct dmi_system_id *d)
++static int __init override_reboot(const struct dmi_system_id *d)
+ {
+     enum reboot_type type = (long)d->driver_data;
+ 
+@@ -181,7 +181,7 @@ static int __init override_reboot(struct dmi_system_id *d)
+     return 0;
+ }
+ 
+-static struct dmi_system_id __initdata reboot_dmi_table[] = {
++static const struct dmi_system_id __initconstrel reboot_dmi_table[] = {
+     {    /* Handle problems with rebooting on Dell E520's */
+         .callback = override_reboot,
+         .driver_data = (void *)(long)BOOT_KBD,
+diff --git a/xen/arch/x86/x86_64/mmconf-fam10h.c b/xen/arch/x86/x86_64/mmconf-fam10h.c
+index 7b2c279c0b..97fbd2f2c0 100644
+--- a/xen/arch/x86/x86_64/mmconf-fam10h.c
++++ b/xen/arch/x86/x86_64/mmconf-fam10h.c
+@@ -183,7 +183,7 @@ void fam10h_check_enable_mmcfg(void)
+ 	wrmsrl(MSR_FAM10H_MMIO_CONF_BASE, val);
+ }
+ 
+-static struct dmi_system_id __initdata mmconf_dmi_table[] = {
++static const struct dmi_system_id __initconstrel mmconf_dmi_table[] = {
+ 	{
+ 		.ident = "Sun Microsystems Machine",
+ 		.matches = {
+diff --git a/xen/include/xen/dmi.h b/xen/include/xen/dmi.h
+index eba2c27b2f..fa25f6cd38 100644
+--- a/xen/include/xen/dmi.h
++++ b/xen/include/xen/dmi.h
+@@ -24,7 +24,7 @@ struct dmi_strmatch {
+ };
+ 
+ struct dmi_system_id {
+-	int (*callback)(struct dmi_system_id *);
++	int (*callback)(const struct dmi_system_id *);
+ 	char *ident;
+ 	struct dmi_strmatch matches[4];
+ 	void *driver_data;
+@@ -32,7 +32,7 @@ struct dmi_system_id {
+ 
+ #define DMI_MATCH(a,b)	{ a, b }
+ 
+-extern int dmi_check_system(struct dmi_system_id *list);
++extern int dmi_check_system(const struct dmi_system_id *list);
+ extern void dmi_scan_machine(void);
+ extern const char *dmi_get_table(paddr_t *base, u32 *len);
+ extern void dmi_efi_get_table(const void *smbios, const void *smbios3);

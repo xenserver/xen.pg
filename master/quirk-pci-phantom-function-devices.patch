@@ -2,34 +2,47 @@ Add PCI phantom functions to Xen based on PCI vendor + device ID.
 
 The list of devices to quirk has been taken from Linux kernel quirk list
 diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
-index 27b3ca7..acfcc18 100644
+index 8108ed5f9a..4d869c2f2a 100644
 --- a/xen/drivers/passthrough/pci.c
 +++ b/xen/drivers/passthrough/pci.c
-@@ -945,6 +945,56 @@ void pci_check_disable_device(u16 seg, u8 bus, u8 devfn)
+@@ -1054,6 +1054,63 @@ void pci_check_disable_device(u16 seg, u8 bus, u8 devfn)
                       PCI_COMMAND, cword & ~PCI_COMMAND_MASTER);
  }
  
-+void quirk_dma_func_phantom(u16 seg, int bus, int dev, int func)
++static void quirk_dma_func_phantom(u16 seg, int bus, int dev, int func)
 +{
-+    struct phantom_dev phantom;
-+    phantom.seg = seg;
-+    phantom.bus = bus;
-+    phantom.slot = PCI_SLOT(PCI_DEVFN(dev, func));
-+    phantom.stride = 1;
++    struct phantom_dev phantom = {
++        .seg = seg,
++        .bus = bus,
++        .slot = PCI_SLOT(PCI_DEVFN(dev, func)),
++        .stride = 1,
++    };
 +
 +    phantom_devs[nr_phantom_devs++] = phantom;
 +}
 +
-+void quirk_scan_pci_device(u16 seg, int bus, int dev, int func)
++static void quirk_scan_pci_device(u16 seg, int bus, int dev, int func)
 +{
-+    switch ( pci_conf_read16(seg, bus, dev, func, PCI_VENDOR_ID) )
++    unsigned int device, vendor = pci_conf_read16(seg, bus, dev, func, PCI_VENDOR_ID);
++
++    switch ( vendor )
 +    {
-+    /* Marvell */
-+    case 0x1b4b:
-+        switch ( pci_conf_read16(seg, bus, dev, func, PCI_DEVICE_ID) )
++    case 0x1b4b: /* Marvell */
++    case 0x197B: /* JMICRON */
++    case 0x1103: /* TTI */
++        break;
++    default:
++        return;
++    }
++
++    device = pci_conf_read16(seg, bus, dev, func, PCI_DEVICE_ID);
++
++    switch ( vendor )
++    {
++    case 0x1b4b: /* Marvell */
++        switch ( device )
 +        {
-+        /* 88SE9123 based controllers */
-+        case 0x9120:
++        case 0x9120: /* 88SE9123 based controllers */
 +        case 0x9123:
 +        case 0x9130:
 +        case 0x9172:
@@ -39,30 +52,24 @@ index 27b3ca7..acfcc18 100644
 +            quirk_dma_func_phantom(seg, bus, dev, func);
 +            break;
 +        }
-+    /* JMICRON */
-+    case 0x197B:
-+        switch ( pci_conf_read16(seg, bus, dev, func, PCI_DEVICE_ID) )
-+        {
-+        /* JMB388 ESD */
-+        case 0x2393:
++        break;
++
++    case 0x197B: /* JMICRON */
++        if ( device == 0x2393 ) /* JMB388 ESD */
 +            quirk_dma_func_phantom(seg, bus, dev, func);
-+            break;
-+        }
-+    /* TTI */
-+    case 0x1103:
-+        switch ( pci_conf_read16(seg, bus, dev, func, PCI_DEVICE_ID) )
-+        {
-+        case 0x0642:
++        break;
++
++    case 0x1103: /* TTI */
++        if ( device == 0x0642 )
 +            quirk_dma_func_phantom(seg, bus, dev, func);
-+            break;
-+        }
++        break;
 +    }
 +}
 +
  /*
   * scan pci devices to add all existed PCI devices to alldevs_list,
   * and setup pci hierarchy in array bus2bridge.
-@@ -967,6 +1017,8 @@ static int __init _scan_pci_devices(struct pci_seg *pseg, void *arg)
+@@ -1076,6 +1133,8 @@ static int __init _scan_pci_devices(struct pci_seg *pseg, void *arg)
                      continue;
                  }
  
