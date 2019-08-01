@@ -7,7 +7,7 @@ This patch was sent upstream to Chao. I expect it to be included in v7.
 
 Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index 68c89ea..a4fe860 100644
+index 68c89eadd6..a4fe860e5c 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
 @@ -1246,7 +1246,8 @@ int xc_physinfo(xc_interface *xch, xc_physinfo_t *info);
@@ -21,7 +21,7 @@ index 68c89ea..a4fe860 100644
                  xc_meminfo_t *meminfo, uint32_t *distance);
  int xc_pcitopoinfo(xc_interface *xch, unsigned num_devs,
 diff --git a/tools/libxc/xc_misc.c b/tools/libxc/xc_misc.c
-index 89437b9..9e9eabf 100644
+index 9f047ba184..3cc87e20eb 100644
 --- a/tools/libxc/xc_misc.c
 +++ b/tools/libxc/xc_misc.c
 @@ -226,7 +226,8 @@ int xc_physinfo(xc_interface *xch,
@@ -43,56 +43,58 @@ index 89437b9..9e9eabf 100644
  
      ret = do_platform_op(xch, &platform_op);
 diff --git a/tools/misc/xen-ucode.c b/tools/misc/xen-ucode.c
-index 2f8306f..28c652e 100644
+index e12af01bf2..4f861abd53 100644
 --- a/tools/misc/xen-ucode.c
 +++ b/tools/misc/xen-ucode.c
-@@ -62,7 +62,7 @@ void show_help(void)
- {
-     fprintf(stderr,
-             "xen-ucode: Xen microcode updating tool\n"
--            "Usage: xen-ucode <microcode blob>\n");
-+            "Usage: xen-ucode <microcode blob> <parallel|sequential>\n");
- 
-     show_curr_cpu(stderr);
+@@ -58,6 +58,15 @@ void show_curr_cpu(FILE *f)
+     xc_interface_close(xch);
  }
-@@ -73,6 +73,7 @@ int main(int argc, char *argv[])
-     char *filename, *buf;
+ 
++static int parse_strategy(const char *arg)
++{
++    if ( !strcmp(arg, "parallel") )
++        return XENPF_microcode_parallel;
++    if ( !strcmp(arg, "sequential") )
++        return XENPF_microcode_sequential;
++    return -1;
++}
++
+ int main(int argc, char *argv[])
+ {
+     int fd, ret;
+@@ -65,6 +74,7 @@ int main(int argc, char *argv[])
+     size_t len;
      struct stat st;
      xc_interface *xch;
-+    uint32_t strategy;
++    int strategy;
  
      if ( argc >= 2 && !strcmp(argv[1], "show-cpu-info") )
      {
-@@ -80,7 +81,17 @@ int main(int argc, char *argv[])
+@@ -72,11 +82,11 @@ int main(int argc, char *argv[])
          return 0;
      }
  
--    if (argc < 2)
-+    if (argc < 3)
-+    {
-+        show_help();
-+        return 0;
-+    }
-+
-+    if (!strcmp(argv[2], "parallel"))
-+        strategy = XENPF_microcode_parallel;
-+    else if (!strcmp(argv[2], "sequential"))
-+        strategy = XENPF_microcode_sequential;
-+    else
+-    if ( argc < 2 )
++    if ( argc < 3 || (strategy = parse_strategy(argv[2])) < 0 )
      {
-         show_help();
+         fprintf(stderr,
+                 "xen-ucode: Xen microcode updating tool\n"
+-                "Usage: %s <microcode blob>\n", argv[0]);
++                "Usage: %s <microcode blob> <parallel|sequential>\n", argv[0]);
+         show_curr_cpu(stderr);
          return 0;
-@@ -115,7 +126,7 @@ int main(int argc, char *argv[])
+     }
+@@ -113,7 +123,7 @@ int main(int argc, char *argv[])
          return errno;
      }
  
 -    ret = xc_microcode_update(xch, buf, len);
 +    ret = xc_microcode_update(xch, buf, len, strategy);
-     if (ret)
+     if ( ret )
          fprintf(stderr, "Failed to update microcode. (err: %s)\n",
                  strerror(errno));
 diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
-index 8aeb152..fad8054 100644
+index 78204b6550..e8511beb36 100644
 --- a/xen/arch/x86/microcode.c
 +++ b/xen/arch/x86/microcode.c
 @@ -37,6 +37,8 @@
@@ -189,7 +191,7 @@ index 8aeb152..fad8054 100644
       * Late loading dance. Why the heavy-handed stop_machine effort?
       *
 diff --git a/xen/arch/x86/platform_hypercall.c b/xen/arch/x86/platform_hypercall.c
-index 131e2ef..9e12cca 100644
+index 131e2ef1ea..9e12cca953 100644
 --- a/xen/arch/x86/platform_hypercall.c
 +++ b/xen/arch/x86/platform_hypercall.c
 @@ -283,7 +283,8 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
@@ -203,10 +205,10 @@ index 131e2ef..9e12cca 100644
      break;
  
 diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
-index 9925916..7e58d3d 100644
+index c89b72444d..11c1f2d47f 100644
 --- a/xen/include/asm-x86/processor.h
 +++ b/xen/include/asm-x86/processor.h
-@@ -572,7 +572,8 @@ int guest_rdmsr_xen(const struct vcpu *v, uint32_t idx, uint64_t *val);
+@@ -568,7 +568,8 @@ int guest_rdmsr_xen(const struct vcpu *v, uint32_t idx, uint64_t *val);
  int guest_wrmsr_xen(struct vcpu *v, uint32_t idx, uint64_t val);
  
  void microcode_set_module(unsigned int);
@@ -217,7 +219,7 @@ index 9925916..7e58d3d 100644
  int early_microcode_init(void);
  int microcode_init_intel(void);
 diff --git a/xen/include/public/platform.h b/xen/include/public/platform.h
-index d0b22c8..8cd0060 100644
+index d0b22c89d9..8cd006099c 100644
 --- a/xen/include/public/platform.h
 +++ b/xen/include/public/platform.h
 @@ -114,6 +114,9 @@ struct xenpf_microcode_update {
