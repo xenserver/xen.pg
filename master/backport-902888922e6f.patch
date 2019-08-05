@@ -1,0 +1,39 @@
+From 902888922e6feda2c485cc4bdeffd0d6e6c26e14 Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Thu, 27 Jun 2019 20:41:54 +0100
+Subject: x86/cpuid: leak OSXSAVE only when XSAVE is not clear in policy
+
+This fixes booting of old non-PV-OPS kernels which historically
+looked for OSXSAVE instead of XSAVE bit in CPUID to check whether
+XSAVE feature is enabled. If such a guest appears to be started on
+an XSAVE enabled CPU and the feature is explicitly cleared in
+policy, leaked OSXSAVE bit from Xen will lead to guest crash early in
+boot.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index eb9c1938dd..1ef201b273 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -994,7 +994,8 @@ void pv_cpuid(uint32_t leaf, uint32_t subleaf,
+              *    damage itself.
+              *
+              * - Enlightened CPUID or CPUID faulting available:
+-             *    Xen can fully control what is seen here.  Guest kernels need
++             *    Xen can fully control what is seen here.  When the guest has
++             *    been configured to have XSAVE available, guest kernels need
+              *    to see the leaked OSXSAVE via the enlightened path, but
+              *    guest userspace and the native is given architectural
+              *    behaviour.
+@@ -1004,7 +1005,8 @@ void pv_cpuid(uint32_t leaf, uint32_t subleaf,
+              */
+             /* OSXSAVE cleared by pv_featureset.  Fast-forward CR4 back in. */
+             if ( (curr->arch.pv_vcpu.ctrlreg[4] & X86_CR4_OSXSAVE) ||
+-                 (regs->entry_vector == TRAP_invalid_op &&
++                 (c & cpufeat_mask(X86_FEATURE_XSAVE) &&
++                  regs->entry_vector == TRAP_invalid_op &&
+                   guest_kernel_mode(curr, regs) &&
+                   (read_cr4() & X86_CR4_OSXSAVE)) )
+                 c |= cpufeat_mask(X86_FEATURE_OSXSAVE);
