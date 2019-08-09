@@ -22,12 +22,12 @@
 %define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 debug=n
 %endif
 
-%define base_cset e5122c6c4a413e5d185b25094a15b4ee6d5daf4b
-%define base_dir  %{name}-4.12.0
+%define base_cset RELEASE-%{version}
+%define base_dir  %{name}-%{version}
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.12.0
+Version: 4.12.1
 Release: 8.0.10
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
