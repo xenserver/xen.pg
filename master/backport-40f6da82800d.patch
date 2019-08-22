@@ -1,0 +1,88 @@
+From 40f6da82800d5a23212ec3ccc4819b77ea0a9980 Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Wed, 21 Aug 2019 09:22:58 +0100
+Subject: [PATCH] viridian: make viridian_time_domain_freeze() safe to call...
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+...on a partially destroyed domain.
+
+viridian_time_domain_freeze() and viridian_time_vcpu_freeze() rely
+(respectively) on the dynamically allocated per-domain and per-vcpu viridian
+areas [1], which are freed during domain_relinquish_resources().
+Because arch_domain_pause() can call viridian_domain_time_freeze() this
+can lead to host crashes if e.g. a XEN_DOMCTL_pausedomain is issued after
+domain_relinquish_resources() has run.
+
+To prevent such crashes, this patch adds a check of is_dying into
+viridian_time_domain_freeze(), and viridian_time_domain_thaw() which is
+similarly vulnerable to indirection into freed memory.
+
+NOTE: The patch also makes viridian_time_vcpu_freeze/thaw() static, since
+      they have no callers outside of the same source module.
+
+[1] See commit e7a9b5e72f26 "viridian: separately allocate domain and vcpu
+    structures".
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+---
+ xen/arch/x86/hvm/viridian/time.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/viridian/time.c b/xen/arch/x86/hvm/viridian/time.c
+index ac087383c8..6ddca29b29 100644
+--- a/xen/arch/x86/hvm/viridian/time.c
++++ b/xen/arch/x86/hvm/viridian/time.c
+@@ -296,7 +296,7 @@ void viridian_time_poll_timers(struct vcpu *v)
+         poll_stimer(v, i);
+ }
+ 
+-void viridian_time_vcpu_freeze(struct vcpu *v)
++static void time_vcpu_freeze(struct vcpu *v)
+ {
+     struct viridian_vcpu *vv = v->arch.hvm.viridian;
+     unsigned int i;
+@@ -314,7 +314,7 @@ void viridian_time_vcpu_freeze(struct vcpu *v)
+     }
+ }
+ 
+-void viridian_time_vcpu_thaw(struct vcpu *v)
++static void time_vcpu_thaw(struct vcpu *v)
+ {
+     struct viridian_vcpu *vv = v->arch.hvm.viridian;
+     unsigned int i;
+@@ -336,11 +336,11 @@ void viridian_time_domain_freeze(const struct domain *d)
+ {
+     struct vcpu *v;
+ 
+-    if ( !is_viridian_domain(d) )
++    if ( d->is_dying || !is_viridian_domain(d) )
+         return;
+ 
+     for_each_vcpu ( d, v )
+-        viridian_time_vcpu_freeze(v);
++        time_vcpu_freeze(v);
+ 
+     time_ref_count_freeze(d);
+ }
+@@ -349,13 +349,13 @@ void viridian_time_domain_thaw(const struct domain *d)
+ {
+     struct vcpu *v;
+ 
+-    if ( !is_viridian_domain(d) )
++    if ( d->is_dying || !is_viridian_domain(d) )
+         return;
+ 
+     time_ref_count_thaw(d);
+ 
+     for_each_vcpu ( d, v )
+-        viridian_time_vcpu_thaw(v);
++        time_vcpu_thaw(v);
+ }
+ 
+ int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
+-- 
+2.17.1
+
