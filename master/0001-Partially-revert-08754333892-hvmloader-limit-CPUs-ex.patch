@@ -6,11 +6,13 @@ Subject: [PATCH] Partially revert 08754333892 ("hvmloader: limit CPUs exposed
 
 This will populate all 128 lapic entries in MADT again. It's needed for
 compatibility with Xen 4.7 behaviour until guests are presented with
-correct CPUID topology.
+correct CPUID topology (CA-299235).
+
+Also add a workaround for running PV-in-PVH guests (CA-324919).
 
 Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
 diff --git a/tools/libacpi/build.c b/tools/libacpi/build.c
-index fa7d14e090..68a82c3351 100644
+index fa7d14e090..3b154a2561 100644
 --- a/tools/libacpi/build.c
 +++ b/tools/libacpi/build.c
 @@ -56,6 +56,9 @@ struct acpi_info {
@@ -54,7 +56,7 @@ index fa7d14e090..68a82c3351 100644
                          ? ACPI_LOCAL_APIC_ENABLED : 0);
          lapic++;
      }
-@@ -551,12 +555,14 @@ int acpi_build_tables(struct acpi_ctxt *ctxt, struct acpi_config *config)
+@@ -551,14 +555,26 @@ int acpi_build_tables(struct acpi_ctxt *ctxt, struct acpi_config *config)
          dsdt = ctxt->mem_ops.alloc(ctxt, config->dsdt_15cpu_len, 16);
          if (!dsdt) goto oom;
          memcpy(dsdt, config->dsdt_15cpu, config->dsdt_15cpu_len);
@@ -68,4 +70,16 @@ index fa7d14e090..68a82c3351 100644
 +        nr_processor_objects = HVM_MAX_VCPUS;
      }
  
++    /*
++     * Allow PV guests running under the xen-pvshim to figure out the correct
++     * number of cpu available.
++     *
++     * Try to automatically detect a PV-in-PVH guest without any additional
++     * bodge: xenguest doesn't set ACPI_HAS_VGA during PVH build
++     */
++    if ( !(config->table_flags & ACPI_HAS_VGA) )
++        nr_processor_objects = config->hvminfo->nr_vcpus;
++
      /*
+      * N.B. ACPI 1.0 operating systems may not handle FADT with revision 2
+      * or above properly, notably Windows 2000, which tries to copy FADT
