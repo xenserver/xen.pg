@@ -1,0 +1,426 @@
+From 9bb2307252c788d058c02bd4de69962dcab1559d Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Wed, 24 Jul 2019 11:03:47 +0200
+Subject: [PATCH 10/52] xen/sched: let pick_cpu return a scheduler resource
+
+Instead of returning a physical cpu number let pick_cpu() return a
+scheduler resource instead. Rename pick_cpu() to pick_resource() to
+reflect that change.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+---
+ xen/common/sched_arinc653.c  | 13 +++++++------
+ xen/common/sched_credit.c    | 16 ++++++++--------
+ xen/common/sched_credit2.c   | 22 +++++++++++-----------
+ xen/common/sched_null.c      | 23 ++++++++++++-----------
+ xen/common/sched_rt.c        | 18 +++++++++---------
+ xen/common/schedule.c        | 18 ++++++++++--------
+ xen/include/xen/perfc_defn.h |  2 +-
+ xen/include/xen/sched-if.h   | 10 +++++-----
+ 8 files changed, 63 insertions(+), 59 deletions(-)
+
+diff --git a/xen/common/sched_arinc653.c b/xen/common/sched_arinc653.c
+index cdf5c2cc97..9754aaa503 100644
+--- a/xen/common/sched_arinc653.c
++++ b/xen/common/sched_arinc653.c
+@@ -601,15 +601,16 @@ a653sched_do_schedule(
+ }
+ 
+ /**
+- * Xen scheduler callback function to select a CPU for the VCPU to run on
++ * Xen scheduler callback function to select a resource for the VCPU to run on
+  *
+  * @param ops       Pointer to this instance of the scheduler structure
+  * @param unit      Pointer to struct sched_unit
+  *
+- * @return          Number of selected physical CPU
++ * @return          Scheduler resource to run on
+  */
+-static int
+-a653sched_pick_cpu(const struct scheduler *ops, const struct sched_unit *unit)
++static struct sched_resource *
++a653sched_pick_resource(const struct scheduler *ops,
++                        const struct sched_unit *unit)
+ {
+     struct vcpu *vc = unit->vcpu_list;
+     cpumask_t *online;
+@@ -627,7 +628,7 @@ a653sched_pick_cpu(const struct scheduler *ops, const struct sched_unit *unit)
+          || (cpu >= nr_cpu_ids) )
+         cpu = vc->processor;
+ 
+-    return cpu;
++    return get_sched_res(cpu);
+ }
+ 
+ /**
+@@ -720,7 +721,7 @@ static const struct scheduler sched_arinc653_def = {
+ 
+     .do_schedule    = a653sched_do_schedule,
+ 
+-    .pick_cpu       = a653sched_pick_cpu,
++    .pick_resource  = a653sched_pick_resource,
+ 
+     .switch_sched   = a653_switch_sched,
+ 
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index 2bc7fa9220..b34cc32ce0 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -853,8 +853,8 @@ _csched_cpu_pick(const struct scheduler *ops, struct vcpu *vc, bool_t commit)
+     return cpu;
+ }
+ 
+-static int
+-csched_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
++static struct sched_resource *
++csched_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
+     struct vcpu *vc = unit->vcpu_list;
+     struct csched_vcpu *svc = CSCHED_VCPU(vc);
+@@ -867,7 +867,7 @@ csched_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
+      * get boosted, which we don't deserve as we are "only" migrating.
+      */
+     set_bit(CSCHED_FLAG_VCPU_MIGRATING, &svc->flags);
+-    return _csched_cpu_pick(ops, vc, 1);
++    return get_sched_res(_csched_cpu_pick(ops, vc, 1));
+ }
+ 
+ static inline void
+@@ -967,7 +967,7 @@ csched_vcpu_acct(struct csched_private *prv, unsigned int cpu)
+         /*
+          * If it's been active a while, check if we'd be better off
+          * migrating it to run elsewhere (see multi-core and multi-thread
+-         * support in csched_cpu_pick()).
++         * support in csched_res_pick()).
+          */
+         new_cpu = _csched_cpu_pick(ops, current, 0);
+ 
+@@ -1022,11 +1022,11 @@ csched_unit_insert(const struct scheduler *ops, struct sched_unit *unit)
+ 
+     BUG_ON( is_idle_vcpu(vc) );
+ 
+-    /* csched_cpu_pick() looks in vc->processor's runq, so we need the lock. */
++    /* csched_res_pick() looks in vc->processor's runq, so we need the lock. */
+     lock = vcpu_schedule_lock_irq(vc);
+ 
+-    vc->processor = csched_cpu_pick(ops, unit);
+-    unit->res = get_sched_res(vc->processor);
++    unit->res = csched_res_pick(ops, unit);
++    vc->processor = unit->res->master_cpu;
+ 
+     spin_unlock_irq(lock);
+ 
+@@ -2278,7 +2278,7 @@ static const struct scheduler sched_credit_def = {
+     .adjust_affinity= csched_aff_cntl,
+     .adjust_global  = csched_sys_cntl,
+ 
+-    .pick_cpu       = csched_cpu_pick,
++    .pick_resource  = csched_res_pick,
+     .do_schedule    = csched_schedule,
+ 
+     .dump_cpu_state = csched_dump_pcpu,
+diff --git a/xen/common/sched_credit2.c b/xen/common/sched_credit2.c
+index 200de63bee..cea4a11087 100644
+--- a/xen/common/sched_credit2.c
++++ b/xen/common/sched_credit2.c
+@@ -626,9 +626,9 @@ static inline bool has_cap(const struct csched2_vcpu *svc)
+  * runq, _always_ happens by means of tickling:
+  *  - when a vcpu wakes up, it calls csched2_unit_wake(), which calls
+  *    runq_tickle();
+- *  - when a migration is initiated in schedule.c, we call csched2_cpu_pick(),
++ *  - when a migration is initiated in schedule.c, we call csched2_res_pick(),
+  *    csched2_unit_migrate() (which calls migrate()) and csched2_unit_wake().
+- *    csched2_cpu_pick() looks for the least loaded runq and return just any
++ *    csched2_res_pick() looks for the least loaded runq and return just any
+  *    of its processors. Then, csched2_unit_migrate() just moves the vcpu to
+  *    the chosen runq, and it is again runq_tickle(), called by
+  *    csched2_unit_wake() that actually decides what pcpu to use within the
+@@ -677,7 +677,7 @@ void smt_idle_mask_clear(unsigned int cpu, cpumask_t *mask)
+ }
+ 
+ /*
+- * In csched2_cpu_pick(), it may not be possible to actually look at remote
++ * In csched2_res_pick(), it may not be possible to actually look at remote
+  * runqueues (the trylock-s on their spinlocks can fail!). If that happens,
+  * we pick, in order of decreasing preference:
+  *  1) svc's current pcpu, if it is part of svc's soft affinity;
+@@ -2202,8 +2202,8 @@ csched2_context_saved(const struct scheduler *ops, struct sched_unit *unit)
+ }
+ 
+ #define MAX_LOAD (STIME_MAX)
+-static int
+-csched2_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
++static struct sched_resource *
++csched2_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
+     struct csched2_private *prv = csched2_priv(ops);
+     struct vcpu *vc = unit->vcpu_list;
+@@ -2215,7 +2215,7 @@ csched2_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ 
+     ASSERT(!cpumask_empty(&prv->active_queues));
+ 
+-    SCHED_STAT_CRANK(pick_cpu);
++    SCHED_STAT_CRANK(pick_resource);
+ 
+     /* Locking:
+      * - Runqueue lock of vc->processor is already locked
+@@ -2424,7 +2424,7 @@ csched2_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
+                     (unsigned char *)&d);
+     }
+ 
+-    return new_cpu;
++    return get_sched_res(new_cpu);
+ }
+ 
+ /* Working state of the load-balancing algorithm */
+@@ -3121,11 +3121,11 @@ csched2_unit_insert(const struct scheduler *ops, struct sched_unit *unit)
+     ASSERT(!is_idle_vcpu(vc));
+     ASSERT(list_empty(&svc->runq_elem));
+ 
+-    /* csched2_cpu_pick() expects the pcpu lock to be held */
++    /* csched2_res_pick() expects the pcpu lock to be held */
+     lock = vcpu_schedule_lock_irq(vc);
+ 
+-    vc->processor = csched2_cpu_pick(ops, unit);
+-    unit->res = get_sched_res(vc->processor);
++    unit->res = csched2_res_pick(ops, unit);
++    vc->processor = unit->res->master_cpu;
+ 
+     spin_unlock_irq(lock);
+ 
+@@ -4112,7 +4112,7 @@ static const struct scheduler sched_credit2_def = {
+     .adjust_affinity= csched2_aff_cntl,
+     .adjust_global  = csched2_sys_cntl,
+ 
+-    .pick_cpu       = csched2_cpu_pick,
++    .pick_resource  = csched2_res_pick,
+     .migrate        = csched2_unit_migrate,
+     .do_schedule    = csched2_schedule,
+     .context_saved  = csched2_context_saved,
+diff --git a/xen/common/sched_null.c b/xen/common/sched_null.c
+index c30fe2e443..3bb3a53452 100644
+--- a/xen/common/sched_null.c
++++ b/xen/common/sched_null.c
+@@ -261,9 +261,11 @@ static void null_free_domdata(const struct scheduler *ops, void *data)
+  *
+  * So this is not part of any hot path.
+  */
+-static unsigned int pick_cpu(struct null_private *prv, struct vcpu *v)
++static struct sched_resource *
++pick_res(struct null_private *prv, const struct sched_unit *unit)
+ {
+     unsigned int bs;
++    struct vcpu *v = unit->vcpu_list;
+     unsigned int cpu = v->processor, new_cpu;
+     cpumask_t *cpus = cpupool_domain_cpumask(v->domain);
+ 
+@@ -327,7 +329,7 @@ static unsigned int pick_cpu(struct null_private *prv, struct vcpu *v)
+         __trace_var(TRC_SNULL_PICKED_CPU, 1, sizeof(d), &d);
+     }
+ 
+-    return new_cpu;
++    return get_sched_res(new_cpu);
+ }
+ 
+ static void vcpu_assign(struct null_private *prv, struct vcpu *v,
+@@ -457,8 +459,8 @@ static void null_unit_insert(const struct scheduler *ops,
+     }
+ 
+  retry:
+-    cpu = v->processor = pick_cpu(prv, v);
+-    unit->res = get_sched_res(cpu);
++    unit->res = pick_res(prv, unit);
++    cpu = v->processor = unit->res->master_cpu;
+ 
+     spin_unlock(lock);
+ 
+@@ -599,7 +601,7 @@ static void null_unit_wake(const struct scheduler *ops,
+          */
+         while ( cpumask_intersects(&prv->cpus_free, cpumask_scratch_cpu(cpu)) )
+         {
+-            unsigned int new_cpu = pick_cpu(prv, v);
++            unsigned int new_cpu = pick_res(prv, unit)->master_cpu;
+ 
+             if ( test_and_clear_bit(new_cpu, &prv->cpus_free) )
+             {
+@@ -648,12 +650,11 @@ static void null_unit_sleep(const struct scheduler *ops,
+     SCHED_STAT_CRANK(vcpu_sleep);
+ }
+ 
+-static int null_cpu_pick(const struct scheduler *ops,
+-                         const struct sched_unit *unit)
++static struct sched_resource *
++null_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
+-    struct vcpu *v = unit->vcpu_list;
+-    ASSERT(!is_idle_vcpu(v));
+-    return pick_cpu(null_priv(ops), v);
++    ASSERT(!is_idle_vcpu(unit->vcpu_list));
++    return pick_res(null_priv(ops), unit);
+ }
+ 
+ static void null_unit_migrate(const struct scheduler *ops,
+@@ -985,7 +986,7 @@ static const struct scheduler sched_null_def = {
+ 
+     .wake           = null_unit_wake,
+     .sleep          = null_unit_sleep,
+-    .pick_cpu       = null_cpu_pick,
++    .pick_resource  = null_res_pick,
+     .migrate        = null_unit_migrate,
+     .do_schedule    = null_schedule,
+ 
+diff --git a/xen/common/sched_rt.c b/xen/common/sched_rt.c
+index 3ba76f1c4a..f303271399 100644
+--- a/xen/common/sched_rt.c
++++ b/xen/common/sched_rt.c
+@@ -631,12 +631,12 @@ replq_reinsert(const struct scheduler *ops, struct rt_vcpu *svc)
+ }
+ 
+ /*
+- * Pick a valid CPU for the vcpu vc
+- * Valid CPU of a vcpu is intesection of vcpu's affinity
+- * and available cpus
++ * Pick a valid resource for the vcpu vc
++ * Valid resource of a vcpu is intesection of vcpu's affinity
++ * and available resources
+  */
+-static int
+-rt_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
++static struct sched_resource *
++rt_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
+     struct vcpu *vc = unit->vcpu_list;
+     cpumask_t cpus;
+@@ -651,7 +651,7 @@ rt_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
+             : cpumask_cycle(vc->processor, &cpus);
+     ASSERT( !cpumask_empty(&cpus) && cpumask_test_cpu(cpu, &cpus) );
+ 
+-    return cpu;
++    return get_sched_res(cpu);
+ }
+ 
+ /*
+@@ -892,8 +892,8 @@ rt_unit_insert(const struct scheduler *ops, struct sched_unit *unit)
+     BUG_ON( is_idle_vcpu(vc) );
+ 
+     /* This is safe because vc isn't yet being scheduled */
+-    vc->processor = rt_cpu_pick(ops, unit);
+-    unit->res = get_sched_res(vc->processor);
++    unit->res = rt_res_pick(ops, unit);
++    vc->processor = unit->res->master_cpu;
+ 
+     lock = vcpu_schedule_lock_irq(vc);
+ 
+@@ -1562,7 +1562,7 @@ static const struct scheduler sched_rtds_def = {
+ 
+     .adjust         = rt_dom_cntl,
+ 
+-    .pick_cpu       = rt_cpu_pick,
++    .pick_resource  = rt_res_pick,
+     .do_schedule    = rt_schedule,
+     .sleep          = rt_unit_sleep,
+     .wake           = rt_unit_wake,
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 2bf7966476..b7cdc15bd1 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -87,10 +87,10 @@ sched_idle_switch_sched(struct scheduler *new_ops, unsigned int cpu,
+     return &sched_free_cpu_lock;
+ }
+ 
+-static int
+-sched_idle_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
++static struct sched_resource *
++sched_idle_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
+-    return unit->res->master_cpu;
++    return unit->res;
+ }
+ 
+ static void *
+@@ -122,7 +122,7 @@ static struct scheduler sched_idle_ops = {
+     .opt_name       = "idle",
+     .sched_data     = NULL,
+ 
+-    .pick_cpu       = sched_idle_cpu_pick,
++    .pick_resource  = sched_idle_res_pick,
+     .do_schedule    = sched_idle_schedule,
+ 
+     .alloc_vdata    = sched_idle_alloc_vdata,
+@@ -746,7 +746,8 @@ static void vcpu_migrate_finish(struct vcpu *v)
+                 break;
+ 
+             /* Select a new CPU. */
+-            new_cpu = sched_pick_cpu(vcpu_scheduler(v), v->sched_unit);
++            new_cpu = sched_pick_resource(vcpu_scheduler(v),
++                                          v->sched_unit)->master_cpu;
+             if ( (new_lock == per_cpu(schedule_data, new_cpu).schedule_lock) &&
+                  cpumask_test_cpu(new_cpu, v->domain->cpupool->cpu_valid) )
+                 break;
+@@ -839,8 +840,9 @@ void restore_vcpu_affinity(struct domain *d)
+ 
+         /* v->processor might have changed, so reacquire the lock. */
+         lock = vcpu_schedule_lock_irq(v);
+-        v->processor = sched_pick_cpu(vcpu_scheduler(v), v->sched_unit);
+-        v->sched_unit->res = get_sched_res(v->processor);
++        v->sched_unit->res = sched_pick_resource(vcpu_scheduler(v),
++                                                 v->sched_unit);
++        v->processor = v->sched_unit->res->master_cpu;
+         spin_unlock_irq(lock);
+ 
+         if ( old_cpu != v->processor )
+@@ -1853,7 +1855,7 @@ void __init scheduler_init(void)
+ 
+         sched_test_func(init);
+         sched_test_func(deinit);
+-        sched_test_func(pick_cpu);
++        sched_test_func(pick_resource);
+         sched_test_func(alloc_vdata);
+         sched_test_func(free_vdata);
+         sched_test_func(switch_sched);
+diff --git a/xen/include/xen/perfc_defn.h b/xen/include/xen/perfc_defn.h
+index ef6f86b91e..1ad4384080 100644
+--- a/xen/include/xen/perfc_defn.h
++++ b/xen/include/xen/perfc_defn.h
+@@ -69,7 +69,7 @@ PERFCOUNTER(migrate_on_runq,        "csched2: migrate_on_runq")
+ PERFCOUNTER(migrate_no_runq,        "csched2: migrate_no_runq")
+ PERFCOUNTER(runtime_min_timer,      "csched2: runtime_min_timer")
+ PERFCOUNTER(runtime_max_timer,      "csched2: runtime_max_timer")
+-PERFCOUNTER(pick_cpu,               "csched2: pick_cpu")
++PERFCOUNTER(pick_resource,          "csched2: pick_resource")
+ PERFCOUNTER(need_fallback_cpu,      "csched2: need_fallback_cpu")
+ PERFCOUNTER(migrated,               "csched2: migrated")
+ PERFCOUNTER(migrate_resisted,       "csched2: migrate_resisted")
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index b9e2920c66..2d9d77c6d3 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -189,8 +189,8 @@ struct scheduler {
+     struct task_slice (*do_schedule) (const struct scheduler *, s_time_t,
+                                       bool_t tasklet_work_scheduled);
+ 
+-    int          (*pick_cpu)       (const struct scheduler *,
+-                                    const struct sched_unit *);
++    struct sched_resource *(*pick_resource)(const struct scheduler *,
++                                            const struct sched_unit *);
+     void         (*migrate)        (const struct scheduler *,
+                                     struct sched_unit *, unsigned int);
+     int          (*adjust)         (const struct scheduler *, struct domain *,
+@@ -355,10 +355,10 @@ static inline void sched_migrate(const struct scheduler *s,
+     }
+ }
+ 
+-static inline int sched_pick_cpu(const struct scheduler *s,
+-                                 const struct sched_unit *unit)
++static inline struct sched_resource *sched_pick_resource(
++    const struct scheduler *s, const struct sched_unit *unit)
+ {
+-    return s->pick_cpu(s, unit);
++    return s->pick_resource(s, unit);
+ }
+ 
+ static inline void sched_adjust_affinity(const struct scheduler *s,
+-- 
+2.17.1
+

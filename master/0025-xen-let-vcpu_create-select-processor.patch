@@ -1,0 +1,363 @@
+From c7760c0cd541f2f68e77c01042db9d053adf1049 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Wed, 24 Jul 2019 11:03:48 +0200
+Subject: [PATCH 25/52] xen: let vcpu_create() select processor
+
+Today there are two distinct scenarios for vcpu_create(): either for
+creation of idle-domain vcpus (vcpuid == processor) or for creation of
+"normal" domain vcpus (including dom0), where the caller selects the
+initial processor on a round-robin scheme of the allowed processors
+(allowed being based on cpupool and affinities).
+
+Instead of passing the initial processor to vcpu_create() and passing
+on to sched_init_vcpu() let sched_init_vcpu() do the processor
+selection. For supporting dom0 vcpu creation use the node_affinity of
+the domain as a base for selecting the processors. User domains will
+have initially all nodes set, so this is no different behavior compared
+to today. In theory this is not guaranteed as vcpus are created only
+with XEN_DOMCTL_max_vcpus being called, but this call is going to be
+removed in future and the toolstack doesn't call
+XEN_DOMCTL_setnodeaffinity before calling XEN_DOMCTL_max_vcpus.
+
+To be able to use const struct domain * make cpupool_domain_cpumask()
+take a const domain pointer, too.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Julien Grall <julien.grall@arm.com>
+---
+ xen/arch/arm/domain_build.c      | 13 +++++-----
+ xen/arch/x86/dom0_build.c        | 10 +++-----
+ xen/arch/x86/hvm/dom0_build.c    |  9 ++-----
+ xen/arch/x86/pv/dom0_build.c     | 10 ++------
+ xen/common/domain.c              |  5 ++--
+ xen/common/domctl.c              | 10 ++------
+ xen/common/schedule.c            | 44 +++++++++++++++++++++++++++++---
+ xen/include/asm-x86/dom0_build.h |  3 +--
+ xen/include/xen/domain.h         |  3 +--
+ xen/include/xen/sched-if.h       |  2 +-
+ xen/include/xen/sched.h          |  2 +-
+ 11 files changed, 62 insertions(+), 49 deletions(-)
+
+diff --git a/xen/arch/arm/domain_build.c b/xen/arch/arm/domain_build.c
+index a0fee1ef13..f6575f918d 100644
+--- a/xen/arch/arm/domain_build.c
++++ b/xen/arch/arm/domain_build.c
+@@ -80,7 +80,7 @@ unsigned int __init dom0_max_vcpus(void)
+ 
+ struct vcpu *__init alloc_dom0_vcpu0(struct domain *dom0)
+ {
+-    return vcpu_create(dom0, 0, 0);
++    return vcpu_create(dom0, 0);
+ }
+ 
+ static unsigned int __init get_allocation_size(paddr_t size)
+@@ -1925,7 +1925,7 @@ static void __init find_gnttab_region(struct domain *d,
+ 
+ static int __init construct_domain(struct domain *d, struct kernel_info *kinfo)
+ {
+-    int i, cpu;
++    int i;
+     struct vcpu *v = d->vcpu[0];
+     struct cpu_user_regs *regs = &v->arch.cpu_info->guest_cpu_user_regs;
+ 
+@@ -1988,12 +1988,11 @@ static int __init construct_domain(struct domain *d, struct kernel_info *kinfo)
+     }
+ #endif
+ 
+-    for ( i = 1, cpu = 0; i < d->max_vcpus; i++ )
++    for ( i = 1; i < d->max_vcpus; i++ )
+     {
+-        cpu = cpumask_cycle(cpu, &cpu_online_map);
+-        if ( vcpu_create(d, i, cpu) == NULL )
++        if ( vcpu_create(d, i) == NULL )
+         {
+-            printk("Failed to allocate dom0 vcpu %d on pcpu %d\n", i, cpu);
++            printk("Failed to allocate d0v%u\n", i);
+             break;
+         }
+ 
+@@ -2028,7 +2027,7 @@ static int __init construct_domU(struct domain *d,
+ 
+     kinfo.vpl011 = dt_property_read_bool(node, "vpl011");
+ 
+-    if ( vcpu_create(d, 0, 0) == NULL )
++    if ( vcpu_create(d, 0) == NULL )
+         return -ENOMEM;
+     d->max_pages = ~0U;
+ 
+diff --git a/xen/arch/x86/dom0_build.c b/xen/arch/x86/dom0_build.c
+index c69570920c..6265dd4a1c 100644
+--- a/xen/arch/x86/dom0_build.c
++++ b/xen/arch/x86/dom0_build.c
+@@ -198,12 +198,9 @@ custom_param("dom0_nodes", parse_dom0_nodes);
+ 
+ static cpumask_t __initdata dom0_cpus;
+ 
+-struct vcpu *__init dom0_setup_vcpu(struct domain *d,
+-                                    unsigned int vcpu_id,
+-                                    unsigned int prev_cpu)
++struct vcpu *__init dom0_setup_vcpu(struct domain *d, unsigned int vcpu_id)
+ {
+-    unsigned int cpu = cpumask_cycle(prev_cpu, &dom0_cpus);
+-    struct vcpu *v = vcpu_create(d, vcpu_id, cpu);
++    struct vcpu *v = vcpu_create(d, vcpu_id);
+ 
+     if ( v )
+     {
+@@ -273,8 +270,7 @@ struct vcpu *__init alloc_dom0_vcpu0(struct domain *dom0)
+     dom0->node_affinity = dom0_nodes;
+     dom0->auto_node_affinity = !dom0_nr_pxms;
+ 
+-    return dom0_setup_vcpu(dom0, 0,
+-                           cpumask_last(&dom0_cpus) /* so it wraps around to first pcpu */);
++    return dom0_setup_vcpu(dom0, 0);
+ }
+ 
+ #ifdef CONFIG_SHADOW_PAGING
+diff --git a/xen/arch/x86/hvm/dom0_build.c b/xen/arch/x86/hvm/dom0_build.c
+index 8845399ae9..fd8d9609b1 100644
+--- a/xen/arch/x86/hvm/dom0_build.c
++++ b/xen/arch/x86/hvm/dom0_build.c
+@@ -614,7 +614,7 @@ static int __init pvh_setup_cpus(struct domain *d, paddr_t entry,
+                                  paddr_t start_info)
+ {
+     struct vcpu *v = d->vcpu[0];
+-    unsigned int cpu = v->processor, i;
++    unsigned int i;
+     int rc;
+     /*
+      * This sets the vCPU state according to the state described in
+@@ -636,12 +636,7 @@ static int __init pvh_setup_cpus(struct domain *d, paddr_t entry,
+     };
+ 
+     for ( i = 1; i < d->max_vcpus; i++ )
+-    {
+-        const struct vcpu *p = dom0_setup_vcpu(d, i, cpu);
+-
+-        if ( p )
+-            cpu = p->processor;
+-    }
++        dom0_setup_vcpu(d, i);
+ 
+     domain_update_node_affinity(d);
+ 
+diff --git a/xen/arch/x86/pv/dom0_build.c b/xen/arch/x86/pv/dom0_build.c
+index 1bd53e9c08..565c6c8b44 100644
+--- a/xen/arch/x86/pv/dom0_build.c
++++ b/xen/arch/x86/pv/dom0_build.c
+@@ -285,7 +285,7 @@ int __init dom0_construct_pv(struct domain *d,
+                              module_t *initrd,
+                              char *cmdline)
+ {
+-    int i, cpu, rc, compatible, order, machine;
++    int i, rc, compatible, order, machine;
+     struct cpu_user_regs *regs;
+     unsigned long pfn, mfn;
+     unsigned long nr_pages;
+@@ -694,14 +694,8 @@ int __init dom0_construct_pv(struct domain *d,
+ 
+     printk("Dom%u has maximum %u VCPUs\n", d->domain_id, d->max_vcpus);
+ 
+-    cpu = v->processor;
+     for ( i = 1; i < d->max_vcpus; i++ )
+-    {
+-        const struct vcpu *p = dom0_setup_vcpu(d, i, cpu);
+-
+-        if ( p )
+-            cpu = p->processor;
+-    }
++        dom0_setup_vcpu(d, i);
+ 
+     domain_update_node_affinity(d);
+     d->arch.paging.mode = 0;
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index ac6439d2ac..f72d5a6227 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -135,8 +135,7 @@ static void vcpu_destroy(struct vcpu *v)
+     free_vcpu_struct(v);
+ }
+ 
+-struct vcpu *vcpu_create(
+-    struct domain *d, unsigned int vcpu_id, unsigned int cpu_id)
++struct vcpu *vcpu_create(struct domain *d, unsigned int vcpu_id)
+ {
+     struct vcpu *v;
+ 
+@@ -168,7 +167,7 @@ struct vcpu *vcpu_create(
+         init_waitqueue_vcpu(v);
+     }
+ 
+-    if ( sched_init_vcpu(v, cpu_id) != 0 )
++    if ( sched_init_vcpu(v) != 0 )
+         goto fail_wq;
+ 
+     if ( arch_vcpu_create(v) != 0 )
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 2f9768f08f..8a694e0d37 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -532,8 +532,7 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+ 
+     case XEN_DOMCTL_max_vcpus:
+     {
+-        unsigned int i, max = op->u.max_vcpus.max, cpu;
+-        cpumask_t *online;
++        unsigned int i, max = op->u.max_vcpus.max;
+ 
+         ret = -EINVAL;
+         if ( (d == current->domain) || /* no domain_pause() */
+@@ -544,18 +543,13 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+         domain_pause(d);
+ 
+         ret = -ENOMEM;
+-        online = cpupool_domain_cpumask(d);
+ 
+         for ( i = 0; i < max; i++ )
+         {
+             if ( d->vcpu[i] != NULL )
+                 continue;
+ 
+-            cpu = (i == 0) ?
+-                cpumask_any(online) :
+-                cpumask_cycle(d->vcpu[i-1]->processor, online);
+-
+-            if ( vcpu_create(d, i, cpu) == NULL )
++            if ( vcpu_create(d, i) == NULL )
+                 goto maxvcpu_out;
+         }
+ 
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 05bc42d7e9..74769f2f9b 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -371,14 +371,52 @@ static struct sched_unit *sched_alloc_unit(struct vcpu *v)
+     return NULL;
+ }
+ 
+-int sched_init_vcpu(struct vcpu *v, unsigned int processor)
++static unsigned int sched_select_initial_cpu(const struct vcpu *v)
++{
++    const struct domain *d = v->domain;
++    nodeid_t node;
++    spinlock_t *lock;
++    unsigned long flags;
++    unsigned int cpu_ret, cpu = smp_processor_id();
++    cpumask_t *cpus = cpumask_scratch_cpu(cpu);
++
++    lock = pcpu_schedule_lock_irqsave(cpu, &flags);
++    cpumask_clear(cpus);
++    for_each_node_mask ( node, d->node_affinity )
++        cpumask_or(cpus, cpus, &node_to_cpumask(node));
++    cpumask_and(cpus, cpus, cpupool_domain_cpumask(d));
++    if ( cpumask_empty(cpus) )
++        cpumask_copy(cpus, cpupool_domain_cpumask(d));
++
++    if ( v->vcpu_id == 0 )
++        cpu_ret = cpumask_first(cpus);
++    else
++    {
++        /* We can rely on previous vcpu being available. */
++        ASSERT(!is_idle_domain(d));
++
++        cpu_ret = cpumask_cycle(d->vcpu[v->vcpu_id - 1]->processor, cpus);
++    }
++
++    pcpu_schedule_unlock_irqrestore(lock, flags, cpu);
++
++    return cpu_ret;
++}
++
++int sched_init_vcpu(struct vcpu *v)
+ {
+     struct domain *d = v->domain;
+     struct sched_unit *unit;
++    unsigned int processor;
+ 
+     if ( (unit = sched_alloc_unit(v)) == NULL )
+         return 1;
+ 
++    if ( is_idle_domain(d) )
++        processor = v->vcpu_id;
++    else
++        processor = sched_select_initial_cpu(v);
++
+     sched_set_res(unit, get_sched_res(processor));
+ 
+     /* Initialise the per-vcpu timers. */
+@@ -1763,7 +1801,7 @@ static int cpu_schedule_up(unsigned int cpu)
+         return 0;
+ 
+     if ( idle_vcpu[cpu] == NULL )
+-        vcpu_create(idle_vcpu[0]->domain, cpu, cpu);
++        vcpu_create(idle_vcpu[0]->domain, cpu);
+     else
+         idle_vcpu[cpu]->sched_unit->res = sd;
+ 
+@@ -1942,7 +1980,7 @@ void __init scheduler_init(void)
+     BUG_ON(nr_cpu_ids > ARRAY_SIZE(idle_vcpu));
+     idle_domain->vcpu = idle_vcpu;
+     idle_domain->max_vcpus = nr_cpu_ids;
+-    if ( vcpu_create(idle_domain, 0, 0) == NULL )
++    if ( vcpu_create(idle_domain, 0) == NULL )
+         BUG();
+     get_sched_res(0)->curr = idle_vcpu[0]->sched_unit;
+ }
+diff --git a/xen/include/asm-x86/dom0_build.h b/xen/include/asm-x86/dom0_build.h
+index 33a5483739..3eb4b036e1 100644
+--- a/xen/include/asm-x86/dom0_build.h
++++ b/xen/include/asm-x86/dom0_build.h
+@@ -11,8 +11,7 @@ extern unsigned int dom0_memflags;
+ unsigned long dom0_compute_nr_pages(struct domain *d,
+                                     struct elf_dom_parms *parms,
+                                     unsigned long initrd_len);
+-struct vcpu *dom0_setup_vcpu(struct domain *d, unsigned int vcpu_id,
+-                             unsigned int cpu);
++struct vcpu *dom0_setup_vcpu(struct domain *d, unsigned int vcpu_id);
+ int dom0_setup_permissions(struct domain *d);
+ 
+ int dom0_construct_pv(struct domain *d, const module_t *image,
+diff --git a/xen/include/xen/domain.h b/xen/include/xen/domain.h
+index 3f09cb66c0..4ca3db5a18 100644
+--- a/xen/include/xen/domain.h
++++ b/xen/include/xen/domain.h
+@@ -13,8 +13,7 @@ typedef union {
+     struct compat_vcpu_guest_context *cmp;
+ } vcpu_guest_context_u __attribute__((__transparent_union__));
+ 
+-struct vcpu *vcpu_create(
+-    struct domain *d, unsigned int vcpu_id, unsigned int cpu_id);
++struct vcpu *vcpu_create(struct domain *d, unsigned int vcpu_id);
+ 
+ unsigned int dom0_max_vcpus(void);
+ struct vcpu *alloc_dom0_vcpu0(struct domain *dom0);
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index b5967d26af..f70182dd4e 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -458,7 +458,7 @@ struct cpupool
+ #define cpupool_online_cpumask(_pool) \
+     (((_pool) == NULL) ? &cpu_online_map : (_pool)->cpu_valid)
+ 
+-static inline cpumask_t* cpupool_domain_cpumask(struct domain *d)
++static inline cpumask_t *cpupool_domain_cpumask(const struct domain *d)
+ {
+     /*
+      * d->cpupool is NULL only for the idle domain, and no one should
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index d4698b3f0d..56ed863b08 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -659,7 +659,7 @@ void __domain_crash(struct domain *d);
+ void noreturn asm_domain_crash_synchronous(unsigned long addr);
+ 
+ void scheduler_init(void);
+-int  sched_init_vcpu(struct vcpu *v, unsigned int processor);
++int  sched_init_vcpu(struct vcpu *v);
+ void sched_destroy_vcpu(struct vcpu *v);
+ int  sched_init_domain(struct domain *d, int poolid);
+ void sched_destroy_domain(struct domain *d);
+-- 
+2.17.1
+

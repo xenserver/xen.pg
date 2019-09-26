@@ -1,0 +1,400 @@
+From 16dfca97418d77e497b1cac8d8425816b2a05908 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 13 Sep 2019 11:36:02 +0200
+Subject: [PATCH 02/52] xen/sched: remove cpu from pool0 before removing it
+
+Today a cpu which is removed from the system is taken directly from
+Pool0 to the offline state. This will conflict with the new idle
+scheduler, so remove it from Pool0 first. Additionally accept removing
+a free cpu instead of requiring it to be in Pool0.
+
+For the resume failed case we need to call the scheduler code for that
+situation after the cpupool handling, so move the scheduler code into
+a function and call it from cpupool_cpu_remove_forced() and remove the
+CPU_RESUME_FAILED case from cpu_schedule_callback().
+
+Note that we are calling now schedule_cpu_switch() in stop_machine
+context so we need to switch from spinlock_irq to spinlock_irqsave.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ xen/common/cpupool.c       | 182 ++++++++++++++++++++++---------------
+ xen/common/schedule.c      |  27 ++++--
+ xen/include/xen/sched-if.h |   2 +
+ 3 files changed, 130 insertions(+), 81 deletions(-)
+
+diff --git a/xen/common/cpupool.c b/xen/common/cpupool.c
+index caea5bd8b3..dcdf18ee08 100644
+--- a/xen/common/cpupool.c
++++ b/xen/common/cpupool.c
+@@ -282,22 +282,14 @@ static int cpupool_assign_cpu_locked(struct cpupool *c, unsigned int cpu)
+     return 0;
+ }
+ 
+-static long cpupool_unassign_cpu_helper(void *info)
++static int cpupool_unassign_cpu_finish(struct cpupool *c)
+ {
+     int cpu = cpupool_moving_cpu;
+-    struct cpupool *c = info;
+     struct domain *d;
+-    long ret;
+-
+-    cpupool_dprintk("cpupool_unassign_cpu(pool=%d,cpu=%d)\n",
+-                    cpupool_cpu_moving->cpupool_id, cpu);
++    int ret;
+ 
+-    spin_lock(&cpupool_lock);
+     if ( c != cpupool_cpu_moving )
+-    {
+-        ret = -EADDRNOTAVAIL;
+-        goto out;
+-    }
++        return -EADDRNOTAVAIL;
+ 
+     /*
+      * We need this for scanning the domain list, both in
+@@ -332,51 +324,29 @@ static long cpupool_unassign_cpu_helper(void *info)
+         domain_update_node_affinity(d);
+     }
+     rcu_read_unlock(&domlist_read_lock);
+-out:
+-    spin_unlock(&cpupool_lock);
+-    cpupool_dprintk("cpupool_unassign_cpu ret=%ld\n", ret);
++
+     return ret;
+ }
+ 
+-/*
+- * unassign a specific cpu from a cpupool
+- * we must be sure not to run on the cpu to be unassigned! to achieve this
+- * the main functionality is performed via continue_hypercall_on_cpu on a
+- * specific cpu.
+- * if the cpu to be removed is the last one of the cpupool no active domain
+- * must be bound to the cpupool. dying domains are moved to cpupool0 as they
+- * might be zombies.
+- * possible failures:
+- * - last cpu and still active domains in cpupool
+- * - cpu just being unplugged
+- */
+-static int cpupool_unassign_cpu(struct cpupool *c, unsigned int cpu)
++static int cpupool_unassign_cpu_start(struct cpupool *c, unsigned int cpu)
+ {
+-    int work_cpu;
+     int ret;
+     struct domain *d;
+ 
+-    cpupool_dprintk("cpupool_unassign_cpu(pool=%d,cpu=%d)\n",
+-                    c->cpupool_id, cpu);
+-
+     spin_lock(&cpupool_lock);
+     ret = -EADDRNOTAVAIL;
+-    if ( (cpupool_moving_cpu != -1) && (cpu != cpupool_moving_cpu) )
+-        goto out;
+-    if ( cpumask_test_cpu(cpu, &cpupool_locked_cpus) )
++    if ( ((cpupool_moving_cpu != -1) || !cpumask_test_cpu(cpu, c->cpu_valid))
++         && (cpu != cpupool_moving_cpu) )
+         goto out;
+ 
+     ret = 0;
+-    if ( !cpumask_test_cpu(cpu, c->cpu_valid) && (cpu != cpupool_moving_cpu) )
+-        goto out;
+-
+     if ( (c->n_dom > 0) && (cpumask_weight(c->cpu_valid) == 1) &&
+          (cpu != cpupool_moving_cpu) )
+     {
+         rcu_read_lock(&domlist_read_lock);
+         for_each_domain_in_cpupool(d, c)
+         {
+-            if ( !d->is_dying )
++            if ( !d->is_dying && system_state == SYS_STATE_active )
+             {
+                 ret = -EBUSY;
+                 break;
+@@ -393,8 +363,58 @@ static int cpupool_unassign_cpu(struct cpupool *c, unsigned int cpu)
+     atomic_inc(&c->refcnt);
+     cpupool_cpu_moving = c;
+     cpumask_clear_cpu(cpu, c->cpu_valid);
++
++out:
+     spin_unlock(&cpupool_lock);
+ 
++    return ret;
++}
++
++static long cpupool_unassign_cpu_helper(void *info)
++{
++    struct cpupool *c = info;
++    long ret;
++
++    cpupool_dprintk("cpupool_unassign_cpu(pool=%d,cpu=%d)\n",
++                    cpupool_cpu_moving->cpupool_id, cpupool_moving_cpu);
++    spin_lock(&cpupool_lock);
++
++    ret = cpupool_unassign_cpu_finish(c);
++
++    spin_unlock(&cpupool_lock);
++    cpupool_dprintk("cpupool_unassign_cpu ret=%ld\n", ret);
++
++    return ret;
++}
++
++/*
++ * unassign a specific cpu from a cpupool
++ * we must be sure not to run on the cpu to be unassigned! to achieve this
++ * the main functionality is performed via continue_hypercall_on_cpu on a
++ * specific cpu.
++ * if the cpu to be removed is the last one of the cpupool no active domain
++ * must be bound to the cpupool. dying domains are moved to cpupool0 as they
++ * might be zombies.
++ * possible failures:
++ * - last cpu and still active domains in cpupool
++ * - cpu just being unplugged
++ */
++static int cpupool_unassign_cpu(struct cpupool *c, unsigned int cpu)
++{
++    int work_cpu;
++    int ret;
++
++    cpupool_dprintk("cpupool_unassign_cpu(pool=%d,cpu=%d)\n",
++                    c->cpupool_id, cpu);
++
++    ret = cpupool_unassign_cpu_start(c, cpu);
++    if ( ret )
++    {
++        cpupool_dprintk("cpupool_unassign_cpu(pool=%d,cpu=%d) ret %d\n",
++                        c->cpupool_id, cpu, ret);
++        return ret;
++    }
++
+     work_cpu = smp_processor_id();
+     if ( work_cpu == cpu )
+     {
+@@ -403,12 +423,6 @@ static int cpupool_unassign_cpu(struct cpupool *c, unsigned int cpu)
+             work_cpu = cpumask_next(cpu, cpupool0->cpu_valid);
+     }
+     return continue_hypercall_on_cpu(work_cpu, cpupool_unassign_cpu_helper, c);
+-
+-out:
+-    spin_unlock(&cpupool_lock);
+-    cpupool_dprintk("cpupool_unassign_cpu(pool=%d,cpu=%d) ret %d\n",
+-                    c->cpupool_id, cpu, ret);
+-    return ret;
+ }
+ 
+ /*
+@@ -492,30 +506,54 @@ static int cpupool_cpu_add(unsigned int cpu)
+ }
+ 
+ /*
+- * Called to remove a CPU from a pool. The CPU is locked, to forbid removing
+- * it from pool0. In fact, if we want to hot-unplug a CPU, it must belong to
+- * pool0, or we fail.
++ * This function is called in stop_machine context, so we can be sure no
++ * non-idle vcpu is active on the system.
+  */
+-static int cpupool_cpu_remove(unsigned int cpu)
++static void cpupool_cpu_remove(unsigned int cpu)
+ {
+-    int ret = -ENODEV;
++    int ret;
+ 
+-    spin_lock(&cpupool_lock);
++    ASSERT(is_idle_vcpu(current));
+ 
+-    if ( cpumask_test_cpu(cpu, cpupool0->cpu_valid) )
++    if ( !cpumask_test_cpu(cpu, &cpupool_free_cpus) )
+     {
+-        /*
+-         * If we are not suspending, we are hot-unplugging cpu, and that is
+-         * allowed only for CPUs in pool0.
+-         */
+-        cpumask_clear_cpu(cpu, cpupool0->cpu_valid);
+-        ret = 0;
++        ret = cpupool_unassign_cpu_finish(cpupool0);
++        BUG_ON(ret);
+     }
++}
+ 
+-    if ( !ret )
++/*
++ * Called before a CPU is being removed from the system.
++ * Removing a CPU is allowed for free CPUs or CPUs in Pool-0 (those are moved
++ * to free cpus actually before removing them).
++ * The CPU is locked, to forbid adding it again to another cpupool.
++ */
++static int cpupool_cpu_remove_prologue(unsigned int cpu)
++{
++    int ret = 0;
++
++    spin_lock(&cpupool_lock);
++
++    if ( cpumask_test_cpu(cpu, &cpupool_locked_cpus) )
++        ret = -EBUSY;
++    else
+         cpumask_set_cpu(cpu, &cpupool_locked_cpus);
++
+     spin_unlock(&cpupool_lock);
+ 
++    if ( ret )
++        return  ret;
++
++    if ( cpumask_test_cpu(cpu, cpupool0->cpu_valid) )
++    {
++        /* Cpupool0 is populated only after all cpus are up. */
++        ASSERT(system_state == SYS_STATE_active);
++
++        ret = cpupool_unassign_cpu_start(cpupool0, cpu);
++    }
++    else if ( !cpumask_test_cpu(cpu, &cpupool_free_cpus) )
++        ret = -ENODEV;
++
+     return ret;
+ }
+ 
+@@ -523,13 +561,13 @@ static int cpupool_cpu_remove(unsigned int cpu)
+  * Called during resume for all cpus which didn't come up again. The cpu must
+  * be removed from the cpupool it is assigned to. In case a cpupool will be
+  * left without cpu we move all domains of that cpupool to cpupool0.
++ * As we are called with all domains still frozen there is no need to take the
++ * cpupool lock here.
+  */
+ static void cpupool_cpu_remove_forced(unsigned int cpu)
+ {
+     struct cpupool **c;
+-    struct domain *d;
+-
+-    spin_lock(&cpupool_lock);
++    int ret;
+ 
+     if ( cpumask_test_cpu(cpu, &cpupool_free_cpus) )
+         cpumask_clear_cpu(cpu, &cpupool_free_cpus);
+@@ -539,19 +577,13 @@ static void cpupool_cpu_remove_forced(unsigned int cpu)
+         {
+             if ( cpumask_test_cpu(cpu, (*c)->cpu_valid) )
+             {
+-                cpumask_clear_cpu(cpu, (*c)->cpu_valid);
+-                if ( cpumask_weight((*c)->cpu_valid) == 0 )
+-                {
+-                    if ( *c == cpupool0 )
+-                        panic("No cpu left in cpupool0\n");
+-                    for_each_domain_in_cpupool(d, *c)
+-                        cpupool_move_domain_locked(d, cpupool0);
+-                }
++                ret = cpupool_unassign_cpu(*c, cpu);
++                BUG_ON(ret);
+             }
+         }
+     }
+ 
+-    spin_unlock(&cpupool_lock);
++    sched_rm_cpu(cpu);
+ }
+ 
+ /*
+@@ -619,7 +651,8 @@ int cpupool_do_sysctl(struct xen_sysctl_cpupool_op *op)
+         if ( cpu >= nr_cpu_ids )
+             goto addcpu_out;
+         ret = -ENODEV;
+-        if ( !cpumask_test_cpu(cpu, &cpupool_free_cpus) )
++        if ( !cpumask_test_cpu(cpu, &cpupool_free_cpus) ||
++             cpumask_test_cpu(cpu, &cpupool_locked_cpus) )
+             goto addcpu_out;
+         c = cpupool_find_by_id(op->cpupool_id);
+         ret = -ENOENT;
+@@ -746,7 +779,12 @@ static int cpu_callback(
+     case CPU_DOWN_PREPARE:
+         /* Suspend/Resume don't change assignments of cpus to cpupools. */
+         if ( system_state <= SYS_STATE_active )
+-            rc = cpupool_cpu_remove(cpu);
++            rc = cpupool_cpu_remove_prologue(cpu);
++        break;
++    case CPU_DYING:
++        /* Suspend/Resume don't change assignments of cpus to cpupools. */
++        if ( system_state <= SYS_STATE_active )
++            cpupool_cpu_remove(cpu);
+         break;
+     case CPU_RESUME_FAILED:
+         cpupool_cpu_remove_forced(cpu);
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 7b71581756..93164c64f6 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -1654,6 +1654,20 @@ static void cpu_schedule_down(unsigned int cpu)
+     kill_timer(&sd->s_timer);
+ }
+ 
++void sched_rm_cpu(unsigned int cpu)
++{
++    int rc;
++    struct schedule_data *sd = &per_cpu(schedule_data, cpu);
++    struct scheduler *sched = per_cpu(scheduler, cpu);
++
++    rcu_read_lock(&domlist_read_lock);
++    rc = cpu_disable_scheduler(cpu);
++    BUG_ON(rc);
++    rcu_read_unlock(&domlist_read_lock);
++    sched_deinit_pdata(sched, sd->sched_priv, cpu);
++    cpu_schedule_down(cpu);
++}
++
+ static int cpu_schedule_callback(
+     struct notifier_block *nfb, unsigned long action, void *hcpu)
+ {
+@@ -1709,16 +1723,10 @@ static int cpu_schedule_callback(
+         rc = cpu_disable_scheduler_check(cpu);
+         rcu_read_unlock(&domlist_read_lock);
+         break;
+-    case CPU_RESUME_FAILED:
+     case CPU_DEAD:
+         if ( system_state == SYS_STATE_suspend )
+             break;
+-        rcu_read_lock(&domlist_read_lock);
+-        rc = cpu_disable_scheduler(cpu);
+-        BUG_ON(rc);
+-        rcu_read_unlock(&domlist_read_lock);
+-        sched_deinit_pdata(sched, sd->sched_priv, cpu);
+-        cpu_schedule_down(cpu);
++        sched_rm_cpu(cpu);
+         break;
+     case CPU_UP_CANCELED:
+         if ( system_state != SYS_STATE_resume )
+@@ -1841,6 +1849,7 @@ int schedule_cpu_switch(unsigned int cpu, struct cpupool *c)
+     struct cpupool *old_pool = per_cpu(cpupool, cpu);
+     struct schedule_data *sd = &per_cpu(schedule_data, cpu);
+     spinlock_t *old_lock, *new_lock;
++    unsigned long flags;
+ 
+     /*
+      * pCPUs only move from a valid cpupool to free (i.e., out of any pool),
+@@ -1895,7 +1904,7 @@ int schedule_cpu_switch(unsigned int cpu, struct cpupool *c)
+      * that the lock itself changed, and retry acquiring the new one (which
+      * will be the correct, remapped one, at that point).
+      */
+-    old_lock = pcpu_schedule_lock_irq(cpu);
++    old_lock = pcpu_schedule_lock_irqsave(cpu, &flags);
+ 
+     vpriv_old = idle->sched_priv;
+     ppriv_old = sd->sched_priv;
+@@ -1913,7 +1922,7 @@ int schedule_cpu_switch(unsigned int cpu, struct cpupool *c)
+     sd->schedule_lock = new_lock;
+ 
+     /* _Not_ pcpu_schedule_unlock(): schedule_lock may have changed! */
+-    spin_unlock_irq(old_lock);
++    spin_unlock_irqrestore(old_lock, flags);
+ 
+     sched_do_tick_resume(new_ops, cpu);
+ 
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index d82ead586a..dc255b064b 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -437,4 +437,6 @@ affinity_balance_cpumask(const struct vcpu *v, int step, cpumask_t *mask)
+         cpumask_copy(mask, v->cpu_hard_affinity);
+ }
+ 
++void sched_rm_cpu(unsigned int cpu);
++
+ #endif /* __XEN_SCHED_IF_H__ */
+-- 
+2.17.1
+

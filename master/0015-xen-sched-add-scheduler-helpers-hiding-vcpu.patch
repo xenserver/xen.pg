@@ -1,0 +1,194 @@
+From c675d8ffee60e943202ed0a35668e654c7778cda Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Wed, 24 Jul 2019 11:03:48 +0200
+Subject: [PATCH 15/52] xen/sched: add scheduler helpers hiding vcpu
+
+Add the following helpers using a sched_unit as input instead of a
+vcpu:
+
+- is_idle_unit() similar to is_idle_vcpu()
+- is_unit_online() similar to is_vcpu_online() (returns true when any
+  of its vcpus is online)
+- unit_runnable() like vcpu_runnable() (returns true if any of its
+  vcpus is runnable)
+- sched_set_res() to set the current scheduling resource of a unit
+- sched_unit_cpu() to get the current processor of a unit (returns
+  the master_cpu of the scheduling resource of a unit)
+- sched_{set|clear}_pause_flags[_atomic]() to modify pause_flags of the
+  associated vcpu(s) (modifies the pause_flags of all vcpus of the
+  unit)
+- sched_idle_unit() to get the sched_unit pointer of the idle vcpu of a
+  specific physical cpu
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ xen/common/sched_credit.c  |  3 +-
+ xen/common/schedule.c      | 21 +++++++------
+ xen/include/xen/sched-if.h | 61 +++++++++++++++++++++++++++++++++++---
+ 3 files changed, 68 insertions(+), 17 deletions(-)
+
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index 0bc1f70f32..5b2c8ec0d1 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -1660,8 +1660,7 @@ csched_runq_steal(int peer_cpu, int cpu, int pri, int balance_step)
+             SCHED_STAT_CRANK(migrate_queued);
+             WARN_ON(vc->is_urgent);
+             runq_remove(speer);
+-            vc->processor = cpu;
+-            vc->sched_unit->res = get_sched_res(cpu);
++            sched_set_res(vc->sched_unit, get_sched_res(cpu));
+             /*
+              * speer will start executing directly on cpu, without having to
+              * go through runq_insert(). So we must update the runnable count
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 11e5c2895b..152b76ccd6 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -84,7 +84,7 @@ static spinlock_t *
+ sched_idle_switch_sched(struct scheduler *new_ops, unsigned int cpu,
+                         void *pdata, void *vdata)
+ {
+-    idle_vcpu[cpu]->sched_unit->priv = NULL;
++    sched_idle_unit(cpu)->priv = NULL;
+ 
+     return &sched_free_cpu_lock;
+ }
+@@ -376,12 +376,11 @@ int sched_init_vcpu(struct vcpu *v, unsigned int processor)
+     struct domain *d = v->domain;
+     struct sched_unit *unit;
+ 
+-    v->processor = processor;
+-
+     if ( (unit = sched_alloc_unit(v)) == NULL )
+         return 1;
+ 
+-    unit->res = get_sched_res(processor);
++    sched_set_res(unit, get_sched_res(processor));
++
+     /* Initialise the per-vcpu timers. */
+     spin_lock_init(&v->periodic_timer_lock);
+     init_timer(&v->periodic_timer, vcpu_periodic_timer_fn,
+@@ -496,8 +495,7 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+ 
+         sched_set_affinity(v, &cpumask_all, &cpumask_all);
+ 
+-        v->processor = new_p;
+-        v->sched_unit->res = get_sched_res(new_p);
++        sched_set_res(v->sched_unit, get_sched_res(new_p));
+         /*
+          * With v->processor modified we must not
+          * - make any further changes assuming we hold the scheduler lock,
+@@ -817,8 +815,9 @@ void restore_vcpu_affinity(struct domain *d)
+         spinlock_t *lock;
+         unsigned int old_cpu = v->processor;
+         struct sched_unit *unit = v->sched_unit;
++        struct sched_resource *res;
+ 
+-        ASSERT(!vcpu_runnable(v));
++        ASSERT(!unit_runnable(unit));
+ 
+         /*
+          * Re-assign the initial processor as after resume we have no
+@@ -851,15 +850,15 @@ void restore_vcpu_affinity(struct domain *d)
+             }
+         }
+ 
+-        v->processor = cpumask_any(cpumask_scratch_cpu(cpu));
+-        unit->res = get_sched_res(v->processor);
++        res = get_sched_res(cpumask_any(cpumask_scratch_cpu(cpu)));
++        sched_set_res(unit, res);
+ 
+         spin_unlock_irq(lock);
+ 
+         /* v->processor might have changed, so reacquire the lock. */
+         lock = unit_schedule_lock_irq(unit);
+-        unit->res = sched_pick_resource(vcpu_scheduler(v), unit);
+-        v->processor = unit->res->master_cpu;
++        res = sched_pick_resource(vcpu_scheduler(v), unit);
++        sched_set_res(unit, res);
+         spin_unlock_irq(lock);
+ 
+         if ( old_cpu != v->processor )
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index c320854527..fa3ca51a90 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -60,6 +60,62 @@ static inline void set_sched_res(unsigned int cpu, struct sched_resource *res)
+     per_cpu(sched_res, cpu) = res;
+ }
+ 
++static inline bool is_idle_unit(const struct sched_unit *unit)
++{
++    return is_idle_vcpu(unit->vcpu_list);
++}
++
++static inline bool is_unit_online(const struct sched_unit *unit)
++{
++    return is_vcpu_online(unit->vcpu_list);
++}
++
++static inline bool unit_runnable(const struct sched_unit *unit)
++{
++    return vcpu_runnable(unit->vcpu_list);
++}
++
++static inline void sched_set_res(struct sched_unit *unit,
++                                 struct sched_resource *res)
++{
++    unit->vcpu_list->processor = res->master_cpu;
++    unit->res = res;
++}
++
++static inline unsigned int sched_unit_cpu(const struct sched_unit *unit)
++{
++    return unit->res->master_cpu;
++}
++
++static inline void sched_set_pause_flags(struct sched_unit *unit,
++                                         unsigned int bit)
++{
++    __set_bit(bit, &unit->vcpu_list->pause_flags);
++}
++
++static inline void sched_clear_pause_flags(struct sched_unit *unit,
++                                           unsigned int bit)
++{
++    __clear_bit(bit, &unit->vcpu_list->pause_flags);
++}
++
++static inline void sched_set_pause_flags_atomic(struct sched_unit *unit,
++                                                unsigned int bit)
++{
++    set_bit(bit, &unit->vcpu_list->pause_flags);
++}
++
++static inline void sched_clear_pause_flags_atomic(struct sched_unit *unit,
++                                                  unsigned int bit)
++{
++    clear_bit(bit, &unit->vcpu_list->pause_flags);
++}
++
++static inline struct sched_unit *sched_idle_unit(unsigned int cpu)
++{
++    return idle_vcpu[cpu]->sched_unit;
++}
++
+ /*
+  * Scratch space, for avoiding having too many cpumask_t on the stack.
+  * Within each scheduler, when using the scratch mask of one pCPU:
+@@ -346,10 +402,7 @@ static inline void sched_migrate(const struct scheduler *s,
+     if ( s->migrate )
+         s->migrate(s, unit, cpu);
+     else
+-    {
+-        unit->vcpu_list->processor = cpu;
+-        unit->res = get_sched_res(cpu);
+-    }
++        sched_set_res(unit, get_sched_res(cpu));
+ }
+ 
+ static inline struct sched_resource *sched_pick_resource(
+-- 
+2.17.1
+

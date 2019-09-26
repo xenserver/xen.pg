@@ -1,0 +1,120 @@
+From 72e5f50e1dc467f42d6a071df36e0e6e0b1772f6 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Wed, 24 Jul 2019 11:03:49 +0200
+Subject: [PATCH 51/52] xen/sched: disable scheduling when entering ACPI deep
+ sleep states
+
+When entering deep sleep states all domains are paused resulting in
+all cpus only running idle vcpus. This enables us to stop scheduling
+completely in order to avoid synchronization problems with core
+scheduling when individual cpus are offlined.
+
+Disabling the scheduler is done by replacing the softirq handler
+with a dummy scheduling routine only enabling tasklets to run.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ xen/arch/x86/acpi/power.c |  4 ++++
+ xen/common/schedule.c     | 31 +++++++++++++++++++++++++++++--
+ xen/include/xen/sched.h   |  2 ++
+ 3 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/xen/arch/x86/acpi/power.c b/xen/arch/x86/acpi/power.c
+index 269b1408d4..47a6c47bbf 100644
+--- a/xen/arch/x86/acpi/power.c
++++ b/xen/arch/x86/acpi/power.c
+@@ -145,12 +145,16 @@ static void freeze_domains(void)
+     for_each_domain ( d )
+         domain_pause(d);
+     rcu_read_unlock(&domlist_read_lock);
++
++    scheduler_disable();
+ }
+ 
+ static void thaw_domains(void)
+ {
+     struct domain *d;
+ 
++    scheduler_enable();
++
+     rcu_read_lock(&domlist_read_lock);
+     for_each_domain ( d )
+     {
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 4b2ccb7ddc..800d2405a7 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -87,6 +87,8 @@ extern const struct scheduler *__start_schedulers_array[], *__end_schedulers_arr
+ 
+ static struct scheduler __read_mostly ops;
+ 
++static bool scheduler_active;
++
+ static struct sched_resource *
+ sched_idle_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
+@@ -2241,6 +2243,13 @@ static struct sched_unit *sched_wait_rendezvous_in(struct sched_unit *prev,
+         cpu_relax();
+ 
+         *lock = pcpu_schedule_lock_irq(cpu);
++
++        if ( unlikely(!scheduler_active) )
++        {
++            ASSERT(is_idle_unit(prev));
++            atomic_set(&prev->next_task->rendezvous_out_cnt, 0);
++            prev->rendezvous_in_cnt = 0;
++        }
+     }
+ 
+     return prev->next_task;
+@@ -2589,14 +2598,32 @@ const cpumask_t *sched_get_opt_cpumask(enum sched_gran opt, unsigned int cpu)
+     return mask;
+ }
+ 
++static void schedule_dummy(void)
++{
++    sched_tasklet_check_cpu(smp_processor_id());
++}
++
++void scheduler_disable(void)
++{
++    scheduler_active = false;
++    open_softirq(SCHEDULE_SOFTIRQ, schedule_dummy);
++    open_softirq(SCHED_SLAVE_SOFTIRQ, schedule_dummy);
++}
++
++void scheduler_enable(void)
++{
++    open_softirq(SCHEDULE_SOFTIRQ, schedule);
++    open_softirq(SCHED_SLAVE_SOFTIRQ, sched_slave);
++    scheduler_active = true;
++}
++
+ /* Initialise the data structures. */
+ void __init scheduler_init(void)
+ {
+     struct domain *idle_domain;
+     int i;
+ 
+-    open_softirq(SCHEDULE_SOFTIRQ, schedule);
+-    open_softirq(SCHED_SLAVE_SOFTIRQ, sched_slave);
++    scheduler_enable();
+ 
+     for ( i = 0; i < NUM_SCHEDULERS; i++)
+     {
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index cc65922b88..bfd5517ac4 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -933,6 +933,8 @@ void restore_vcpu_affinity(struct domain *d);
+ void vcpu_runstate_get(struct vcpu *v, struct vcpu_runstate_info *runstate);
+ uint64_t get_cpu_idle_time(unsigned int cpu);
+ void sched_guest_idle(void (*idle) (void), unsigned int cpu);
++void scheduler_enable(void);
++void scheduler_disable(void);
+ 
+ /*
+  * Used by idle loop to decide whether there is work to do:
+-- 
+2.17.1
+

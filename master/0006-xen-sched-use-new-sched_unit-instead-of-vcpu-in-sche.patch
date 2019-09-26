@@ -1,0 +1,1047 @@
+From 7ae9144eaa5ef4463c1841368d2f0d721aa5a1df Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Wed, 24 Jul 2019 11:03:47 +0200
+Subject: [PATCH 06/52] xen/sched: use new sched_unit instead of vcpu in
+ scheduler interfaces
+
+In order to prepare core- and socket-scheduling use a new struct
+sched_unit instead of struct vcpu for interfaces of the different
+schedulers.
+
+Rename the per-scheduler functions insert_vcpu and remove_vcpu to
+insert_unit and remove_unit to reflect the change of the parameter.
+In the schedulers rename local functions switched to sched_unit, too.
+
+For now this new struct will contain a domain, a vcpu pointer and a
+unit_id only and is allocated at vcpu creation time.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+---
+ xen/common/sched_arinc653.c | 30 +++++++-----
+ xen/common/sched_credit.c   | 41 ++++++++++-------
+ xen/common/sched_credit2.c  | 57 +++++++++++++----------
+ xen/common/sched_null.c     | 38 +++++++++------
+ xen/common/sched_rt.c       | 33 +++++++------
+ xen/common/schedule.c       | 54 ++++++++++++++--------
+ xen/include/xen/sched-if.h  | 92 +++++++++++++++++++++----------------
+ xen/include/xen/sched.h     |  7 +++
+ 8 files changed, 219 insertions(+), 133 deletions(-)
+
+diff --git a/xen/common/sched_arinc653.c b/xen/common/sched_arinc653.c
+index 72b988ea5f..e8b13a0022 100644
+--- a/xen/common/sched_arinc653.c
++++ b/xen/common/sched_arinc653.c
+@@ -376,13 +376,16 @@ a653sched_deinit(struct scheduler *ops)
+  * This function allocates scheduler-specific data for a VCPU
+  *
+  * @param ops       Pointer to this instance of the scheduler structure
++ * @param unit      Pointer to struct sched_unit
+  *
+  * @return          Pointer to the allocated data
+  */
+ static void *
+-a653sched_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
++a653sched_alloc_vdata(const struct scheduler *ops, struct sched_unit *unit,
++                      void *dd)
+ {
+     a653sched_priv_t *sched_priv = SCHED_PRIV(ops);
++    struct vcpu *vc = unit->vcpu_list;
+     arinc653_vcpu_t *svc;
+     unsigned int entry;
+     unsigned long flags;
+@@ -458,11 +461,13 @@ a653sched_free_vdata(const struct scheduler *ops, void *priv)
+  * Xen scheduler callback function to sleep a VCPU
+  *
+  * @param ops       Pointer to this instance of the scheduler structure
+- * @param vc        Pointer to the VCPU structure for the current domain
++ * @param unit      Pointer to struct sched_unit
+  */
+ static void
+-a653sched_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
++a653sched_unit_sleep(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
++
+     if ( AVCPU(vc) != NULL )
+         AVCPU(vc)->awake = 0;
+ 
+@@ -478,11 +483,13 @@ a653sched_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
+  * Xen scheduler callback function to wake up a VCPU
+  *
+  * @param ops       Pointer to this instance of the scheduler structure
+- * @param vc        Pointer to the VCPU structure for the current domain
++ * @param unit      Pointer to struct sched_unit
+  */
+ static void
+-a653sched_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
++a653sched_unit_wake(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
++
+     if ( AVCPU(vc) != NULL )
+         AVCPU(vc)->awake = 1;
+ 
+@@ -597,13 +604,14 @@ a653sched_do_schedule(
+  * Xen scheduler callback function to select a CPU for the VCPU to run on
+  *
+  * @param ops       Pointer to this instance of the scheduler structure
+- * @param v         Pointer to the VCPU structure for the current domain
++ * @param unit      Pointer to struct sched_unit
+  *
+  * @return          Number of selected physical CPU
+  */
+ static int
+-a653sched_pick_cpu(const struct scheduler *ops, struct vcpu *vc)
++a653sched_pick_cpu(const struct scheduler *ops, const struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     cpumask_t *online;
+     unsigned int cpu;
+ 
+@@ -702,11 +710,11 @@ static const struct scheduler sched_arinc653_def = {
+     .free_vdata     = a653sched_free_vdata,
+     .alloc_vdata    = a653sched_alloc_vdata,
+ 
+-    .insert_vcpu    = NULL,
+-    .remove_vcpu    = NULL,
++    .insert_unit    = NULL,
++    .remove_unit    = NULL,
+ 
+-    .sleep          = a653sched_vcpu_sleep,
+-    .wake           = a653sched_vcpu_wake,
++    .sleep          = a653sched_unit_sleep,
++    .wake           = a653sched_unit_wake,
+     .yield          = NULL,
+     .context_saved  = NULL,
+ 
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index 70fe718127..94d733dcb5 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -854,15 +854,16 @@ _csched_cpu_pick(const struct scheduler *ops, struct vcpu *vc, bool_t commit)
+ }
+ 
+ static int
+-csched_cpu_pick(const struct scheduler *ops, struct vcpu *vc)
++csched_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched_vcpu *svc = CSCHED_VCPU(vc);
+ 
+     /*
+      * We have been called by vcpu_migrate() (in schedule.c), as part
+      * of the process of seeing if vc can be migrated to another pcpu.
+      * We make a note about this in svc->flags so that later, in
+-     * csched_vcpu_wake() (still called from vcpu_migrate()) we won't
++     * csched_unit_wake() (still called from vcpu_migrate()) we won't
+      * get boosted, which we don't deserve as we are "only" migrating.
+      */
+     set_bit(CSCHED_FLAG_VCPU_MIGRATING, &svc->flags);
+@@ -990,8 +991,10 @@ csched_vcpu_acct(struct csched_private *prv, unsigned int cpu)
+ }
+ 
+ static void *
+-csched_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
++csched_alloc_vdata(const struct scheduler *ops, struct sched_unit *unit,
++                   void *dd)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched_vcpu *svc;
+ 
+     /* Allocate per-VCPU info */
+@@ -1011,8 +1014,9 @@ csched_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
+ }
+ 
+ static void
+-csched_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
++csched_unit_insert(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched_vcpu *svc = vc->sched_priv;
+     spinlock_t *lock;
+ 
+@@ -1021,7 +1025,7 @@ csched_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
+     /* csched_cpu_pick() looks in vc->processor's runq, so we need the lock. */
+     lock = vcpu_schedule_lock_irq(vc);
+ 
+-    vc->processor = csched_cpu_pick(ops, vc);
++    vc->processor = csched_cpu_pick(ops, unit);
+ 
+     spin_unlock_irq(lock);
+ 
+@@ -1046,9 +1050,10 @@ csched_free_vdata(const struct scheduler *ops, void *priv)
+ }
+ 
+ static void
+-csched_vcpu_remove(const struct scheduler *ops, struct vcpu *vc)
++csched_unit_remove(const struct scheduler *ops, struct sched_unit *unit)
+ {
+     struct csched_private *prv = CSCHED_PRIV(ops);
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched_vcpu * const svc = CSCHED_VCPU(vc);
+     struct csched_dom * const sdom = svc->sdom;
+ 
+@@ -1073,8 +1078,9 @@ csched_vcpu_remove(const struct scheduler *ops, struct vcpu *vc)
+ }
+ 
+ static void
+-csched_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
++csched_unit_sleep(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched_vcpu * const svc = CSCHED_VCPU(vc);
+     unsigned int cpu = vc->processor;
+ 
+@@ -1097,8 +1103,9 @@ csched_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
+ }
+ 
+ static void
+-csched_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
++csched_unit_wake(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched_vcpu * const svc = CSCHED_VCPU(vc);
+     bool_t migrating;
+ 
+@@ -1158,8 +1165,9 @@ csched_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
+ }
+ 
+ static void
+-csched_vcpu_yield(const struct scheduler *ops, struct vcpu *vc)
++csched_unit_yield(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched_vcpu * const svc = CSCHED_VCPU(vc);
+ 
+     /* Let the scheduler know that this vcpu is trying to yield */
+@@ -1212,9 +1220,10 @@ csched_dom_cntl(
+ }
+ 
+ static void
+-csched_aff_cntl(const struct scheduler *ops, struct vcpu *v,
++csched_aff_cntl(const struct scheduler *ops, struct sched_unit *unit,
+                 const cpumask_t *hard, const cpumask_t *soft)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     struct csched_vcpu *svc = CSCHED_VCPU(v);
+ 
+     if ( !hard )
+@@ -1743,7 +1752,7 @@ csched_load_balance(struct csched_private *prv, int cpu,
+                  * - if we race with inc_nr_runnable(), we skip a pCPU that may
+                  *   have runnable vCPUs in its runqueue, but that's not a
+                  *   problem because:
+-                 *   + if racing with csched_vcpu_insert() or csched_vcpu_wake(),
++                 *   + if racing with csched_unit_insert() or csched_unit_wake(),
+                  *     __runq_tickle() will be called afterwords, so the vCPU
+                  *     won't get stuck in the runqueue for too long;
+                  *   + if racing with csched_runq_steal(), it may be that a
+@@ -2256,12 +2265,12 @@ static const struct scheduler sched_credit_def = {
+ 
+     .global_init    = csched_global_init,
+ 
+-    .insert_vcpu    = csched_vcpu_insert,
+-    .remove_vcpu    = csched_vcpu_remove,
++    .insert_unit    = csched_unit_insert,
++    .remove_unit    = csched_unit_remove,
+ 
+-    .sleep          = csched_vcpu_sleep,
+-    .wake           = csched_vcpu_wake,
+-    .yield          = csched_vcpu_yield,
++    .sleep          = csched_unit_sleep,
++    .wake           = csched_unit_wake,
++    .yield          = csched_unit_yield,
+ 
+     .adjust         = csched_dom_cntl,
+     .adjust_affinity= csched_aff_cntl,
+diff --git a/xen/common/sched_credit2.c b/xen/common/sched_credit2.c
+index 6b77da7476..1973dbddcc 100644
+--- a/xen/common/sched_credit2.c
++++ b/xen/common/sched_credit2.c
+@@ -273,7 +273,7 @@
+  * CSFLAG_delayed_runq_add: Do we need to add this to the runqueue once it'd done
+  * being context switched out?
+  * + Set when scheduling out in csched2_schedule() if prev is runnable
+- * + Set in csched2_vcpu_wake if it finds CSFLAG_scheduled set
++ * + Set in csched2_unit_wake if it finds CSFLAG_scheduled set
+  * + Read in csched2_context_saved().  If set, it adds prev to the runqueue and
+  *   clears the bit.
+  */
+@@ -624,14 +624,14 @@ static inline bool has_cap(const struct csched2_vcpu *svc)
+  * This logic is entirely implemented in runq_tickle(), and that is enough.
+  * In fact, in this scheduler, placement of a vcpu on one of the pcpus of a
+  * runq, _always_ happens by means of tickling:
+- *  - when a vcpu wakes up, it calls csched2_vcpu_wake(), which calls
++ *  - when a vcpu wakes up, it calls csched2_unit_wake(), which calls
+  *    runq_tickle();
+  *  - when a migration is initiated in schedule.c, we call csched2_cpu_pick(),
+- *    csched2_vcpu_migrate() (which calls migrate()) and csched2_vcpu_wake().
++ *    csched2_unit_migrate() (which calls migrate()) and csched2_unit_wake().
+  *    csched2_cpu_pick() looks for the least loaded runq and return just any
+- *    of its processors. Then, csched2_vcpu_migrate() just moves the vcpu to
++ *    of its processors. Then, csched2_unit_migrate() just moves the vcpu to
+  *    the chosen runq, and it is again runq_tickle(), called by
+- *    csched2_vcpu_wake() that actually decides what pcpu to use within the
++ *    csched2_unit_wake() that actually decides what pcpu to use within the
+  *    chosen runq;
+  *  - when a migration is initiated in sched_credit2.c, by calling  migrate()
+  *    directly, that again temporarily use a random pcpu from the new runq,
+@@ -2027,8 +2027,10 @@ csched2_vcpu_check(struct vcpu *vc)
+ #endif
+ 
+ static void *
+-csched2_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
++csched2_alloc_vdata(const struct scheduler *ops, struct sched_unit *unit,
++                    void *dd)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched2_vcpu *svc;
+ 
+     /* Allocate per-VCPU info */
+@@ -2070,8 +2072,9 @@ csched2_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
+ }
+ 
+ static void
+-csched2_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
++csched2_unit_sleep(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched2_vcpu * const svc = csched2_vcpu(vc);
+ 
+     ASSERT(!is_idle_vcpu(vc));
+@@ -2092,8 +2095,9 @@ csched2_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
+ }
+ 
+ static void
+-csched2_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
++csched2_unit_wake(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched2_vcpu * const svc = csched2_vcpu(vc);
+     unsigned int cpu = vc->processor;
+     s_time_t now;
+@@ -2147,16 +2151,18 @@ out:
+ }
+ 
+ static void
+-csched2_vcpu_yield(const struct scheduler *ops, struct vcpu *v)
++csched2_unit_yield(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     struct csched2_vcpu * const svc = csched2_vcpu(v);
+ 
+     __set_bit(__CSFLAG_vcpu_yield, &svc->flags);
+ }
+ 
+ static void
+-csched2_context_saved(const struct scheduler *ops, struct vcpu *vc)
++csched2_context_saved(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched2_vcpu * const svc = csched2_vcpu(vc);
+     spinlock_t *lock = vcpu_schedule_lock_irq(vc);
+     s_time_t now = NOW();
+@@ -2197,9 +2203,10 @@ csched2_context_saved(const struct scheduler *ops, struct vcpu *vc)
+ 
+ #define MAX_LOAD (STIME_MAX)
+ static int
+-csched2_cpu_pick(const struct scheduler *ops, struct vcpu *vc)
++csched2_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
+     struct csched2_private *prv = csched2_priv(ops);
++    struct vcpu *vc = unit->vcpu_list;
+     int i, min_rqi = -1, min_s_rqi = -1;
+     unsigned int new_cpu, cpu = vc->processor;
+     struct csched2_vcpu *svc = csched2_vcpu(vc);
+@@ -2734,9 +2741,10 @@ retry:
+ }
+ 
+ static void
+-csched2_vcpu_migrate(
+-    const struct scheduler *ops, struct vcpu *vc, unsigned int new_cpu)
++csched2_unit_migrate(
++    const struct scheduler *ops, struct sched_unit *unit, unsigned int new_cpu)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct domain *d = vc->domain;
+     struct csched2_vcpu * const svc = csched2_vcpu(vc);
+     struct csched2_runqueue_data *trqd;
+@@ -2997,9 +3005,10 @@ csched2_dom_cntl(
+ }
+ 
+ static void
+-csched2_aff_cntl(const struct scheduler *ops, struct vcpu *v,
++csched2_aff_cntl(const struct scheduler *ops, struct sched_unit *unit,
+                  const cpumask_t *hard, const cpumask_t *soft)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     struct csched2_vcpu *svc = csched2_vcpu(v);
+ 
+     if ( !hard )
+@@ -3097,8 +3106,9 @@ csched2_free_domdata(const struct scheduler *ops, void *data)
+ }
+ 
+ static void
+-csched2_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
++csched2_unit_insert(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched2_vcpu *svc = vc->sched_priv;
+     struct csched2_dom * const sdom = svc->sdom;
+     spinlock_t *lock;
+@@ -3109,7 +3119,7 @@ csched2_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
+     /* csched2_cpu_pick() expects the pcpu lock to be held */
+     lock = vcpu_schedule_lock_irq(vc);
+ 
+-    vc->processor = csched2_cpu_pick(ops, vc);
++    vc->processor = csched2_cpu_pick(ops, unit);
+ 
+     spin_unlock_irq(lock);
+ 
+@@ -3136,8 +3146,9 @@ csched2_free_vdata(const struct scheduler *ops, void *priv)
+ }
+ 
+ static void
+-csched2_vcpu_remove(const struct scheduler *ops, struct vcpu *vc)
++csched2_unit_remove(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct csched2_vcpu * const svc = csched2_vcpu(vc);
+     spinlock_t *lock;
+ 
+@@ -4083,19 +4094,19 @@ static const struct scheduler sched_credit2_def = {
+ 
+     .global_init    = csched2_global_init,
+ 
+-    .insert_vcpu    = csched2_vcpu_insert,
+-    .remove_vcpu    = csched2_vcpu_remove,
++    .insert_unit    = csched2_unit_insert,
++    .remove_unit    = csched2_unit_remove,
+ 
+-    .sleep          = csched2_vcpu_sleep,
+-    .wake           = csched2_vcpu_wake,
+-    .yield          = csched2_vcpu_yield,
++    .sleep          = csched2_unit_sleep,
++    .wake           = csched2_unit_wake,
++    .yield          = csched2_unit_yield,
+ 
+     .adjust         = csched2_dom_cntl,
+     .adjust_affinity= csched2_aff_cntl,
+     .adjust_global  = csched2_sys_cntl,
+ 
+     .pick_cpu       = csched2_cpu_pick,
+-    .migrate        = csched2_vcpu_migrate,
++    .migrate        = csched2_unit_migrate,
+     .do_schedule    = csched2_schedule,
+     .context_saved  = csched2_context_saved,
+ 
+diff --git a/xen/common/sched_null.c b/xen/common/sched_null.c
+index 6782ecda5c..a5a9ce2d57 100644
+--- a/xen/common/sched_null.c
++++ b/xen/common/sched_null.c
+@@ -186,8 +186,9 @@ static void null_deinit_pdata(const struct scheduler *ops, void *pcpu, int cpu)
+ }
+ 
+ static void *null_alloc_vdata(const struct scheduler *ops,
+-                              struct vcpu *v, void *dd)
++                              struct sched_unit *unit, void *dd)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     struct null_vcpu *nvc;
+ 
+     nvc = xzalloc(struct null_vcpu);
+@@ -435,8 +436,10 @@ static spinlock_t *null_switch_sched(struct scheduler *new_ops,
+     return &sd->_lock;
+ }
+ 
+-static void null_vcpu_insert(const struct scheduler *ops, struct vcpu *v)
++static void null_unit_insert(const struct scheduler *ops,
++                             struct sched_unit *unit)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     struct null_private *prv = null_priv(ops);
+     struct null_vcpu *nvc = null_vcpu(v);
+     unsigned int cpu;
+@@ -496,8 +499,10 @@ static void null_vcpu_insert(const struct scheduler *ops, struct vcpu *v)
+     SCHED_STAT_CRANK(vcpu_insert);
+ }
+ 
+-static void null_vcpu_remove(const struct scheduler *ops, struct vcpu *v)
++static void null_unit_remove(const struct scheduler *ops,
++                             struct sched_unit *unit)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     struct null_private *prv = null_priv(ops);
+     struct null_vcpu *nvc = null_vcpu(v);
+     spinlock_t *lock;
+@@ -532,8 +537,10 @@ static void null_vcpu_remove(const struct scheduler *ops, struct vcpu *v)
+     SCHED_STAT_CRANK(vcpu_remove);
+ }
+ 
+-static void null_vcpu_wake(const struct scheduler *ops, struct vcpu *v)
++static void null_unit_wake(const struct scheduler *ops,
++                           struct sched_unit *unit)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     struct null_private *prv = null_priv(ops);
+     struct null_vcpu *nvc = null_vcpu(v);
+     unsigned int cpu = v->processor;
+@@ -604,8 +611,10 @@ static void null_vcpu_wake(const struct scheduler *ops, struct vcpu *v)
+     cpu_raise_softirq(v->processor, SCHEDULE_SOFTIRQ);
+ }
+ 
+-static void null_vcpu_sleep(const struct scheduler *ops, struct vcpu *v)
++static void null_unit_sleep(const struct scheduler *ops,
++                            struct sched_unit *unit)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     struct null_private *prv = null_priv(ops);
+     unsigned int cpu = v->processor;
+     bool tickled = false;
+@@ -637,15 +646,18 @@ static void null_vcpu_sleep(const struct scheduler *ops, struct vcpu *v)
+     SCHED_STAT_CRANK(vcpu_sleep);
+ }
+ 
+-static int null_cpu_pick(const struct scheduler *ops, struct vcpu *v)
++static int null_cpu_pick(const struct scheduler *ops,
++                         const struct sched_unit *unit)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     ASSERT(!is_idle_vcpu(v));
+     return pick_cpu(null_priv(ops), v);
+ }
+ 
+-static void null_vcpu_migrate(const struct scheduler *ops, struct vcpu *v,
+-                              unsigned int new_cpu)
++static void null_unit_migrate(const struct scheduler *ops,
++                              struct sched_unit *unit, unsigned int new_cpu)
+ {
++    struct vcpu *v = unit->vcpu_list;
+     struct null_private *prv = null_priv(ops);
+     struct null_vcpu *nvc = null_vcpu(v);
+ 
+@@ -965,13 +977,13 @@ static const struct scheduler sched_null_def = {
+     .alloc_domdata  = null_alloc_domdata,
+     .free_domdata   = null_free_domdata,
+ 
+-    .insert_vcpu    = null_vcpu_insert,
+-    .remove_vcpu    = null_vcpu_remove,
++    .insert_unit    = null_unit_insert,
++    .remove_unit    = null_unit_remove,
+ 
+-    .wake           = null_vcpu_wake,
+-    .sleep          = null_vcpu_sleep,
++    .wake           = null_unit_wake,
++    .sleep          = null_unit_sleep,
+     .pick_cpu       = null_cpu_pick,
+-    .migrate        = null_vcpu_migrate,
++    .migrate        = null_unit_migrate,
+     .do_schedule    = null_schedule,
+ 
+     .dump_cpu_state = null_dump_pcpu,
+diff --git a/xen/common/sched_rt.c b/xen/common/sched_rt.c
+index e0e350bdf3..0f5e0ebcc1 100644
+--- a/xen/common/sched_rt.c
++++ b/xen/common/sched_rt.c
+@@ -136,7 +136,7 @@
+  * RTDS_delayed_runq_add: Do we need to add this to the RunQ/DepletedQ
+  * once it's done being context switching out?
+  * + Set when scheduling out in rt_schedule() if prev is runable
+- * + Set in rt_vcpu_wake if it finds RTDS_scheduled set
++ * + Set in rt_unit_wake if it finds RTDS_scheduled set
+  * + Read in rt_context_saved(). If set, it adds prev to the Runqueue/DepletedQ
+  *   and clears the bit.
+  */
+@@ -636,8 +636,9 @@ replq_reinsert(const struct scheduler *ops, struct rt_vcpu *svc)
+  * and available cpus
+  */
+ static int
+-rt_cpu_pick(const struct scheduler *ops, struct vcpu *vc)
++rt_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     cpumask_t cpus;
+     cpumask_t *online;
+     int cpu;
+@@ -837,8 +838,9 @@ rt_free_domdata(const struct scheduler *ops, void *data)
+ }
+ 
+ static void *
+-rt_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
++rt_alloc_vdata(const struct scheduler *ops, struct sched_unit *unit, void *dd)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct rt_vcpu *svc;
+ 
+     /* Allocate per-VCPU info */
+@@ -880,8 +882,9 @@ rt_free_vdata(const struct scheduler *ops, void *priv)
+  * dest. cpupool.
+  */
+ static void
+-rt_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
++rt_unit_insert(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct rt_vcpu *svc = rt_vcpu(vc);
+     s_time_t now;
+     spinlock_t *lock;
+@@ -889,7 +892,7 @@ rt_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
+     BUG_ON( is_idle_vcpu(vc) );
+ 
+     /* This is safe because vc isn't yet being scheduled */
+-    vc->processor = rt_cpu_pick(ops, vc);
++    vc->processor = rt_cpu_pick(ops, unit);
+ 
+     lock = vcpu_schedule_lock_irq(vc);
+ 
+@@ -913,8 +916,9 @@ rt_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
+  * Remove rt_vcpu svc from the old scheduler in source cpupool.
+  */
+ static void
+-rt_vcpu_remove(const struct scheduler *ops, struct vcpu *vc)
++rt_unit_remove(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct rt_vcpu * const svc = rt_vcpu(vc);
+     struct rt_dom * const sdom = svc->sdom;
+     spinlock_t *lock;
+@@ -1133,8 +1137,9 @@ rt_schedule(const struct scheduler *ops, s_time_t now, bool_t tasklet_work_sched
+  * The lock is already grabbed in schedule.c, no need to lock here
+  */
+ static void
+-rt_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
++rt_unit_sleep(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct rt_vcpu * const svc = rt_vcpu(vc);
+ 
+     BUG_ON( is_idle_vcpu(vc) );
+@@ -1248,8 +1253,9 @@ runq_tickle(const struct scheduler *ops, struct rt_vcpu *new)
+  * TODO: what if these two vcpus belongs to the same domain?
+  */
+ static void
+-rt_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
++rt_unit_wake(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct rt_vcpu * const svc = rt_vcpu(vc);
+     s_time_t now;
+     bool_t missed;
+@@ -1318,8 +1324,9 @@ rt_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
+  * and then pick the highest priority vcpu from runq to run
+  */
+ static void
+-rt_context_saved(const struct scheduler *ops, struct vcpu *vc)
++rt_context_saved(const struct scheduler *ops, struct sched_unit *unit)
+ {
++    struct vcpu *vc = unit->vcpu_list;
+     struct rt_vcpu *svc = rt_vcpu(vc);
+     spinlock_t *lock = vcpu_schedule_lock_irq(vc);
+ 
+@@ -1548,15 +1555,15 @@ static const struct scheduler sched_rtds_def = {
+     .free_domdata   = rt_free_domdata,
+     .alloc_vdata    = rt_alloc_vdata,
+     .free_vdata     = rt_free_vdata,
+-    .insert_vcpu    = rt_vcpu_insert,
+-    .remove_vcpu    = rt_vcpu_remove,
++    .insert_unit    = rt_unit_insert,
++    .remove_unit    = rt_unit_remove,
+ 
+     .adjust         = rt_dom_cntl,
+ 
+     .pick_cpu       = rt_cpu_pick,
+     .do_schedule    = rt_schedule,
+-    .sleep          = rt_vcpu_sleep,
+-    .wake           = rt_vcpu_wake,
++    .sleep          = rt_unit_sleep,
++    .wake           = rt_unit_wake,
+     .context_saved  = rt_context_saved,
+ };
+ 
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 13b5ffc7cf..41af52bc2b 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -87,13 +87,13 @@ sched_idle_switch_sched(struct scheduler *new_ops, unsigned int cpu,
+ }
+ 
+ static int
+-sched_idle_cpu_pick(const struct scheduler *ops, struct vcpu *v)
++sched_idle_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
+-    return v->processor;
++    return unit->vcpu_list->processor;
+ }
+ 
+ static void *
+-sched_idle_alloc_vdata(const struct scheduler *ops, struct vcpu *v,
++sched_idle_alloc_vdata(const struct scheduler *ops, struct sched_unit *unit,
+                        void *dd)
+ {
+     /* Any non-NULL pointer is fine here. */
+@@ -308,9 +308,17 @@ static void sched_spin_unlock_double(spinlock_t *lock1, spinlock_t *lock2,
+ int sched_init_vcpu(struct vcpu *v, unsigned int processor)
+ {
+     struct domain *d = v->domain;
++    struct sched_unit *unit;
+ 
+     v->processor = processor;
+ 
++    if ( (unit = xzalloc(struct sched_unit)) == NULL )
++        return 1;
++    unit->vcpu_list = v;
++    unit->unit_id = v->vcpu_id;
++    unit->domain = d;
++    v->sched_unit = unit;
++
+     /* Initialise the per-vcpu timers. */
+     spin_lock_init(&v->periodic_timer_lock);
+     init_timer(&v->periodic_timer, vcpu_periodic_timer_fn,
+@@ -320,9 +328,13 @@ int sched_init_vcpu(struct vcpu *v, unsigned int processor)
+     init_timer(&v->poll_timer, poll_timer_fn,
+                v, v->processor);
+ 
+-    v->sched_priv = sched_alloc_vdata(dom_scheduler(d), v, d->sched_priv);
++    v->sched_priv = sched_alloc_vdata(dom_scheduler(d), unit, d->sched_priv);
+     if ( v->sched_priv == NULL )
++    {
++        v->sched_unit = NULL;
++        xfree(unit);
+         return 1;
++    }
+ 
+     /*
+      * Initialize affinity settings. The idler, and potentially
+@@ -341,7 +353,7 @@ int sched_init_vcpu(struct vcpu *v, unsigned int processor)
+     }
+     else
+     {
+-        sched_insert_vcpu(dom_scheduler(d), v);
++        sched_insert_unit(dom_scheduler(d), unit);
+     }
+ 
+     return 0;
+@@ -382,7 +394,8 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+ 
+     for_each_vcpu ( d, v )
+     {
+-        vcpu_priv[v->vcpu_id] = sched_alloc_vdata(c->sched, v, domdata);
++        vcpu_priv[v->vcpu_id] = sched_alloc_vdata(c->sched, v->sched_unit,
++                                                  domdata);
+         if ( vcpu_priv[v->vcpu_id] == NULL )
+         {
+             for_each_vcpu ( d, v )
+@@ -400,7 +413,7 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+ 
+     for_each_vcpu ( d, v )
+     {
+-        sched_remove_vcpu(old_ops, v);
++        sched_remove_unit(old_ops, v->sched_unit);
+     }
+ 
+     d->cpupool = c;
+@@ -435,7 +448,7 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+ 
+         new_p = cpumask_cycle(new_p, c->cpu_valid);
+ 
+-        sched_insert_vcpu(c->sched, v);
++        sched_insert_unit(c->sched, v->sched_unit);
+ 
+         sched_free_vdata(old_ops, vcpudata);
+     }
+@@ -453,13 +466,17 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+ 
+ void sched_destroy_vcpu(struct vcpu *v)
+ {
++    struct sched_unit *unit = v->sched_unit;
++
+     kill_timer(&v->periodic_timer);
+     kill_timer(&v->singleshot_timer);
+     kill_timer(&v->poll_timer);
+     if ( test_and_clear_bool(v->is_urgent) )
+         atomic_dec(&per_cpu(schedule_data, v->processor).urgent_count);
+-    sched_remove_vcpu(vcpu_scheduler(v), v);
++    sched_remove_unit(vcpu_scheduler(v), unit);
+     sched_free_vdata(vcpu_scheduler(v), v->sched_priv);
++    v->sched_unit = NULL;
++    xfree(unit);
+ }
+ 
+ int sched_init_domain(struct domain *d, int poolid)
+@@ -510,7 +527,7 @@ void vcpu_sleep_nosync_locked(struct vcpu *v)
+         if ( v->runstate.state == RUNSTATE_runnable )
+             vcpu_runstate_change(v, RUNSTATE_offline, NOW());
+ 
+-        sched_sleep(vcpu_scheduler(v), v);
++        sched_sleep(vcpu_scheduler(v), v->sched_unit);
+     }
+ }
+ 
+@@ -551,7 +568,7 @@ void vcpu_wake(struct vcpu *v)
+     {
+         if ( v->runstate.state >= RUNSTATE_blocked )
+             vcpu_runstate_change(v, RUNSTATE_runnable, NOW());
+-        sched_wake(vcpu_scheduler(v), v);
++        sched_wake(vcpu_scheduler(v), v->sched_unit);
+     }
+     else if ( !(v->pause_flags & VPF_blocked) )
+     {
+@@ -606,7 +623,7 @@ static void vcpu_move_locked(struct vcpu *v, unsigned int new_cpu)
+      * Actual CPU switch to new CPU.  This is safe because the lock
+      * pointer can't change while the current lock is held.
+      */
+-    sched_migrate(vcpu_scheduler(v), v, new_cpu);
++    sched_migrate(vcpu_scheduler(v), v->sched_unit, new_cpu);
+ }
+ 
+ /*
+@@ -684,7 +701,7 @@ static void vcpu_migrate_finish(struct vcpu *v)
+                 break;
+ 
+             /* Select a new CPU. */
+-            new_cpu = sched_pick_cpu(vcpu_scheduler(v), v);
++            new_cpu = sched_pick_cpu(vcpu_scheduler(v), v->sched_unit);
+             if ( (new_lock == per_cpu(schedule_data, new_cpu).schedule_lock) &&
+                  cpumask_test_cpu(new_cpu, v->domain->cpupool->cpu_valid) )
+                 break;
+@@ -776,7 +793,7 @@ void restore_vcpu_affinity(struct domain *d)
+ 
+         /* v->processor might have changed, so reacquire the lock. */
+         lock = vcpu_schedule_lock_irq(v);
+-        v->processor = sched_pick_cpu(vcpu_scheduler(v), v);
++        v->processor = sched_pick_cpu(vcpu_scheduler(v), v->sched_unit);
+         spin_unlock_irq(lock);
+ 
+         if ( old_cpu != v->processor )
+@@ -888,7 +905,7 @@ static int cpu_disable_scheduler_check(unsigned int cpu)
+ void sched_set_affinity(
+     struct vcpu *v, const cpumask_t *hard, const cpumask_t *soft)
+ {
+-    sched_adjust_affinity(dom_scheduler(v->domain), v, hard, soft);
++    sched_adjust_affinity(dom_scheduler(v->domain), v->sched_unit, hard, soft);
+ 
+     if ( hard )
+         cpumask_copy(v->cpu_hard_affinity, hard);
+@@ -1063,7 +1080,7 @@ long vcpu_yield(void)
+     struct vcpu * v=current;
+     spinlock_t *lock = vcpu_schedule_lock_irq(v);
+ 
+-    sched_yield(vcpu_scheduler(v), v);
++    sched_yield(vcpu_scheduler(v), v->sched_unit);
+     vcpu_schedule_unlock_irq(lock, v);
+ 
+     SCHED_STAT_CRANK(vcpu_yield);
+@@ -1612,7 +1629,7 @@ void context_saved(struct vcpu *prev)
+     /* Check for migration request /after/ clearing running flag. */
+     smp_mb();
+ 
+-    sched_context_saved(vcpu_scheduler(prev), prev);
++    sched_context_saved(vcpu_scheduler(prev), prev->sched_unit);
+ 
+     vcpu_migrate_finish(prev);
+ }
+@@ -1888,7 +1905,8 @@ int schedule_cpu_switch(unsigned int cpu, struct cpupool *c)
+     ppriv = sched_alloc_pdata(new_ops, cpu);
+     if ( IS_ERR(ppriv) )
+         return PTR_ERR(ppriv);
+-    vpriv = sched_alloc_vdata(new_ops, idle, idle->domain->sched_priv);
++    vpriv = sched_alloc_vdata(new_ops, idle->sched_unit,
++                              idle->domain->sched_priv);
+     if ( vpriv == NULL )
+     {
+         sched_free_pdata(new_ops, ppriv, cpu);
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index dc255b064b..0af89fbd02 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -141,8 +141,8 @@ struct scheduler {
+     void         (*deinit)         (struct scheduler *);
+ 
+     void         (*free_vdata)     (const struct scheduler *, void *);
+-    void *       (*alloc_vdata)    (const struct scheduler *, struct vcpu *,
+-                                    void *);
++    void *       (*alloc_vdata)    (const struct scheduler *,
++                                    struct sched_unit *, void *);
+     void         (*free_pdata)     (const struct scheduler *, void *, int);
+     void *       (*alloc_pdata)    (const struct scheduler *, int);
+     void         (*init_pdata)     (const struct scheduler *, void *, int);
+@@ -156,24 +156,32 @@ struct scheduler {
+     spinlock_t * (*switch_sched)   (struct scheduler *, unsigned int,
+                                     void *, void *);
+ 
+-    /* Activate / deactivate vcpus in a cpu pool */
+-    void         (*insert_vcpu)    (const struct scheduler *, struct vcpu *);
+-    void         (*remove_vcpu)    (const struct scheduler *, struct vcpu *);
+-
+-    void         (*sleep)          (const struct scheduler *, struct vcpu *);
+-    void         (*wake)           (const struct scheduler *, struct vcpu *);
+-    void         (*yield)          (const struct scheduler *, struct vcpu *);
+-    void         (*context_saved)  (const struct scheduler *, struct vcpu *);
++    /* Activate / deactivate units in a cpu pool */
++    void         (*insert_unit)    (const struct scheduler *,
++                                    struct sched_unit *);
++    void         (*remove_unit)    (const struct scheduler *,
++                                    struct sched_unit *);
++
++    void         (*sleep)          (const struct scheduler *,
++                                    struct sched_unit *);
++    void         (*wake)           (const struct scheduler *,
++                                    struct sched_unit *);
++    void         (*yield)          (const struct scheduler *,
++                                    struct sched_unit *);
++    void         (*context_saved)  (const struct scheduler *,
++                                    struct sched_unit *);
+ 
+     struct task_slice (*do_schedule) (const struct scheduler *, s_time_t,
+                                       bool_t tasklet_work_scheduled);
+ 
+-    int          (*pick_cpu)       (const struct scheduler *, struct vcpu *);
+-    void         (*migrate)        (const struct scheduler *, struct vcpu *,
+-                                    unsigned int);
++    int          (*pick_cpu)       (const struct scheduler *,
++                                    const struct sched_unit *);
++    void         (*migrate)        (const struct scheduler *,
++                                    struct sched_unit *, unsigned int);
+     int          (*adjust)         (const struct scheduler *, struct domain *,
+                                     struct xen_domctl_scheduler_op *);
+-    void         (*adjust_affinity)(const struct scheduler *, struct vcpu *,
++    void         (*adjust_affinity)(const struct scheduler *,
++                                    struct sched_unit *,
+                                     const struct cpumask *,
+                                     const struct cpumask *);
+     int          (*adjust_global)  (const struct scheduler *,
+@@ -267,10 +275,10 @@ static inline void sched_deinit_pdata(const struct scheduler *s, void *data,
+         s->deinit_pdata(s, data, cpu);
+ }
+ 
+-static inline void *sched_alloc_vdata(const struct scheduler *s, struct vcpu *v,
+-                                      void *dom_data)
++static inline void *sched_alloc_vdata(const struct scheduler *s,
++                                      struct sched_unit *unit, void *dom_data)
+ {
+-    return s->alloc_vdata(s, v, dom_data);
++    return s->alloc_vdata(s, unit, dom_data);
+ }
+ 
+ static inline void sched_free_vdata(const struct scheduler *s, void *data)
+@@ -278,64 +286,70 @@ static inline void sched_free_vdata(const struct scheduler *s, void *data)
+     s->free_vdata(s, data);
+ }
+ 
+-static inline void sched_insert_vcpu(const struct scheduler *s, struct vcpu *v)
++static inline void sched_insert_unit(const struct scheduler *s,
++                                     struct sched_unit *unit)
+ {
+-    if ( s->insert_vcpu )
+-        s->insert_vcpu(s, v);
++    if ( s->insert_unit )
++        s->insert_unit(s, unit);
+ }
+ 
+-static inline void sched_remove_vcpu(const struct scheduler *s, struct vcpu *v)
++static inline void sched_remove_unit(const struct scheduler *s,
++                                     struct sched_unit *unit)
+ {
+-    if ( s->remove_vcpu )
+-        s->remove_vcpu(s, v);
++    if ( s->remove_unit )
++        s->remove_unit(s, unit);
+ }
+ 
+-static inline void sched_sleep(const struct scheduler *s, struct vcpu *v)
++static inline void sched_sleep(const struct scheduler *s,
++                               struct sched_unit *unit)
+ {
+     if ( s->sleep )
+-        s->sleep(s, v);
++        s->sleep(s, unit);
+ }
+ 
+-static inline void sched_wake(const struct scheduler *s, struct vcpu *v)
++static inline void sched_wake(const struct scheduler *s,
++                              struct sched_unit *unit)
+ {
+     if ( s->wake )
+-        s->wake(s, v);
++        s->wake(s, unit);
+ }
+ 
+-static inline void sched_yield(const struct scheduler *s, struct vcpu *v)
++static inline void sched_yield(const struct scheduler *s,
++                               struct sched_unit *unit)
+ {
+     if ( s->yield )
+-        s->yield(s, v);
++        s->yield(s, unit);
+ }
+ 
+ static inline void sched_context_saved(const struct scheduler *s,
+-                                       struct vcpu *v)
++                                       struct sched_unit *unit)
+ {
+     if ( s->context_saved )
+-        s->context_saved(s, v);
++        s->context_saved(s, unit);
+ }
+ 
+-static inline void sched_migrate(const struct scheduler *s, struct vcpu *v,
+-                                 unsigned int cpu)
++static inline void sched_migrate(const struct scheduler *s,
++                                 struct sched_unit *unit, unsigned int cpu)
+ {
+     if ( s->migrate )
+-        s->migrate(s, v, cpu);
++        s->migrate(s, unit, cpu);
+     else
+-        v->processor = cpu;
++        unit->vcpu_list->processor = cpu;
+ }
+ 
+-static inline int sched_pick_cpu(const struct scheduler *s, struct vcpu *v)
++static inline int sched_pick_cpu(const struct scheduler *s,
++                                 const struct sched_unit *unit)
+ {
+-    return s->pick_cpu(s, v);
++    return s->pick_cpu(s, unit);
+ }
+ 
+ static inline void sched_adjust_affinity(const struct scheduler *s,
+-                                         struct vcpu *v,
++                                         struct sched_unit *unit,
+                                          const cpumask_t *hard,
+                                          const cpumask_t *soft)
+ {
+     if ( s->adjust_affinity )
+-        s->adjust_affinity(s, v, hard, soft);
++        s->adjust_affinity(s, unit, hard, soft);
+ }
+ 
+ static inline int sched_adjust_dom(const struct scheduler *s, struct domain *d,
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 40097ff334..386549ebbb 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -161,6 +161,7 @@ struct vcpu
+ 
+     struct timer     poll_timer;    /* timeout for SCHEDOP_poll */
+ 
++    struct sched_unit *sched_unit;
+     void            *sched_priv;    /* scheduler-specific data */
+ 
+     struct vcpu_runstate_info runstate;
+@@ -273,6 +274,12 @@ struct vcpu
+     struct arch_vcpu arch;
+ };
+ 
++struct sched_unit {
++    struct domain         *domain;
++    struct vcpu           *vcpu_list;
++    unsigned int           unit_id;
++};
++
+ /* Per-domain lock can be recursively acquired in fault handlers. */
+ #define domain_lock(d) spin_lock_recursive(&(d)->domain_lock)
+ #define domain_unlock(d) spin_unlock_recursive(&(d)->domain_lock)
+-- 
+2.17.1
+

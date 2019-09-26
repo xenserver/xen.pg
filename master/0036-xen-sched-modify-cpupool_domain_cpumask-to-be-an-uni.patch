@@ -1,0 +1,140 @@
+From 3ca1d11cd95611fe8ded08b493896fc0a588e653 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Wed, 24 Jul 2019 11:03:48 +0200
+Subject: [PATCH 36/52] xen/sched: modify cpupool_domain_cpumask() to be an
+ unit mask
+
+cpupool_domain_cpumask() is used by scheduling to select cpus or to
+iterate over cpus. In order to support scheduling units spanning
+multiple cpus let cpupool_domain_cpumask() return a cpumask with only
+one bit set per scheduling resource.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ xen/common/cpupool.c       | 29 ++++++++++++++++++++---------
+ xen/common/schedule.c      |  5 +++--
+ xen/include/xen/sched-if.h |  5 ++++-
+ 3 files changed, 27 insertions(+), 12 deletions(-)
+
+diff --git a/xen/common/cpupool.c b/xen/common/cpupool.c
+index fd30040922..a5f4113915 100644
+--- a/xen/common/cpupool.c
++++ b/xen/common/cpupool.c
+@@ -36,26 +36,35 @@ static DEFINE_SPINLOCK(cpupool_lock);
+ 
+ DEFINE_PER_CPU(struct cpupool *, cpupool);
+ 
++static void free_cpupool_struct(struct cpupool *c)
++{
++    if ( c )
++    {
++        free_cpumask_var(c->res_valid);
++        free_cpumask_var(c->cpu_valid);
++    }
++    xfree(c);
++}
++
+ static struct cpupool *alloc_cpupool_struct(void)
+ {
+     struct cpupool *c = xzalloc(struct cpupool);
+ 
+-    if ( !c || !zalloc_cpumask_var(&c->cpu_valid) )
++    if ( !c )
++        return NULL;
++
++    zalloc_cpumask_var(&c->cpu_valid);
++    zalloc_cpumask_var(&c->res_valid);
++
++    if ( !c->cpu_valid || !c->res_valid )
+     {
+-        xfree(c);
++        free_cpupool_struct(c);
+         c = NULL;
+     }
+ 
+     return c;
+ }
+ 
+-static void free_cpupool_struct(struct cpupool *c)
+-{
+-    if ( c )
+-        free_cpumask_var(c->cpu_valid);
+-    xfree(c);
+-}
+-
+ /*
+  * find a cpupool by it's id. to be called with cpupool lock held
+  * if exact is not specified, the first cpupool with an id larger or equal to
+@@ -269,6 +278,7 @@ static int cpupool_assign_cpu_locked(struct cpupool *c, unsigned int cpu)
+         cpupool_cpu_moving = NULL;
+     }
+     cpumask_set_cpu(cpu, c->cpu_valid);
++    cpumask_and(c->res_valid, c->cpu_valid, sched_res_mask);
+ 
+     rcu_read_lock(&domlist_read_lock);
+     for_each_domain_in_cpupool(d, c)
+@@ -361,6 +371,7 @@ static int cpupool_unassign_cpu_start(struct cpupool *c, unsigned int cpu)
+     atomic_inc(&c->refcnt);
+     cpupool_cpu_moving = c;
+     cpumask_clear_cpu(cpu, c->cpu_valid);
++    cpumask_and(c->res_valid, c->cpu_valid, sched_res_mask);
+ 
+ out:
+     spin_unlock(&cpupool_lock);
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index a79065c826..87660c6978 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -57,6 +57,7 @@ integer_param("sched_ratelimit_us", sched_ratelimit_us);
+ 
+ /* Number of vcpus per struct sched_unit. */
+ static unsigned int __read_mostly sched_granularity = 1;
++const cpumask_t *sched_res_mask = &cpumask_all;
+ 
+ /* Common lock for free cpus. */
+ static DEFINE_SPINLOCK(sched_free_cpu_lock);
+@@ -414,9 +415,9 @@ static unsigned int sched_select_initial_cpu(const struct vcpu *v)
+     cpumask_clear(cpus);
+     for_each_node_mask ( node, d->node_affinity )
+         cpumask_or(cpus, cpus, &node_to_cpumask(node));
+-    cpumask_and(cpus, cpus, cpupool_domain_cpumask(d));
++    cpumask_and(cpus, cpus, d->cpupool->cpu_valid);
+     if ( cpumask_empty(cpus) )
+-        cpumask_copy(cpus, cpupool_domain_cpumask(d));
++        cpumask_copy(cpus, d->cpupool->cpu_valid);
+ 
+     if ( v->vcpu_id == 0 )
+         cpu_ret = cpumask_first(cpus);
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index 6a4dbac935..84d0658578 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -22,6 +22,8 @@ extern cpumask_t cpupool_free_cpus;
+ #define SCHED_DEFAULT_RATELIMIT_US 1000
+ extern int sched_ratelimit_us;
+ 
++/* Scheduling resource mask. */
++extern const cpumask_t *sched_res_mask;
+ 
+ /*
+  * In order to allow a scheduler to remap the lock->cpu mapping,
+@@ -521,6 +523,7 @@ struct cpupool
+     int              cpupool_id;
+     unsigned int     n_dom;
+     cpumask_var_t    cpu_valid;      /* all cpus assigned to pool */
++    cpumask_var_t    res_valid;      /* all scheduling resources of pool */
+     struct cpupool   *next;
+     struct scheduler *sched;
+     atomic_t         refcnt;
+@@ -536,7 +539,7 @@ static inline cpumask_t *cpupool_domain_cpumask(const struct domain *d)
+      * be interested in calling this for the idle domain.
+      */
+     ASSERT(d->cpupool != NULL);
+-    return d->cpupool->cpu_valid;
++    return d->cpupool->res_valid;
+ }
+ 
+ /*
+-- 
+2.17.1
+

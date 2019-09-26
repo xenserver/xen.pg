@@ -26,7 +26,7 @@ Cc: Thomas Gleixner <tglx@linutronix.de>
 Cc: Andrew Cooper <andrew.cooper3@citrix.com>
 Cc: Jan Beulich <jbeulich@suse.com>
 diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
-index 23cf550a1e..f4a417eefd 100644
+index c2ea20f89a..caa39d34ec 100644
 --- a/xen/arch/x86/microcode.c
 +++ b/xen/arch/x86/microcode.c
 @@ -22,6 +22,7 @@
@@ -83,10 +83,10 @@ index 23cf550a1e..f4a417eefd 100644
 +static atomic_t cpu_in, cpu_out, cpu_updated;
 +
  /*
-  * Return the patch with the highest revision id among all matching
-  * patches in the blob. Return NULL if no suitable patch.
-@@ -270,31 +296,90 @@ bool microcode_update_cache(struct microcode_patch *patch)
-     return true;
+  * Return a patch that covers current CPU. If there are multiple patches,
+  * return the one with the highest revision number. Return error If no
+@@ -264,38 +290,85 @@ static int microcode_update_cpu(const struct microcode_patch *patch)
+     return err;
  }
  
 -static long do_microcode_update(void *patch)
@@ -94,14 +94,10 @@ index 23cf550a1e..f4a417eefd 100644
 +static int wait_for_cpus(atomic_t *cnt, unsigned int expect,
 +                         unsigned int timeout)
  {
--    int error, cpu;
--
--    error = microcode_update_cpu(patch);
--    if ( error )
+-    unsigned int cpu;
+-    int ret = microcode_update_cpu(patch);
 +    while ( atomic_read(cnt) < expect )
-     {
--        microcode_ops->free_patch(microcode_cache);
--        return error;
++    {
 +        if ( !timeout )
 +        {
 +            printk("CPU%d: Timeout when waiting for CPUs calling in\n",
@@ -110,14 +106,13 @@ index 23cf550a1e..f4a417eefd 100644
 +        }
 +        udelay(1);
 +        timeout--;
-     }
++    }
  
+-    /* Store the patch after a successful loading */
+-    if ( !ret && patch )
 +    return 0;
 +}
- 
--    cpu = cpumask_next(smp_processor_id(), &cpu_online_map);
--    if ( cpu < nr_cpu_ids )
--        return continue_hypercall_on_cpu(cpu, do_microcode_update, patch);
++
 +static int do_microcode_update(void *patch)
 +{
 +    unsigned int cpu = smp_processor_id();
@@ -125,14 +120,12 @@ index 23cf550a1e..f4a417eefd 100644
 +    unsigned int finished;
 +    int ret;
 +    static bool error;
- 
--    microcode_update_cache(patch);
++
 +    atomic_inc(&cpu_in);
 +    ret = wait_for_cpus(&cpu_in, cpu_nr, MICROCODE_CALLIN_TIMEOUT_US);
 +    if ( ret )
 +        return ret;
- 
--    return error;
++
 +    ret = microcode_ops->collect_cpu_info(&this_cpu(cpu_sig));
 +    /*
 +     * Load microcode update on only one logical processor per core.
@@ -140,17 +133,29 @@ index 23cf550a1e..f4a417eefd 100644
 +     * lowest thread id is chosen to perform the loading.
 +     */
 +    if ( !ret && (cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu))) )
-+    {
+     {
+-        spin_lock(&microcode_mutex);
+-        microcode_update_cache(patch);
+-        spin_unlock(&microcode_mutex);
+-        patch = NULL;
 +        ret = microcode_ops->apply_microcode(patch);
 +        if ( !ret )
 +            atomic_inc(&cpu_updated);
-+    }
-+    /*
+     }
+ 
+     if ( microcode_ops->end_update_percpu )
+         microcode_ops->end_update_percpu();
+ 
+     /*
+-     * Each thread tries to load ucode and only the first thread of a core
+-     * would succeed. Ignore error other than -EIO.
 +     * Increase the wait timeout to a safe value here since we're serializing
 +     * the microcode update and that could take a while on a large number of
 +     * CPUs. And that is fine as the *actual* timeout will be determined by
 +     * the last CPU finished updating and thus cut short
-+     */
+      */
+-    if ( ret != -EIO )
+-        ret = 0;
 +    atomic_inc(&cpu_out);
 +    finished = atomic_read(&cpu_out);
 +    while ( !error && finished != cpu_nr )
@@ -166,21 +171,27 @@ index 23cf550a1e..f4a417eefd 100644
 +            panic("Timeout when finishing updating microcode (finished %d/%d)",
 +                  finished, cpu_nr);
 +        }
-+
+ 
+-    cpu = cpumask_next(smp_processor_id(), &cpu_online_map);
+-    if ( cpu < nr_cpu_ids )
+-        return continue_hypercall_on_cpu(cpu, do_microcode_update, patch) ?
+-                                                                          : ret;
 +        finished = atomic_read(&cpu_out);
 +    }
-+
+ 
+-    /* Free the patch if no CPU has loaded it successfully. */
+-    if ( patch )
+-        microcode_free_patch(patch);
 +    /*
 +     * Refresh CPU signature (revision) on threads which didn't call
 +     * apply_microcode().
 +     */
 +    if ( cpu != cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
 +        ret = microcode_ops->collect_cpu_info(&this_cpu(cpu_sig));
-+
-+    return ret;
- }
  
- int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+     return ret;
+ }
+@@ -304,6 +377,7 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
  {
      int ret;
      void *buffer;
@@ -188,7 +199,7 @@ index 23cf550a1e..f4a417eefd 100644
      struct microcode_patch *patch;
  
      if ( len != (uint32_t)len )
-@@ -316,11 +401,18 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+@@ -336,19 +410,73 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
          goto free;
      }
  
@@ -203,17 +214,11 @@ index 23cf550a1e..f4a417eefd 100644
      {
          ret = microcode_ops->start_update();
          if ( ret != 0 )
+         {
+             microcode_free_patch(patch);
 -            goto free;
 +            goto put;
-     }
- 
-     patch = microcode_parse_blob(buffer, len);
-@@ -337,12 +429,59 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
-         if ( patch )
-             microcode_ops->free_patch(patch);
-         ret = -EINVAL;
--        goto free;
-+        goto put;
+         }
      }
  
 -    ret = continue_hypercall_on_cpu(cpumask_first(&cpu_online_map),

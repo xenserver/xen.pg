@@ -22,13 +22,13 @@
 %define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 debug=n
 %endif
 
-%define base_cset RELEASE-%{version}
-%define base_dir  %{name}-%{version}
+%define base_cset cd93953538aac6026a8012d14a63b320eadd0c98
+%define base_dir  %{name}-4.13.0
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.12.1
-Release: 8.0.11
+Version: 4.13.0
+Release: 8.0.12
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -202,9 +202,6 @@ cp %{SOURCE4} .
 
 %build
 
-# Placate ./configure, but don't pull in external content.
-export WGET=/bin/false FETCHER=/bin/false
-
 %configure --disable-qemu-traditional \
            --disable-seabios \
            --disable-stubdom \
@@ -333,6 +330,7 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/%{name}/hvm/save.h
 %{_includedir}/%{name}/io/9pfs.h
 %{_includedir}/%{name}/io/blkif.h
+%{_includedir}/%{name}/io/cameraif.h
 %{_includedir}/%{name}/io/console.h
 %{_includedir}/%{name}/io/displif.h
 %{_includedir}/%{name}/io/fbif.h
@@ -384,28 +382,28 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxenstore.so.3.0.3
 %{_libdir}/libxentoolcore.so.1
 %{_libdir}/libxentoolcore.so.1.0
-%{_libdir}/libxenvchan.so.4.12
-%{_libdir}/libxenvchan.so.4.12.0
+%{_libdir}/libxenvchan.so.4.13
+%{_libdir}/libxenvchan.so.4.13.0
 
 %files libs-devel
 # Lib Xen Evtchn
 %{_includedir}/xenevtchn.h
 %{_libdir}/libxenevtchn.a
 %{_libdir}/libxenevtchn.so
-/usr/share/pkgconfig/xenevtchn.pc
+%{_libdir}/pkgconfig/xenevtchn.pc
 
 # Lib Xen Gnttab
 %{_includedir}/xengnttab.h
 %{_libdir}/libxengnttab.a
 %{_libdir}/libxengnttab.so
-/usr/share/pkgconfig/xengnttab.pc
+%{_libdir}/pkgconfig/xengnttab.pc
 
 # Lib XenStore
 %{_includedir}/xenstore.h
 %{_includedir}/xenstore_lib.h
 %{_libdir}/libxenstore.a
 %{_libdir}/libxenstore.so
-/usr/share/pkgconfig/xenstore.pc
+%{_libdir}/pkgconfig/xenstore.pc
 # Legacy XenStore header files, excluded to discourage their use
 %exclude %{_includedir}/xs.h
 %exclude %{_includedir}/xenstore-compat/xs.h
@@ -415,13 +413,13 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/xentoolcore.h
 %{_libdir}/libxentoolcore.a
 %{_libdir}/libxentoolcore.so
-/usr/share/pkgconfig/xentoolcore.pc
+%{_libdir}/pkgconfig/xentoolcore.pc
 
 # Lib Xen Vchan
 %{_includedir}/libxenvchan.h
 %{_libdir}/libxenvchan.a
 %{_libdir}/libxenvchan.so
-/usr/share/pkgconfig/xenvchan.pc
+%{_libdir}/pkgconfig/xenvchan.pc
 
 %files dom0-tools
 %{_sysconfdir}/bash_completion.d/xl.sh
@@ -543,7 +541,6 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_sbindir}/xentrace_setsize
 %{_sbindir}/xenwatchdogd
 %{_sbindir}/xl
-%exclude %{_sbindir}/xen-tmem-list-parse
 %exclude %{_sbindir}/xenlockprof
 %{_mandir}/man1/xentop.1.gz
 %{_mandir}/man1/xentrace_format.1.gz
@@ -584,24 +581,24 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %files dom0-libs
 %{_libdir}/libxencall.so.1
 %{_libdir}/libxencall.so.1.2
-%{_libdir}/libxenctrl.so.4.12
-%{_libdir}/libxenctrl.so.4.12.0
+%{_libdir}/libxenctrl.so.4.13
+%{_libdir}/libxenctrl.so.4.13.0
 %{_libdir}/libxendevicemodel.so.1
 %{_libdir}/libxendevicemodel.so.1.3
 %{_libdir}/libxenforeignmemory.so.1
 %{_libdir}/libxenforeignmemory.so.1.3
-%{_libdir}/libxenfsimage.so.4.12
-%{_libdir}/libxenfsimage.so.4.12.0
-%{_libdir}/libxenguest.so.4.12
-%{_libdir}/libxenguest.so.4.12.0
-%{_libdir}/libxenlight.so.4.12
-%{_libdir}/libxenlight.so.4.12.0
-%{_libdir}/libxenstat.so.4.12
-%{_libdir}/libxenstat.so.4.12.0
+%{_libdir}/libxenfsimage.so.4.13
+%{_libdir}/libxenfsimage.so.4.13.0
+%{_libdir}/libxenguest.so.4.13
+%{_libdir}/libxenguest.so.4.13.0
+%{_libdir}/libxenlight.so.4.13
+%{_libdir}/libxenlight.so.4.13.0
+%{_libdir}/libxenstat.so.4.13
+%{_libdir}/libxenstat.so.4.13.0
 %{_libdir}/libxentoollog.so.1
 %{_libdir}/libxentoollog.so.1.0
-%{_libdir}/libxlutil.so.4.12
-%{_libdir}/libxlutil.so.4.12.0
+%{_libdir}/libxlutil.so.4.13
+%{_libdir}/libxlutil.so.4.13.0
 %{_libdir}/xenfsimage/btrfs/fsimage.so
 %{_libdir}/xenfsimage/ext2fs-lib/fsimage.so
 %{_libdir}/xenfsimage/fat/fsimage.so
@@ -620,33 +617,33 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_includedir}/xencall.h
 %{_libdir}/libxencall.a
 %{_libdir}/libxencall.so
-/usr/share/pkgconfig/xencall.pc
+%{_libdir}/pkgconfig/xencall.pc
 
 %{_includedir}/xenctrl.h
 %{_includedir}/xenctrl_compat.h
 %{_libdir}/libxenctrl.a
 %{_libdir}/libxenctrl.so
-/usr/share/pkgconfig/xencontrol.pc
+%{_libdir}/pkgconfig/xencontrol.pc
 
 %{_includedir}/xendevicemodel.h
 %{_libdir}/libxendevicemodel.a
 %{_libdir}/libxendevicemodel.so
-/usr/share/pkgconfig/xendevicemodel.pc
+%{_libdir}/pkgconfig/xendevicemodel.pc
 
 %{_includedir}/xenforeignmemory.h
 %{_libdir}/libxenforeignmemory.a
 %{_libdir}/libxenforeignmemory.so
-/usr/share/pkgconfig/xenforeignmemory.pc
+%{_libdir}/pkgconfig/xenforeignmemory.pc
 
 %{_includedir}/xenguest.h
 %{_libdir}/libxenguest.a
 %{_libdir}/libxenguest.so
-/usr/share/pkgconfig/xenguest.pc
+%{_libdir}/pkgconfig/xenguest.pc
 
 %{_includedir}/xentoollog.h
 %{_libdir}/libxentoollog.a
 %{_libdir}/libxentoollog.so
-/usr/share/pkgconfig/xentoollog.pc
+%{_libdir}/pkgconfig/xentoollog.pc
 
 %{_includedir}/_libxl_list.h
 %{_includedir}/_libxl_types.h
@@ -661,13 +658,13 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/libxenlight.so
 %{_libdir}/libxlutil.a
 %{_libdir}/libxlutil.so
-/usr/share/pkgconfig/xenlight.pc
-/usr/share/pkgconfig/xlutil.pc
+%{_libdir}/pkgconfig/xenlight.pc
+%{_libdir}/pkgconfig/xlutil.pc
 
 %{_includedir}/xenstat.h
 %{_libdir}/libxenstat.a
 %{_libdir}/libxenstat.so
-/usr/share/pkgconfig/xenstat.pc
+%{_libdir}/pkgconfig/xenstat.pc
 
 %files ocaml-libs
 %{_libdir}/ocaml/stublibs/dllxenbus_stubs.so
@@ -736,10 +733,10 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libdir}/ocaml/xentoollog/xentoollog.cmxa
 
 %files installer-files
-%{_libdir}/libxenctrl.so.4.12
-%{_libdir}/libxenctrl.so.4.12.0
-%{_libdir}/libxenguest.so.4.12
-%{_libdir}/libxenguest.so.4.12.0
+%{_libdir}/libxenctrl.so.4.13
+%{_libdir}/libxenctrl.so.4.13.0
+%{_libdir}/libxenguest.so.4.13
+%{_libdir}/libxenguest.so.4.13.0
 %{python_sitearch}/xen/__init__.py*
 %{python_sitearch}/xen/lowlevel/__init__.py*
 %{python_sitearch}/xen/lowlevel/xc.so
