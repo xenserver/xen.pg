@@ -1,0 +1,581 @@
+From 71e617a6b8f69849c70eda1b3c58f1ff6b244e5a Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Tue, 17 Sep 2019 16:11:48 +0200
+Subject: use is_iommu_enabled() where appropriate...
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+...rather than testing the global iommu_enabled flag and ops pointer.
+
+Now that there is a per-domain flag indicating whether the domain is
+permitted to use the IOMMU (which determines whether the ops pointer will
+be set), many tests of the global iommu_enabled flag and ops pointer can
+be translated into tests of the per-domain flag. Some of the other tests of
+purely the global iommu_enabled flag can also be translated into tests of
+the per-domain flag.
+
+NOTE: The comment in iommu_share_p2m_table() is also fixed; need_iommu()
+      disappeared some time ago. Also, whilst the style of the 'if' in
+      flask_iommu_resource_use_perm() is fixed, I have not translated any
+      instances of u32 into uint32_t to keep consistency. IMO such a
+      translation would be better done globally for the source module in
+      a separate patch.
+      The change to the definition of iommu_call() is to keep the PV shim
+      build happy. Without this change it will fail to compile with errors
+      of the form:
+
+iommu.c:361:32: error: unused variable ‘hd’ [-Werror=unused-variable]
+     const struct domain_iommu *hd = dom_iommu(d);
+                                     ^~
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: "Roger Pau Monné" <roger.pau@citrix.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Acked-by: Daniel De Graaf <dgdegra@tycho.nsa.gov>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Julien Grall <julien.grall@arm.com>
+
+diff --git a/xen/arch/arm/p2m.c b/xen/arch/arm/p2m.c
+index e28ea1c..7f14429 100644
+--- a/xen/arch/arm/p2m.c
++++ b/xen/arch/arm/p2m.c
+@@ -1531,7 +1531,7 @@ int p2m_init(struct domain *d)
+      * shared with the CPU, Xen has to make sure that the PT changes have
+      * reached the memory
+      */
+-    p2m->clean_pte = iommu_enabled &&
++    p2m->clean_pte = is_iommu_enabled(d) &&
+         !iommu_has_feature(d, IOMMU_FEAT_COHERENT_WALK);
+ 
+     rc = p2m_alloc_table(d);
+diff --git a/xen/arch/x86/dom0_build.c b/xen/arch/x86/dom0_build.c
+index c695709..d381784 100644
+--- a/xen/arch/x86/dom0_build.c
++++ b/xen/arch/x86/dom0_build.c
+@@ -356,7 +356,7 @@ unsigned long __init dom0_compute_nr_pages(
+         avail -= d->max_vcpus - 1;
+ 
+     /* Reserve memory for iommu_dom0_init() (rough estimate). */
+-    if ( iommu_enabled )
++    if ( is_iommu_enabled(d) )
+     {
+         unsigned int s;
+ 
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index a744696..d1334c7 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -708,7 +708,7 @@ long arch_do_domctl(
+             break;
+ 
+         ret = -ESRCH;
+-        if ( iommu_enabled )
++        if ( is_iommu_enabled(d) )
+         {
+             pcidevs_lock();
+             ret = pt_irq_create_bind(d, bind);
+@@ -737,7 +737,7 @@ long arch_do_domctl(
+         if ( ret )
+             break;
+ 
+-        if ( iommu_enabled )
++        if ( is_iommu_enabled(d) )
+         {
+             pcidevs_lock();
+             ret = pt_irq_destroy_bind(d, bind);
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 452ac48..3831c6d 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -465,7 +465,7 @@ void hvm_migrate_timers(struct vcpu *v)
+ 
+ void hvm_migrate_pirq(struct hvm_pirq_dpci *pirq_dpci, const struct vcpu *v)
+ {
+-    ASSERT(iommu_enabled &&
++    ASSERT(is_iommu_enabled(v->domain) &&
+            (is_hardware_domain(v->domain) || hvm_domain_irq(v->domain)->dpci));
+ 
+     if ( (pirq_dpci->flags & HVM_IRQ_DPCI_MACH_MSI) &&
+@@ -496,7 +496,7 @@ void hvm_migrate_pirqs(struct vcpu *v)
+ {
+     struct domain *d = v->domain;
+ 
+-    if ( !iommu_enabled || !hvm_domain_irq(d)->dpci )
++    if ( !is_iommu_enabled(d) || !hvm_domain_irq(d)->dpci )
+        return;
+ 
+     spin_lock(&d->event_lock);
+@@ -2264,7 +2264,7 @@ int hvm_set_cr0(unsigned long value, bool may_defer)
+     }
+ 
+     if ( ((value ^ old_value) & X86_CR0_CD) &&
+-         iommu_enabled && hvm_funcs.handle_cd &&
++         is_iommu_enabled(d) && hvm_funcs.handle_cd &&
+          (!rangeset_is_empty(d->iomem_caps) ||
+           !rangeset_is_empty(d->arch.ioport_caps) ||
+           has_arch_pdevs(d)) )
+diff --git a/xen/arch/x86/hvm/vioapic.c b/xen/arch/x86/hvm/vioapic.c
+index 9c25f72..9aeef32 100644
+--- a/xen/arch/x86/hvm/vioapic.c
++++ b/xen/arch/x86/hvm/vioapic.c
+@@ -536,7 +536,7 @@ void vioapic_update_EOI(struct domain *d, u8 vector)
+ 
+             ent->fields.remote_irr = 0;
+ 
+-            if ( iommu_enabled )
++            if ( is_iommu_enabled(d) )
+             {
+                 spin_unlock(&d->arch.hvm.irq_lock);
+                 hvm_dpci_eoi(d, vioapic->base_gsi + pin, ent);
+diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
+index 16f14ab..ed27e8d 100644
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -1087,7 +1087,7 @@ static int construct_vmcs(struct vcpu *v)
+         vmx_clear_msr_intercept(v, MSR_IA32_SYSENTER_CS, VMX_MSR_RW);
+         vmx_clear_msr_intercept(v, MSR_IA32_SYSENTER_ESP, VMX_MSR_RW);
+         vmx_clear_msr_intercept(v, MSR_IA32_SYSENTER_EIP, VMX_MSR_RW);
+-        if ( paging_mode_hap(d) && (!iommu_enabled || iommu_snoop) )
++        if ( paging_mode_hap(d) && (!is_iommu_enabled(d) || iommu_snoop) )
+             vmx_clear_msr_intercept(v, MSR_IA32_CR_PAT, VMX_MSR_RW);
+         if ( (vmexit_ctl & VM_EXIT_CLEAR_BNDCFGS) &&
+              (vmentry_ctl & VM_ENTRY_LOAD_BNDCFGS) )
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 0060310..3b3d5b6 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -1210,7 +1210,7 @@ static void vmx_handle_cd(struct vcpu *v, unsigned long value)
+         {
+             v->arch.hvm.cache_mode = NORMAL_CACHE_MODE;
+             vmx_set_guest_pat(v, *pat);
+-            if ( !iommu_enabled || iommu_snoop )
++            if ( !is_iommu_enabled(v->domain) || iommu_snoop )
+                 vmx_clear_msr_intercept(v, MSR_IA32_CR_PAT, VMX_MSR_RW);
+             hvm_asid_flush_vcpu(v); /* no need to flush cache */
+         }
+diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
+index d0e6290..220990f 100644
+--- a/xen/arch/x86/mm/p2m-ept.c
++++ b/xen/arch/x86/mm/p2m-ept.c
+@@ -260,7 +260,7 @@ static bool_t ept_split_super_page(struct p2m_domain *p2m,
+         *epte = *ept_entry;
+         epte->sp = (level > 1);
+         epte->mfn += i * trunk;
+-        epte->snp = (iommu_enabled && iommu_snoop);
++        epte->snp = is_iommu_enabled(p2m->domain) && iommu_snoop;
+         epte->suppress_ve = 1;
+ 
+         ept_p2m_type_to_flags(p2m, epte, epte->sa_p2mt, epte->access);
+@@ -772,7 +772,7 @@ ept_set_entry(struct p2m_domain *p2m, gfn_t gfn_, mfn_t mfn,
+         new_entry.sp = !!i;
+         new_entry.sa_p2mt = p2mt;
+         new_entry.access = p2ma;
+-        new_entry.snp = (iommu_enabled && iommu_snoop);
++        new_entry.snp = is_iommu_enabled(d) && iommu_snoop;
+ 
+         /* the caller should take care of the previous page */
+         new_entry.mfn = mfn_x(mfn);
+diff --git a/xen/drivers/passthrough/amd/iommu_guest.c b/xen/drivers/passthrough/amd/iommu_guest.c
+index 7f2dd66..1f2bcfb 100644
+--- a/xen/drivers/passthrough/amd/iommu_guest.c
++++ b/xen/drivers/passthrough/amd/iommu_guest.c
+@@ -821,7 +821,7 @@ int guest_iommu_init(struct domain* d)
+     struct guest_iommu *iommu;
+     struct domain_iommu *hd = dom_iommu(d);
+ 
+-    if ( !is_hvm_domain(d) || !iommu_enabled || !iommuv2_enabled ||
++    if ( !is_hvm_domain(d) || !is_iommu_enabled(d) || !iommuv2_enabled ||
+          !has_viommu(d) )
+         return 0;
+ 
+diff --git a/xen/drivers/passthrough/device_tree.c b/xen/drivers/passthrough/device_tree.c
+index d32b172..12f2c4c 100644
+--- a/xen/drivers/passthrough/device_tree.c
++++ b/xen/drivers/passthrough/device_tree.c
+@@ -29,7 +29,7 @@ int iommu_assign_dt_device(struct domain *d, struct dt_device_node *dev)
+     int rc = -EBUSY;
+     struct domain_iommu *hd = dom_iommu(d);
+ 
+-    if ( !iommu_enabled || !hd->platform_ops )
++    if ( !is_iommu_enabled(d) )
+         return -EINVAL;
+ 
+     if ( !dt_device_is_protected(dev) )
+@@ -71,7 +71,7 @@ int iommu_deassign_dt_device(struct domain *d, struct dt_device_node *dev)
+     const struct domain_iommu *hd = dom_iommu(d);
+     int rc;
+ 
+-    if ( !iommu_enabled || !hd->platform_ops )
++    if ( !is_iommu_enabled(d) )
+         return -EINVAL;
+ 
+     if ( !dt_device_is_protected(dev) )
+diff --git a/xen/drivers/passthrough/io.c b/xen/drivers/passthrough/io.c
+index 4290c7c..b292e79 100644
+--- a/xen/drivers/passthrough/io.c
++++ b/xen/drivers/passthrough/io.c
+@@ -434,7 +434,7 @@ int pt_irq_create_bind(
+             if ( vcpu )
+                 pirq_dpci->gmsi.posted = true;
+         }
+-        if ( vcpu && iommu_enabled )
++        if ( vcpu && is_iommu_enabled(d) )
+             hvm_migrate_pirq(pirq_dpci, vcpu);
+ 
+         /* Use interrupt posting if it is supported. */
+@@ -817,7 +817,7 @@ int hvm_do_IRQ_dpci(struct domain *d, struct pirq *pirq)
+ 
+     ASSERT(is_hvm_domain(d));
+ 
+-    if ( !iommu_enabled || (!is_hardware_domain(d) && !dpci) ||
++    if ( !is_iommu_enabled(d) || (!is_hardware_domain(d) && !dpci) ||
+          !pirq_dpci || !(pirq_dpci->flags & HVM_IRQ_DPCI_MAPPED) )
+         return 0;
+ 
+@@ -869,7 +869,7 @@ static int _hvm_dpci_msi_eoi(struct domain *d,
+ 
+ void hvm_dpci_msi_eoi(struct domain *d, int vector)
+ {
+-    if ( !iommu_enabled ||
++    if ( !is_iommu_enabled(d) ||
+          (!hvm_domain_irq(d)->dpci && !is_hardware_domain(d)) )
+        return;
+ 
+@@ -1001,7 +1001,7 @@ void hvm_dpci_eoi(struct domain *d, unsigned int guest_gsi,
+     const struct hvm_irq_dpci *hvm_irq_dpci;
+     const struct hvm_girq_dpci_mapping *girq;
+ 
+-    if ( !iommu_enabled )
++    if ( !is_iommu_enabled(d) )
+         return;
+ 
+     if ( is_hardware_domain(d) )
+diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
+index f42402b..09ce9d9 100644
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -183,7 +183,7 @@ void __hwdom_init iommu_hwdom_init(struct domain *d)
+ 
+     check_hwdom_reqs(d);
+ 
+-    if ( !iommu_enabled )
++    if ( !is_iommu_enabled(d) )
+         return;
+ 
+     register_keyhandler('o', &iommu_dump_p2m_table, "dump iommu p2m table", 0);
+@@ -288,7 +288,7 @@ int iommu_construct(struct domain *d)
+ 
+ void iommu_domain_destroy(struct domain *d)
+ {
+-    if ( !iommu_enabled || !dom_iommu(d)->platform_ops )
++    if ( !is_iommu_enabled(d) )
+         return;
+ 
+     iommu_teardown(d);
+@@ -304,7 +304,7 @@ int iommu_map(struct domain *d, dfn_t dfn, mfn_t mfn,
+     unsigned long i;
+     int rc = 0;
+ 
+-    if ( !iommu_enabled || !hd->platform_ops )
++    if ( !is_iommu_enabled(d) )
+         return 0;
+ 
+     ASSERT(IS_ALIGNED(dfn_x(dfn), (1ul << page_order)));
+@@ -364,7 +364,7 @@ int iommu_unmap(struct domain *d, dfn_t dfn, unsigned int page_order,
+     unsigned long i;
+     int rc = 0;
+ 
+-    if ( !iommu_enabled || !hd->platform_ops )
++    if ( !is_iommu_enabled(d) )
+         return 0;
+ 
+     ASSERT(IS_ALIGNED(dfn_x(dfn), (1ul << page_order)));
+@@ -417,7 +417,7 @@ int iommu_lookup_page(struct domain *d, dfn_t dfn, mfn_t *mfn,
+ {
+     const struct domain_iommu *hd = dom_iommu(d);
+ 
+-    if ( !iommu_enabled || !hd->platform_ops || !hd->platform_ops->lookup_page )
++    if ( !is_iommu_enabled(d) || !hd->platform_ops->lookup_page )
+         return -EOPNOTSUPP;
+ 
+     return iommu_call(hd->platform_ops, lookup_page, d, dfn, mfn, flags);
+@@ -446,8 +446,8 @@ int iommu_iotlb_flush(struct domain *d, dfn_t dfn, unsigned int page_count,
+     const struct domain_iommu *hd = dom_iommu(d);
+     int rc;
+ 
+-    if ( !iommu_enabled || !hd->platform_ops ||
+-         !hd->platform_ops->iotlb_flush || !page_count || !flush_flags )
++    if ( !is_iommu_enabled(d) || !hd->platform_ops->iotlb_flush ||
++         !page_count || !flush_flags )
+         return 0;
+ 
+     if ( dfn_eq(dfn, INVALID_DFN) )
+@@ -474,8 +474,8 @@ int iommu_iotlb_flush_all(struct domain *d, unsigned int flush_flags)
+     const struct domain_iommu *hd = dom_iommu(d);
+     int rc;
+ 
+-    if ( !iommu_enabled || !hd->platform_ops ||
+-         !hd->platform_ops->iotlb_flush_all || !flush_flags )
++    if ( !is_iommu_enabled(d) || !hd->platform_ops->iotlb_flush_all ||
++         !flush_flags )
+         return 0;
+ 
+     /*
+@@ -560,8 +560,8 @@ int iommu_do_domctl(
+ {
+     int ret = -ENODEV;
+ 
+-    if ( !iommu_enabled )
+-        return -ENOSYS;
++    if ( !is_iommu_enabled(d) )
++        return -EOPNOTSUPP;
+ 
+ #ifdef CONFIG_HAS_PCI
+     ret = iommu_do_pci_domctl(domctl, d, u_domctl);
+@@ -580,9 +580,9 @@ void iommu_share_p2m_table(struct domain* d)
+     ASSERT(hap_enabled(d));
+     /*
+      * iommu_use_hap_pt(d) cannot be used here because during domain
+-     * construction need_iommu(d) will always return false here.
++     * construction has_iommu_pt(d) will always return false here.
+      */
+-    if ( iommu_enabled && iommu_hap_pt_share )
++    if ( is_iommu_enabled(d) && iommu_hap_pt_share )
+         iommu_get_ops()->share_p2m(d);
+ }
+ 
+@@ -612,10 +612,7 @@ int iommu_get_reserved_device_memory(iommu_grdm_t *func, void *ctxt)
+ 
+ bool_t iommu_has_feature(struct domain *d, enum iommu_feature feature)
+ {
+-    if ( !iommu_enabled )
+-        return 0;
+-
+-    return test_bit(feature, dom_iommu(d)->features);
++    return is_iommu_enabled(d) && test_bit(feature, dom_iommu(d)->features);
+ }
+ 
+ static void iommu_dump_p2m_table(unsigned char key)
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index ca3a676..d28f17a 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -601,7 +601,7 @@ static void pci_enable_acs(struct pci_dev *pdev)
+     u16 cap, ctrl, seg = pdev->seg;
+     u8 bus = pdev->bus;
+ 
+-    if ( !iommu_enabled )
++    if ( !is_iommu_enabled(pdev->domain) )
+         return;
+ 
+     pos = pci_find_ext_capability(seg, bus, pdev->devfn, PCI_EXT_CAP_ID_ACS);
+@@ -870,7 +870,7 @@ static int pci_clean_dpci_irqs(struct domain *d)
+ {
+     struct hvm_irq_dpci *hvm_irq_dpci = NULL;
+ 
+-    if ( !iommu_enabled )
++    if ( !is_iommu_enabled(d) )
+         return 0;
+ 
+     if ( !is_hvm_domain(d) )
+@@ -903,7 +903,7 @@ static int deassign_device(struct domain *d, uint16_t seg, uint8_t bus,
+     struct pci_dev *pdev;
+     int ret = 0;
+ 
+-    if ( !iommu_enabled || !hd->platform_ops )
++    if ( !is_iommu_enabled(d) )
+         return -EINVAL;
+ 
+     ASSERT(pcidevs_locked());
+@@ -1389,7 +1389,7 @@ static int iommu_add_device(struct pci_dev *pdev)
+     ASSERT(pcidevs_locked());
+ 
+     hd = dom_iommu(pdev->domain);
+-    if ( !iommu_enabled || !hd->platform_ops )
++    if ( !is_iommu_enabled(pdev->domain) )
+         return 0;
+ 
+     rc = hd->platform_ops->add_device(pdev->devfn, pci_to_dev(pdev));
+@@ -1418,7 +1418,7 @@ static int iommu_enable_device(struct pci_dev *pdev)
+     ASSERT(pcidevs_locked());
+ 
+     hd = dom_iommu(pdev->domain);
+-    if ( !iommu_enabled || !hd->platform_ops ||
++    if ( !is_iommu_enabled(pdev->domain) ||
+          !hd->platform_ops->enable_device )
+         return 0;
+ 
+@@ -1434,7 +1434,7 @@ static int iommu_remove_device(struct pci_dev *pdev)
+         return -EINVAL;
+ 
+     hd = dom_iommu(pdev->domain);
+-    if ( !iommu_enabled || !hd->platform_ops )
++    if ( !is_iommu_enabled(pdev->domain) )
+         return 0;
+ 
+     for ( devfn = pdev->devfn ; pdev->phantom_stride; )
+@@ -1477,7 +1477,7 @@ static int assign_device(struct domain *d, u16 seg, u8 bus, u8 devfn, u32 flag)
+     struct pci_dev *pdev;
+     int rc = 0;
+ 
+-    if ( !iommu_enabled || !hd->platform_ops )
++    if ( !is_iommu_enabled(d) )
+         return 0;
+ 
+     /* Prevent device assign if mem paging or mem sharing have been 
+@@ -1543,7 +1543,7 @@ static int iommu_get_device_group(
+     int i = 0;
+     const struct iommu_ops *ops = hd->platform_ops;
+ 
+-    if ( !iommu_enabled || !ops || !ops->get_device_group_id )
++    if ( !is_iommu_enabled(d) || !ops->get_device_group_id )
+         return 0;
+ 
+     group_id = ops->get_device_group_id(seg, bus, devfn);
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index 04d46f7..7ffafdc 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -1719,7 +1719,7 @@ static void iommu_domain_teardown(struct domain *d)
+         xfree(mrmrr);
+     }
+ 
+-    ASSERT(iommu_enabled);
++    ASSERT(is_iommu_enabled(d));
+ 
+     /*
+      * We can't use iommu_use_hap_pt here because either IOMMU state
+diff --git a/xen/drivers/passthrough/vtd/x86/hvm.c b/xen/drivers/passthrough/vtd/x86/hvm.c
+index 6675dca..f77b358 100644
+--- a/xen/drivers/passthrough/vtd/x86/hvm.c
++++ b/xen/drivers/passthrough/vtd/x86/hvm.c
+@@ -51,7 +51,7 @@ void hvm_dpci_isairq_eoi(struct domain *d, unsigned int isairq)
+     struct hvm_irq_dpci *dpci = NULL;
+ 
+     ASSERT(isairq < NR_ISAIRQS);
+-    if ( !iommu_enabled )
++    if ( !is_iommu_enabled(d) )
+         return;
+ 
+     spin_lock(&d->event_lock);
+diff --git a/xen/drivers/passthrough/x86/iommu.c b/xen/drivers/passthrough/x86/iommu.c
+index 92c1d01..8319fe0 100644
+--- a/xen/drivers/passthrough/x86/iommu.c
++++ b/xen/drivers/passthrough/x86/iommu.c
+@@ -180,7 +180,7 @@ int arch_iommu_populate_page_table(struct domain *d)
+ 
+ void __hwdom_init arch_iommu_check_autotranslated_hwdom(struct domain *d)
+ {
+-    if ( !iommu_enabled )
++    if ( !is_iommu_enabled(d) )
+         panic("Presently, iommu must be enabled for PVH hardware domain\n");
+ }
+ 
+diff --git a/xen/include/asm-x86/iommu.h b/xen/include/asm-x86/iommu.h
+index facf835..31fda4b 100644
+--- a/xen/include/asm-x86/iommu.h
++++ b/xen/include/asm-x86/iommu.h
+@@ -61,8 +61,15 @@ extern struct iommu_ops iommu_ops;
+ 
+ #ifdef NDEBUG
+ # include <asm/alternative.h>
+-# define iommu_call(ops, fn, args...)  alternative_call(iommu_ops.fn, ## args)
+-# define iommu_vcall(ops, fn, args...) alternative_vcall(iommu_ops.fn, ## args)
++# define iommu_call(ops, fn, args...) ({      \
++    (void)(ops);                              \
++    alternative_call(iommu_ops.fn, ## args);  \
++})
++
++# define iommu_vcall(ops, fn, args...) ({     \
++    (void)(ops);                              \
++    alternative_vcall(iommu_ops.fn, ## args); \
++})
+ #endif
+ 
+ static inline const struct iommu_ops *iommu_get_ops(void)
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 6800f2d..a449869 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -883,7 +883,7 @@ static int flask_map_domain_msi (struct domain *d, int irq, const void *data,
+ #endif
+ }
+ 
+-static u32 flask_iommu_resource_use_perm(void)
++static u32 flask_iommu_resource_use_perm(const struct domain *d)
+ {
+     /* Obtain the permission level required for allowing a domain
+      * to use an assigned device.
+@@ -896,7 +896,7 @@ static u32 flask_iommu_resource_use_perm(void)
+      */
+     u32 perm = RESOURCE__USE_NOIOMMU;
+ 
+-    if (iommu_enabled)
++    if ( is_iommu_enabled(d) )
+         perm = ( iommu_intremap ? RESOURCE__USE_IOMMU :
+                                   RESOURCE__USE_IOMMU_NOINTREMAP );
+     return perm;
+@@ -907,7 +907,7 @@ static int flask_map_domain_irq (struct domain *d, int irq, const void *data)
+     u32 sid, dsid;
+     int rc = -EPERM;
+     struct avc_audit_data ad;
+-    u32 dperm = flask_iommu_resource_use_perm();
++    u32 dperm = flask_iommu_resource_use_perm(d);
+ 
+     if ( irq >= nr_static_irqs && data ) {
+         rc = flask_map_domain_msi(d, irq, data, &sid, &ad);
+@@ -973,7 +973,7 @@ static int flask_bind_pt_irq (struct domain *d, struct xen_domctl_bind_pt_irq *b
+     int rc = -EPERM;
+     int irq;
+     struct avc_audit_data ad;
+-    u32 dperm = flask_iommu_resource_use_perm();
++    u32 dperm = flask_iommu_resource_use_perm(d);
+ 
+     rc = current_has_perm(d, SECCLASS_RESOURCE, RESOURCE__ADD);
+     if ( rc )
+@@ -1046,7 +1046,7 @@ static int flask_iomem_permission(struct domain *d, uint64_t start, uint64_t end
+ 
+     data.ssid = domain_sid(current->domain);
+     data.dsid = domain_sid(d);
+-    data.use_perm = flask_iommu_resource_use_perm();
++    data.use_perm = flask_iommu_resource_use_perm(d);
+ 
+     return security_iterate_iomem_sids(start, end, _iomem_has_perm, &data);
+ }
+@@ -1071,7 +1071,7 @@ static int flask_pci_config_permission(struct domain *d, uint32_t machine_bdf, u
+     if ( access && (end >= 0x10 && start < 0x28) )
+         perm = RESOURCE__SETUP;
+     else
+-        perm = flask_iommu_resource_use_perm();
++        perm = flask_iommu_resource_use_perm(d);
+ 
+     AVC_AUDIT_DATA_INIT(&ad, DEV);
+     ad.device = (unsigned long) machine_bdf;
+@@ -1296,7 +1296,7 @@ static int flask_assign_device(struct domain *d, uint32_t machine_bdf)
+     u32 dsid, rsid;
+     int rc = -EPERM;
+     struct avc_audit_data ad;
+-    u32 dperm = flask_iommu_resource_use_perm();
++    u32 dperm = flask_iommu_resource_use_perm(d);
+ 
+     if ( !d )
+         return flask_test_assign_device(machine_bdf);
+@@ -1355,7 +1355,7 @@ static int flask_assign_dtdevice(struct domain *d, const char *dtpath)
+     u32 dsid, rsid;
+     int rc = -EPERM;
+     struct avc_audit_data ad;
+-    u32 dperm = flask_iommu_resource_use_perm();
++    u32 dperm = flask_iommu_resource_use_perm(d);
+ 
+     if ( !d )
+         return flask_test_assign_dtdevice(dtpath);
+@@ -1540,7 +1540,7 @@ static int flask_ioport_permission(struct domain *d, uint32_t start, uint32_t en
+ 
+     data.ssid = domain_sid(current->domain);
+     data.dsid = domain_sid(d);
+-    data.use_perm = flask_iommu_resource_use_perm();
++    data.use_perm = flask_iommu_resource_use_perm(d);
+ 
+     return security_iterate_ioport_sids(start, end, _ioport_has_perm, &data);
+ }

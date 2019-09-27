@@ -1,0 +1,289 @@
+From c0902a9a143a2aa7551941879fa58705da473ae6 Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Tue, 17 Sep 2019 16:12:47 +0200
+Subject: sysctl / libxl: report whether IOMMU/HAP page table sharing is
+ supported
+
+This patch defines a new bit reported in the hw_cap field of struct
+xen_sysctl_physinfo to indicate whether the platform supports sharing of
+HAP page tables (i.e. the P2M) with the IOMMU. This informs the toolstack
+whether the domain needs extra memory to store discrete IOMMU page tables
+or not.
+
+NOTE: This patch makes sure iommu_hap_pt_shared is clear if HAP is not
+      supported or the IOMMU is disabled, and defines it to false if
+      !CONFIG_HVM.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+Acked-by: Wei Liu <wl@xen.org>
+Acked-by: Julien Grall <julien.grall@arm.com>
+
+diff --git a/tools/libxl/libxl.c b/tools/libxl/libxl.c
+index 57073c0..a0d8428 100644
+--- a/tools/libxl/libxl.c
++++ b/tools/libxl/libxl.c
+@@ -402,6 +402,8 @@ int libxl_get_physinfo(libxl_ctx *ctx, libxl_physinfo *physinfo)
+     physinfo->cap_hap = !!(xcphysinfo.capabilities & XEN_SYSCTL_PHYSCAP_hap);
+     physinfo->cap_shadow =
+         !!(xcphysinfo.capabilities & XEN_SYSCTL_PHYSCAP_shadow);
++    physinfo->cap_iommu_hap_pt_share =
++        !!(xcphysinfo.capabilities & XEN_SYSCTL_PHYSCAP_iommu_hap_pt_share);
+ 
+     GC_FREE;
+     return 0;
+diff --git a/tools/libxl/libxl.h b/tools/libxl/libxl.h
+index 466df2c..8169d44 100644
+--- a/tools/libxl/libxl.h
++++ b/tools/libxl/libxl.h
+@@ -402,6 +402,13 @@
+ #define LIBXL_HAVE_PHYSINFO_CAP_HAP_SHADOW 1
+ 
+ /*
++ * LIBXL_HAVE_PHYSINFO_CAP_IOMMU_HAP_PT_SHARE indicates that libxl_physinfo
++ * has a cap_iommu_hap_pt_share field that indicates whether the hardware
++ * supports sharing the IOMMU and HAP page tables.
++ */
++#define LIBXL_HAVE_PHYSINFO_CAP_IOMMU_HAP_PT_SHARE 1
++
++/*
+  * libxl ABI compatibility
+  *
+  * The only guarantee which libxl makes regarding ABI compatibility
+diff --git a/tools/libxl/libxl_types.idl b/tools/libxl/libxl_types.idl
+index 6f431ba..7253d6e 100644
+--- a/tools/libxl/libxl_types.idl
++++ b/tools/libxl/libxl_types.idl
+@@ -1027,6 +1027,7 @@ libxl_physinfo = Struct("physinfo", [
+     ("cap_hvm_directio", bool), # No longer HVM specific
+     ("cap_hap", bool),
+     ("cap_shadow", bool),
++    ("cap_iommu_hap_pt_share", bool),
+     ], dir=DIR_OUT)
+ 
+ libxl_connectorinfo = Struct("connectorinfo", [
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index 35dddbb..de4bae6 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -110,6 +110,7 @@ type physinfo_cap_flag =
+ 	| CAP_DirectIO
+ 	| CAP_HAP
+ 	| CAP_Shadow
++	| CAP_IOMMU_HAP_PT_SHARE
+ 
+ type physinfo =
+ {
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index 0dd55e9..c885e75 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -57,7 +57,6 @@ type domain_create_flag =
+   | CDF_OOS_OFF
+   | CDF_XS_DOMAIN
+   | CDF_IOMMU
+-
+ type domctl_create_config = {
+   ssidref: int32;
+   handle: string;
+@@ -95,6 +94,8 @@ type physinfo_cap_flag =
+   | CAP_DirectIO
+   | CAP_HAP
+   | CAP_Shadow
++  | CAP_IOMMU_HAP_PT_SHARE
++
+ type physinfo = {
+   threads_per_core : int;
+   cores_per_socket : int;
+diff --git a/tools/xl/xl_info.c b/tools/xl/xl_info.c
+index 148c474..bfbca93 100644
+--- a/tools/xl/xl_info.c
++++ b/tools/xl/xl_info.c
+@@ -210,13 +210,14 @@ static void output_physinfo(void)
+          info.hw_cap[4], info.hw_cap[5], info.hw_cap[6], info.hw_cap[7]
+         );
+ 
+-    maybe_printf("virt_caps              :%s%s%s%s%s%s\n",
++    maybe_printf("virt_caps              :%s%s%s%s%s%s%s\n",
+          info.cap_pv ? " pv" : "",
+          info.cap_hvm ? " hvm" : "",
+          info.cap_hvm && info.cap_hvm_directio ? " hvm_directio" : "",
+          info.cap_pv && info.cap_hvm_directio ? " pv_directio" : "",
+          info.cap_hap ? " hap" : "",
+-         info.cap_shadow ? " shadow" : ""
++         info.cap_shadow ? " shadow" : "",
++         info.cap_iommu_hap_pt_share ? " iommu_hap_pt_share" : ""
+         );
+ 
+     vinfo = libxl_get_version_info(ctx);
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 3831c6d..977934a 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -142,6 +142,23 @@ static struct notifier_block cpu_nfb = {
+     .notifier_call = cpu_callback
+ };
+ 
++static bool __init hap_supported(const struct hvm_function_table *fns)
++{
++    if ( !fns->hap_supported )
++    {
++        printk("HVM: Hardware Assisted Paging (HAP) not detected\n");
++        return false;
++    }
++
++    if ( !opt_hap_enabled )
++    {
++        printk("HVM: Hardware Assisted Paging (HAP) detected but disabled\n");
++        return false;
++    }
++
++    return true;
++}
++
+ static int __init hvm_enable(void)
+ {
+     const struct hvm_function_table *fns = NULL;
+@@ -158,13 +175,8 @@ static int __init hvm_enable(void)
+     hvm_enabled = 1;
+ 
+     printk("HVM: %s enabled\n", fns->name);
+-    if ( !fns->hap_supported )
+-        printk("HVM: Hardware Assisted Paging (HAP) not detected\n");
+-    else if ( !opt_hap_enabled )
+-    {
+-        hvm_funcs.hap_supported = 0;
+-        printk("HVM: Hardware Assisted Paging (HAP) detected but disabled\n");
+-    }
++    if ( !hap_supported(fns) )
++        clear_iommu_hap_pt_share();
+     else
+     {
+         printk("HVM: Hardware Assisted Paging (HAP) detected\n");
+diff --git a/xen/common/sysctl.c b/xen/common/sysctl.c
+index c8f8642..e8763c7 100644
+--- a/xen/common/sysctl.c
++++ b/xen/common/sysctl.c
+@@ -269,6 +269,8 @@ long do_sysctl(XEN_GUEST_HANDLE_PARAM(xen_sysctl_t) u_sysctl)
+         arch_do_physinfo(pi);
+         if ( iommu_enabled )
+             pi->capabilities |= XEN_SYSCTL_PHYSCAP_directio;
++        if ( iommu_hap_pt_share )
++            pi->capabilities |= XEN_SYSCTL_PHYSCAP_iommu_hap_pt_share;
+ 
+         if ( copy_to_guest(u_sysctl, op, 1) )
+             ret = -EFAULT;
+diff --git a/xen/drivers/passthrough/amd/iommu_init.c b/xen/drivers/passthrough/amd/iommu_init.c
+index d6a5cf2..100d0bb 100644
+--- a/xen/drivers/passthrough/amd/iommu_init.c
++++ b/xen/drivers/passthrough/amd/iommu_init.c
+@@ -1412,7 +1412,8 @@ int __init amd_iommu_init(bool xt)
+      * since it only supports p2m_ram_rw, and this would
+      * prevent doing IO to/from mapped grant frames.
+      */
+-    iommu_hap_pt_share = 0;
++    clear_iommu_hap_pt_share();
++
+     printk(XENLOG_DEBUG "AMD-Vi: Disabled HAP memory map sharing with IOMMU\n");
+ 
+     /* per iommu initialization  */
+diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
+index 09ce9d9..11ece4d 100644
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -49,7 +49,11 @@ int8_t __hwdom_initdata iommu_hwdom_reserved = -1;
+  * default until we find a good solution to resolve it.
+  */
+ bool_t __read_mostly iommu_intpost;
+-bool_t __read_mostly iommu_hap_pt_share = 1;
++
++#ifndef iommu_hap_pt_share
++bool __read_mostly iommu_hap_pt_share = true;
++#endif
++
+ bool_t __read_mostly iommu_debug;
+ bool_t __read_mostly amd_iommu_perdev_intremap = 1;
+ 
+@@ -102,8 +106,10 @@ static int __init parse_iommu_param(const char *s)
+             iommu_hwdom_passthrough = val;
+         else if ( (val = parse_boolean("dom0-strict", s, ss)) >= 0 )
+             iommu_hwdom_strict = val;
++#ifndef iommu_hap_pt_share
+         else if ( (val = parse_boolean("sharept", s, ss)) >= 0 )
+             iommu_hap_pt_share = val;
++#endif
+         else
+             rc = -EINVAL;
+ 
+@@ -511,7 +517,10 @@ int __init iommu_setup(void)
+         iommu_enabled = (rc == 0);
+     }
+     if ( !iommu_enabled )
++    {
+         iommu_intremap = 0;
++        clear_iommu_hap_pt_share();
++    }
+ 
+     if ( (force_iommu && !iommu_enabled) ||
+          (force_intremap && !iommu_intremap) )
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index 7ffafdc..f123760 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -2310,7 +2310,7 @@ static int __init vtd_setup(void)
+             iommu_intpost = 0;
+ 
+         if ( !vtd_ept_page_compatible(iommu) )
+-            iommu_hap_pt_share = 0;
++            clear_iommu_hap_pt_share();
+ 
+         ret = iommu_set_interrupt(drhd);
+         if ( ret )
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index e324442..19457a4 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -96,9 +96,13 @@ struct xen_sysctl_tbuf_op {
+ /* The platform supports software paging. */
+ #define _XEN_SYSCTL_PHYSCAP_shadow       4
+ #define XEN_SYSCTL_PHYSCAP_shadow        (1u<<_XEN_SYSCTL_PHYSCAP_shadow)
++/* The platform supports sharing of HAP page tables with the IOMMU. */
++#define _XEN_SYSCTL_PHYSCAP_iommu_hap_pt_share 5
++#define XEN_SYSCTL_PHYSCAP_iommu_hap_pt_share  \
++    (1u << _XEN_SYSCTL_PHYSCAP_iommu_hap_pt_share)
+ 
+ /* Max XEN_SYSCTL_PHYSCAP_* constant.  Used for ABI checking. */
+-#define XEN_SYSCTL_PHYSCAP_MAX XEN_SYSCTL_PHYSCAP_shadow
++#define XEN_SYSCTL_PHYSCAP_MAX XEN_SYSCTL_PHYSCAP_iommu_hap_pt_share
+ 
+ struct xen_sysctl_physinfo {
+     uint32_t threads_per_core;
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index ab258b8..c5ed7ef 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -55,7 +55,22 @@ static inline bool_t dfn_eq(dfn_t x, dfn_t y)
+ extern bool_t iommu_enable, iommu_enabled;
+ extern bool_t force_iommu, iommu_verbose, iommu_igfx;
+ extern bool_t iommu_snoop, iommu_qinval, iommu_intremap, iommu_intpost;
+-extern bool_t iommu_hap_pt_share;
++
++#ifdef CONFIG_HVM
++extern bool iommu_hap_pt_share;
++#else
++#define iommu_hap_pt_share false
++#endif
++
++static inline void clear_iommu_hap_pt_share(void)
++{
++#ifndef iommu_hap_pt_share
++    iommu_hap_pt_share = false;
++#elif iommu_hap_pt_share
++    ASSERT_UNREACHABLE();
++#endif
++}
++
+ extern bool_t iommu_debug;
+ extern bool_t amd_iommu_perdev_intremap;
+ 

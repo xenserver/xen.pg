@@ -1,0 +1,674 @@
+From babde47a3feda6dd4ba318e1e57bd2ee9f2c1116 Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Wed, 25 Sep 2019 16:14:55 +0200
+Subject: introduce a 'passthrough' configuration option to xl.cfg...
+
+...and hence the ability to disable IOMMU mappings, and control EPT
+sharing.
+
+This patch introduces a new 'libxl_passthrough' enumeration into
+libxl_domain_create_info. The value will be set by xl either when it parses
+a new 'passthrough' option in xl.cfg, or implicitly if there is passthrough
+hardware specified for the domain.
+
+If the value of the passthrough configuration option is 'disabled' then
+the XEN_DOMCTL_CDF_iommu flag will be clear in the xen_domctl_createdomain
+flags, thus allowing the toolstack to control whether the domain gets
+IOMMU mappings or not (where previously they were globally set).
+
+If the value of the passthrough configuration option is 'sync_pt' then
+a new 'iommu_opts' field in xen_domctl_createdomain will be set with the
+value XEN_DOMCTL_IOMMU_no_sharept. This will override the global default
+set in iommu_hap_pt_share, thus allowing the toolstack to control whether
+EPT sharing is used for the domain.
+
+If the value of passthrough is 'enabled' then xl will choose an appropriate
+default according to the type of domain and hardware support.
+
+NOTE: The 'iommu_memkb' overhead in libxl_domain_build_info will now only
+      be set if passthrough is 'sync_pt' (or xl has chosen this mode as
+      a default).
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+Acked-by: Julien Grall <julien.grall@arm.com>
+Reviewed-by: Anthony PERARD <anthony.perard@citrix.com>
+
+diff --git a/docs/man/xl.cfg.5.pod.in b/docs/man/xl.cfg.5.pod.in
+index e71b3b4..71ea49b 100644
+--- a/docs/man/xl.cfg.5.pod.in
++++ b/docs/man/xl.cfg.5.pod.in
+@@ -605,6 +605,63 @@ option should only be used with a trusted device tree.
+ Note that the partial device tree should avoid using the phandle 65000
+ which is reserved by the toolstack.
+ 
++=item B<passthrough="STRING">
++
++Specify whether IOMMU mappings are enabled for the domain and hence whether
++it will be enabled for passthrough hardware. Valid values for this option
++are:
++
++=over 4
++
++=item B<disabled>
++
++IOMMU mappings are disabled for the domain and so hardware may not be
++passed through.
++
++This option is the default if no passthrough hardware is specified in the
++domain's configuration.
++
++=item B<enabled>
++
++This option enables IOMMU mappings and selects an appropriate default
++operating mode (see below for details of the operating modes). For HVM/PVH
++domains running on platforms where the option is available, this is
++equivalent to B<share_pt>. Otherwise, and also for PV domains, this
++option is equivalent to B<sync_pt>.
++
++This option is the default if passthrough hardware is specified in the
++domain's configuration.
++
++=item B<sync_pt>
++
++This option means that IOMMU mappings will be synchronized with the
++domain's P2M table as follows:
++
++For a PV domain, all writable pages assigned to the domain are identity
++mapped by MFN in the IOMMU page table. Thus a device driver running in the
++domain may program passthrough hardware for DMA using MFN values
++(i.e. host/machine frame numbers) looked up in its P2M.
++
++For an HVM/PVH domain, all non-foreign RAM pages present in its P2M will be
++mapped by GFN in the IOMMU page table. Thus a device driver running in the
++domain may program passthrough hardware using GFN values (i.e. guest
++physical frame numbers) without any further translation.
++
++This option is not currently available on Arm.
++
++=item B<share_pt>
++
++This option is unavailable for a PV domain. For an HVM/PVH domain, this
++option means that the IOMMU will be programmed to directly reference the
++domain's P2M table as its page table. From the point of view of a device
++driver running in the domain this is functionally equivalent to B<sync_pt>
++but places less load on the hypervisor and so should generally be selected
++in preference. However, the availability of this option is hardware
++specific. If B<xl info> reports B<virt_caps> containing
++B<iommu_hap_pt_share> then this option may be used.
++
++=back
++
+ =back
+ 
+ =head2 Devices
+diff --git a/tools/libxl/libxl.h b/tools/libxl/libxl.h
+index de50c10..f711cfc 100644
+--- a/tools/libxl/libxl.h
++++ b/tools/libxl/libxl.h
+@@ -421,6 +421,15 @@
+ #define LIBXL_HAVE_BUILDINFO_IOMMU_MEMKB 1
+ 
+ /*
++ * LIBXL_HAVE_CREATEINFO_PASSTHROUGH indicates that
++ * libxl_domain_create_info has a passthrough field (which is a
++ * libxl_passthrough enumeration) that indicates whether device pass-
++ * through is enabled for the domain and, if so, whether the IOMMU and
++ * HAP page tables may be shared or not.
++ */
++#define LIBXL_HAVE_CREATEINFO_PASSTHROUGH 1
++
++/*
+  * libxl ABI compatibility
+  *
+  * The only guarantee which libxl makes regarding ABI compatibility
+diff --git a/tools/libxl/libxl_create.c b/tools/libxl/libxl_create.c
+index 93fbe1d..b58e030 100644
+--- a/tools/libxl/libxl_create.c
++++ b/tools/libxl/libxl_create.c
+@@ -30,6 +30,13 @@
+ int libxl__domain_create_info_setdefault(libxl__gc *gc,
+                                          libxl_domain_create_info *c_info)
+ {
++    libxl_physinfo info;
++    int rc;
++
++    rc = libxl_get_physinfo(CTX, &info);
++    if (rc)
++        return rc;
++
+     if (!c_info->type) {
+         LOG(ERROR, "domain type unspecified");
+         return ERROR_INVAL;
+@@ -38,12 +45,6 @@ int libxl__domain_create_info_setdefault(libxl__gc *gc,
+     libxl__arch_domain_create_info_setdefault(gc, c_info);
+ 
+     if (c_info->type != LIBXL_DOMAIN_TYPE_PV) {
+-        libxl_physinfo info;
+-        int rc = libxl_get_physinfo(CTX, &info);
+-
+-        if (rc)
+-            return rc;
+-
+         if (info.cap_hap)
+             libxl_defbool_setdefault(&c_info->hap, true);
+         else if (info.cap_shadow)
+@@ -62,6 +63,13 @@ int libxl__domain_create_info_setdefault(libxl__gc *gc,
+     if (!c_info->ssidref)
+         c_info->ssidref = SECINITSID_DOMU;
+ 
++    if (info.cap_hvm_directio &&
++        (c_info->passthrough == LIBXL_PASSTHROUGH_ENABLED)) {
++        c_info->passthrough = ((c_info->type == LIBXL_DOMAIN_TYPE_PV) ||
++                               !info.cap_iommu_hap_pt_share) ?
++            LIBXL_PASSTHROUGH_SYNC_PT : LIBXL_PASSTHROUGH_SHARE_PT;
++    }
++
+     return 0;
+ }
+ 
+@@ -578,6 +586,16 @@ int libxl__domain_make(libxl__gc *gc, libxl_domain_config *d_config,
+                 libxl_defbool_val(info->oos) ? 0 : XEN_DOMCTL_CDF_oos_off;
+         }
+ 
++        assert(info->passthrough != LIBXL_PASSTHROUGH_ENABLED);
++        LOG(DETAIL, "passthrough: %s",
++            libxl_passthrough_to_string(info->passthrough));
++
++        if (info->passthrough != LIBXL_PASSTHROUGH_DISABLED)
++            create.flags |= XEN_DOMCTL_CDF_iommu;
++
++        if (info->passthrough == LIBXL_PASSTHROUGH_SYNC_PT)
++            create.iommu_opts |= XEN_DOMCTL_IOMMU_no_sharept;
++
+         /* Ultimately, handle is an array of 16 uint8_t, same as uuid */
+         libxl_uuid_copy(ctx, (libxl_uuid *)&create.handle, &info->uuid);
+ 
+diff --git a/tools/libxl/libxl_types.idl b/tools/libxl/libxl_types.idl
+index 0b12b33..54ac685 100644
+--- a/tools/libxl/libxl_types.idl
++++ b/tools/libxl/libxl_types.idl
+@@ -263,6 +263,13 @@ libxl_vkb_backend = Enumeration("vkb_backend", [
+     (2, "LINUX")
+     ])
+ 
++libxl_passthrough = Enumeration("passthrough", [
++    (0, "enabled"),
++    (1, "disabled"),
++    (2, "sync_pt"),
++    (3, "share_pt"),
++    ])
++
+ #
+ # Complex libxl types
+ #
+@@ -408,6 +415,7 @@ libxl_domain_create_info = Struct("domain_create_info",[
+     ("pool_name",    string),
+     ("run_hotplug_scripts",libxl_defbool),
+     ("driver_domain",libxl_defbool),
++    ("passthrough",  libxl_passthrough),
+     ], dir=DIR_IN)
+ 
+ libxl_domain_restore_params = Struct("domain_restore_params", [
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index de4bae6..e00a74d 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -65,11 +65,15 @@ type domain_create_flag =
+ 	| CDF_XS_DOMAIN
+ 	| CDF_IOMMU
+ 
++type domain_create_iommu_opts =
++	| IOMMU_NO_SHAREPT
++
+ type domctl_create_config =
+ {
+ 	ssidref: int32;
+ 	handle: string;
+ 	flags: domain_create_flag list;
++	iommu_opts: domain_create_iommu_opts list;
+ 	max_vcpus: int;
+ 	max_evtchn_port: int;
+ 	max_grant_frames: int;
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index c885e75..0e7049d 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -57,10 +57,15 @@ type domain_create_flag =
+   | CDF_OOS_OFF
+   | CDF_XS_DOMAIN
+   | CDF_IOMMU
++
++type domain_create_iommu_opts =
++  | IOMMU_NO_SHAREPT
++
+ type domctl_create_config = {
+   ssidref: int32;
+   handle: string;
+   flags: domain_create_flag list;
++  iommu_opts: domain_create_iommu_opts list;
+   max_vcpus: int;
+   max_evtchn_port: int;
+   max_grant_frames: int;
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index 0cdd873..48f39f8 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -190,11 +190,12 @@ CAMLprim value stub_xc_domain_create(value xch, value config)
+ #define VAL_SSIDREF             Field(config, 0)
+ #define VAL_HANDLE              Field(config, 1)
+ #define VAL_FLAGS               Field(config, 2)
+-#define VAL_MAX_VCPUS           Field(config, 3)
+-#define VAL_MAX_EVTCHN_PORT     Field(config, 4)
+-#define VAL_MAX_GRANT_FRAMES    Field(config, 5)
+-#define VAL_MAX_MAPTRACK_FRAMES Field(config, 6)
+-#define VAL_ARCH                Field(config, 7)
++#define VAL_IOMMU_OPTS          Field(config, 3)
++#define VAL_MAX_VCPUS           Field(config, 4)
++#define VAL_MAX_EVTCHN_PORT     Field(config, 5)
++#define VAL_MAX_GRANT_FRAMES    Field(config, 6)
++#define VAL_MAX_MAPTRACK_FRAMES Field(config, 7)
++#define VAL_ARCH                Field(config, 8)
+ 
+ 	uint32_t domid = 0;
+ 	int result;
+@@ -213,6 +214,11 @@ CAMLprim value stub_xc_domain_create(value xch, value config)
+ 		/* ! XEN_DOMCTL_CDF_ XEN_DOMCTL_CDF_MAX max */
+ 		(VAL_FLAGS);
+ 
++	cfg.iommu_opts = ocaml_list_to_c_bitmap
++		/* ! domain_create_iommu_opts IOMMU_ lc */
++		/* ! XEN_DOMCTL_IOMMU_ XEN_DOMCTL_IOMMU_MAX max */
++		(VAL_IOMMU_OPTS);
++
+ 	arch_domconfig = Field(VAL_ARCH, 0);
+ 	switch ( Tag_val(VAL_ARCH) )
+ 	{
+@@ -247,6 +253,7 @@ CAMLprim value stub_xc_domain_create(value xch, value config)
+ #undef VAL_MAX_GRANT_FRAMES
+ #undef VAL_MAX_EVTCHN_PORT
+ #undef VAL_MAX_VCPUS
++#undef VAL_IOMMU_OPTS
+ #undef VAL_FLAGS
+ #undef VAL_HANDLE
+ #undef VAL_SSIDREF
+diff --git a/tools/xl/xl_parse.c b/tools/xl/xl_parse.c
+index bc7ccba..c2e61b6 100644
+--- a/tools/xl/xl_parse.c
++++ b/tools/xl/xl_parse.c
+@@ -1461,6 +1461,113 @@ void parse_config_data(const char *config_source,
+         exit(1);
+     }
+ 
++    if (!xlu_cfg_get_list (config, "pci", &pcis, 0, 0)) {
++        d_config->num_pcidevs = 0;
++        d_config->pcidevs = NULL;
++        for(i = 0; (buf = xlu_cfg_get_listitem (pcis, i)) != NULL; i++) {
++            libxl_device_pci *pcidev;
++
++            pcidev = ARRAY_EXTEND_INIT_NODEVID(d_config->pcidevs,
++                                               d_config->num_pcidevs,
++                                               libxl_device_pci_init);
++            pcidev->msitranslate = pci_msitranslate;
++            pcidev->power_mgmt = pci_power_mgmt;
++            pcidev->permissive = pci_permissive;
++            pcidev->seize = pci_seize;
++            /*
++             * Like other pci option, the per-device policy always follows
++             * the global policy by default.
++             */
++            pcidev->rdm_policy = b_info->u.hvm.rdm.policy;
++            e = xlu_pci_parse_bdf(config, pcidev, buf);
++            if (e) {
++                fprintf(stderr,
++                        "unable to parse PCI BDF `%s' for passthrough\n",
++                        buf);
++                exit(-e);
++            }
++        }
++        if (d_config->num_pcidevs && c_info->type == LIBXL_DOMAIN_TYPE_PV)
++            libxl_defbool_set(&b_info->u.pv.e820_host, true);
++    }
++
++    if (!xlu_cfg_get_list (config, "dtdev", &dtdevs, 0, 0)) {
++        d_config->num_dtdevs = 0;
++        d_config->dtdevs = NULL;
++        for (i = 0; (buf = xlu_cfg_get_listitem(dtdevs, i)) != NULL; i++) {
++            libxl_device_dtdev *dtdev;
++
++            dtdev = ARRAY_EXTEND_INIT_NODEVID(d_config->dtdevs,
++                                              d_config->num_dtdevs,
++                                              libxl_device_dtdev_init);
++
++            dtdev->path = strdup(buf);
++            if (dtdev->path == NULL) {
++                fprintf(stderr, "unable to duplicate string for dtdevs\n");
++                exit(-1);
++            }
++        }
++    }
++
++    if (xlu_cfg_get_string(config, "passthrough", &buf, 0)) {
++        c_info->passthrough =
++            (d_config->num_pcidevs || d_config->num_dtdevs)
++            ? LIBXL_PASSTHROUGH_ENABLED : LIBXL_PASSTHROUGH_DISABLED;
++    } else {
++        libxl_passthrough o;
++
++        e = libxl_passthrough_from_string(buf, &o);
++        if (e) {
++            fprintf(stderr,
++                    "ERROR: unknown passthrough option '%s'\n",
++                    buf);
++            exit(-ERROR_FAIL);
++        }
++
++        c_info->passthrough = o;
++    }
++
++    switch (c_info->passthrough) {
++    case LIBXL_PASSTHROUGH_ENABLED:
++        /*
++         * Choose a suitable default. libxl would also do this but
++         * choosing here allows the code calculating 'iommu_memkb'
++         * below make an informed decision.
++         */
++        c_info->passthrough =
++            (c_info->type == LIBXL_DOMAIN_TYPE_PV) || !iommu_hap_pt_share
++            ? LIBXL_PASSTHROUGH_SYNC_PT : LIBXL_PASSTHROUGH_SHARE_PT;
++        break;
++
++    case LIBXL_PASSTHROUGH_DISABLED:
++        if (d_config->num_pcidevs || d_config->num_dtdevs) {
++            fprintf(stderr,
++                    "ERROR: passthrough disabled but devices are specified\n");
++            exit(-ERROR_FAIL);
++        }
++        break;
++    case LIBXL_PASSTHROUGH_SHARE_PT:
++        if (c_info->type == LIBXL_DOMAIN_TYPE_PV) {
++            fprintf(stderr,
++                    "ERROR: passthrough=\"share_pt\" not valid for PV domain\n");
++            exit(-ERROR_FAIL);
++        } else if (!iommu_hap_pt_share) {
++            fprintf(stderr,
++                    "ERROR: passthrough=\"share_pt\" not supported on this platform\n");
++            exit(-ERROR_FAIL);
++        }
++        break;
++    case LIBXL_PASSTHROUGH_SYNC_PT:
++        break;
++    }
++
++    if ((c_info->passthrough != LIBXL_PASSTHROUGH_DISABLED) &&
++        !iommu_enabled) {
++        fprintf(stderr,
++                "ERROR: passthrough not supported on this platform\n");
++        exit(-ERROR_FAIL);
++    }
++
+     /* libxl_get_required_shadow_memory() and
+      * libxl_get_required_iommu_memory() must be called after final values
+      * (default or specified) for vcpus and memory are set, because the
+@@ -1470,11 +1577,10 @@ void parse_config_data(const char *config_source,
+         : libxl_get_required_shadow_memory(b_info->max_memkb,
+                                            b_info->max_vcpus);
+ 
+-    /* No IOMMU reservation is needed if either the IOMMU is disabled or it
+-     * can share the P2M. */
+-    b_info->iommu_memkb = (!iommu_enabled || iommu_hap_pt_share)
+-        ? 0
+-        : libxl_get_required_iommu_memory(b_info->max_memkb);
++    /* No IOMMU reservation is needed if passthrough mode is not 'sync_pt' */
++    b_info->iommu_memkb = (c_info->passthrough == LIBXL_PASSTHROUGH_SYNC_PT)
++        ? libxl_get_required_iommu_memory(b_info->max_memkb)
++        : 0;
+ 
+     xlu_cfg_get_defbool(config, "nomigrate", &b_info->disable_migrate, 0);
+ 
+@@ -2298,54 +2404,6 @@ skip_vfb:
+         }
+     }
+ 
+-    if (!xlu_cfg_get_list (config, "pci", &pcis, 0, 0)) {
+-        d_config->num_pcidevs = 0;
+-        d_config->pcidevs = NULL;
+-        for(i = 0; (buf = xlu_cfg_get_listitem (pcis, i)) != NULL; i++) {
+-            libxl_device_pci *pcidev;
+-
+-            pcidev = ARRAY_EXTEND_INIT_NODEVID(d_config->pcidevs,
+-                                               d_config->num_pcidevs,
+-                                               libxl_device_pci_init);
+-            pcidev->msitranslate = pci_msitranslate;
+-            pcidev->power_mgmt = pci_power_mgmt;
+-            pcidev->permissive = pci_permissive;
+-            pcidev->seize = pci_seize;
+-            /*
+-             * Like other pci option, the per-device policy always follows
+-             * the global policy by default.
+-             */
+-            pcidev->rdm_policy = b_info->u.hvm.rdm.policy;
+-            e = xlu_pci_parse_bdf(config, pcidev, buf);
+-            if (e) {
+-                fprintf(stderr,
+-                        "unable to parse PCI BDF `%s' for passthrough\n",
+-                        buf);
+-                exit(-e);
+-            }
+-        }
+-        if (d_config->num_pcidevs && c_info->type == LIBXL_DOMAIN_TYPE_PV)
+-            libxl_defbool_set(&b_info->u.pv.e820_host, true);
+-    }
+-
+-    if (!xlu_cfg_get_list (config, "dtdev", &dtdevs, 0, 0)) {
+-        d_config->num_dtdevs = 0;
+-        d_config->dtdevs = NULL;
+-        for (i = 0; (buf = xlu_cfg_get_listitem(dtdevs, i)) != NULL; i++) {
+-            libxl_device_dtdev *dtdev;
+-
+-            dtdev = ARRAY_EXTEND_INIT_NODEVID(d_config->dtdevs,
+-                                              d_config->num_dtdevs,
+-                                              libxl_device_dtdev_init);
+-
+-            dtdev->path = strdup(buf);
+-            if (dtdev->path == NULL) {
+-                fprintf(stderr, "unable to duplicate string for dtdevs\n");
+-                exit(-1);
+-            }
+-        }
+-    }
+-
+     if (!xlu_cfg_get_list(config, "usbctrl", &usbctrls, 0, 0)) {
+         d_config->num_usbctrls = 0;
+         d_config->usbctrls = NULL;
+diff --git a/xen/arch/arm/domain.c b/xen/arch/arm/domain.c
+index ae13e47..61d35cd 100644
+--- a/xen/arch/arm/domain.c
++++ b/xen/arch/arm/domain.c
+@@ -617,6 +617,14 @@ int arch_sanitise_domain_config(struct xen_domctl_createdomain *config)
+         return -EINVAL;
+     }
+ 
++    /* The P2M table must always be shared between the CPU and the IOMMU */
++    if ( config->iommu_opts & XEN_DOMCTL_IOMMU_no_sharept )
++    {
++        dprintk(XENLOG_INFO,
++                "Unsupported iommu option: XEN_DOMCTL_IOMMU_no_sharept\n");
++        return -EINVAL;
++    }
++
+     /* Fill in the native GIC version, passed back to the toolstack. */
+     if ( config->arch.gic_version == XEN_DOMCTL_CONFIG_GIC_NATIVE )
+     {
+@@ -677,7 +685,7 @@ int arch_domain_create(struct domain *d,
+     ASSERT(config != NULL);
+ 
+     /* p2m_init relies on some value initialized by the IOMMU subsystem */
+-    if ( (rc = iommu_domain_init(d)) != 0 )
++    if ( (rc = iommu_domain_init(d, config->iommu_opts)) != 0 )
+         goto fail;
+ 
+     if ( (rc = p2m_init(d)) != 0 )
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index dbdf6b1..c0faf68 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -611,7 +611,7 @@ int arch_domain_create(struct domain *d,
+     if ( (rc = init_domain_irq_mapping(d)) != 0 )
+         goto fail;
+ 
+-    if ( (rc = iommu_domain_init(d)) != 0 )
++    if ( (rc = iommu_domain_init(d, config->iommu_opts)) != 0 )
+         goto fail;
+ 
+     psr_domain_init(d);
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index 4681f29..0733ee8 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -308,6 +308,13 @@ static int sanitise_domain_config(struct xen_domctl_createdomain *config)
+         return -EINVAL;
+     }
+ 
++    if ( !(config->flags & XEN_DOMCTL_CDF_iommu) && config->iommu_opts )
++    {
++        dprintk(XENLOG_INFO,
++                "IOMMU options specified but IOMMU not enabled\n");
++        return -EINVAL;
++    }
++
+     if ( config->max_vcpus < 1 )
+     {
+         dprintk(XENLOG_INFO, "No vCPUS\n");
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 5dcfe3c..6e6e9b9 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -515,19 +515,6 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+             rover = dom;
+         }
+ 
+-        /*
+-         * For now, make sure the createdomain IOMMU flag is set if the
+-         * IOMMU is enabled. When the flag comes under toolstack control
+-         * this can go away.
+-         */
+-        if ( op->u.createdomain.flags & XEN_DOMCTL_CDF_iommu )
+-        {
+-            ASSERT_UNREACHABLE();
+-            return -EINVAL;
+-        }
+-        if ( iommu_enabled )
+-            op->u.createdomain.flags |= XEN_DOMCTL_CDF_iommu;
+-
+         d = domain_create(dom, &op->u.createdomain, false);
+         if ( IS_ERR(d) )
+         {
+diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
+index 71f17e7..e8fddc2 100644
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -163,7 +163,7 @@ static void __hwdom_init check_hwdom_reqs(struct domain *d)
+     iommu_hwdom_strict = true;
+ }
+ 
+-int iommu_domain_init(struct domain *d)
++int iommu_domain_init(struct domain *d, unsigned int opts)
+ {
+     struct domain_iommu *hd = dom_iommu(d);
+     int ret = 0;
+@@ -188,6 +188,15 @@ int iommu_domain_init(struct domain *d)
+         check_hwdom_reqs(d); /* may modify iommu_hwdom_strict */
+ 
+     /*
++     * Use shared page tables for HAP and IOMMU if the global option
++     * is enabled (from which we can infer the h/w is capable) and
++     * the domain options do not disallow it. HAP must, of course, also
++     * be enabled.
++     */
++    hd->hap_pt_share = hap_enabled(d) && iommu_hap_pt_share &&
++        !(opts & XEN_DOMCTL_IOMMU_no_sharept);
++
++    /*
+      * NB: 'relaxed' h/w domains don't need the IOMMU mappings to be kept
+      *     in-sync with their assigned pages because all host RAM will be
+      *     mapped during hwdom_init().
+@@ -195,6 +204,8 @@ int iommu_domain_init(struct domain *d)
+     if ( !is_hardware_domain(d) || iommu_hwdom_strict )
+         hd->need_sync = !iommu_use_hap_pt(d);
+ 
++    ASSERT(!(hd->need_sync && hd->hap_pt_share));
++
+     return 0;
+ }
+ 
+diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
+index 1b3176a..ba84aea 100644
+--- a/xen/include/public/domctl.h
++++ b/xen/include/public/domctl.h
+@@ -38,7 +38,7 @@
+ #include "hvm/save.h"
+ #include "memory.h"
+ 
+-#define XEN_DOMCTL_INTERFACE_VERSION 0x00000011
++#define XEN_DOMCTL_INTERFACE_VERSION 0x00000012
+ 
+ /*
+  * NB. xen_domctl.domain is an IN/OUT parameter for this operation.
+@@ -73,6 +73,14 @@ struct xen_domctl_createdomain {
+ 
+     uint32_t flags;
+ 
++#define _XEN_DOMCTL_IOMMU_no_sharept  0
++#define XEN_DOMCTL_IOMMU_no_sharept   (1U << _XEN_DOMCTL_IOMMU_no_sharept)
++
++/* Max XEN_DOMCTL_IOMMU_* constant.  Used for ABI checking. */
++#define XEN_DOMCTL_IOMMU_MAX XEN_DOMCTL_IOMMU_no_sharept
++
++    uint32_t iommu_opts;
++
+     /*
+      * Various domain limits, which impact the quantity of resources (global
+      * mapping space, xenheap, etc) a guest may consume.
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index 42a92a3..7c3003f 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -84,7 +84,7 @@ extern unsigned int iommu_dev_iotlb_timeout;
+ int iommu_setup(void);
+ int iommu_hardware_setup(void);
+ 
+-int iommu_domain_init(struct domain *d);
++int iommu_domain_init(struct domain *d, unsigned int opts);
+ void iommu_hwdom_init(struct domain *d);
+ void iommu_domain_destroy(struct domain *d);
+ 
+@@ -278,10 +278,14 @@ struct domain_iommu {
+     /* Features supported by the IOMMU */
+     DECLARE_BITMAP(features, IOMMU_FEAT_count);
+ 
++    /* Does the guest share HAP mapping with the IOMMU? */
++    bool hap_pt_share;
++
+     /*
+-     * Does the guest reqire mappings to be synchonized, to maintain
+-     * the default dfn == pfn map. (See comment on dfn at the top of
+-     * include/xen/mm.h).
++     * Does the guest require mappings to be synchronized, to maintain
++     * the default dfn == pfn map? (See comment on dfn at the top of
++     * include/xen/mm.h). Note that hap_pt_share == false does not
++     * necessarily imply this is true.
+      */
+     bool need_sync;
+ };
+@@ -291,8 +295,7 @@ struct domain_iommu {
+ #define iommu_clear_feature(d, f) clear_bit(f, dom_iommu(d)->features)
+ 
+ /* Are we using the domain P2M table as its IOMMU pagetable? */
+-#define iommu_use_hap_pt(d) \
+-    (hap_enabled(d) && is_iommu_enabled(d) && iommu_hap_pt_share)
++#define iommu_use_hap_pt(d)       (dom_iommu(d)->hap_pt_share)
+ 
+ /* Does the IOMMU pagetable need to be kept synchronized with the P2M */
+ #ifdef CONFIG_HAS_PASSTHROUGH

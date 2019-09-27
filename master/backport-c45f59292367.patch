@@ -1,0 +1,235 @@
+From c45f59292367ca61059fc1be6f198c0f78f25b8b Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Tue, 17 Sep 2019 16:10:38 +0200
+Subject: domain: introduce XEN_DOMCTL_CDF_iommu flag
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This patch introduces a common domain creation flag to determine whether
+the domain is permitted to make use of the IOMMU. Currently the flag is
+always set for both dom0 and any domU created by libxl if the IOMMU is
+globally enabled (i.e. iommu_enabled == 1). sanitise_domain_config() is
+modified to reject the flag if !iommu_enabled.
+
+A new helper function, is_iommu_enabled(), is added to test the flag and
+iommu_domain_init() will return immediately if !is_iommu_enabled(). This is
+slightly different to the previous behaviour based on !iommu_enabled where
+the call to arch_iommu_domain_init() was made regardless, however it appears
+that this call was only necessary to initialize the dt_devices list for ARM
+such that iommu_release_dt_devices() can be called unconditionally by
+domain_relinquish_resources(). Adding a simple check of is_iommu_enabled()
+into iommu_release_dt_devices() keeps this unconditional call working.
+
+No functional change should be observed with this patch applied.
+
+Subsequent patches will allow the toolstack to control whether use of the
+IOMMU is enabled for a domain.
+
+NOTE: The introduction of the is_iommu_enabled() helper function might
+      seem excessive but its use is expected to increase with subsequent
+      patches. Also, having iommu_domain_init() bail before calling
+      arch_iommu_domain_init() is not strictly necessary, but I think the
+      consequent addition of the call to is_iommu_enabled() in
+      iommu_release_dt_devices() makes the code clearer.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: "Roger Pau Monné" <roger.pau@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+Acked-by: Julien Grall <julien.grall@arm.com>
+
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index 43aafa7..35dddbb 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -63,6 +63,7 @@ type domain_create_flag =
+ 	| CDF_S3_INTEGRITY
+ 	| CDF_OOS_OFF
+ 	| CDF_XS_DOMAIN
++	| CDF_IOMMU
+ 
+ type domctl_create_config =
+ {
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index 1bcfa3f..0dd55e9 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -56,6 +56,7 @@ type domain_create_flag =
+   | CDF_S3_INTEGRITY
+   | CDF_OOS_OFF
+   | CDF_XS_DOMAIN
++  | CDF_IOMMU
+ 
+ type domctl_create_config = {
+   ssidref: int32;
+diff --git a/xen/arch/arm/domain.c b/xen/arch/arm/domain.c
+index a9c4113..ae13e47 100644
+--- a/xen/arch/arm/domain.c
++++ b/xen/arch/arm/domain.c
+@@ -608,9 +608,12 @@ int arch_sanitise_domain_config(struct xen_domctl_createdomain *config)
+ {
+     unsigned int max_vcpus;
+ 
+-    if ( config->flags != (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap) )
++    /* HVM and HAP must be set. IOMMU may or may not be */
++    if ( (config->flags & ~XEN_DOMCTL_CDF_iommu) !=
++         (XEN_DOMCTL_CDF_hvm | XEN_DOMCTL_CDF_hap) )
+     {
+-        dprintk(XENLOG_INFO, "Unsupported configuration %#x\n", config->flags);
++        dprintk(XENLOG_INFO, "Unsupported configuration %#x\n",
++                config->flags);
+         return -EINVAL;
+     }
+ 
+diff --git a/xen/arch/arm/setup.c b/xen/arch/arm/setup.c
+index ebbfad9..077b8d0 100644
+--- a/xen/arch/arm/setup.c
++++ b/xen/arch/arm/setup.c
+@@ -947,6 +947,9 @@ void __init start_xen(unsigned long boot_phys_offset,
+     dom0_cfg.arch.tee_type = tee_get_type();
+     dom0_cfg.max_vcpus = dom0_max_vcpus();
+ 
++    if ( iommu_enabled )
++        dom0_cfg.flags |= XEN_DOMCTL_CDF_iommu;
++
+     dom0 = domain_create(0, &dom0_cfg, true);
+     if ( IS_ERR(dom0) || (alloc_dom0_vcpu0(dom0) == NULL) )
+         panic("Error creating domain 0\n");
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 27981ad..dec60d0 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -1732,6 +1732,9 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+     }
+     dom0_cfg.max_vcpus = dom0_max_vcpus();
+ 
++    if ( iommu_enabled )
++        dom0_cfg.flags |= XEN_DOMCTL_CDF_iommu;
++
+     /* Create initial domain 0. */
+     dom0 = domain_create(get_initial_domain_id(), &dom0_cfg, !pv_shim);
+     if ( IS_ERR(dom0) || (alloc_dom0_vcpu0(dom0) == NULL) )
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index 09917b2..4681f29 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -301,7 +301,8 @@ static int sanitise_domain_config(struct xen_domctl_createdomain *config)
+                            XEN_DOMCTL_CDF_hap |
+                            XEN_DOMCTL_CDF_s3_integrity |
+                            XEN_DOMCTL_CDF_oos_off |
+-                           XEN_DOMCTL_CDF_xs_domain) )
++                           XEN_DOMCTL_CDF_xs_domain |
++                           XEN_DOMCTL_CDF_iommu) )
+     {
+         dprintk(XENLOG_INFO, "Unknown CDF flags %#x\n", config->flags);
+         return -EINVAL;
+@@ -320,6 +321,12 @@ static int sanitise_domain_config(struct xen_domctl_createdomain *config)
+         return -EINVAL;
+     }
+ 
++    if ( (config->flags & XEN_DOMCTL_CDF_iommu) && !iommu_enabled )
++    {
++        dprintk(XENLOG_INFO, "IOMMU is not enabled\n");
++        return -EINVAL;
++    }
++
+     return arch_sanitise_domain_config(config);
+ }
+ 
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 6e6e9b9..5dcfe3c 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -515,6 +515,19 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+             rover = dom;
+         }
+ 
++        /*
++         * For now, make sure the createdomain IOMMU flag is set if the
++         * IOMMU is enabled. When the flag comes under toolstack control
++         * this can go away.
++         */
++        if ( op->u.createdomain.flags & XEN_DOMCTL_CDF_iommu )
++        {
++            ASSERT_UNREACHABLE();
++            return -EINVAL;
++        }
++        if ( iommu_enabled )
++            op->u.createdomain.flags |= XEN_DOMCTL_CDF_iommu;
++
+         d = domain_create(dom, &op->u.createdomain, false);
+         if ( IS_ERR(d) )
+         {
+diff --git a/xen/drivers/passthrough/device_tree.c b/xen/drivers/passthrough/device_tree.c
+index b6eaae7..d32b172 100644
+--- a/xen/drivers/passthrough/device_tree.c
++++ b/xen/drivers/passthrough/device_tree.c
+@@ -119,6 +119,9 @@ int iommu_release_dt_devices(struct domain *d)
+     struct dt_device_node *dev, *_dev;
+     int rc;
+ 
++    if ( !is_iommu_enabled(d) )
++        return 0;
++
+     list_for_each_entry_safe(dev, _dev, &hd->dt_devices, domain_list)
+     {
+         rc = iommu_deassign_dt_device(d, dev);
+diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
+index b82f778..f42402b 100644
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -151,6 +151,9 @@ int iommu_domain_init(struct domain *d)
+     struct domain_iommu *hd = dom_iommu(d);
+     int ret = 0;
+ 
++    if ( !is_iommu_enabled(d) )
++        return 0;
++
+ #ifdef CONFIG_NUMA
+     hd->node = NUMA_NO_NODE;
+ #endif
+@@ -159,9 +162,6 @@ int iommu_domain_init(struct domain *d)
+     if ( ret )
+         return ret;
+ 
+-    if ( !iommu_enabled )
+-        return 0;
+-
+     hd->platform_ops = iommu_get_ops();
+     return hd->platform_ops->init(d);
+ }
+diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
+index 77f546c..1b3176a 100644
+--- a/xen/include/public/domctl.h
++++ b/xen/include/public/domctl.h
+@@ -64,9 +64,12 @@ struct xen_domctl_createdomain {
+  /* Is this a xenstore domain? */
+ #define _XEN_DOMCTL_CDF_xs_domain     4
+ #define XEN_DOMCTL_CDF_xs_domain      (1U<<_XEN_DOMCTL_CDF_xs_domain)
++ /* Should this domain be permitted to use the IOMMU? */
++#define _XEN_DOMCTL_CDF_iommu         5
++#define XEN_DOMCTL_CDF_iommu          (1U<<_XEN_DOMCTL_CDF_iommu)
+ 
+ /* Max XEN_DOMCTL_CDF_* constant.  Used for ABI checking. */
+-#define XEN_DOMCTL_CDF_MAX XEN_DOMCTL_CDF_xs_domain
++#define XEN_DOMCTL_CDF_MAX XEN_DOMCTL_CDF_iommu
+ 
+     uint32_t flags;
+ 
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index e3601c1..2d17c84 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -983,6 +983,11 @@ static inline bool is_xenstore_domain(const struct domain *d)
+     return d->options & XEN_DOMCTL_CDF_xs_domain;
+ }
+ 
++static inline bool is_iommu_enabled(const struct domain *d)
++{
++    return evaluate_nospec(d->options & XEN_DOMCTL_CDF_iommu);
++}
++
+ extern bool sched_smt_power_savings;
+ 
+ extern enum cpufreq_controller {

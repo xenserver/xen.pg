@@ -1,0 +1,41 @@
+From 06e9edab6cfe3addb5e7c498131f3f5dcf886d4f Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Tue, 3 Sep 2019 14:42:42 +0100
+Subject: [PATCH] x86/mm: partially revert 37201c62 "make logdirty and iommu
+ mutually exclusive"
+
+There is no need to prevent logdirty from being enabled unless the IOMMU is
+sharing EPT mappings (in which case disabling write permissions may cause
+DMA faults).
+
+This patch therefore reverts the commit and replaces is with a check that
+EPT sharing is turned off.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+diff --git a/xen/arch/x86/mm/paging.c b/xen/arch/x86/mm/paging.c
+index 469bb76..91d4160 100644
+--- a/xen/arch/x86/mm/paging.c
++++ b/xen/arch/x86/mm/paging.c
+@@ -213,7 +213,7 @@ int paging_log_dirty_enable(struct domain *d, bool log_global)
+ {
+     int ret;
+ 
+-    if ( has_arch_pdevs(d) && log_global )
++    if ( iommu_use_hap_pt(d) && log_global )
+     {
+         /*
+          * Refuse to turn on global log-dirty mode
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index 537a884..66beebf 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -1533,8 +1533,7 @@ static int assign_device(struct domain *d, u16 seg, u8 bus, u8 devfn, u32 flag)
+     /* Prevent device assign if mem paging or mem sharing have been 
+      * enabled for this domain */
+     if ( unlikely(d->arch.hvm.mem_sharing_enabled ||
+-                  vm_event_check_ring(d->vm_event_paging) ||
+-                  p2m_get_hostp2m(d)->global_logdirty) )
++                  vm_event_check_ring(d->vm_event_paging)) )
+         return -EXDEV;
+ 
+     if ( !pcidevs_trylock() )

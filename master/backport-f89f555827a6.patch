@@ -1,0 +1,803 @@
+From f89f555827a6634582ff78ef26e7167b2bddbbfa Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Wed, 25 Sep 2019 16:12:02 +0200
+Subject: remove late (on-demand) construction of IOMMU page tables
+
+Now that there is a per-domain IOMMU-enable flag, which should be set if
+any device is going to be passed through, stop deferring page table
+construction until the assignment is done. Also don't tear down the tables
+again when the last device is de-assigned; defer that task until domain
+destruction.
+
+This allows the has_iommu_pt() helper and iommu_status enumeration to be
+removed. Calls to has_iommu_pt() are simply replaced by calls to
+is_iommu_enabled(). Remaining open-coded tests of iommu_hap_pt_share can
+also be replaced by calls to iommu_use_hap_pt().
+The arch_iommu_populate_page_table() and iommu_construct() functions become
+redundant, as does the 'strict mode' dom0 page_list mapping code in
+iommu_hwdom_init(), and iommu_teardown() can be made static is its only
+remaining caller, iommu_domain_destroy(), is within the same source
+module.
+
+All in all, about 220 lines of code are removed from the hypervisor (at
+the expense of some additions in the toolstack).
+
+NOTE: This patch will cause a small amount of extra resource to be used
+      to accommodate IOMMU page tables that may never be used, since the
+      per-domain IOMMU-enable flag is currently set to the value of the
+      global iommu_enable flag. A subsequent patch will add an option to
+      the toolstack to allow it to be turned off if there is no intention
+      to assign passthrough hardware to the domain.
+      To account for the extra resource, 'iommu_memkb' has been added to
+      domain_build_info. This patch sets it to a value calculated based
+      on the domain's maximum memory when the P2M sharing is either not
+      supported or globally disabled, or zero otherwise. However, when
+      the toolstack option mentioned above is added, it will also be zero
+      if the per-domain IOMMU-enable flag is turned off.
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Alexandru Isaila <aisaila@bitdefender.com>
+Acked-by: Razvan Cojocaru <rcojocaru@bitdefender.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Julien Grall <julien.grall@arm.com>
+Acked-by: Wei Liu <wl@xen.org>
+
+diff --git a/tools/libxl/libxl.h b/tools/libxl/libxl.h
+index 3421e5a..de50c10 100644
+--- a/tools/libxl/libxl.h
++++ b/tools/libxl/libxl.h
+@@ -414,6 +414,13 @@
+ #define LIBXL_HAVE_PHYSINFO_CAP_IOMMU_HAP_PT_SHARE 1
+ 
+ /*
++ * LIBXL_HAVE_BUILDINFO_IOMMU_MEMKB indicates thate libxl_domain_build_info
++ * has an iommu_memkb field which should be set with the amount of memory
++ * overhead needed by the domain for populating IOMMU page tables.
++ */
++#define LIBXL_HAVE_BUILDINFO_IOMMU_MEMKB 1
++
++/*
+  * libxl ABI compatibility
+  *
+  * The only guarantee which libxl makes regarding ABI compatibility
+diff --git a/tools/libxl/libxl_mem.c b/tools/libxl/libxl_mem.c
+index 448a2af..fd6f333 100644
+--- a/tools/libxl/libxl_mem.c
++++ b/tools/libxl/libxl_mem.c
+@@ -461,15 +461,17 @@ int libxl_domain_need_memory(libxl_ctx *ctx,
+     if (rc) goto out;
+ 
+     *need_memkb = b_info->target_memkb;
++    *need_memkb += b_info->shadow_memkb + b_info->iommu_memkb;
++
+     switch (b_info->type) {
+     case LIBXL_DOMAIN_TYPE_PVH:
+     case LIBXL_DOMAIN_TYPE_HVM:
+-        *need_memkb += b_info->shadow_memkb + LIBXL_HVM_EXTRA_MEMORY;
++        *need_memkb += LIBXL_HVM_EXTRA_MEMORY;
+         if (libxl_defbool_val(b_info->device_model_stubdomain))
+             *need_memkb += 32 * 1024;
+         break;
+     case LIBXL_DOMAIN_TYPE_PV:
+-        *need_memkb += b_info->shadow_memkb + LIBXL_PV_EXTRA_MEMORY;
++        *need_memkb += LIBXL_PV_EXTRA_MEMORY;
+         break;
+     default:
+         rc = ERROR_INVAL;
+diff --git a/tools/libxl/libxl_types.idl b/tools/libxl/libxl_types.idl
+index 04c9762..0b12b33 100644
+--- a/tools/libxl/libxl_types.idl
++++ b/tools/libxl/libxl_types.idl
+@@ -491,6 +491,7 @@ libxl_domain_build_info = Struct("domain_build_info",[
+     ("target_memkb",    MemKB),
+     ("video_memkb",     MemKB),
+     ("shadow_memkb",    MemKB),
++    ("iommu_memkb",     MemKB),
+     ("rtc_timeoffset",  uint32),
+     ("exec_ssidref",    uint32),
+     ("exec_ssid_label", string),
+diff --git a/tools/libxl/libxl_utils.c b/tools/libxl/libxl_utils.c
+index f360f5e..405733b 100644
+--- a/tools/libxl/libxl_utils.c
++++ b/tools/libxl/libxl_utils.c
+@@ -48,6 +48,21 @@ unsigned long libxl_get_required_shadow_memory(unsigned long maxmem_kb, unsigned
+     return 4 * (256 * smp_cpus + 2 * (maxmem_kb / 1024));
+ }
+ 
++unsigned long libxl_get_required_iommu_memory(unsigned long maxmem_kb)
++{
++    unsigned long iommu_pages = 0, mem_pages = maxmem_kb / 4;
++    unsigned int level;
++
++    /* Assume a 4 level page table with 512 entries per level */
++    for (level = 0; level < 4; level++)
++    {
++        mem_pages = DIV_ROUNDUP(mem_pages, 512);
++        iommu_pages += mem_pages;
++    }
++
++    return iommu_pages * 4;
++}
++
+ char *libxl_domid_to_name(libxl_ctx *ctx, uint32_t domid)
+ {
+     unsigned int len;
+diff --git a/tools/libxl/libxl_utils.h b/tools/libxl/libxl_utils.h
+index 44409af..630ccbe 100644
+--- a/tools/libxl/libxl_utils.h
++++ b/tools/libxl/libxl_utils.h
+@@ -24,6 +24,7 @@ const
+ char *libxl_basename(const char *name); /* returns string from strdup */
+ 
+ unsigned long libxl_get_required_shadow_memory(unsigned long maxmem_kb, unsigned int smp_cpus);
++unsigned long libxl_get_required_iommu_memory(unsigned long maxmem_kb);
+ int libxl_name_to_domid(libxl_ctx *ctx, const char *name, uint32_t *domid);
+ int libxl_domain_qualifier_to_domid(libxl_ctx *ctx, const char *name, uint32_t *domid);
+ char *libxl_domid_to_name(libxl_ctx *ctx, uint32_t domid);
+diff --git a/tools/xl/xl_parse.c b/tools/xl/xl_parse.c
+index 0604374..bc7ccba 100644
+--- a/tools/xl/xl_parse.c
++++ b/tools/xl/xl_parse.c
+@@ -1207,6 +1207,7 @@ void parse_config_data(const char *config_source,
+                        int config_len,
+                        libxl_domain_config *d_config)
+ {
++    libxl_physinfo physinfo;
+     const char *buf;
+     long l, vcpus = 0;
+     XLU_Config *config;
+@@ -1221,10 +1222,22 @@ void parse_config_data(const char *config_source,
+     int pci_seize = 0;
+     int i, e;
+     char *kernel_basename;
++    bool iommu_enabled, iommu_hap_pt_share;
+ 
+     libxl_domain_create_info *c_info = &d_config->c_info;
+     libxl_domain_build_info *b_info = &d_config->b_info;
+ 
++    libxl_physinfo_init(&physinfo);
++    if (libxl_get_physinfo(ctx, &physinfo) != 0) {
++        libxl_physinfo_dispose(&physinfo);
++        fprintf(stderr, "libxl_get_physinfo failed\n");
++        exit(EXIT_FAILURE);
++    }
++
++    iommu_enabled = physinfo.cap_hvm_directio;
++    iommu_hap_pt_share = physinfo.cap_iommu_hap_pt_share;
++    libxl_physinfo_dispose(&physinfo);
++
+     config= xlu_cfg_init(stderr, config_source);
+     if (!config) {
+         fprintf(stderr, "Failed to allocate for configuration\n");
+@@ -1448,14 +1461,21 @@ void parse_config_data(const char *config_source,
+         exit(1);
+     }
+ 
+-    /* libxl_get_required_shadow_memory() must be called after final values
++    /* libxl_get_required_shadow_memory() and
++     * libxl_get_required_iommu_memory() must be called after final values
+      * (default or specified) for vcpus and memory are set, because the
+-     * calculation depends on those values. */
++     * calculations depend on those values. */
+     b_info->shadow_memkb = !xlu_cfg_get_long(config, "shadow_memory", &l, 0)
+         ? l * 1024
+         : libxl_get_required_shadow_memory(b_info->max_memkb,
+                                            b_info->max_vcpus);
+ 
++    /* No IOMMU reservation is needed if either the IOMMU is disabled or it
++     * can share the P2M. */
++    b_info->iommu_memkb = (!iommu_enabled || iommu_hap_pt_share)
++        ? 0
++        : libxl_get_required_iommu_memory(b_info->max_memkb);
++
+     xlu_cfg_get_defbool(config, "nomigrate", &b_info->disable_migrate, 0);
+ 
+     if (!xlu_cfg_get_long(config, "tsc_mode", &l, 1)) {
+diff --git a/xen/arch/arm/p2m.c b/xen/arch/arm/p2m.c
+index 7f14429..6925657 100644
+--- a/xen/arch/arm/p2m.c
++++ b/xen/arch/arm/p2m.c
+@@ -1056,7 +1056,7 @@ static int __p2m_set_entry(struct p2m_domain *p2m,
+          !mfn_eq(lpae_get_mfn(*entry), lpae_get_mfn(orig_pte)) )
+         p2m_free_entry(p2m, orig_pte, level);
+ 
+-    if ( has_iommu_pt(p2m->domain) &&
++    if ( is_iommu_enabled(p2m->domain) &&
+          (lpae_is_valid(orig_pte) || lpae_is_valid(*entry)) )
+     {
+         unsigned int flush_flags = 0;
+diff --git a/xen/arch/x86/dom0_build.c b/xen/arch/x86/dom0_build.c
+index d381784..7cfab2d 100644
+--- a/xen/arch/x86/dom0_build.c
++++ b/xen/arch/x86/dom0_build.c
+@@ -365,7 +365,7 @@ unsigned long __init dom0_compute_nr_pages(
+     }
+ 
+     need_paging = is_hvm_domain(d) &&
+-        (!iommu_hap_pt_share || !paging_mode_hap(d));
++        (!iommu_use_hap_pt(d) || !paging_mode_hap(d));
+     for ( ; ; need_paging = false )
+     {
+         nr_pages = get_memsize(&dom0_size, avail);
+diff --git a/xen/arch/x86/hvm/mtrr.c b/xen/arch/x86/hvm/mtrr.c
+index 7ccd85b..5ad15ea 100644
+--- a/xen/arch/x86/hvm/mtrr.c
++++ b/xen/arch/x86/hvm/mtrr.c
+@@ -783,7 +783,8 @@ HVM_REGISTER_SAVE_RESTORE(MTRR, hvm_save_mtrr_msr, hvm_load_mtrr_msr, 1,
+ 
+ void memory_type_changed(struct domain *d)
+ {
+-    if ( (has_iommu_pt(d) || cache_flush_permitted(d)) && d->vcpu && d->vcpu[0] )
++    if ( (is_iommu_enabled(d) || cache_flush_permitted(d)) &&
++         d->vcpu && d->vcpu[0] )
+     {
+         p2m_memory_type_changed(d);
+         flush_all(FLUSH_CACHE);
+@@ -831,7 +832,7 @@ int epte_get_entry_emt(struct domain *d, unsigned long gfn, mfn_t mfn,
+         return MTRR_TYPE_UNCACHABLE;
+     }
+ 
+-    if ( !has_iommu_pt(d) && !cache_flush_permitted(d) )
++    if ( !is_iommu_enabled(d) && !cache_flush_permitted(d) )
+     {
+         *ipat = 1;
+         return MTRR_TYPE_WRBACK;
+diff --git a/xen/arch/x86/mm/mem_sharing.c b/xen/arch/x86/mm/mem_sharing.c
+index a5fe89e..efb8821 100644
+--- a/xen/arch/x86/mm/mem_sharing.c
++++ b/xen/arch/x86/mm/mem_sharing.c
+@@ -1664,7 +1664,7 @@ int mem_sharing_domctl(struct domain *d, struct xen_domctl_mem_sharing_op *mec)
+         case XEN_DOMCTL_MEM_SHARING_CONTROL:
+         {
+             rc = 0;
+-            if ( unlikely(has_iommu_pt(d) && mec->u.enable) )
++            if ( unlikely(is_iommu_enabled(d) && mec->u.enable) )
+                 rc = -EXDEV;
+             else
+                 d->arch.hvm.mem_sharing_enabled = mec->u.enable;
+diff --git a/xen/arch/x86/mm/p2m.c b/xen/arch/x86/mm/p2m.c
+index 8a5229e..e5e4349 100644
+--- a/xen/arch/x86/mm/p2m.c
++++ b/xen/arch/x86/mm/p2m.c
+@@ -1341,7 +1341,7 @@ int set_identity_p2m_entry(struct domain *d, unsigned long gfn_l,
+ 
+     if ( !paging_mode_translate(p2m->domain) )
+     {
+-        if ( !has_iommu_pt(d) )
++        if ( !is_iommu_enabled(d) )
+             return 0;
+         return iommu_legacy_map(d, _dfn(gfn_l), _mfn(gfn_l), PAGE_ORDER_4K,
+                                 IOMMUF_readable | IOMMUF_writable);
+@@ -1432,7 +1432,7 @@ int clear_identity_p2m_entry(struct domain *d, unsigned long gfn_l)
+ 
+     if ( !paging_mode_translate(d) )
+     {
+-        if ( !has_iommu_pt(d) )
++        if ( !is_iommu_enabled(d) )
+             return 0;
+         return iommu_legacy_unmap(d, _dfn(gfn_l), PAGE_ORDER_4K);
+     }
+diff --git a/xen/arch/x86/mm/paging.c b/xen/arch/x86/mm/paging.c
+index 69aa228..d9a52c4 100644
+--- a/xen/arch/x86/mm/paging.c
++++ b/xen/arch/x86/mm/paging.c
+@@ -213,7 +213,7 @@ int paging_log_dirty_enable(struct domain *d, bool_t log_global)
+ {
+     int ret;
+ 
+-    if ( has_iommu_pt(d) && log_global )
++    if ( is_iommu_enabled(d) && log_global )
+     {
+         /*
+          * Refuse to turn on global log-dirty mode
+diff --git a/xen/arch/x86/x86_64/mm.c b/xen/arch/x86/x86_64/mm.c
+index 795a467..fa55f34 100644
+--- a/xen/arch/x86/x86_64/mm.c
++++ b/xen/arch/x86/x86_64/mm.c
+@@ -1434,7 +1434,7 @@ int memory_add(unsigned long spfn, unsigned long epfn, unsigned int pxm)
+      * shared or being kept in sync then newly added memory needs to be
+      * mapped here.
+      */
+-    if ( has_iommu_pt(hardware_domain) &&
++    if ( is_iommu_enabled(hardware_domain) &&
+          !iommu_use_hap_pt(hardware_domain) &&
+          !need_iommu_pt_sync(hardware_domain) )
+     {
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index d5aff83..7364fd2 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -823,7 +823,7 @@ int xenmem_add_to_physmap(struct domain *d, struct xen_add_to_physmap *xatp,
+     xatp->gpfn += start;
+     xatp->size -= start;
+ 
+-    if ( has_iommu_pt(d) )
++    if ( is_iommu_enabled(d) )
+        this_cpu(iommu_dont_flush_iotlb) = 1;
+ 
+     while ( xatp->size > done )
+@@ -844,7 +844,7 @@ int xenmem_add_to_physmap(struct domain *d, struct xen_add_to_physmap *xatp,
+         }
+     }
+ 
+-    if ( has_iommu_pt(d) )
++    if ( is_iommu_enabled(d) )
+     {
+         int ret;
+ 
+diff --git a/xen/common/vm_event.c b/xen/common/vm_event.c
+index 2a1c87e..3b18195 100644
+--- a/xen/common/vm_event.c
++++ b/xen/common/vm_event.c
+@@ -630,7 +630,7 @@ int vm_event_domctl(struct domain *d, struct xen_domctl_vm_event_op *vec)
+ 
+             /* No paging if iommu is used */
+             rc = -EMLINK;
+-            if ( unlikely(has_iommu_pt(d)) )
++            if ( unlikely(is_iommu_enabled(d)) )
+                 break;
+ 
+             rc = -EXDEV;
+diff --git a/xen/drivers/passthrough/device_tree.c b/xen/drivers/passthrough/device_tree.c
+index 12f2c4c..ea9fd54 100644
+--- a/xen/drivers/passthrough/device_tree.c
++++ b/xen/drivers/passthrough/device_tree.c
+@@ -40,17 +40,6 @@ int iommu_assign_dt_device(struct domain *d, struct dt_device_node *dev)
+     if ( !list_empty(&dev->domain_list) )
+         goto fail;
+ 
+-    /*
+-     * The hwdom is forced to use IOMMU for protecting assigned
+-     * device. Therefore the IOMMU data is already set up.
+-     */
+-    ASSERT(!is_hardware_domain(d) ||
+-           hd->status == IOMMU_STATUS_initialized);
+-
+-    rc = iommu_construct(d);
+-    if ( rc )
+-        goto fail;
+-
+     /* The flag field doesn't matter to DT device. */
+     rc = hd->platform_ops->assign_device(d, 0, dt_to_dev(dev), 0);
+ 
+diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
+index 11ece4d..71f17e7 100644
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -152,6 +152,17 @@ static int __init parse_dom0_iommu_param(const char *s)
+ }
+ custom_param("dom0-iommu", parse_dom0_iommu_param);
+ 
++static void __hwdom_init check_hwdom_reqs(struct domain *d)
++{
++    if ( iommu_hwdom_none || !paging_mode_translate(d) )
++        return;
++
++    arch_iommu_check_autotranslated_hwdom(d);
++
++    iommu_hwdom_passthrough = false;
++    iommu_hwdom_strict = true;
++}
++
+ int iommu_domain_init(struct domain *d)
+ {
+     struct domain_iommu *hd = dom_iommu(d);
+@@ -169,129 +180,44 @@ int iommu_domain_init(struct domain *d)
+         return ret;
+ 
+     hd->platform_ops = iommu_get_ops();
+-    return hd->platform_ops->init(d);
+-}
++    ret = hd->platform_ops->init(d);
++    if ( ret )
++        return ret;
+ 
+-static void __hwdom_init check_hwdom_reqs(struct domain *d)
+-{
+-    if ( iommu_hwdom_none || !paging_mode_translate(d) )
+-        return;
++    if ( is_hardware_domain(d) )
++        check_hwdom_reqs(d); /* may modify iommu_hwdom_strict */
+ 
+-    arch_iommu_check_autotranslated_hwdom(d);
++    /*
++     * NB: 'relaxed' h/w domains don't need the IOMMU mappings to be kept
++     *     in-sync with their assigned pages because all host RAM will be
++     *     mapped during hwdom_init().
++     */
++    if ( !is_hardware_domain(d) || iommu_hwdom_strict )
++        hd->need_sync = !iommu_use_hap_pt(d);
+ 
+-    iommu_hwdom_passthrough = false;
+-    iommu_hwdom_strict = true;
++    return 0;
+ }
+ 
+ void __hwdom_init iommu_hwdom_init(struct domain *d)
+ {
+     struct domain_iommu *hd = dom_iommu(d);
+ 
+-    check_hwdom_reqs(d);
+-
+     if ( !is_iommu_enabled(d) )
+         return;
+ 
+     register_keyhandler('o', &iommu_dump_p2m_table, "dump iommu p2m table", 0);
+ 
+-    hd->status = IOMMU_STATUS_initializing;
+-    /*
+-     * NB: relaxed hw domains don't need sync because all ram is already
+-     * mapped in the iommu page tables.
+-     */
+-    hd->need_sync = iommu_hwdom_strict && !iommu_use_hap_pt(d);
+-    if ( need_iommu_pt_sync(d) )
+-    {
+-        struct page_info *page;
+-        unsigned int i = 0, flush_flags = 0;
+-        int rc = 0;
+-
+-        page_list_for_each ( page, &d->page_list )
+-        {
+-            unsigned long mfn = mfn_x(page_to_mfn(page));
+-            unsigned long dfn = mfn_to_gmfn(d, mfn);
+-            unsigned int mapping = IOMMUF_readable;
+-            int ret;
+-
+-            if ( ((page->u.inuse.type_info & PGT_count_mask) == 0) ||
+-                 ((page->u.inuse.type_info & PGT_type_mask)
+-                  == PGT_writable_page) )
+-                mapping |= IOMMUF_writable;
+-
+-            ret = iommu_map(d, _dfn(dfn), _mfn(mfn), 0, mapping,
+-                            &flush_flags);
+-
+-            if ( !rc )
+-                rc = ret;
+-
+-            if ( !(i++ & 0xfffff) )
+-                process_pending_softirqs();
+-        }
+-
+-        /* Use while-break to avoid compiler warning */
+-        while ( iommu_iotlb_flush_all(d, flush_flags) )
+-            break;
+-
+-        if ( rc )
+-            printk(XENLOG_WARNING "d%d: IOMMU mapping failed: %d\n",
+-                   d->domain_id, rc);
+-    }
+-
+     hd->platform_ops->hwdom_init(d);
+-
+-    hd->status = IOMMU_STATUS_initialized;
+ }
+ 
+-void iommu_teardown(struct domain *d)
++static void iommu_teardown(struct domain *d)
+ {
+     struct domain_iommu *hd = dom_iommu(d);
+ 
+-    hd->status = IOMMU_STATUS_disabled;
+     hd->platform_ops->teardown(d);
+     tasklet_schedule(&iommu_pt_cleanup_tasklet);
+ }
+ 
+-int iommu_construct(struct domain *d)
+-{
+-    struct domain_iommu *hd = dom_iommu(d);
+-
+-    if ( hd->status == IOMMU_STATUS_initialized )
+-        return 0;
+-
+-    hd->status = IOMMU_STATUS_initializing;
+-
+-    if ( !iommu_use_hap_pt(d) )
+-    {
+-        int rc;
+-
+-        hd->need_sync = true;
+-
+-        rc = arch_iommu_populate_page_table(d);
+-        if ( rc )
+-        {
+-            if ( rc != -ERESTART )
+-            {
+-                hd->need_sync = false;
+-                hd->status = IOMMU_STATUS_disabled;
+-            }
+-
+-            return rc;
+-        }
+-    }
+-
+-    hd->status = IOMMU_STATUS_initialized;
+-
+-    /*
+-     * There may be dirty cache lines when a device is assigned
+-     * and before has_iommu_pt(d) becoming true, this will cause
+-     * memory_type_changed lose effect if memory type changes.
+-     * Call memory_type_changed here to amend this.
+-     */
+-    memory_type_changed(d);
+-
+-    return 0;
+-}
+-
+ void iommu_domain_destroy(struct domain *d)
+ {
+     if ( !is_iommu_enabled(d) )
+@@ -587,11 +513,8 @@ int iommu_do_domctl(
+ void iommu_share_p2m_table(struct domain* d)
+ {
+     ASSERT(hap_enabled(d));
+-    /*
+-     * iommu_use_hap_pt(d) cannot be used here because during domain
+-     * construction has_iommu_pt(d) will always return false here.
+-     */
+-    if ( is_iommu_enabled(d) && iommu_hap_pt_share )
++
++    if ( iommu_use_hap_pt(d) )
+         iommu_get_ops()->share_p2m(d);
+ }
+ 
+@@ -638,8 +561,7 @@ static void iommu_dump_p2m_table(unsigned char key)
+     ops = iommu_get_ops();
+     for_each_domain(d)
+     {
+-        if ( is_hardware_domain(d) ||
+-             dom_iommu(d)->status < IOMMU_STATUS_initialized )
++        if ( is_hardware_domain(d) || !is_iommu_enabled(d) )
+             continue;
+ 
+         if ( iommu_use_hap_pt(d) )
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index b3c4c91..7deef2f 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -948,9 +948,6 @@ static int deassign_device(struct domain *d, uint16_t seg, uint8_t bus,
+ 
+     pdev->fault.count = 0;
+ 
+-    if ( !has_arch_pdevs(d) && has_iommu_pt(d) )
+-        iommu_teardown(d);
+-
+     return ret;
+ }
+ 
+@@ -1499,13 +1496,6 @@ static int assign_device(struct domain *d, u16 seg, u8 bus, u8 devfn, u32 flag)
+     if ( !pcidevs_trylock() )
+         return -ERESTART;
+ 
+-    rc = iommu_construct(d);
+-    if ( rc )
+-    {
+-        pcidevs_unlock();
+-        return rc;
+-    }
+-
+     pdev = pci_get_pdev_by_domain(hardware_domain, seg, bus, devfn);
+     if ( !pdev )
+     {
+@@ -1534,8 +1524,6 @@ static int assign_device(struct domain *d, u16 seg, u8 bus, u8 devfn, u32 flag)
+     }
+ 
+  done:
+-    if ( !has_arch_pdevs(d) && has_iommu_pt(d) )
+-        iommu_teardown(d);
+     pcidevs_unlock();
+ 
+     return rc;
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index f123760..3c17f11 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -1721,15 +1721,7 @@ static void iommu_domain_teardown(struct domain *d)
+ 
+     ASSERT(is_iommu_enabled(d));
+ 
+-    /*
+-     * We can't use iommu_use_hap_pt here because either IOMMU state
+-     * is already changed to IOMMU_STATUS_disabled at this point or
+-     * has always been IOMMU_STATUS_disabled.
+-     *
+-     * We also need to test if HAP is enabled because PV guests can
+-     * enter this path too.
+-     */
+-    if ( hap_enabled(d) && iommu_hap_pt_share )
++    if ( iommu_use_hap_pt(d) )
+         return;
+ 
+     spin_lock(&hd->arch.mapping_lock);
+diff --git a/xen/drivers/passthrough/x86/iommu.c b/xen/drivers/passthrough/x86/iommu.c
+index 8319fe0..47a3e55 100644
+--- a/xen/drivers/passthrough/x86/iommu.c
++++ b/xen/drivers/passthrough/x86/iommu.c
+@@ -81,103 +81,6 @@ int __init iommu_setup_hpet_msi(struct msi_desc *msi)
+     return ops->setup_hpet_msi ? ops->setup_hpet_msi(msi) : -ENODEV;
+ }
+ 
+-int arch_iommu_populate_page_table(struct domain *d)
+-{
+-    struct page_info *page;
+-    int rc = 0, n = 0;
+-
+-    spin_lock(&d->page_alloc_lock);
+-
+-    if ( unlikely(d->is_dying) )
+-        rc = -ESRCH;
+-
+-    while ( !rc && (page = page_list_remove_head(&d->page_list)) )
+-    {
+-        if ( is_hvm_domain(d) ||
+-            (page->u.inuse.type_info & PGT_type_mask) == PGT_writable_page )
+-        {
+-            mfn_t mfn = page_to_mfn(page);
+-            gfn_t gfn = mfn_to_gfn(d, mfn);
+-            unsigned int flush_flags = 0;
+-
+-            if ( !gfn_eq(gfn, INVALID_GFN) )
+-            {
+-                dfn_t dfn = _dfn(gfn_x(gfn));
+-
+-                ASSERT(!(gfn_x(gfn) >> DEFAULT_DOMAIN_ADDRESS_WIDTH));
+-                BUG_ON(SHARED_M2P(gfn_x(gfn)));
+-                rc = iommu_map(d, dfn, mfn, PAGE_ORDER_4K,
+-                               IOMMUF_readable | IOMMUF_writable,
+-                               &flush_flags);
+-
+-                /*
+-                 * We may be working behind the back of a running guest, which
+-                 * may change the type of a page at any time.  We can't prevent
+-                 * this (for instance, by bumping the type count while mapping
+-                 * the page) without causing legitimate guest type-change
+-                 * operations to fail.  So after adding the page to the IOMMU,
+-                 * check again to make sure this is still valid.  NB that the
+-                 * writable entry in the iommu is harmless until later, when
+-                 * the actual device gets assigned.
+-                 */
+-                if ( !rc && !is_hvm_domain(d) &&
+-                     ((page->u.inuse.type_info & PGT_type_mask) !=
+-                      PGT_writable_page) )
+-                {
+-                    rc = iommu_unmap(d, dfn, PAGE_ORDER_4K, &flush_flags);
+-                    /* If the type changed yet again, simply force a retry. */
+-                    if ( !rc && ((page->u.inuse.type_info & PGT_type_mask) ==
+-                                 PGT_writable_page) )
+-                        rc = -ERESTART;
+-                }
+-            }
+-            if ( rc )
+-            {
+-                page_list_add(page, &d->page_list);
+-                break;
+-            }
+-        }
+-        page_list_add_tail(page, &d->arch.relmem_list);
+-        if ( !(++n & 0xff) && !page_list_empty(&d->page_list) &&
+-             hypercall_preempt_check() )
+-            rc = -ERESTART;
+-    }
+-
+-    if ( !rc )
+-    {
+-        /*
+-         * The expectation here is that generally there are many normal pages
+-         * on relmem_list (the ones we put there) and only few being in an
+-         * offline/broken state. The latter ones are always at the head of the
+-         * list. Hence we first move the whole list, and then move back the
+-         * first few entries.
+-         */
+-        page_list_move(&d->page_list, &d->arch.relmem_list);
+-        while ( !page_list_empty(&d->page_list) &&
+-                (page = page_list_first(&d->page_list),
+-                 (page->count_info & (PGC_state|PGC_broken))) )
+-        {
+-            page_list_del(page, &d->page_list);
+-            page_list_add_tail(page, &d->arch.relmem_list);
+-        }
+-    }
+-
+-    spin_unlock(&d->page_alloc_lock);
+-
+-    if ( !rc )
+-        /*
+-         * flush_flags are not tracked across hypercall pre-emption so
+-         * assume a full flush is necessary.
+-         */
+-        rc = iommu_iotlb_flush_all(
+-            d, IOMMU_FLUSHF_added | IOMMU_FLUSHF_modified);
+-
+-    if ( rc && rc != -ERESTART )
+-        iommu_teardown(d);
+-
+-    return rc;
+-}
+-
+ void __hwdom_init arch_iommu_check_autotranslated_hwdom(struct domain *d)
+ {
+     if ( !is_iommu_enabled(d) )
+diff --git a/xen/include/asm-arm/iommu.h b/xen/include/asm-arm/iommu.h
+index 904c9ae..1577e83 100644
+--- a/xen/include/asm-arm/iommu.h
++++ b/xen/include/asm-arm/iommu.h
+@@ -21,7 +21,7 @@ struct arch_iommu
+ };
+ 
+ /* Always share P2M Table between the CPU and the IOMMU */
+-#define iommu_use_hap_pt(d) (has_iommu_pt(d))
++#define iommu_use_hap_pt(d) is_iommu_enabled(d)
+ 
+ const struct iommu_ops *iommu_get_ops(void);
+ void iommu_set_ops(const struct iommu_ops *ops);
+diff --git a/xen/include/asm-x86/iommu.h b/xen/include/asm-x86/iommu.h
+index 31fda4b..5071afd 100644
+--- a/xen/include/asm-x86/iommu.h
++++ b/xen/include/asm-x86/iommu.h
+@@ -88,7 +88,7 @@ extern const struct iommu_init_ops *iommu_init_ops;
+ 
+ /* Are we using the domain P2M table as its IOMMU pagetable? */
+ #define iommu_use_hap_pt(d) \
+-    (hap_enabled(d) && has_iommu_pt(d) && iommu_hap_pt_share)
++    (hap_enabled(d) && is_iommu_enabled(d) && iommu_hap_pt_share)
+ 
+ void iommu_update_ire_from_apic(unsigned int apic, unsigned int reg, unsigned int value);
+ unsigned int iommu_read_apic_from_ire(unsigned int apic, unsigned int reg);
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index c5ed7ef..dfec0ca 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -88,15 +88,9 @@ void iommu_domain_destroy(struct domain *d);
+ 
+ void arch_iommu_domain_destroy(struct domain *d);
+ int arch_iommu_domain_init(struct domain *d);
+-int arch_iommu_populate_page_table(struct domain *d);
+ void arch_iommu_check_autotranslated_hwdom(struct domain *d);
+ void arch_iommu_hwdom_init(struct domain *d);
+ 
+-int iommu_construct(struct domain *d);
+-
+-/* Function used internally, use iommu_domain_destroy */
+-void iommu_teardown(struct domain *d);
+-
+ /*
+  * The following flags are passed to map operations and passed by lookup
+  * operations.
+@@ -263,13 +257,6 @@ struct iommu_ops {
+ # define iommu_vcall iommu_call
+ #endif
+ 
+-enum iommu_status
+-{
+-    IOMMU_STATUS_disabled,
+-    IOMMU_STATUS_initializing,
+-    IOMMU_STATUS_initialized
+-};
+-
+ struct domain_iommu {
+     struct arch_iommu arch;
+ 
+@@ -289,9 +276,6 @@ struct domain_iommu {
+     /* Features supported by the IOMMU */
+     DECLARE_BITMAP(features, IOMMU_FEAT_count);
+ 
+-    /* Status of guest IOMMU mappings */
+-    enum iommu_status status;
+-
+     /*
+      * Does the guest reqire mappings to be synchonized, to maintain
+      * the default dfn == pfn map. (See comment on dfn at the top of
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 2d17c84..ae1faf7 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -966,10 +966,8 @@ static inline bool is_hwdom_pinned_vcpu(const struct vcpu *v)
+ }
+ 
+ #ifdef CONFIG_HAS_PASSTHROUGH
+-#define has_iommu_pt(d) (dom_iommu(d)->status != IOMMU_STATUS_disabled)
+ #define need_iommu_pt_sync(d) (dom_iommu(d)->need_sync)
+ #else
+-#define has_iommu_pt(d) false
+ #define need_iommu_pt_sync(d) false
+ #endif
+ 
