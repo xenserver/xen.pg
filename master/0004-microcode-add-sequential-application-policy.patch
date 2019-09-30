@@ -94,10 +94,10 @@ index e12af01bf2..4f861abd53 100644
          fprintf(stderr, "Failed to update microcode. (err: %s)\n",
                  strerror(errno));
 diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
-index caa39d34ec..728429accc 100644
+index b882ac8a7a..4b5859cc55 100644
 --- a/xen/arch/x86/microcode.c
 +++ b/xen/arch/x86/microcode.c
-@@ -37,6 +37,8 @@
+@@ -36,6 +36,8 @@
  #include <xen/earlycpio.h>
  #include <xen/watchdog.h>
  
@@ -106,48 +106,88 @@ index caa39d34ec..728429accc 100644
  #include <asm/delay.h>
  #include <asm/msr.h>
  #include <asm/processor.h>
-@@ -215,6 +217,10 @@ DEFINE_PER_CPU(struct cpu_signature, cpu_sig);
-  */
- static atomic_t cpu_in, cpu_out, cpu_updated;
+@@ -61,6 +63,10 @@ static signed int __initdata ucode_mod_idx;
+ static bool_t __initdata ucode_mod_forced;
+ static unsigned int nr_cores;
  
 +static uint32_t application_strategy;
 +/* The next CPU to perform a ucode update */
 +static atomic_t next_cpu;
 +
  /*
-  * Return a patch that covers current CPU. If there are multiple patches,
-  * return the one with the highest revision number. Return error If no
-@@ -322,6 +328,19 @@ static int do_microcode_update(void *patch)
-     if ( ret )
-         return ret;
+  * These states help to coordinate CPUs during loading an update.
+  *
+@@ -336,6 +342,22 @@ static int microcode_update_cpu(const struct microcode_patch *patch)
+     return err;
+ }
+ 
++static void sequential_set_next_cpu(void)
++{
++    unsigned int cpu;
++
++    /* Was this the last cpu? */
++    if ( (atomic_read(&cpu_out) + 1) == nr_cores )
++        return;
++
++    /* Select the next primary thread */
++    do {
++        cpu = atomic_read(&next_cpu);
++        atomic_set(&next_cpu, cpumask_next(cpu, &cpu_online_map));
++        cpu = atomic_read(&next_cpu);
++    } while ( cpu != cpumask_first(per_cpu(cpu_sibling_mask, cpu)) );
++}
++
+ static bool wait_for_state(typeof(loading_state) state)
+ {
+     typeof(loading_state) cur_state;
+@@ -375,19 +397,34 @@ static int secondary_thread_fn(void)
+ 
+ static int primary_thread_fn(const struct microcode_patch *patch)
+ {
++    unsigned int cpu = smp_processor_id(), done;
+     int ret = 0;
+ 
+     if ( !wait_for_state(LOADING_CALLIN) )
+         return -EBUSY;
+ 
+-    cpumask_set_cpu(smp_processor_id(), &cpu_callin_map);
++    cpumask_set_cpu(cpu, &cpu_callin_map);
+ 
+     if ( !wait_for_state(LOADING_ENTER) )
+         return -EBUSY;
  
 +    while ( application_strategy == XENPF_microcode_sequential &&
 +            cpu != atomic_read(&next_cpu) )
 +    {
-+        finished = atomic_read(&cpu_out);
-+        if ( wait_for_cpus(&next_cpu, cpu, MICROCODE_UPDATE_TIMEOUT_US) )
-+        {
-+            if ( atomic_read(&cpu_out) > finished )
-+                continue;
++        done = atomic_read(&cpu_out);
++        if ( wait_for_condition(wait_cpu_callout, (done + 1),
++                                MICROCODE_UPDATE_TIMEOUT_US) )
 +            panic("Timeout during sequential microcode update (finished %d/%d)",
-+                  finished, cpu_nr);
-+        }
++                  done, nr_cores);
 +    }
 +
-     ret = microcode_ops->collect_cpu_info(&this_cpu(cpu_sig));
-     /*
-      * Load microcode update on only one logical processor per core.
-@@ -338,6 +357,9 @@ static int do_microcode_update(void *patch)
-     if ( microcode_ops->end_update_percpu )
-         microcode_ops->end_update_percpu();
- 
-+    if ( application_strategy == XENPF_microcode_sequential )
-+        atomic_set(&next_cpu, cpumask_next(cpu, &cpu_online_map));
+     ret = microcode_ops->apply_microcode(patch);
+     if ( !ret )
+         atomic_inc(&cpu_updated);
 +
-     /*
-      * Increase the wait timeout to a safe value here since we're serializing
-      * the microcode update and that could take a while on a large number of
-@@ -373,7 +395,8 @@ static int do_microcode_update(void *patch)
++    if ( application_strategy == XENPF_microcode_sequential )
++        sequential_set_next_cpu();
++
+     atomic_inc(&cpu_out);
+ 
+     return ret;
+@@ -425,6 +462,10 @@ static int control_thread_fn(const struct microcode_patch *patch)
+     ret = microcode_ops->apply_microcode(patch);
+     if ( !ret )
+         atomic_inc(&cpu_updated);
++
++    if ( application_strategy == XENPF_microcode_sequential )
++        sequential_set_next_cpu();
++
+     atomic_inc(&cpu_out);
+ 
+     tick = rdtsc_ordered();
+@@ -483,7 +524,8 @@ static int do_microcode_update(void *patch)
      return ret;
  }
  
@@ -157,7 +197,7 @@ index caa39d34ec..728429accc 100644
  {
      int ret;
      void *buffer;
-@@ -386,6 +409,10 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+@@ -496,6 +538,10 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
      if ( microcode_ops == NULL )
          return -EINVAL;
  
@@ -168,21 +208,15 @@ index caa39d34ec..728429accc 100644
      buffer = xmalloc_bytes(len);
      if ( !buffer )
          return -ENOMEM;
-@@ -437,13 +464,19 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+@@ -550,8 +596,13 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
          if ( cpu == cpumask_first(per_cpu(cpu_sibling_mask, cpu)) )
              nr_cores++;
  
--    printk(XENLOG_INFO "%d cores are to update their microcode\n", nr_cores);
-+    printk(XENLOG_INFO "%d cores are to update their microcode %s\n", nr_cores,
+-    printk(XENLOG_INFO "%u cores are to update their microcode\n", nr_cores);
++    printk(XENLOG_INFO "%u cores are to update their microcode %s\n", nr_cores,
 +           strategy == XENPF_microcode_parallel ? "in parallel" :
 +                                                  "sequentially");
  
-     /*
-      * We intend to disable interrupt for long time, which may lead to
-      * watchdog timeout.
-      */
-     watchdog_disable();
-+
 +    application_strategy = strategy;
 +    if ( strategy == XENPF_microcode_sequential )
 +        atomic_set(&next_cpu, cpumask_first(&cpu_online_map));
@@ -204,10 +238,10 @@ index 131e2ef1ea..9e12cca953 100644
      break;
  
 diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
-index ffd0db2b36..b2acf88a8a 100644
+index c92956fe89..860a4f5bf1 100644
 --- a/xen/include/asm-x86/processor.h
 +++ b/xen/include/asm-x86/processor.h
-@@ -571,7 +571,8 @@ int guest_rdmsr_xen(const struct vcpu *v, uint32_t idx, uint64_t *val);
+@@ -568,7 +568,8 @@ int guest_rdmsr_xen(const struct vcpu *v, uint32_t idx, uint64_t *val);
  int guest_wrmsr_xen(struct vcpu *v, uint32_t idx, uint64_t val);
  
  void microcode_set_module(unsigned int);

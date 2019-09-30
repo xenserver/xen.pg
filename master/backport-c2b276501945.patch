@@ -1,8 +1,8 @@
-From ce395bb28cc14ac5bf6bd34ce82bf50a2668d77c Mon Sep 17 00:00:00 2001
+From c2b276501945efccbbf2769eb32840b4d6d1c848 Mon Sep 17 00:00:00 2001
 From: Chao Gao <chao.gao@intel.com>
-Date: Thu, 12 Sep 2019 15:22:24 +0800
-Subject: [PATCH 3/3] microcode: reduce memory allocation and copy when
- creating a patch
+Date: Fri, 27 Sep 2019 14:18:10 +0200
+Subject: x86/microcode: reduce memory allocation and copy when creating a
+ patch
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -18,8 +18,10 @@ it is sure that there is a matching ucode.
 
 Signed-off-by: Chao Gao <chao.gao@intel.com>
 Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
 diff --git a/xen/arch/x86/microcode_amd.c b/xen/arch/x86/microcode_amd.c
-index 01993084b9..9a8f179dc6 100644
+index f6a5fcc793..9a8f179dc6 100644
 --- a/xen/arch/x86/microcode_amd.c
 +++ b/xen/arch/x86/microcode_amd.c
 @@ -194,36 +194,6 @@ static bool match_cpu(const struct microcode_patch *patch)
@@ -124,7 +126,7 @@ index 01993084b9..9a8f179dc6 100644
      int error = 0;
      unsigned int current_cpu_id;
      unsigned int equiv_cpu_id;
-@@ -550,29 +520,22 @@ static struct microcode_patch *cpu_request_microcode(const void *buf,
+@@ -550,24 +520,22 @@ static struct microcode_patch *cpu_request_microcode(const void *buf,
      while ( (error = get_ucode_from_buffer_amd(mc_amd, buf, bufsize,
                                                 &offset)) == 0 )
      {
@@ -143,13 +145,13 @@ index 01993084b9..9a8f179dc6 100644
           */
 -        if ( (microcode_fits(new_patch->mc_amd) != MIS_UCODE) &&
 -             (!patch || (compare_patch(new_patch, patch) == NEW_UCODE)) )
+-            SWAP(patch, new_patch);
+-
+-        if ( new_patch )
+-            microcode_free_patch(new_patch);
 +        if ( (microcode_fits(mc_amd) != MIS_UCODE) &&
 +             (!saved || (compare_header(mc_amd->mpb, saved) == NEW_UCODE)) )
-         {
--            struct microcode_patch *tmp = patch;
--
--            patch = new_patch;
--            new_patch = tmp;
++        {
 +            xfree(saved);
 +            saved = mc_amd->mpb;
 +            saved_size = mc_amd->mpb_size;
@@ -158,14 +160,11 @@ index 01993084b9..9a8f179dc6 100644
 +        {
 +            xfree(mc_amd->mpb);
 +            mc_amd->mpb = NULL;
-         }
--
--        if ( new_patch )
--            microcode_free_patch(new_patch);
++        }
  
          if ( offset >= bufsize )
              break;
-@@ -601,7 +564,22 @@ static struct microcode_patch *cpu_request_microcode(const void *buf,
+@@ -596,7 +564,22 @@ static struct microcode_patch *cpu_request_microcode(const void *buf,
               *(const uint32_t *)(buf + offset) == UCODE_MAGIC )
              break;
      }
@@ -190,7 +189,7 @@ index 01993084b9..9a8f179dc6 100644
    out:
      if ( error && !patch )
 diff --git a/xen/arch/x86/microcode_intel.c b/xen/arch/x86/microcode_intel.c
-index 1b3ac93e00..02f30ffc6f 100644
+index a7125d8a19..c083e1752f 100644
 --- a/xen/arch/x86/microcode_intel.c
 +++ b/xen/arch/x86/microcode_intel.c
 @@ -285,25 +285,6 @@ static enum microcode_match_result compare_patch(
@@ -226,12 +225,12 @@ index 1b3ac93e00..02f30ffc6f 100644
 -static long get_next_ucode_from_buffer(void **mc, const u8 *buf,
 -                                       unsigned long size, long offset)
 +static long get_next_ucode_from_buffer(struct microcode_intel **mc,
-+                                       const u8 *buf, unsigned long size,
-+                                       long offset)
++                                       const uint8_t *buf, unsigned long size,
++                                       unsigned long offset)
  {
      struct microcode_header_intel *mc_header;
      unsigned long total_size;
-@@ -385,47 +367,46 @@ static struct microcode_patch *cpu_request_microcode(const void *buf,
+@@ -385,42 +367,46 @@ static struct microcode_patch *cpu_request_microcode(const void *buf,
  {
      long offset = 0;
      int error = 0;
@@ -262,21 +261,18 @@ index 1b3ac93e00..02f30ffc6f 100644
           */
 -        if ( (microcode_update_match(&new_patch->mc_intel->hdr) != MIS_UCODE) &&
 -             (!patch || (compare_patch(new_patch, patch) == NEW_UCODE)) )
-+        if ( (microcode_update_match(&mc->hdr) != MIS_UCODE) &&
-+             (!saved || (mc->hdr.rev > saved->hdr.rev)) )
-         {
--            struct microcode_patch *tmp = patch;
--
--            patch = new_patch;
--            new_patch = tmp;
-+            xfree(saved);
-+            saved = mc;
-         }
+-            SWAP(patch, new_patch);
 -
 -        if ( new_patch )
 -            microcode_free_patch(new_patch);
 -
 -        xfree(mc);
++        if ( (microcode_update_match(&mc->hdr) != MIS_UCODE) &&
++             (!saved || (mc->hdr.rev > saved->hdr.rev)) )
++        {
++            xfree(saved);
++            saved = mc;
++        }
 +        else
 +            xfree(mc);
      }
