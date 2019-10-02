@@ -1,0 +1,55 @@
+From 427709a9b2831b71e5a86f2b1b99185fb270d0f5 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 27 Sep 2019 09:00:29 +0200
+Subject: xen/sched: add runstate counters to struct sched_unit
+
+Add counters to struct sched_unit summing up runstates of associated
+vcpus. This allows doing quick checks whether a unit has any vcpu
+running or whether only a single vcpu of a unit is running.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index d9fdb82fe2..feef90f8eb 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -248,6 +248,7 @@ static inline void vcpu_runstate_change(
+     struct vcpu *v, int new_state, s_time_t new_entry_time)
+ {
+     s_time_t delta;
++    struct sched_unit *unit = v->sched_unit;
+ 
+     ASSERT(v->runstate.state != new_state);
+     ASSERT(spin_is_locked(get_sched_res(v->processor)->schedule_lock));
+@@ -256,6 +257,9 @@ static inline void vcpu_runstate_change(
+ 
+     trace_runstate_change(v, new_state);
+ 
++    unit->runstate_cnt[v->runstate.state]--;
++    unit->runstate_cnt[new_state]++;
++
+     delta = new_entry_time - v->runstate.state_entry_time;
+     if ( delta > 0 )
+     {
+@@ -380,6 +384,7 @@ static struct sched_unit *sched_alloc_unit(struct vcpu *v)
+     unit->vcpu_list = v;
+     unit->unit_id = v->vcpu_id;
+     unit->domain = d;
++    unit->runstate_cnt[v->runstate.state]++;
+ 
+     for ( prev_unit = &d->sched_unit_list; *prev_unit;
+           prev_unit = &(*prev_unit)->next_in_list )
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 6de9ddaaa9..92272256ea 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -277,6 +277,8 @@ struct sched_unit {
+ 
+     /* Last time unit got (de-)scheduled. */
+     uint64_t               state_entry_time;
++    /* Vcpu state summary. */
++    unsigned int           runstate_cnt[4];
+ 
+     /* Bitmask of CPUs on which this VCPU may run. */
+     cpumask_var_t          cpu_hard_affinity;

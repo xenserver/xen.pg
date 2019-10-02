@@ -1,0 +1,40 @@
+From 19049f8d796a220b14675a1e8b657279bd293041 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 27 Sep 2019 14:03:42 +0200
+Subject: sched: fix locking in a653sched_free_vdata()
+
+The arinc653 scheduler's free_vdata() function is missing proper
+locking: as it is modifying the scheduler's private vcpu list it needs
+to take the scheduler lock during that operation.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+
+diff --git a/xen/common/sched_arinc653.c b/xen/common/sched_arinc653.c
+index 72b988ea5f..d47b747ef4 100644
+--- a/xen/common/sched_arinc653.c
++++ b/xen/common/sched_arinc653.c
+@@ -442,16 +442,22 @@ a653sched_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
+ static void
+ a653sched_free_vdata(const struct scheduler *ops, void *priv)
+ {
++    a653sched_priv_t *sched_priv = SCHED_PRIV(ops);
+     arinc653_vcpu_t *av = priv;
++    unsigned long flags;
+ 
+     if (av == NULL)
+         return;
+ 
++    spin_lock_irqsave(&sched_priv->lock, flags);
++
+     if ( !is_idle_vcpu(av->vc) )
+         list_del(&av->list);
+ 
+     xfree(av);
+     update_schedule_vcpus(ops);
++
++    spin_unlock_irqrestore(&sched_priv->lock, flags);
+ }
+ 
+ /**

@@ -1,0 +1,498 @@
+From 7a4e6711114905b3cbbe48e81c3222361a7f3579 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 27 Sep 2019 09:00:31 +0200
+Subject: xen/sched: move struct task_slice into struct sched_unit
+
+In order to prepare for multiple vcpus per schedule unit move struct
+task_slice in schedule() from the local stack into struct sched_unit
+of the currently running unit. To make access easier for the single
+schedulers add the pointer of the currently running unit as a parameter
+of do_schedule().
+
+While at it switch the tasklet_work_scheduled parameter of
+do_schedule() from bool_t to bool.
+
+As struct task_slice is only ever modified with the local schedule
+lock held it is safe to directly set the different units in struct
+sched_unit instead of using an on-stack copy for returning the data.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+
+diff --git a/xen/common/sched_arinc653.c b/xen/common/sched_arinc653.c
+index 2bc187c92b..fcf81db19a 100644
+--- a/xen/common/sched_arinc653.c
++++ b/xen/common/sched_arinc653.c
+@@ -503,18 +503,14 @@ a653sched_unit_wake(const struct scheduler *ops, struct sched_unit *unit)
+  *
+  * @param ops       Pointer to this instance of the scheduler structure
+  * @param now       Current time
+- *
+- * @return          Address of the UNIT structure scheduled to be run next
+- *                  Amount of time to execute the returned UNIT
+- *                  Flag for whether the UNIT was migrated
+  */
+-static struct task_slice
++static void
+ a653sched_do_schedule(
+     const struct scheduler *ops,
++    struct sched_unit *prev,
+     s_time_t now,
+-    bool_t tasklet_work_scheduled)
++    bool tasklet_work_scheduled)
+ {
+-    struct task_slice ret;                      /* hold the chosen domain */
+     struct sched_unit *new_task = NULL;
+     static unsigned int sched_index = 0;
+     static s_time_t next_switch_time;
+@@ -592,13 +588,11 @@ a653sched_do_schedule(
+      * Return the amount of time the next domain has to run and the address
+      * of the selected task's UNIT structure.
+      */
+-    ret.time = next_switch_time - now;
+-    ret.task = new_task;
+-    ret.migrated = 0;
+-
+-    BUG_ON(ret.time <= 0);
++    prev->next_time = next_switch_time - now;
++    prev->next_task = new_task;
++    new_task->migrated = false;
+ 
+-    return ret;
++    BUG_ON(prev->next_time <= 0);
+ }
+ 
+ /**
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index 7f6ba35766..299eff21ac 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -1675,7 +1675,7 @@ csched_runq_steal(int peer_cpu, int cpu, int pri, int balance_step)
+ 
+ static struct csched_unit *
+ csched_load_balance(struct csched_private *prv, int cpu,
+-    struct csched_unit *snext, bool_t *stolen)
++    struct csched_unit *snext, bool *stolen)
+ {
+     struct cpupool *c = per_cpu(cpupool, cpu);
+     struct csched_unit *speer;
+@@ -1791,7 +1791,7 @@ csched_load_balance(struct csched_private *prv, int cpu,
+                 /* As soon as one unit is found, balancing ends */
+                 if ( speer != NULL )
+                 {
+-                    *stolen = 1;
++                    *stolen = true;
+                     /*
+                      * Next time we'll look for work to steal on this node, we
+                      * will start from the next pCPU, with respect to this one,
+@@ -1821,19 +1821,18 @@ csched_load_balance(struct csched_private *prv, int cpu,
+  * This function is in the critical path. It is designed to be simple and
+  * fast for the common case.
+  */
+-static struct task_slice
+-csched_schedule(
+-    const struct scheduler *ops, s_time_t now, bool_t tasklet_work_scheduled)
++static void csched_schedule(
++    const struct scheduler *ops, struct sched_unit *unit, s_time_t now,
++    bool tasklet_work_scheduled)
+ {
+     const unsigned int cur_cpu = smp_processor_id();
+     const unsigned int sched_cpu = sched_get_resource_cpu(cur_cpu);
+     struct list_head * const runq = RUNQ(sched_cpu);
+-    struct sched_unit *unit = current->sched_unit;
+     struct csched_unit * const scurr = CSCHED_UNIT(unit);
+     struct csched_private *prv = CSCHED_PRIV(ops);
+     struct csched_unit *snext;
+-    struct task_slice ret;
+     s_time_t runtime, tslice;
++    bool migrated = false;
+ 
+     SCHED_STAT_CRANK(schedule);
+     CSCHED_UNIT_CHECK(unit);
+@@ -1924,7 +1923,6 @@ csched_schedule(
+                         (unsigned char *)&d);
+         }
+ 
+-        ret.migrated = 0;
+         goto out;
+     }
+     tslice = prv->tslice;
+@@ -1942,7 +1940,6 @@ csched_schedule(
+     }
+ 
+     snext = __runq_elem(runq->next);
+-    ret.migrated = 0;
+ 
+     /* Tasklet work (which runs in idle UNIT context) overrides all else. */
+     if ( tasklet_work_scheduled )
+@@ -1968,7 +1965,7 @@ csched_schedule(
+     if ( snext->pri > CSCHED_PRI_TS_OVER )
+         __runq_remove(snext);
+     else
+-        snext = csched_load_balance(prv, sched_cpu, snext, &ret.migrated);
++        snext = csched_load_balance(prv, sched_cpu, snext, &migrated);
+ 
+     /*
+      * Update idlers mask if necessary. When we're idling, other CPUs
+@@ -1991,12 +1988,12 @@ out:
+     /*
+      * Return task to run next...
+      */
+-    ret.time = (is_idle_unit(snext->unit) ?
++    unit->next_time = (is_idle_unit(snext->unit) ?
+                 -1 : tslice);
+-    ret.task = snext->unit;
++    unit->next_task = snext->unit;
++    snext->unit->migrated = migrated;
+ 
+-    CSCHED_UNIT_CHECK(ret.task);
+-    return ret;
++    CSCHED_UNIT_CHECK(unit->next_task);
+ }
+ 
+ static void
+diff --git a/xen/common/sched_credit2.c b/xen/common/sched_credit2.c
+index c4c6c69a0e..87d142bbe4 100644
+--- a/xen/common/sched_credit2.c
++++ b/xen/common/sched_credit2.c
+@@ -3446,19 +3446,18 @@ runq_candidate(struct csched2_runqueue_data *rqd,
+  * This function is in the critical path. It is designed to be simple and
+  * fast for the common case.
+  */
+-static struct task_slice
+-csched2_schedule(
+-    const struct scheduler *ops, s_time_t now, bool tasklet_work_scheduled)
++static void csched2_schedule(
++    const struct scheduler *ops, struct sched_unit *currunit, s_time_t now,
++    bool tasklet_work_scheduled)
+ {
+     const unsigned int cur_cpu = smp_processor_id();
+     const unsigned int sched_cpu = sched_get_resource_cpu(cur_cpu);
+     struct csched2_runqueue_data *rqd;
+-    struct sched_unit *currunit = current->sched_unit;
+     struct csched2_unit * const scurr = csched2_unit(currunit);
+     struct csched2_unit *snext = NULL;
+     unsigned int skipped_units = 0;
+-    struct task_slice ret;
+     bool tickled;
++    bool migrated = false;
+ 
+     SCHED_STAT_CRANK(schedule);
+     CSCHED2_UNIT_CHECK(currunit);
+@@ -3543,8 +3542,6 @@ csched2_schedule(
+          && unit_runnable(currunit) )
+         __set_bit(__CSFLAG_delayed_runq_add, &scurr->flags);
+ 
+-    ret.migrated = 0;
+-
+     /* Accounting for non-idle tasks */
+     if ( !is_idle_unit(snext->unit) )
+     {
+@@ -3594,7 +3591,7 @@ csched2_schedule(
+             snext->credit += CSCHED2_MIGRATE_COMPENSATION;
+             sched_set_res(snext->unit, get_sched_res(sched_cpu));
+             SCHED_STAT_CRANK(migrated);
+-            ret.migrated = 1;
++            migrated = true;
+         }
+     }
+     else
+@@ -3625,11 +3622,11 @@ csched2_schedule(
+     /*
+      * Return task to run next...
+      */
+-    ret.time = csched2_runtime(ops, sched_cpu, snext, now);
+-    ret.task = snext->unit;
++    currunit->next_time = csched2_runtime(ops, sched_cpu, snext, now);
++    currunit->next_task = snext->unit;
++    snext->unit->migrated = migrated;
+ 
+-    CSCHED2_UNIT_CHECK(ret.task);
+-    return ret;
++    CSCHED2_UNIT_CHECK(currunit->next_task);
+ }
+ 
+ static void
+diff --git a/xen/common/sched_null.c b/xen/common/sched_null.c
+index 51edc3dbb9..80a7d45935 100644
+--- a/xen/common/sched_null.c
++++ b/xen/common/sched_null.c
+@@ -779,16 +779,14 @@ static inline void null_unit_check(struct sched_unit *unit)
+  *  - the unit assigned to the pCPU, if there's one and it can run;
+  *  - the idle unit, otherwise.
+  */
+-static struct task_slice null_schedule(const struct scheduler *ops,
+-                                       s_time_t now,
+-                                       bool_t tasklet_work_scheduled)
++static void null_schedule(const struct scheduler *ops, struct sched_unit *prev,
++                          s_time_t now, bool tasklet_work_scheduled)
+ {
+     unsigned int bs;
+     const unsigned int cur_cpu = smp_processor_id();
+     const unsigned int sched_cpu = sched_get_resource_cpu(cur_cpu);
+     struct null_private *prv = null_priv(ops);
+     struct null_unit *wvc;
+-    struct task_slice ret;
+ 
+     SCHED_STAT_CRANK(schedule);
+     NULL_UNIT_CHECK(current->sched_unit);
+@@ -816,19 +814,18 @@ static struct task_slice null_schedule(const struct scheduler *ops,
+     if ( tasklet_work_scheduled )
+     {
+         trace_var(TRC_SNULL_TASKLET, 1, 0, NULL);
+-        ret.task = sched_idle_unit(sched_cpu);
++        prev->next_task = sched_idle_unit(sched_cpu);
+     }
+     else
+-        ret.task = per_cpu(npc, sched_cpu).unit;
+-    ret.migrated = 0;
+-    ret.time = -1;
++        prev->next_task = per_cpu(npc, sched_cpu).unit;
++    prev->next_time = -1;
+ 
+     /*
+      * We may be new in the cpupool, or just coming back online. In which
+      * case, there may be units in the waitqueue that we can assign to us
+      * and run.
+      */
+-    if ( unlikely(ret.task == NULL) )
++    if ( unlikely(prev->next_task == NULL) )
+     {
+         spin_lock(&prv->waitq_lock);
+ 
+@@ -854,7 +851,7 @@ static struct task_slice null_schedule(const struct scheduler *ops,
+                 {
+                     unit_assign(prv, wvc->unit, sched_cpu);
+                     list_del_init(&wvc->waitq_elem);
+-                    ret.task = wvc->unit;
++                    prev->next_task = wvc->unit;
+                     goto unlock;
+                 }
+             }
+@@ -862,15 +859,17 @@ static struct task_slice null_schedule(const struct scheduler *ops,
+  unlock:
+         spin_unlock(&prv->waitq_lock);
+ 
+-        if ( ret.task == NULL && !cpumask_test_cpu(sched_cpu, &prv->cpus_free) )
++        if ( prev->next_task == NULL &&
++             !cpumask_test_cpu(sched_cpu, &prv->cpus_free) )
+             cpumask_set_cpu(sched_cpu, &prv->cpus_free);
+     }
+ 
+-    if ( unlikely(ret.task == NULL || !unit_runnable(ret.task)) )
+-        ret.task = sched_idle_unit(sched_cpu);
++    if ( unlikely(prev->next_task == NULL || !unit_runnable(prev->next_task)) )
++        prev->next_task = sched_idle_unit(sched_cpu);
+ 
+-    NULL_UNIT_CHECK(ret.task);
+-    return ret;
++    NULL_UNIT_CHECK(prev->next_task);
++
++    prev->next_task->migrated = false;
+ }
+ 
+ static inline void dump_unit(struct null_private *prv, struct null_unit *nvc)
+diff --git a/xen/common/sched_rt.c b/xen/common/sched_rt.c
+index 151353b9a0..cfd7d334fa 100644
+--- a/xen/common/sched_rt.c
++++ b/xen/common/sched_rt.c
+@@ -1053,16 +1053,16 @@ runq_pick(const struct scheduler *ops, const cpumask_t *mask)
+  * schedule function for rt scheduler.
+  * The lock is already grabbed in schedule.c, no need to lock here
+  */
+-static struct task_slice
+-rt_schedule(const struct scheduler *ops, s_time_t now, bool_t tasklet_work_scheduled)
++static void
++rt_schedule(const struct scheduler *ops, struct sched_unit *currunit,
++            s_time_t now, bool tasklet_work_scheduled)
+ {
+     const unsigned int cur_cpu = smp_processor_id();
+     const unsigned int sched_cpu = sched_get_resource_cpu(cur_cpu);
+     struct rt_private *prv = rt_priv(ops);
+-    struct rt_unit *const scurr = rt_unit(current->sched_unit);
++    struct rt_unit *const scurr = rt_unit(currunit);
+     struct rt_unit *snext = NULL;
+-    struct task_slice ret = { .migrated = 0 };
+-    struct sched_unit *currunit = current->sched_unit;
++    bool migrated = false;
+ 
+     /* TRACE */
+     {
+@@ -1110,7 +1110,7 @@ rt_schedule(const struct scheduler *ops, s_time_t now, bool_t tasklet_work_sched
+         __set_bit(__RTDS_delayed_runq_add, &scurr->flags);
+ 
+     snext->last_start = now;
+-    ret.time =  -1; /* if an idle unit is picked */
++    currunit->next_time =  -1; /* if an idle unit is picked */
+     if ( !is_idle_unit(snext->unit) )
+     {
+         if ( snext != scurr )
+@@ -1121,13 +1121,13 @@ rt_schedule(const struct scheduler *ops, s_time_t now, bool_t tasklet_work_sched
+         if ( sched_unit_master(snext->unit) != sched_cpu )
+         {
+             sched_set_res(snext->unit, get_sched_res(sched_cpu));
+-            ret.migrated = 1;
++            migrated = true;
+         }
+-        ret.time = snext->cur_budget; /* invoke the scheduler next time */
++        /* Invoke the scheduler next time. */
++        currunit->next_time = snext->cur_budget;
+     }
+-    ret.task = snext->unit;
+-
+-    return ret;
++    currunit->next_task = snext->unit;
++    snext->unit->migrated = migrated;
+ }
+ 
+ /*
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index faa5ca5929..4711ece1ef 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -117,15 +117,14 @@ sched_idle_free_udata(const struct scheduler *ops, void *priv)
+ {
+ }
+ 
+-static struct task_slice sched_idle_schedule(
+-    const struct scheduler *ops, s_time_t now,
++static void sched_idle_schedule(
++    const struct scheduler *ops, struct sched_unit *unit, s_time_t now,
+     bool tasklet_work_scheduled)
+ {
+     const unsigned int cpu = smp_processor_id();
+-    struct task_slice ret = { .time = -1 };
+ 
+-    ret.task = sched_idle_unit(cpu);
+-    return ret;
++    unit->next_time = -1;
++    unit->next_task = sched_idle_unit(cpu);
+ }
+ 
+ static struct scheduler sched_idle_ops = {
+@@ -1726,10 +1725,9 @@ static void schedule(void)
+     s_time_t              now;
+     struct scheduler     *sched;
+     unsigned long        *tasklet_work = &this_cpu(tasklet_work_to_do);
+-    bool_t                tasklet_work_scheduled = 0;
++    bool                  tasklet_work_scheduled = false;
+     struct sched_resource *sd;
+     spinlock_t           *lock;
+-    struct task_slice     next_slice;
+     int cpu = smp_processor_id();
+ 
+     ASSERT_NOT_IN_ATOMIC();
+@@ -1745,12 +1743,12 @@ static void schedule(void)
+         set_bit(_TASKLET_scheduled, tasklet_work);
+         /* fallthrough */
+     case TASKLET_enqueued|TASKLET_scheduled:
+-        tasklet_work_scheduled = 1;
++        tasklet_work_scheduled = true;
+         break;
+     case TASKLET_scheduled:
+         clear_bit(_TASKLET_scheduled, tasklet_work);
+     case 0:
+-        /*tasklet_work_scheduled = 0;*/
++        /*tasklet_work_scheduled = false;*/
+         break;
+     default:
+         BUG();
+@@ -1764,14 +1762,14 @@ static void schedule(void)
+ 
+     /* get policy-specific decision on scheduling... */
+     sched = this_cpu(scheduler);
+-    next_slice = sched->do_schedule(sched, now, tasklet_work_scheduled);
++    sched->do_schedule(sched, prev, now, tasklet_work_scheduled);
+ 
+-    next = next_slice.task;
++    next = prev->next_task;
+ 
+     sd->curr = next;
+ 
+-    if ( next_slice.time >= 0 ) /* -ve means no limit */
+-        set_timer(&sd->s_timer, now + next_slice.time);
++    if ( prev->next_time >= 0 ) /* -ve means no limit */
++        set_timer(&sd->s_timer, now + prev->next_time);
+ 
+     if ( unlikely(prev == next) )
+     {
+@@ -1779,7 +1777,7 @@ static void schedule(void)
+         TRACE_4D(TRC_SCHED_SWITCH_INFCONT,
+                  next->domain->domain_id, next->unit_id,
+                  now - prev->state_entry_time,
+-                 next_slice.time);
++                 prev->next_time);
+         trace_continue_running(next->vcpu_list);
+         return continue_running(prev->vcpu_list);
+     }
+@@ -1791,7 +1789,7 @@ static void schedule(void)
+              next->domain->domain_id, next->unit_id,
+              (next->vcpu_list->runstate.state == RUNSTATE_runnable) ?
+              (now - next->state_entry_time) : 0,
+-             next_slice.time);
++             prev->next_time);
+ 
+     ASSERT(prev->vcpu_list->runstate.state == RUNSTATE_running);
+ 
+@@ -1820,7 +1818,7 @@ static void schedule(void)
+ 
+     stop_timer(&prev->vcpu_list->periodic_timer);
+ 
+-    if ( next_slice.migrated )
++    if ( next->migrated )
+         vcpu_move_irqs(next->vcpu_list);
+ 
+     vcpu_periodic_timer_work(next->vcpu_list);
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index d7fad0cbcc..0423be987d 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -230,12 +230,6 @@ static inline spinlock_t *pcpu_schedule_trylock(unsigned int cpu)
+     return NULL;
+ }
+ 
+-struct task_slice {
+-    struct sched_unit *task;
+-    s_time_t           time;
+-    bool_t             migrated;
+-};
+-
+ struct scheduler {
+     char *name;             /* full name for this scheduler      */
+     char *opt_name;         /* option name for this scheduler    */
+@@ -278,8 +272,9 @@ struct scheduler {
+     void         (*context_saved)  (const struct scheduler *,
+                                     struct sched_unit *);
+ 
+-    struct task_slice (*do_schedule) (const struct scheduler *, s_time_t,
+-                                      bool_t tasklet_work_scheduled);
++    void         (*do_schedule)    (const struct scheduler *,
++                                    struct sched_unit *, s_time_t,
++                                    bool tasklet_work_scheduled);
+ 
+     struct sched_resource *(*pick_resource)(const struct scheduler *,
+                                             const struct sched_unit *);
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 92272256ea..ebf723a866 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -274,6 +274,8 @@ struct sched_unit {
+     bool                   is_running;
+     /* Does soft affinity actually play a role (given hard affinity)? */
+     bool                   soft_aff_effective;
++    /* Item has been migrated to other cpu(s). */
++    bool                   migrated;
+ 
+     /* Last time unit got (de-)scheduled. */
+     uint64_t               state_entry_time;
+@@ -286,6 +288,10 @@ struct sched_unit {
+     cpumask_var_t          cpu_hard_affinity_saved;
+     /* Bitmask of CPUs on which this VCPU prefers to run. */
+     cpumask_var_t          cpu_soft_affinity;
++
++    /* Next unit to run. */
++    struct sched_unit      *next_task;
++    s_time_t                next_time;
+ };
+ 
+ #define for_each_sched_unit(d, u)                                         \

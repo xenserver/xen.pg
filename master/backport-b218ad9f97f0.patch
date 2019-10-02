@@ -1,0 +1,70 @@
+From b218ad9f97f0eb2af75d6bc3fadf68ea3c20bc88 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 27 Sep 2019 09:00:23 +0200
+Subject: xen: add sched_unit_pause_nosync() and sched_unit_unpause()
+
+The credit scheduler calls vcpu_pause_nosync() and vcpu_unpause()
+today. Add sched_unit_pause_nosync() and sched_unit_unpause() to
+perform the same operations on scheduler units instead.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index e710b3c6fa..21c3a033b9 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -1065,7 +1065,7 @@ csched_unit_remove(const struct scheduler *ops, struct sched_unit *unit)
+     if ( test_and_clear_bit(CSCHED_FLAG_UNIT_PARKED, &svc->flags) )
+     {
+         SCHED_STAT_CRANK(unit_unpark);
+-        vcpu_unpause(svc->unit->vcpu_list);
++        sched_unit_unpause(svc->unit);
+     }
+ 
+     spin_lock_irq(&prv->lock);
+@@ -1515,7 +1515,7 @@ csched_acct(void* dummy)
+                      !test_and_set_bit(CSCHED_FLAG_UNIT_PARKED, &svc->flags) )
+                 {
+                     SCHED_STAT_CRANK(unit_park);
+-                    vcpu_pause_nosync(svc->unit->vcpu_list);
++                    sched_unit_pause_nosync(svc->unit);
+                 }
+ 
+                 /* Lower bound on credits */
+@@ -1539,7 +1539,7 @@ csched_acct(void* dummy)
+                      * if it is woken up here.
+                      */
+                     SCHED_STAT_CRANK(unit_unpark);
+-                    vcpu_unpause(svc->unit->vcpu_list);
++                    sched_unit_unpause(svc->unit);
+                     clear_bit(CSCHED_FLAG_UNIT_PARKED, &svc->flags);
+                 }
+ 
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index 2b9d50b9fe..45ac03f0f8 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -466,6 +466,22 @@ static inline int sched_adjust_cpupool(const struct scheduler *s,
+     return s->adjust_global ? s->adjust_global(s, op) : 0;
+ }
+ 
++static inline void sched_unit_pause_nosync(const struct sched_unit *unit)
++{
++    struct vcpu *v;
++
++    for_each_sched_unit_vcpu ( unit, v )
++        vcpu_pause_nosync(v);
++}
++
++static inline void sched_unit_unpause(const struct sched_unit *unit)
++{
++    struct vcpu *v;
++
++    for_each_sched_unit_vcpu ( unit, v )
++        vcpu_unpause(v);
++}
++
+ #define REGISTER_SCHEDULER(x) static const struct scheduler *x##_entry \
+   __used_section(".data.schedulers") = &x;
+ 

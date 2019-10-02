@@ -1,0 +1,267 @@
+From 6658e6d352fe4d959b18cf58b6c3949e02bb4c85 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 27 Sep 2019 08:22:56 +0200
+Subject: [PATCH 02/19] xen/sched: introduce unit_runnable_state()
+
+Today the vcpu runstate of a new scheduled vcpu is always set to
+"running" even if at that time vcpu_runnable() is already returning
+false due to a race (e.g. with pausing the vcpu).
+
+With core scheduling this can no longer work as not all vcpus of a
+schedule unit have to be "running" when being scheduled. So the vcpu's
+new runstate has to be selected at the same time as the runnability of
+the related schedule unit is probed.
+
+For this purpose introduce a new helper unit_runnable_state() which
+will save the new runstate of all tested vcpus in a new field of the
+vcpu struct.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+ xen/common/domain.c         |  1 +
+ xen/common/sched_arinc653.c |  2 +-
+ xen/common/sched_credit.c   | 49 ++++++++++++++++++++-----------------
+ xen/common/sched_credit2.c  |  7 +++---
+ xen/common/sched_null.c     |  3 ++-
+ xen/common/sched_rt.c       |  8 +++++-
+ xen/common/schedule.c       |  2 +-
+ xen/include/xen/sched-if.h  | 30 +++++++++++++++++++++++
+ xen/include/xen/sched.h     |  1 +
+ 9 files changed, 73 insertions(+), 30 deletions(-)
+
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index 601da28c9c..a9882509ed 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -157,6 +157,7 @@ struct vcpu *vcpu_create(struct domain *d, unsigned int vcpu_id)
+     if ( is_idle_domain(d) )
+     {
+         v->runstate.state = RUNSTATE_running;
++        v->new_state = RUNSTATE_running;
+     }
+     else
+     {
+diff --git a/xen/common/sched_arinc653.c b/xen/common/sched_arinc653.c
+index fcf81db19a..dd5876eacd 100644
+--- a/xen/common/sched_arinc653.c
++++ b/xen/common/sched_arinc653.c
+@@ -563,7 +563,7 @@ a653sched_do_schedule(
+     if ( !((new_task != NULL)
+            && (AUNIT(new_task) != NULL)
+            && AUNIT(new_task)->awake
+-           && unit_runnable(new_task)) )
++           && unit_runnable_state(new_task)) )
+         new_task = IDLETASK(cpu);
+     BUG_ON(new_task == NULL);
+ 
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index 299eff21ac..00beac3ea4 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -1894,7 +1894,7 @@ static void csched_schedule(
+     if ( !test_bit(CSCHED_FLAG_UNIT_YIELD, &scurr->flags)
+          && !tasklet_work_scheduled
+          && prv->ratelimit
+-         && unit_runnable(unit)
++         && unit_runnable_state(unit)
+          && !is_idle_unit(unit)
+          && runtime < prv->ratelimit )
+     {
+@@ -1939,33 +1939,36 @@ static void csched_schedule(
+         dec_nr_runnable(sched_cpu);
+     }
+ 
+-    snext = __runq_elem(runq->next);
+-
+-    /* Tasklet work (which runs in idle UNIT context) overrides all else. */
+-    if ( tasklet_work_scheduled )
+-    {
+-        TRACE_0D(TRC_CSCHED_SCHED_TASKLET);
+-        snext = CSCHED_UNIT(sched_idle_unit(sched_cpu));
+-        snext->pri = CSCHED_PRI_TS_BOOST;
+-    }
+-
+     /*
+      * Clear YIELD flag before scheduling out
+      */
+     clear_bit(CSCHED_FLAG_UNIT_YIELD, &scurr->flags);
+ 
+-    /*
+-     * SMP Load balance:
+-     *
+-     * If the next highest priority local runnable UNIT has already eaten
+-     * through its credits, look on other PCPUs to see if we have more
+-     * urgent work... If not, csched_load_balance() will return snext, but
+-     * already removed from the runq.
+-     */
+-    if ( snext->pri > CSCHED_PRI_TS_OVER )
+-        __runq_remove(snext);
+-    else
+-        snext = csched_load_balance(prv, sched_cpu, snext, &migrated);
++    do {
++        snext = __runq_elem(runq->next);
++
++        /* Tasklet work (which runs in idle UNIT context) overrides all else. */
++        if ( tasklet_work_scheduled )
++        {
++            TRACE_0D(TRC_CSCHED_SCHED_TASKLET);
++            snext = CSCHED_UNIT(sched_idle_unit(sched_cpu));
++            snext->pri = CSCHED_PRI_TS_BOOST;
++        }
++
++        /*
++         * SMP Load balance:
++         *
++         * If the next highest priority local runnable UNIT has already eaten
++         * through its credits, look on other PCPUs to see if we have more
++         * urgent work... If not, csched_load_balance() will return snext, but
++         * already removed from the runq.
++         */
++        if ( snext->pri > CSCHED_PRI_TS_OVER )
++            __runq_remove(snext);
++        else
++            snext = csched_load_balance(prv, sched_cpu, snext, &migrated);
++
++    } while ( !unit_runnable_state(snext->unit) );
+ 
+     /*
+      * Update idlers mask if necessary. When we're idling, other CPUs
+diff --git a/xen/common/sched_credit2.c b/xen/common/sched_credit2.c
+index 87d142bbe4..0e29e56d5a 100644
+--- a/xen/common/sched_credit2.c
++++ b/xen/common/sched_credit2.c
+@@ -3291,7 +3291,7 @@ runq_candidate(struct csched2_runqueue_data *rqd,
+      * In fact, it may be the case that scurr is about to spin, and there's
+      * no point forcing it to do so until rate limiting expires.
+      */
+-    if ( !yield && prv->ratelimit_us && unit_runnable(scurr->unit) &&
++    if ( !yield && prv->ratelimit_us && unit_runnable_state(scurr->unit) &&
+          (now - scurr->unit->state_entry_time) < MICROSECS(prv->ratelimit_us) )
+     {
+         if ( unlikely(tb_init_done) )
+@@ -3345,7 +3345,7 @@ runq_candidate(struct csched2_runqueue_data *rqd,
+      *
+      * Of course, we also default to idle also if scurr is not runnable.
+      */
+-    if ( unit_runnable(scurr->unit) && !soft_aff_preempt )
++    if ( unit_runnable_state(scurr->unit) && !soft_aff_preempt )
+         snext = scurr;
+     else
+         snext = csched2_unit(sched_idle_unit(cpu));
+@@ -3405,7 +3405,8 @@ runq_candidate(struct csched2_runqueue_data *rqd,
+          * some budget, then choose it.
+          */
+         if ( (yield || svc->credit > snext->credit) &&
+-             (!has_cap(svc) || unit_grab_budget(svc)) )
++             (!has_cap(svc) || unit_grab_budget(svc)) &&
++             unit_runnable_state(svc->unit) )
+             snext = svc;
+ 
+         /* In any case, if we got this far, break. */
+diff --git a/xen/common/sched_null.c b/xen/common/sched_null.c
+index 80a7d45935..3dde1dcd00 100644
+--- a/xen/common/sched_null.c
++++ b/xen/common/sched_null.c
+@@ -864,7 +864,8 @@ static void null_schedule(const struct scheduler *ops, struct sched_unit *prev,
+             cpumask_set_cpu(sched_cpu, &prv->cpus_free);
+     }
+ 
+-    if ( unlikely(prev->next_task == NULL || !unit_runnable(prev->next_task)) )
++    if ( unlikely(prev->next_task == NULL ||
++                  !unit_runnable_state(prev->next_task)) )
+         prev->next_task = sched_idle_unit(sched_cpu);
+ 
+     NULL_UNIT_CHECK(prev->next_task);
+diff --git a/xen/common/sched_rt.c b/xen/common/sched_rt.c
+index cfd7d334fa..fd882f2ca4 100644
+--- a/xen/common/sched_rt.c
++++ b/xen/common/sched_rt.c
+@@ -1092,12 +1092,18 @@ rt_schedule(const struct scheduler *ops, struct sched_unit *currunit,
+     else
+     {
+         snext = runq_pick(ops, cpumask_of(sched_cpu));
++
+         if ( snext == NULL )
+             snext = rt_unit(sched_idle_unit(sched_cpu));
++        else if ( !unit_runnable_state(snext->unit) )
++        {
++            q_remove(snext);
++            snext = rt_unit(sched_idle_unit(sched_cpu));
++        }
+ 
+         /* if scurr has higher priority and budget, still pick scurr */
+         if ( !is_idle_unit(currunit) &&
+-             unit_runnable(currunit) &&
++             unit_runnable_state(currunit) &&
+              scurr->cur_budget > 0 &&
+              ( is_idle_unit(snext->unit) ||
+                compare_unit_priority(scurr, snext) > 0 ) )
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index ff67fb3633..9c1b044b49 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -280,7 +280,7 @@ static inline void sched_unit_runstate_change(struct sched_unit *unit,
+     for_each_sched_unit_vcpu ( unit, v )
+     {
+         if ( running )
+-            vcpu_runstate_change(v, RUNSTATE_running, new_entry_time);
++            vcpu_runstate_change(v, v->new_state, new_entry_time);
+         else
+             vcpu_runstate_change(v,
+                 ((v->pause_flags & VPF_blocked) ? RUNSTATE_blocked :
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index c65dfa943b..7e568a9d9f 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -93,6 +93,36 @@ static inline bool unit_runnable(const struct sched_unit *unit)
+     return false;
+ }
+ 
++/*
++ * Returns whether a sched_unit is runnable and sets new_state for each of its
++ * vcpus. It is mandatory to determine the new runstate for all vcpus of a unit
++ * without dropping the schedule lock (which happens when synchronizing the
++ * context switch of the vcpus of a unit) in order to avoid races with e.g.
++ * vcpu_sleep().
++ */
++static inline bool unit_runnable_state(const struct sched_unit *unit)
++{
++    struct vcpu *v;
++    bool runnable, ret = false;
++
++    if ( is_idle_unit(unit) )
++        return true;
++
++    for_each_sched_unit_vcpu ( unit, v )
++    {
++        runnable = vcpu_runnable(v);
++
++        v->new_state = runnable ? RUNSTATE_running
++                                : (v->pause_flags & VPF_blocked)
++                                  ? RUNSTATE_blocked : RUNSTATE_offline;
++
++        if ( runnable )
++            ret = true;
++    }
++
++    return ret;
++}
++
+ static inline void sched_set_res(struct sched_unit *unit,
+                                  struct sched_resource *res)
+ {
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index c770ab4aa0..12f00cd78d 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -174,6 +174,7 @@ struct vcpu
+         XEN_GUEST_HANDLE(vcpu_runstate_info_compat_t) compat;
+     } runstate_guest; /* guest address */
+ #endif
++    unsigned int     new_state;
+ 
+     /* Has the FPU been initialised? */
+     bool             fpu_initialised;
+-- 
+2.17.1
+

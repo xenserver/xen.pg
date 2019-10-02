@@ -1,0 +1,437 @@
+From 6b9cb4bc2e8322f4e20459878f29ba737bd03acd Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 27 Sep 2019 08:22:56 +0200
+Subject: [PATCH 04/19] xen/sched: modify cpupool_domain_cpumask() to be an
+ unit mask
+
+cpupool_domain_cpumask() is used by scheduling to select cpus or to
+iterate over cpus. In order to support scheduling units spanning
+multiple cpus rename cpupool_domain_cpumask() to
+cpupool_domain_master_cpumask() and let it return a cpumask with only
+one bit set per scheduling resource.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+---
+ xen/common/cpupool.c        | 27 ++++++++++++++++++---------
+ xen/common/domain.c         |  2 +-
+ xen/common/domctl.c         |  2 +-
+ xen/common/sched_arinc653.c |  2 +-
+ xen/common/sched_credit.c   |  4 ++--
+ xen/common/sched_credit2.c  | 22 +++++++++++-----------
+ xen/common/sched_null.c     |  8 ++++----
+ xen/common/sched_rt.c       |  8 ++++----
+ xen/common/schedule.c       | 13 +++++++------
+ xen/include/xen/sched-if.h  |  9 ++++++---
+ 10 files changed, 55 insertions(+), 42 deletions(-)
+
+diff --git a/xen/common/cpupool.c b/xen/common/cpupool.c
+index fd30040922..441a26f16c 100644
+--- a/xen/common/cpupool.c
++++ b/xen/common/cpupool.c
+@@ -36,26 +36,33 @@ static DEFINE_SPINLOCK(cpupool_lock);
+ 
+ DEFINE_PER_CPU(struct cpupool *, cpupool);
+ 
++static void free_cpupool_struct(struct cpupool *c)
++{
++    if ( c )
++    {
++        free_cpumask_var(c->res_valid);
++        free_cpumask_var(c->cpu_valid);
++    }
++    xfree(c);
++}
++
+ static struct cpupool *alloc_cpupool_struct(void)
+ {
+     struct cpupool *c = xzalloc(struct cpupool);
+ 
+-    if ( !c || !zalloc_cpumask_var(&c->cpu_valid) )
++    if ( !c )
++        return NULL;
++
++    if ( !zalloc_cpumask_var(&c->cpu_valid) ||
++         !zalloc_cpumask_var(&c->res_valid) )
+     {
+-        xfree(c);
++        free_cpupool_struct(c);
+         c = NULL;
+     }
+ 
+     return c;
+ }
+ 
+-static void free_cpupool_struct(struct cpupool *c)
+-{
+-    if ( c )
+-        free_cpumask_var(c->cpu_valid);
+-    xfree(c);
+-}
+-
+ /*
+  * find a cpupool by it's id. to be called with cpupool lock held
+  * if exact is not specified, the first cpupool with an id larger or equal to
+@@ -269,6 +276,7 @@ static int cpupool_assign_cpu_locked(struct cpupool *c, unsigned int cpu)
+         cpupool_cpu_moving = NULL;
+     }
+     cpumask_set_cpu(cpu, c->cpu_valid);
++    cpumask_and(c->res_valid, c->cpu_valid, sched_res_mask);
+ 
+     rcu_read_lock(&domlist_read_lock);
+     for_each_domain_in_cpupool(d, c)
+@@ -361,6 +369,7 @@ static int cpupool_unassign_cpu_start(struct cpupool *c, unsigned int cpu)
+     atomic_inc(&c->refcnt);
+     cpupool_cpu_moving = c;
+     cpumask_clear_cpu(cpu, c->cpu_valid);
++    cpumask_and(c->res_valid, c->cpu_valid, sched_res_mask);
+ 
+ out:
+     spin_unlock(&cpupool_lock);
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index 93aa856bcb..9c7360ed2a 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -584,7 +584,7 @@ void domain_update_node_affinity(struct domain *d)
+         return;
+     }
+ 
+-    online = cpupool_domain_cpumask(d);
++    online = cpupool_domain_master_cpumask(d);
+ 
+     spin_lock(&d->node_affinity_lock);
+ 
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 8a694e0d37..d597a09f98 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -619,7 +619,7 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+         if ( op->cmd == XEN_DOMCTL_setvcpuaffinity )
+         {
+             cpumask_var_t new_affinity, old_affinity;
+-            cpumask_t *online = cpupool_domain_cpumask(v->domain);
++            cpumask_t *online = cpupool_domain_master_cpumask(v->domain);
+ 
+             /*
+              * We want to be able to restore hard affinity if we are trying
+diff --git a/xen/common/sched_arinc653.c b/xen/common/sched_arinc653.c
+index dd5876eacd..45c05c6cd9 100644
+--- a/xen/common/sched_arinc653.c
++++ b/xen/common/sched_arinc653.c
+@@ -614,7 +614,7 @@ a653sched_pick_resource(const struct scheduler *ops,
+      * If present, prefer unit's current processor, else
+      * just find the first valid unit.
+      */
+-    online = cpupool_domain_cpumask(unit->domain);
++    online = cpupool_domain_master_cpumask(unit->domain);
+ 
+     cpu = cpumask_first(online);
+ 
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index 00beac3ea4..a6dff8ec62 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -361,7 +361,7 @@ static inline void __runq_tickle(struct csched_unit *new)
+     ASSERT(cur);
+     cpumask_clear(&mask);
+ 
+-    online = cpupool_domain_cpumask(new->sdom->dom);
++    online = cpupool_domain_master_cpumask(new->sdom->dom);
+     cpumask_and(&idle_mask, prv->idlers, online);
+     idlers_empty = cpumask_empty(&idle_mask);
+ 
+@@ -724,7 +724,7 @@ _csched_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit,
+     /* We must always use cpu's scratch space */
+     cpumask_t *cpus = cpumask_scratch_cpu(cpu);
+     cpumask_t idlers;
+-    cpumask_t *online = cpupool_domain_cpumask(unit->domain);
++    cpumask_t *online = cpupool_domain_master_cpumask(unit->domain);
+     struct csched_pcpu *spc = NULL;
+     int balance_step;
+ 
+diff --git a/xen/common/sched_credit2.c b/xen/common/sched_credit2.c
+index 0e29e56d5a..d51df05887 100644
+--- a/xen/common/sched_credit2.c
++++ b/xen/common/sched_credit2.c
+@@ -705,7 +705,7 @@ static int get_fallback_cpu(struct csched2_unit *svc)
+ 
+         affinity_balance_cpumask(unit, bs, cpumask_scratch_cpu(cpu));
+         cpumask_and(cpumask_scratch_cpu(cpu), cpumask_scratch_cpu(cpu),
+-                    cpupool_domain_cpumask(unit->domain));
++                    cpupool_domain_master_cpumask(unit->domain));
+ 
+         /*
+          * This is cases 1 or 3 (depending on bs): if processor is (still)
+@@ -1440,7 +1440,7 @@ runq_tickle(const struct scheduler *ops, struct csched2_unit *new, s_time_t now)
+     struct sched_unit *unit = new->unit;
+     unsigned int bs, cpu = sched_unit_master(unit);
+     struct csched2_runqueue_data *rqd = c2rqd(ops, cpu);
+-    cpumask_t *online = cpupool_domain_cpumask(unit->domain);
++    cpumask_t *online = cpupool_domain_master_cpumask(unit->domain);
+     cpumask_t mask;
+ 
+     ASSERT(new->rqd == rqd);
+@@ -2243,7 +2243,7 @@ csched2_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+     }
+ 
+     cpumask_and(cpumask_scratch_cpu(cpu), unit->cpu_hard_affinity,
+-                cpupool_domain_cpumask(unit->domain));
++                cpupool_domain_master_cpumask(unit->domain));
+ 
+     /*
+      * First check to see if we're here because someone else suggested a place
+@@ -2358,8 +2358,8 @@ csched2_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+          * ok because:
+          * - we know that unit->cpu_hard_affinity and ->cpu_soft_affinity have
+          *   a non-empty intersection (because has_soft is true);
+-         * - we have unit->cpu_hard_affinity & cpupool_domain_cpumask() already
+-         *   in cpumask_scratch, we do save a lot doing like this.
++         * - we have unit->cpu_hard_affinity & cpupool_domain_master_cpumask()
++         *   already in cpumask_scratch, we do save a lot doing like this.
+          *
+          * It's kind of like open coding affinity_balance_cpumask() but, in
+          * this specific case, calling that would mean a lot of (unnecessary)
+@@ -2378,7 +2378,7 @@ csched2_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+          * affinity, so go for it.
+          *
+          * cpumask_scratch already has unit->cpu_hard_affinity &
+-         * cpupool_domain_cpumask() in it, so it's enough that we filter
++         * cpupool_domain_master_cpumask() in it, so it's enough that we filter
+          * with the cpus of the runq.
+          */
+         cpumask_and(cpumask_scratch_cpu(cpu), cpumask_scratch_cpu(cpu),
+@@ -2513,7 +2513,7 @@ static void migrate(const struct scheduler *ops,
+         _runq_deassign(svc);
+ 
+         cpumask_and(cpumask_scratch_cpu(cpu), unit->cpu_hard_affinity,
+-                    cpupool_domain_cpumask(unit->domain));
++                    cpupool_domain_master_cpumask(unit->domain));
+         cpumask_and(cpumask_scratch_cpu(cpu), cpumask_scratch_cpu(cpu),
+                     &trqd->active);
+         sched_set_res(unit,
+@@ -2547,7 +2547,7 @@ static bool unit_is_migrateable(struct csched2_unit *svc,
+     int cpu = sched_unit_master(unit);
+ 
+     cpumask_and(cpumask_scratch_cpu(cpu), unit->cpu_hard_affinity,
+-                cpupool_domain_cpumask(unit->domain));
++                cpupool_domain_master_cpumask(unit->domain));
+ 
+     return !(svc->flags & CSFLAG_runq_migrate_request) &&
+            cpumask_intersects(cpumask_scratch_cpu(cpu), &rqd->active);
+@@ -2763,7 +2763,7 @@ csched2_unit_migrate(
+      * v->processor will be chosen, and during actual domain unpause that
+      * the unit will be assigned to and added to the proper runqueue.
+      */
+-    if ( unlikely(!cpumask_test_cpu(new_cpu, cpupool_domain_cpumask(d))) )
++    if ( unlikely(!cpumask_test_cpu(new_cpu, cpupool_domain_master_cpumask(d))) )
+     {
+         ASSERT(system_state == SYS_STATE_suspend);
+         if ( unit_on_runq(svc) )
+@@ -3069,7 +3069,7 @@ csched2_alloc_domdata(const struct scheduler *ops, struct domain *dom)
+     sdom->nr_units = 0;
+ 
+     init_timer(&sdom->repl_timer, replenish_domain_budget, sdom,
+-               cpumask_any(cpupool_domain_cpumask(dom)));
++               cpumask_any(cpupool_domain_master_cpumask(dom)));
+     spin_lock_init(&sdom->budget_lock);
+     INIT_LIST_HEAD(&sdom->parked_units);
+ 
+@@ -3317,7 +3317,7 @@ runq_candidate(struct csched2_runqueue_data *rqd,
+                                  cpumask_scratch);
+         if ( unlikely(!cpumask_test_cpu(cpu, cpumask_scratch)) )
+         {
+-            cpumask_t *online = cpupool_domain_cpumask(scurr->unit->domain);
++            cpumask_t *online = cpupool_domain_master_cpumask(scurr->unit->domain);
+ 
+             /* Ok, is any of the pcpus in scurr soft-affinity idle? */
+             cpumask_and(cpumask_scratch, cpumask_scratch, &rqd->idle);
+diff --git a/xen/common/sched_null.c b/xen/common/sched_null.c
+index 3dde1dcd00..2525464a7c 100644
+--- a/xen/common/sched_null.c
++++ b/xen/common/sched_null.c
+@@ -125,7 +125,7 @@ static inline bool unit_check_affinity(struct sched_unit *unit,
+ {
+     affinity_balance_cpumask(unit, balance_step, cpumask_scratch_cpu(cpu));
+     cpumask_and(cpumask_scratch_cpu(cpu), cpumask_scratch_cpu(cpu),
+-                cpupool_domain_cpumask(unit->domain));
++                cpupool_domain_master_cpumask(unit->domain));
+ 
+     return cpumask_test_cpu(cpu, cpumask_scratch_cpu(cpu));
+ }
+@@ -266,7 +266,7 @@ pick_res(struct null_private *prv, const struct sched_unit *unit)
+ {
+     unsigned int bs;
+     unsigned int cpu = sched_unit_master(unit), new_cpu;
+-    cpumask_t *cpus = cpupool_domain_cpumask(unit->domain);
++    cpumask_t *cpus = cpupool_domain_master_cpumask(unit->domain);
+ 
+     ASSERT(spin_is_locked(get_sched_res(cpu)->schedule_lock));
+ 
+@@ -467,7 +467,7 @@ static void null_unit_insert(const struct scheduler *ops,
+     lock = unit_schedule_lock(unit);
+ 
+     cpumask_and(cpumask_scratch_cpu(cpu), unit->cpu_hard_affinity,
+-                cpupool_domain_cpumask(unit->domain));
++                cpupool_domain_master_cpumask(unit->domain));
+ 
+     /* If the pCPU is free, we assign unit to it */
+     if ( likely(per_cpu(npc, cpu).unit == NULL) )
+@@ -579,7 +579,7 @@ static void null_unit_wake(const struct scheduler *ops,
+         spin_unlock(&prv->waitq_lock);
+ 
+         cpumask_and(cpumask_scratch_cpu(cpu), unit->cpu_hard_affinity,
+-                    cpupool_domain_cpumask(unit->domain));
++                    cpupool_domain_master_cpumask(unit->domain));
+ 
+         if ( !cpumask_intersects(&prv->cpus_free, cpumask_scratch_cpu(cpu)) )
+         {
+diff --git a/xen/common/sched_rt.c b/xen/common/sched_rt.c
+index fd882f2ca4..d21c416cae 100644
+--- a/xen/common/sched_rt.c
++++ b/xen/common/sched_rt.c
+@@ -326,7 +326,7 @@ rt_dump_unit(const struct scheduler *ops, const struct rt_unit *svc)
+      */
+     mask = cpumask_scratch_cpu(sched_unit_master(svc->unit));
+ 
+-    cpupool_mask = cpupool_domain_cpumask(svc->unit->domain);
++    cpupool_mask = cpupool_domain_master_cpumask(svc->unit->domain);
+     cpumask_and(mask, cpupool_mask, svc->unit->cpu_hard_affinity);
+     printk("[%5d.%-2u] cpu %u, (%"PRI_stime", %"PRI_stime"),"
+            " cur_b=%"PRI_stime" cur_d=%"PRI_stime" last_start=%"PRI_stime"\n"
+@@ -642,7 +642,7 @@ rt_res_pick(const struct scheduler *ops, const struct sched_unit *unit)
+     cpumask_t *online;
+     int cpu;
+ 
+-    online = cpupool_domain_cpumask(unit->domain);
++    online = cpupool_domain_master_cpumask(unit->domain);
+     cpumask_and(&cpus, online, unit->cpu_hard_affinity);
+ 
+     cpu = cpumask_test_cpu(sched_unit_master(unit), &cpus)
+@@ -1016,7 +1016,7 @@ runq_pick(const struct scheduler *ops, const cpumask_t *mask)
+         iter_svc = q_elem(iter);
+ 
+         /* mask cpu_hard_affinity & cpupool & mask */
+-        online = cpupool_domain_cpumask(iter_svc->unit->domain);
++        online = cpupool_domain_master_cpumask(iter_svc->unit->domain);
+         cpumask_and(&cpu_common, online, iter_svc->unit->cpu_hard_affinity);
+         cpumask_and(&cpu_common, mask, &cpu_common);
+         if ( cpumask_empty(&cpu_common) )
+@@ -1191,7 +1191,7 @@ runq_tickle(const struct scheduler *ops, struct rt_unit *new)
+     if ( new == NULL || is_idle_unit(new->unit) )
+         return;
+ 
+-    online = cpupool_domain_cpumask(new->unit->domain);
++    online = cpupool_domain_master_cpumask(new->unit->domain);
+     cpumask_and(&not_tickled, online, new->unit->cpu_hard_affinity);
+     cpumask_andnot(&not_tickled, &not_tickled, &prv->tickled);
+ 
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 3094ff6838..36b1d3df6e 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -63,6 +63,7 @@ integer_param("sched_ratelimit_us", sched_ratelimit_us);
+ 
+ /* Number of vcpus per struct sched_unit. */
+ static unsigned int __read_mostly sched_granularity = 1;
++const cpumask_t *sched_res_mask = &cpumask_all;
+ 
+ /* Common lock for free cpus. */
+ static DEFINE_SPINLOCK(sched_free_cpu_lock);
+@@ -188,7 +189,7 @@ static inline struct scheduler *vcpu_scheduler(const struct vcpu *v)
+ {
+     return unit_scheduler(v->sched_unit);
+ }
+-#define VCPU2ONLINE(_v) cpupool_domain_cpumask((_v)->domain)
++#define VCPU2ONLINE(_v) cpupool_domain_master_cpumask((_v)->domain)
+ 
+ static inline void trace_runstate_change(struct vcpu *v, int new_state)
+ {
+@@ -425,9 +426,9 @@ static unsigned int sched_select_initial_cpu(const struct vcpu *v)
+     cpumask_clear(cpus);
+     for_each_node_mask ( node, d->node_affinity )
+         cpumask_or(cpus, cpus, &node_to_cpumask(node));
+-    cpumask_and(cpus, cpus, cpupool_domain_cpumask(d));
++    cpumask_and(cpus, cpus, d->cpupool->cpu_valid);
+     if ( cpumask_empty(cpus) )
+-        cpumask_copy(cpus, cpupool_domain_cpumask(d));
++        cpumask_copy(cpus, d->cpupool->cpu_valid);
+ 
+     if ( v->vcpu_id == 0 )
+         cpu_ret = cpumask_first(cpus);
+@@ -973,7 +974,7 @@ void restore_vcpu_affinity(struct domain *d)
+         lock = unit_schedule_lock_irq(unit);
+ 
+         cpumask_and(cpumask_scratch_cpu(cpu), unit->cpu_hard_affinity,
+-                    cpupool_domain_cpumask(d));
++                    cpupool_domain_master_cpumask(d));
+         if ( cpumask_empty(cpumask_scratch_cpu(cpu)) )
+         {
+             if ( sched_check_affinity_broken(unit) )
+@@ -981,7 +982,7 @@ void restore_vcpu_affinity(struct domain *d)
+                 sched_set_affinity(unit, unit->cpu_hard_affinity_saved, NULL);
+                 sched_reset_affinity_broken(unit);
+                 cpumask_and(cpumask_scratch_cpu(cpu), unit->cpu_hard_affinity,
+-                            cpupool_domain_cpumask(d));
++                            cpupool_domain_master_cpumask(d));
+             }
+ 
+             if ( cpumask_empty(cpumask_scratch_cpu(cpu)) )
+@@ -991,7 +992,7 @@ void restore_vcpu_affinity(struct domain *d)
+                        unit->vcpu_list);
+                 sched_set_affinity(unit, &cpumask_all, NULL);
+                 cpumask_and(cpumask_scratch_cpu(cpu), unit->cpu_hard_affinity,
+-                            cpupool_domain_cpumask(d));
++                            cpupool_domain_master_cpumask(d));
+             }
+         }
+ 
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index 983f2ece83..1b296b150f 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -22,6 +22,8 @@ extern cpumask_t cpupool_free_cpus;
+ #define SCHED_DEFAULT_RATELIMIT_US 1000
+ extern int sched_ratelimit_us;
+ 
++/* Scheduling resource mask. */
++extern const cpumask_t *sched_res_mask;
+ 
+ /*
+  * In order to allow a scheduler to remap the lock->cpu mapping,
+@@ -535,6 +537,7 @@ struct cpupool
+     int              cpupool_id;
+     unsigned int     n_dom;
+     cpumask_var_t    cpu_valid;      /* all cpus assigned to pool */
++    cpumask_var_t    res_valid;      /* all scheduling resources of pool */
+     struct cpupool   *next;
+     struct scheduler *sched;
+     atomic_t         refcnt;
+@@ -543,14 +546,14 @@ struct cpupool
+ #define cpupool_online_cpumask(_pool) \
+     (((_pool) == NULL) ? &cpu_online_map : (_pool)->cpu_valid)
+ 
+-static inline cpumask_t *cpupool_domain_cpumask(const struct domain *d)
++static inline cpumask_t *cpupool_domain_master_cpumask(const struct domain *d)
+ {
+     /*
+      * d->cpupool is NULL only for the idle domain, and no one should
+      * be interested in calling this for the idle domain.
+      */
+     ASSERT(d->cpupool != NULL);
+-    return d->cpupool->cpu_valid;
++    return d->cpupool->res_valid;
+ }
+ 
+ /*
+@@ -590,7 +593,7 @@ static inline cpumask_t *cpupool_domain_cpumask(const struct domain *d)
+ static inline int has_soft_affinity(const struct sched_unit *unit)
+ {
+     return unit->soft_aff_effective &&
+-           !cpumask_subset(cpupool_domain_cpumask(unit->domain),
++           !cpumask_subset(cpupool_domain_master_cpumask(unit->domain),
+                            unit->cpu_soft_affinity);
+ }
+ 
+-- 
+2.17.1
+

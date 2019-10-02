@@ -1,0 +1,225 @@
+From d36af322e5d18ef7bbd1ac8594e78911176d70b6 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 27 Sep 2019 08:22:57 +0200
+Subject: [PATCH 12/19] xen/sched: prepare per-cpupool scheduling granularity
+
+On- and offlining cpus with core scheduling is rather complicated as
+the cpus are taken on- or offline one by one, but scheduling wants them
+rather to be handled per core.
+
+As the future plan is to be able to select scheduling granularity per
+cpupool prepare that by storing the granularity in struct
+sched_resource (we need it there for free cpus which are not
+associated to any cpupool). Free cpus will always use granularity 1.
+
+Store the selected granularity option (cpu, core or socket) in the
+cpupool , as we will need it to select the appropriate cpu mask when
+populating the cpupool with cpus.
+
+This will make on- and offlining of cpus much easier and avoids
+writing code which would needed to be thrown away later.
+
+Move the granularity related variables to cpupool.c as they are now
+used form there only.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+---
+ xen/common/cpupool.c       |  9 +++++++++
+ xen/common/schedule.c      | 27 ++++++++++++++++-----------
+ xen/include/xen/sched-if.h | 11 +++++++++++
+ 3 files changed, 36 insertions(+), 11 deletions(-)
+
+diff --git a/xen/common/cpupool.c b/xen/common/cpupool.c
+index 60a85f50e1..51f0ff0d88 100644
+--- a/xen/common/cpupool.c
++++ b/xen/common/cpupool.c
+@@ -34,6 +34,14 @@ static cpumask_t cpupool_locked_cpus;
+ 
+ static DEFINE_SPINLOCK(cpupool_lock);
+ 
++static enum sched_gran __read_mostly opt_sched_granularity = SCHED_GRAN_cpu;
++static unsigned int __read_mostly sched_granularity = 1;
++
++unsigned int cpupool_get_granularity(const struct cpupool *c)
++{
++    return c ? sched_granularity : 1;
++}
++
+ static void free_cpupool_struct(struct cpupool *c)
+ {
+     if ( c )
+@@ -173,6 +181,7 @@ static struct cpupool *cpupool_create(
+             return NULL;
+         }
+     }
++    c->gran = opt_sched_granularity;
+ 
+     *q = c;
+ 
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 0dcf004d78..5257225050 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -62,7 +62,6 @@ int sched_ratelimit_us = SCHED_DEFAULT_RATELIMIT_US;
+ integer_param("sched_ratelimit_us", sched_ratelimit_us);
+ 
+ /* Number of vcpus per struct sched_unit. */
+-static unsigned int __read_mostly sched_granularity = 1;
+ bool __read_mostly sched_disable_smt_switching;
+ const cpumask_t *sched_res_mask = &cpumask_all;
+ 
+@@ -435,10 +434,10 @@ static struct sched_unit *sched_alloc_unit(struct vcpu *v)
+ {
+     struct sched_unit *unit, **prev_unit;
+     struct domain *d = v->domain;
++    unsigned int gran = cpupool_get_granularity(d->cpupool);
+ 
+     for_each_sched_unit ( d, unit )
+-        if ( unit->unit_id / sched_granularity ==
+-             v->vcpu_id / sched_granularity )
++        if ( unit->unit_id / gran == v->vcpu_id / gran )
+             break;
+ 
+     if ( unit )
+@@ -593,6 +592,7 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+     void *unitdata;
+     struct scheduler *old_ops;
+     void *old_domdata;
++    unsigned int gran = cpupool_get_granularity(c);
+ 
+     for_each_vcpu ( d, v )
+     {
+@@ -604,8 +604,7 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+     if ( IS_ERR(domdata) )
+         return PTR_ERR(domdata);
+ 
+-    unit_priv = xzalloc_array(void *,
+-                              DIV_ROUND_UP(d->max_vcpus, sched_granularity));
++    unit_priv = xzalloc_array(void *, DIV_ROUND_UP(d->max_vcpus, gran));
+     if ( unit_priv == NULL )
+     {
+         sched_free_domdata(c->sched, domdata);
+@@ -1850,11 +1849,11 @@ static void sched_switch_units(struct sched_resource *sr,
+         if ( is_idle_unit(prev) )
+         {
+             prev->runstate_cnt[RUNSTATE_running] = 0;
+-            prev->runstate_cnt[RUNSTATE_runnable] = sched_granularity;
++            prev->runstate_cnt[RUNSTATE_runnable] = sr->granularity;
+         }
+         if ( is_idle_unit(next) )
+         {
+-            next->runstate_cnt[RUNSTATE_running] = sched_granularity;
++            next->runstate_cnt[RUNSTATE_running] = sr->granularity;
+             next->runstate_cnt[RUNSTATE_runnable] = 0;
+         }
+     }
+@@ -2003,7 +2002,7 @@ void sched_context_switched(struct vcpu *vprev, struct vcpu *vnext)
+     else
+     {
+         vcpu_context_saved(vprev, vnext);
+-        if ( sched_granularity == 1 )
++        if ( sr->granularity == 1 )
+             unit_context_saved(sr);
+     }
+ 
+@@ -2123,11 +2122,12 @@ static struct sched_unit *sched_wait_rendezvous_in(struct sched_unit *prev,
+ {
+     struct sched_unit *next;
+     struct vcpu *v;
++    unsigned int gran = get_sched_res(cpu)->granularity;
+ 
+     if ( !--prev->rendezvous_in_cnt )
+     {
+         next = do_schedule(prev, now, cpu);
+-        atomic_set(&next->rendezvous_out_cnt, sched_granularity + 1);
++        atomic_set(&next->rendezvous_out_cnt, gran + 1);
+         return next;
+     }
+ 
+@@ -2251,6 +2251,7 @@ static void schedule(void)
+     struct sched_resource *sr;
+     spinlock_t           *lock;
+     int cpu = smp_processor_id();
++    unsigned int          gran = get_sched_res(cpu)->granularity;
+ 
+     ASSERT_NOT_IN_ATOMIC();
+ 
+@@ -2276,11 +2277,11 @@ static void schedule(void)
+ 
+     now = NOW();
+ 
+-    if ( sched_granularity > 1 )
++    if ( gran > 1 )
+     {
+         cpumask_t mask;
+ 
+-        prev->rendezvous_in_cnt = sched_granularity;
++        prev->rendezvous_in_cnt = gran;
+         cpumask_andnot(&mask, sr->cpus, cpumask_of(cpu));
+         cpumask_raise_softirq(&mask, SCHED_SLAVE_SOFTIRQ);
+         next = sched_wait_rendezvous_in(prev, &lock, cpu, now);
+@@ -2348,6 +2349,9 @@ static int cpu_schedule_up(unsigned int cpu)
+     init_timer(&sr->s_timer, s_timer_fn, NULL, cpu);
+     atomic_set(&per_cpu(sched_urgent_count, cpu), 0);
+ 
++    /* We start with cpu granularity. */
++    sr->granularity = 1;
++
+     /* Boot CPU is dealt with later in scheduler_init(). */
+     if ( cpu == 0 )
+         return 0;
+@@ -2638,6 +2642,7 @@ int schedule_cpu_switch(unsigned int cpu, struct cpupool *c)
+     sched_free_udata(old_ops, vpriv_old);
+     sched_free_pdata(old_ops, ppriv_old, cpu);
+ 
++    get_sched_res(cpu)->granularity = cpupool_get_granularity(c);
+     get_sched_res(cpu)->cpupool = c;
+     /* When a cpu is added to a pool, trigger it to go pick up some work */
+     if ( c != NULL )
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index e675061290..f8f0f484cb 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -25,6 +25,13 @@ extern int sched_ratelimit_us;
+ /* Scheduling resource mask. */
+ extern const cpumask_t *sched_res_mask;
+ 
++/* Number of vcpus per struct sched_unit. */
++enum sched_gran {
++    SCHED_GRAN_cpu,
++    SCHED_GRAN_core,
++    SCHED_GRAN_socket
++};
++
+ /*
+  * In order to allow a scheduler to remap the lock->cpu mapping,
+  * we have a per-cpu pointer, along with a pre-allocated set of
+@@ -48,6 +55,7 @@ struct sched_resource {
+ 
+     /* Cpu with lowest id in scheduling resource. */
+     unsigned int        master_cpu;
++    unsigned int        granularity;
+     const cpumask_t    *cpus;           /* cpus covered by this struct     */
+ };
+ 
+@@ -546,6 +554,7 @@ struct cpupool
+     struct cpupool   *next;
+     struct scheduler *sched;
+     atomic_t         refcnt;
++    enum sched_gran  gran;
+ };
+ 
+ #define cpupool_online_cpumask(_pool) \
+@@ -561,6 +570,8 @@ static inline cpumask_t *cpupool_domain_master_cpumask(const struct domain *d)
+     return d->cpupool->res_valid;
+ }
+ 
++unsigned int cpupool_get_granularity(const struct cpupool *c);
++
+ /*
+  * Hard and soft affinity load balancing.
+  *
+-- 
+2.17.1
+

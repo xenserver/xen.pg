@@ -1,0 +1,112 @@
+From dfbfaa775290dd8937ce1dc49b8697a3cec39c6b Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 27 Sep 2019 08:22:56 +0200
+Subject: [PATCH 03/19] xen/sched: add support for multiple vcpus per sched
+ unit where missing
+
+In several places there is support for multiple vcpus per sched unit
+missing. Add that missing support (with the exception of initial
+allocation) and missing helpers for that.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+---
+ xen/common/domain.c        |  5 ++++-
+ xen/common/schedule.c      |  9 +++++----
+ xen/include/xen/sched-if.h | 16 +++++++++++++++-
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index a9882509ed..93aa856bcb 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -1273,7 +1273,10 @@ int vcpu_reset(struct vcpu *v)
+     v->async_exception_mask = 0;
+     memset(v->async_exception_state, 0, sizeof(v->async_exception_state));
+ #endif
+-    v->affinity_broken = 0;
++    if ( v->affinity_broken & VCPU_AFFINITY_OVERRIDE )
++        vcpu_temporary_affinity(v, NR_CPUS, VCPU_AFFINITY_OVERRIDE);
++    if ( v->affinity_broken & VCPU_AFFINITY_WAIT )
++        vcpu_temporary_affinity(v, NR_CPUS, VCPU_AFFINITY_WAIT);
+     clear_bit(_VPF_blocked, &v->pause_flags);
+     clear_bit(_VPF_in_reset, &v->pause_flags);
+ 
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 9c1b044b49..3094ff6838 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -252,8 +252,9 @@ static inline void vcpu_runstate_change(
+     s_time_t delta;
+     struct sched_unit *unit = v->sched_unit;
+ 
+-    ASSERT(v->runstate.state != new_state);
+     ASSERT(spin_is_locked(get_sched_res(v->processor)->schedule_lock));
++    if ( v->runstate.state == new_state )
++        return;
+ 
+     vcpu_urgent_count_update(v);
+ 
+@@ -1729,14 +1730,14 @@ static void sched_switch_units(struct sched_resource *sr,
+              (next->vcpu_list->runstate.state == RUNSTATE_runnable) ?
+              (now - next->state_entry_time) : 0, prev->next_time);
+ 
+-    ASSERT(prev->vcpu_list->runstate.state == RUNSTATE_running);
++    ASSERT(unit_running(prev));
+ 
+     TRACE_4D(TRC_SCHED_SWITCH, prev->domain->domain_id, prev->unit_id,
+              next->domain->domain_id, next->unit_id);
+ 
+     sched_unit_runstate_change(prev, false, now);
+ 
+-    ASSERT(next->vcpu_list->runstate.state != RUNSTATE_running);
++    ASSERT(!unit_running(next));
+     sched_unit_runstate_change(next, true, now);
+ 
+     /*
+@@ -1858,7 +1859,7 @@ void sched_context_switched(struct vcpu *vprev, struct vcpu *vnext)
+             while ( atomic_read(&next->rendezvous_out_cnt) )
+                 cpu_relax();
+     }
+-    else if ( vprev != vnext )
++    else if ( vprev != vnext && sched_granularity == 1 )
+         context_saved(vprev);
+ }
+ 
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index 7e568a9d9f..983f2ece83 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -81,6 +81,11 @@ static inline bool is_unit_online(const struct sched_unit *unit)
+     return false;
+ }
+ 
++static inline unsigned int unit_running(const struct sched_unit *unit)
++{
++    return unit->runstate_cnt[RUNSTATE_running];
++}
++
+ /* Returns true if at least one vcpu of the unit is runnable. */
+ static inline bool unit_runnable(const struct sched_unit *unit)
+ {
+@@ -126,7 +131,16 @@ static inline bool unit_runnable_state(const struct sched_unit *unit)
+ static inline void sched_set_res(struct sched_unit *unit,
+                                  struct sched_resource *res)
+ {
+-    unit->vcpu_list->processor = res->master_cpu;
++    unsigned int cpu = cpumask_first(res->cpus);
++    struct vcpu *v;
++
++    for_each_sched_unit_vcpu ( unit, v )
++    {
++        ASSERT(cpu < nr_cpu_ids);
++        v->processor = cpu;
++        cpu = cpumask_next(cpu, res->cpus);
++    }
++
+     unit->res = res;
+ }
+ 
+-- 
+2.17.1
+

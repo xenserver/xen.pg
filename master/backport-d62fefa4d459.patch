@@ -1,0 +1,266 @@
+From d62fefa4d45987375124dda276a099d3d5f896bb Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 27 Sep 2019 09:00:08 +0200
+Subject: xen/sched: introduce struct sched_resource
+
+Add a scheduling abstraction layer between physical processors and the
+schedulers by introducing a struct sched_resource. Each scheduler unit
+running is active on such a scheduler resource. For the time being
+there is one struct sched_resource per cpu, but in future there might
+be one for each core or socket only.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
+
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index 3f77cabc73..4b4d7021de 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -1026,6 +1026,7 @@ csched_unit_insert(const struct scheduler *ops, struct sched_unit *unit)
+     lock = vcpu_schedule_lock_irq(vc);
+ 
+     vc->processor = csched_cpu_pick(ops, unit);
++    unit->res = get_sched_res(vc->processor);
+ 
+     spin_unlock_irq(lock);
+ 
+@@ -1662,6 +1663,7 @@ csched_runq_steal(int peer_cpu, int cpu, int pri, int balance_step)
+             WARN_ON(vc->is_urgent);
+             runq_remove(speer);
+             vc->processor = cpu;
++            vc->sched_unit->res = get_sched_res(cpu);
+             /*
+              * speer will start executing directly on cpu, without having to
+              * go through runq_insert(). So we must update the runnable count
+diff --git a/xen/common/sched_credit2.c b/xen/common/sched_credit2.c
+index 7eb8330a31..2981d642b0 100644
+--- a/xen/common/sched_credit2.c
++++ b/xen/common/sched_credit2.c
+@@ -2520,6 +2520,7 @@ static void migrate(const struct scheduler *ops,
+                     &trqd->active);
+         svc->vcpu->processor = cpumask_cycle(trqd->pick_bias,
+                                              cpumask_scratch_cpu(cpu));
++        svc->vcpu->sched_unit->res = get_sched_res(svc->vcpu->processor);
+         trqd->pick_bias = svc->vcpu->processor;
+         ASSERT(svc->vcpu->processor < nr_cpu_ids);
+ 
+@@ -2775,6 +2776,7 @@ csched2_unit_migrate(
+         }
+         _runq_deassign(svc);
+         vc->processor = new_cpu;
++        unit->res = get_sched_res(new_cpu);
+         return;
+     }
+ 
+@@ -2795,7 +2797,10 @@ csched2_unit_migrate(
+     if ( trqd != svc->rqd )
+         migrate(ops, svc, trqd, now);
+     else
++    {
+         vc->processor = new_cpu;
++        unit->res = get_sched_res(new_cpu);
++    }
+ }
+ 
+ static int
+@@ -3120,6 +3125,7 @@ csched2_unit_insert(const struct scheduler *ops, struct sched_unit *unit)
+     lock = vcpu_schedule_lock_irq(vc);
+ 
+     vc->processor = csched2_cpu_pick(ops, unit);
++    unit->res = get_sched_res(vc->processor);
+ 
+     spin_unlock_irq(lock);
+ 
+@@ -3597,6 +3603,7 @@ csched2_schedule(
+         {
+             snext->credit += CSCHED2_MIGRATE_COMPENSATION;
+             snext->vcpu->processor = cpu;
++            snext->vcpu->sched_unit->res = get_sched_res(cpu);
+             SCHED_STAT_CRANK(migrated);
+             ret.migrated = 1;
+         }
+diff --git a/xen/common/sched_null.c b/xen/common/sched_null.c
+index 48ee5ad0b8..cb5e1b52db 100644
+--- a/xen/common/sched_null.c
++++ b/xen/common/sched_null.c
+@@ -337,6 +337,7 @@ static void vcpu_assign(struct null_private *prv, struct vcpu *v,
+ 
+     per_cpu(npc, cpu).vcpu = v;
+     v->processor = cpu;
++    v->sched_unit->res = get_sched_res(cpu);
+     cpumask_clear_cpu(cpu, &prv->cpus_free);
+ 
+     dprintk(XENLOG_G_INFO, "%d <-- %pv\n", cpu, v);
+@@ -457,6 +458,7 @@ static void null_unit_insert(const struct scheduler *ops,
+ 
+  retry:
+     cpu = v->processor = pick_cpu(prv, v);
++    unit->res = get_sched_res(cpu);
+ 
+     spin_unlock(lock);
+ 
+@@ -749,6 +751,7 @@ static void null_unit_migrate(const struct scheduler *ops,
+      */
+  out:
+     v->processor = new_cpu;
++    unit->res = get_sched_res(new_cpu);
+ }
+ 
+ #ifndef NDEBUG
+diff --git a/xen/common/sched_rt.c b/xen/common/sched_rt.c
+index 4547f55eda..01e95f3276 100644
+--- a/xen/common/sched_rt.c
++++ b/xen/common/sched_rt.c
+@@ -893,6 +893,7 @@ rt_unit_insert(const struct scheduler *ops, struct sched_unit *unit)
+ 
+     /* This is safe because vc isn't yet being scheduled */
+     vc->processor = rt_cpu_pick(ops, unit);
++    unit->res = get_sched_res(vc->processor);
+ 
+     lock = vcpu_schedule_lock_irq(vc);
+ 
+@@ -1123,6 +1124,7 @@ rt_schedule(const struct scheduler *ops, s_time_t now, bool_t tasklet_work_sched
+         if ( snext->vcpu->processor != cpu )
+         {
+             snext->vcpu->processor = cpu;
++            snext->vcpu->sched_unit->res = get_sched_res(cpu);
+             ret.migrated = 1;
+         }
+         ret.time = snext->cur_budget; /* invoke the scheduler next time */
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index d34b789a8f..774f127d88 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -67,6 +67,7 @@ static void poll_timer_fn(void *data);
+ /* This is global for now so that private implementations can reach it */
+ DEFINE_PER_CPU(struct schedule_data, schedule_data);
+ DEFINE_PER_CPU(struct scheduler *, scheduler);
++DEFINE_PER_CPU_READ_MOSTLY(struct sched_resource *, sched_res);
+ 
+ /* Scratch space for cpumasks. */
+ DEFINE_PER_CPU(cpumask_t, cpumask_scratch);
+@@ -89,7 +90,7 @@ sched_idle_switch_sched(struct scheduler *new_ops, unsigned int cpu,
+ static int
+ sched_idle_cpu_pick(const struct scheduler *ops, const struct sched_unit *unit)
+ {
+-    return unit->vcpu_list->processor;
++    return unit->res->master_cpu;
+ }
+ 
+ static void *
+@@ -364,6 +365,7 @@ int sched_init_vcpu(struct vcpu *v, unsigned int processor)
+     if ( (unit = sched_alloc_unit(v)) == NULL )
+         return 1;
+ 
++    unit->res = get_sched_res(processor);
+     /* Initialise the per-vcpu timers. */
+     spin_lock_init(&v->periodic_timer_lock);
+     init_timer(&v->periodic_timer, vcpu_periodic_timer_fn,
+@@ -479,6 +481,7 @@ int sched_move_domain(struct domain *d, struct cpupool *c)
+         sched_set_affinity(v, &cpumask_all, &cpumask_all);
+ 
+         v->processor = new_p;
++        v->sched_unit->res = get_sched_res(new_p);
+         /*
+          * With v->processor modified we must not
+          * - make any further changes assuming we hold the scheduler lock,
+@@ -831,12 +834,14 @@ void restore_vcpu_affinity(struct domain *d)
+         }
+ 
+         v->processor = cpumask_any(cpumask_scratch_cpu(cpu));
++        v->sched_unit->res = get_sched_res(v->processor);
+ 
+         spin_unlock_irq(lock);
+ 
+         /* v->processor might have changed, so reacquire the lock. */
+         lock = vcpu_schedule_lock_irq(v);
+         v->processor = sched_pick_cpu(vcpu_scheduler(v), v->sched_unit);
++        v->sched_unit->res = get_sched_res(v->processor);
+         spin_unlock_irq(lock);
+ 
+         if ( old_cpu != v->processor )
+@@ -1710,6 +1715,13 @@ static void poll_timer_fn(void *data)
+ static int cpu_schedule_up(unsigned int cpu)
+ {
+     struct schedule_data *sd = &per_cpu(schedule_data, cpu);
++    struct sched_resource *res;
++
++    res = xzalloc(struct sched_resource);
++    if ( res == NULL )
++        return -ENOMEM;
++    res->master_cpu = cpu;
++    set_sched_res(cpu, res);
+ 
+     per_cpu(scheduler, cpu) = &sched_idle_ops;
+     spin_lock_init(&sd->_lock);
+@@ -1723,6 +1735,8 @@ static int cpu_schedule_up(unsigned int cpu)
+ 
+     if ( idle_vcpu[cpu] == NULL )
+         vcpu_create(idle_vcpu[0]->domain, cpu, cpu);
++    else
++        idle_vcpu[cpu]->sched_unit->res = res;
+ 
+     if ( idle_vcpu[cpu] == NULL )
+         return -ENOMEM;
+@@ -1745,6 +1759,9 @@ static void cpu_schedule_down(unsigned int cpu)
+     struct schedule_data *sd = &per_cpu(schedule_data, cpu);
+ 
+     kill_timer(&sd->s_timer);
++
++    set_sched_res(cpu, NULL);
++    xfree(sd);
+ }
+ 
+ void sched_rm_cpu(unsigned int cpu)
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index a10f278ba3..5c9ac07587 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -44,9 +44,24 @@ struct schedule_data {
+ 
+ #define curr_on_cpu(c)    (per_cpu(schedule_data, c).curr)
+ 
++struct sched_resource {
++    unsigned int master_cpu;  /* Cpu with lowest id in scheduling resource. */
++};
++
+ DECLARE_PER_CPU(struct schedule_data, schedule_data);
+ DECLARE_PER_CPU(struct scheduler *, scheduler);
+ DECLARE_PER_CPU(struct cpupool *, cpupool);
++DECLARE_PER_CPU(struct sched_resource *, sched_res);
++
++static inline struct sched_resource *get_sched_res(unsigned int cpu)
++{
++    return per_cpu(sched_res, cpu);
++}
++
++static inline void set_sched_res(unsigned int cpu, struct sched_resource *res)
++{
++    per_cpu(sched_res, cpu) = res;
++}
+ 
+ /*
+  * Scratch space, for avoiding having too many cpumask_t on the stack.
+@@ -334,7 +349,10 @@ static inline void sched_migrate(const struct scheduler *s,
+     if ( s->migrate )
+         s->migrate(s, unit, cpu);
+     else
++    {
+         unit->vcpu_list->processor = cpu;
++        unit->res = get_sched_res(cpu);
++    }
+ }
+ 
+ static inline int sched_pick_cpu(const struct scheduler *s,
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 36b1c3b010..5b034d5b59 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -278,6 +278,7 @@ struct sched_unit {
+     struct vcpu           *vcpu_list;
+     void                  *priv;      /* scheduler private data */
+     struct sched_unit     *next_in_list;
++    struct sched_resource *res;
+     unsigned int           unit_id;
+ };
+ 
