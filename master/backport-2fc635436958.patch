@@ -1,7 +1,7 @@
-From 5c0f61e94b79aacfcb8ac9e7f20ddced8ea94303 Mon Sep 17 00:00:00 2001
+From 2fc63543695827eb36d649fd526d2ac3aa3d3f0b Mon Sep 17 00:00:00 2001
 From: Juergen Gross <jgross@suse.com>
-Date: Fri, 27 Sep 2019 08:22:57 +0200
-Subject: [PATCH 14/19] xen/sched: protect scheduling resource via rcu
+Date: Wed, 2 Oct 2019 09:27:39 +0200
+Subject: xen/sched: protect scheduling resource via rcu
 
 In order to be able to move cpus to cpupools with core scheduling
 active it is mandatory to merge multiple cpus into one scheduling
@@ -13,11 +13,6 @@ there are no users left when freeing such a resource.
 
 Signed-off-by: Juergen Gross <jgross@suse.com>
 Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
----
- xen/common/cpupool.c       |   4 +
- xen/common/schedule.c      | 187 +++++++++++++++++++++++++++++++++----
- xen/include/xen/sched-if.h |   7 +-
- 3 files changed, 178 insertions(+), 20 deletions(-)
 
 diff --git a/xen/common/cpupool.c b/xen/common/cpupool.c
 index 02825e779d..7228ca84b4 100644
@@ -45,7 +40,7 @@ index 02825e779d..7228ca84b4 100644
  
  /*
 diff --git a/xen/common/schedule.c b/xen/common/schedule.c
-index a96fc82282..1f23bf0e83 100644
+index 3a9ae6bf3f..e6679f1805 100644
 --- a/xen/common/schedule.c
 +++ b/xen/common/schedule.c
 @@ -77,6 +77,7 @@ static void poll_timer_fn(void *data);
@@ -426,7 +421,7 @@ index a96fc82282..1f23bf0e83 100644
      context_switch(vprev, vnext);
  }
  
-@@ -2186,6 +2274,8 @@ static void sched_slave(void)
+@@ -2188,6 +2276,8 @@ static void sched_slave(void)
  
      ASSERT_NOT_IN_ATOMIC();
  
@@ -435,7 +430,7 @@ index a96fc82282..1f23bf0e83 100644
      lock = pcpu_schedule_lock_irq(cpu);
  
      now = NOW();
-@@ -2209,6 +2299,8 @@ static void sched_slave(void)
+@@ -2213,6 +2303,8 @@ static void sched_slave(void)
      {
          pcpu_schedule_unlock_irq(lock, cpu);
  
@@ -444,7 +439,7 @@ index a96fc82282..1f23bf0e83 100644
          /* Check for failed forced context switch. */
          if ( do_softirq )
              raise_softirq(SCHEDULE_SOFTIRQ);
-@@ -2241,13 +2333,16 @@ static void schedule(void)
+@@ -2245,13 +2337,16 @@ static void schedule(void)
      struct sched_resource *sr;
      spinlock_t           *lock;
      int cpu = smp_processor_id();
@@ -462,7 +457,7 @@ index a96fc82282..1f23bf0e83 100644
  
      lock = pcpu_schedule_lock_irq(cpu);
  
-@@ -2259,6 +2354,8 @@ static void schedule(void)
+@@ -2263,6 +2358,8 @@ static void schedule(void)
           */
          pcpu_schedule_unlock_irq(lock, cpu);
  
@@ -471,7 +466,7 @@ index a96fc82282..1f23bf0e83 100644
          raise_softirq(SCHEDULE_SOFTIRQ);
          return sched_slave();
      }
-@@ -2370,14 +2467,27 @@ static int cpu_schedule_up(unsigned int cpu)
+@@ -2374,14 +2471,27 @@ static int cpu_schedule_up(unsigned int cpu)
      return 0;
  }
  
@@ -501,7 +496,7 @@ index a96fc82282..1f23bf0e83 100644
  }
  
  void sched_rm_cpu(unsigned int cpu)
-@@ -2397,6 +2507,8 @@ static int cpu_schedule_callback(
+@@ -2401,6 +2511,8 @@ static int cpu_schedule_callback(
      unsigned int cpu = (unsigned long)hcpu;
      int rc = 0;
  
@@ -510,7 +505,7 @@ index a96fc82282..1f23bf0e83 100644
      /*
       * From the scheduler perspective, bringing up a pCPU requires
       * allocating and initializing the per-pCPU scheduler specific data,
-@@ -2443,6 +2555,8 @@ static int cpu_schedule_callback(
+@@ -2447,6 +2559,8 @@ static int cpu_schedule_callback(
          break;
      }
  
@@ -519,7 +514,7 @@ index a96fc82282..1f23bf0e83 100644
      return !rc ? NOTIFY_DONE : notifier_from_errno(rc);
  }
  
-@@ -2532,8 +2646,13 @@ void __init scheduler_init(void)
+@@ -2536,8 +2650,13 @@ void __init scheduler_init(void)
      idle_domain->max_vcpus = nr_cpu_ids;
      if ( vcpu_create(idle_domain, 0) == NULL )
          BUG();
@@ -533,7 +528,7 @@ index a96fc82282..1f23bf0e83 100644
  }
  
  /*
-@@ -2546,9 +2665,14 @@ int schedule_cpu_add(unsigned int cpu, struct cpupool *c)
+@@ -2550,9 +2669,14 @@ int schedule_cpu_add(unsigned int cpu, struct cpupool *c)
      struct vcpu *idle;
      void *ppriv, *vpriv;
      struct scheduler *new_ops = c->sched;
@@ -549,7 +544,7 @@ index a96fc82282..1f23bf0e83 100644
  
      ASSERT(cpumask_test_cpu(cpu, &cpupool_free_cpus));
      ASSERT(!cpumask_test_cpu(cpu, c->cpu_valid));
-@@ -2568,13 +2692,18 @@ int schedule_cpu_add(unsigned int cpu, struct cpupool *c)
+@@ -2572,13 +2696,18 @@ int schedule_cpu_add(unsigned int cpu, struct cpupool *c)
      idle = idle_vcpu[cpu];
      ppriv = sched_alloc_pdata(new_ops, cpu);
      if ( IS_ERR(ppriv) )
@@ -570,7 +565,7 @@ index a96fc82282..1f23bf0e83 100644
      }
  
      /*
-@@ -2613,7 +2742,10 @@ int schedule_cpu_add(unsigned int cpu, struct cpupool *c)
+@@ -2617,7 +2746,10 @@ int schedule_cpu_add(unsigned int cpu, struct cpupool *c)
      /* The  cpu is added to a pool, trigger it to go pick up some work */
      cpu_raise_softirq(cpu, SCHEDULE_SOFTIRQ);
  
@@ -582,7 +577,7 @@ index a96fc82282..1f23bf0e83 100644
  }
  
  /*
-@@ -2626,11 +2758,16 @@ int schedule_cpu_rm(unsigned int cpu)
+@@ -2630,11 +2762,16 @@ int schedule_cpu_rm(unsigned int cpu)
  {
      struct vcpu *idle;
      void *ppriv_old, *vpriv_old;
@@ -601,7 +596,7 @@ index a96fc82282..1f23bf0e83 100644
      ASSERT(sr->cpupool != NULL);
      ASSERT(cpumask_test_cpu(cpu, &cpupool_free_cpus));
      ASSERT(!cpumask_test_cpu(cpu, sr->cpupool->cpu_valid));
-@@ -2663,6 +2800,8 @@ int schedule_cpu_rm(unsigned int cpu)
+@@ -2667,6 +2804,8 @@ int schedule_cpu_rm(unsigned int cpu)
      sr->granularity = 1;
      sr->cpupool = NULL;
  
@@ -610,7 +605,7 @@ index a96fc82282..1f23bf0e83 100644
      return 0;
  }
  
-@@ -2711,6 +2850,8 @@ void schedule_dump(struct cpupool *c)
+@@ -2715,6 +2854,8 @@ void schedule_dump(struct cpupool *c)
  
      /* Locking, if necessary, must be handled withing each scheduler */
  
@@ -619,7 +614,7 @@ index a96fc82282..1f23bf0e83 100644
      if ( c != NULL )
      {
          sched = c->sched;
-@@ -2730,6 +2871,8 @@ void schedule_dump(struct cpupool *c)
+@@ -2734,6 +2875,8 @@ void schedule_dump(struct cpupool *c)
          for_each_cpu (i, cpus)
              sched_dump_cpu_state(sched, i);
      }
@@ -628,7 +623,7 @@ index a96fc82282..1f23bf0e83 100644
  }
  
  void sched_tick_suspend(void)
-@@ -2737,10 +2880,14 @@ void sched_tick_suspend(void)
+@@ -2741,10 +2884,14 @@ void sched_tick_suspend(void)
      struct scheduler *sched;
      unsigned int cpu = smp_processor_id();
  
@@ -643,7 +638,7 @@ index a96fc82282..1f23bf0e83 100644
  }
  
  void sched_tick_resume(void)
-@@ -2748,10 +2895,14 @@ void sched_tick_resume(void)
+@@ -2752,10 +2899,14 @@ void sched_tick_resume(void)
      struct scheduler *sched;
      unsigned int cpu = smp_processor_id();
  
@@ -693,6 +688,3 @@ index f8f0f484cb..3988985ee6 100644
  }
  
  static inline struct sched_unit *curr_on_cpu(unsigned int cpu)
--- 
-2.17.1
-

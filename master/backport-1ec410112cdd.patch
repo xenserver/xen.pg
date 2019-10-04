@@ -1,8 +1,7 @@
-From e9ab66c1585ee1b8008c65fe376d5a5b6b7df7f0 Mon Sep 17 00:00:00 2001
+From 1ec410112cdd9eec9cacde5258c24f631f0ea9cd Mon Sep 17 00:00:00 2001
 From: Juergen Gross <jgross@suse.com>
-Date: Fri, 27 Sep 2019 08:22:57 +0200
-Subject: [PATCH 16/19] xen/sched: support differing granularity in
- schedule_cpu_[add/rm]()
+Date: Wed, 2 Oct 2019 09:27:41 +0200
+Subject: xen/sched: support differing granularity in schedule_cpu_[add/rm]()
 
 With core scheduling active schedule_cpu_[add/rm]() has to cope with
 different scheduling granularity: a cpu not in any cpupool is subject
@@ -17,10 +16,6 @@ split.
 
 Signed-off-by: Juergen Gross <jgross@suse.com>
 Reviewed-by: Dario Faggioli <dfaggioli@suse.com>
----
- xen/common/cpupool.c  |  18 ++--
- xen/common/schedule.c | 226 ++++++++++++++++++++++++++++++++++++------
- 2 files changed, 204 insertions(+), 40 deletions(-)
 
 diff --git a/xen/common/cpupool.c b/xen/common/cpupool.c
 index 13dffaadcf..04c3b3c04b 100644
@@ -64,7 +59,7 @@ index 13dffaadcf..04c3b3c04b 100644
      sched_rm_cpu(cpu);
      rcu_read_unlock(&sched_res_rculock);
 diff --git a/xen/common/schedule.c b/xen/common/schedule.c
-index efe077b01f..e411b6d03e 100644
+index 2aa9e677e1..83a3ac416b 100644
 --- a/xen/common/schedule.c
 +++ b/xen/common/schedule.c
 @@ -425,27 +425,30 @@ static void sched_unit_add_vcpu(struct sched_unit *unit, struct vcpu *v)
@@ -151,7 +146,7 @@ index efe077b01f..e411b6d03e 100644
  }
  
  static unsigned int sched_select_initial_cpu(const struct vcpu *v)
-@@ -2419,18 +2436,28 @@ static void poll_timer_fn(void *data)
+@@ -2423,18 +2440,28 @@ static void poll_timer_fn(void *data)
          vcpu_unblock(v);
  }
  
@@ -183,7 +178,7 @@ index efe077b01f..e411b6d03e 100644
  
      sr->master_cpu = cpu;
      cpumask_copy(sr->cpus, cpumask_of(cpu));
-@@ -2480,6 +2507,8 @@ static void sched_res_free(struct rcu_head *head)
+@@ -2484,6 +2511,8 @@ static void sched_res_free(struct rcu_head *head)
      struct sched_resource *sr = container_of(head, struct sched_resource, rcu);
  
      free_cpumask_var(sr->cpus);
@@ -192,7 +187,7 @@ index efe077b01f..e411b6d03e 100644
      xfree(sr);
  }
  
-@@ -2496,6 +2525,8 @@ static void cpu_schedule_down(unsigned int cpu)
+@@ -2500,6 +2529,8 @@ static void cpu_schedule_down(unsigned int cpu)
      cpumask_clear_cpu(cpu, &sched_res_mask);
      set_sched_res(cpu, NULL);
  
@@ -201,7 +196,7 @@ index efe077b01f..e411b6d03e 100644
      call_rcu(&sr->rcu, sched_res_free);
  
      rcu_read_unlock(&sched_res_rculock);
-@@ -2575,6 +2606,30 @@ static struct notifier_block cpu_schedule_nfb = {
+@@ -2579,6 +2610,30 @@ static struct notifier_block cpu_schedule_nfb = {
      .notifier_call = cpu_schedule_callback
  };
  
@@ -232,7 +227,7 @@ index efe077b01f..e411b6d03e 100644
  /* Initialise the data structures. */
  void __init scheduler_init(void)
  {
-@@ -2730,6 +2785,46 @@ int schedule_cpu_add(unsigned int cpu, struct cpupool *c)
+@@ -2734,6 +2789,46 @@ int schedule_cpu_add(unsigned int cpu, struct cpupool *c)
       */
      old_lock = pcpu_schedule_lock_irqsave(cpu, &flags);
  
@@ -279,7 +274,7 @@ index efe077b01f..e411b6d03e 100644
      new_lock = sched_switch_sched(new_ops, cpu, ppriv, vpriv);
  
      sr->scheduler = new_ops;
-@@ -2767,33 +2862,100 @@ out:
+@@ -2771,33 +2866,100 @@ out:
   */
  int schedule_cpu_rm(unsigned int cpu)
  {
@@ -386,7 +381,7 @@ index efe077b01f..e411b6d03e 100644
      sr->scheduler = &sched_idle_ops;
      sr->sched_priv = NULL;
  
-@@ -2811,9 +2973,11 @@ int schedule_cpu_rm(unsigned int cpu)
+@@ -2815,9 +2977,11 @@ int schedule_cpu_rm(unsigned int cpu)
      sr->granularity = 1;
      sr->cpupool = NULL;
  
@@ -399,6 +394,3 @@ index efe077b01f..e411b6d03e 100644
  }
  
  struct scheduler *scheduler_get_default(void)
--- 
-2.17.1
-
