@@ -28,8 +28,14 @@ XenServer changes to Xen command line default options.
 
 * Disallow PV linear pagetables by default.
 
+* Don't load ucode in the NMI context. There are still unresolved
+  concerns about the safety of keeping NMIs "disabled" during loading of
+  a new ucode: can this process reset the NMI latch or not? (needs
+  a confirmation from Intel). Additionally, loading a ucode with NMIs
+  enabled preserves the current behavior that we ship to customers.
+
 diff --git a/xen/arch/x86/e820.c b/xen/arch/x86/e820.c
-index 590ea98..c442e50 100644
+index 8e8a2c4e1b..d3cbc813d6 100644
 --- a/xen/arch/x86/e820.c
 +++ b/xen/arch/x86/e820.c
 @@ -15,7 +15,7 @@
@@ -42,7 +48,7 @@ index 590ea98..c442e50 100644
  
  /*
 diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
-index d9747b4f..4e98ab2 100644
+index 16f14abe8f..938e17747c 100644
 --- a/xen/arch/x86/hvm/vmx/vmcs.c
 +++ b/xen/arch/x86/hvm/vmx/vmcs.c
 @@ -48,7 +48,7 @@ boolean_param("vpid", opt_vpid_enabled);
@@ -54,11 +60,24 @@ index d9747b4f..4e98ab2 100644
  boolean_param("apicv", opt_apicv_enabled);
  
  /*
+diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
+index 7c015cc45f..8ef8c26260 100644
+--- a/xen/arch/x86/microcode.c
++++ b/xen/arch/x86/microcode.c
+@@ -104,7 +104,7 @@ static struct ucode_mod_blob __initdata ucode_blob;
+ static bool_t __initdata ucode_scan;
+ 
+ /* By default, ucode loading is done in NMI handler */
+-static bool ucode_in_nmi = true;
++static bool ucode_in_nmi = false;
+ 
+ /* Protected by microcode_mutex */
+ static struct microcode_patch *microcode_cache;
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 7b991ad..0030c13 100644
+index 0d436827f2..5be663184d 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -172,7 +172,7 @@ static uint32_t base_disallow_mask;
+@@ -187,7 +187,7 @@ static uint32_t base_disallow_mask;
        is_pv_domain(d)) ?                                        \
       L1_DISALLOW_MASK : (L1_DISALLOW_MASK & ~PAGE_CACHE_ATTRS))
  
@@ -67,7 +86,7 @@ index 7b991ad..0030c13 100644
  
  static int __init parse_mmio_relax(const char *s)
  {
-@@ -740,7 +740,7 @@ static void dec_linear_uses(struct page_info *pg)
+@@ -675,7 +675,7 @@ static void dec_linear_uses(struct page_info *pg)
   *     frame if it is mapped by a different root table. This is sufficient and
   *     also necessary to allow validation of a root table mapping itself.
   */
@@ -77,10 +96,10 @@ index 7b991ad..0030c13 100644
  
  #define define_get_linear_pagetable(level)                                  \
 diff --git a/xen/arch/x86/nmi.c b/xen/arch/x86/nmi.c
-index d7fce28..bfe9777 100644
+index e26121a737..3bf2bbf66f 100644
 --- a/xen/arch/x86/nmi.c
 +++ b/xen/arch/x86/nmi.c
-@@ -44,7 +44,7 @@ static DEFINE_PER_CPU(unsigned int, nmi_timer_ticks);
+@@ -45,7 +45,7 @@ static DEFINE_PER_CPU(unsigned int, nmi_timer_ticks);
  bool __initdata opt_watchdog;
  
  /* watchdog_force: If true, process unknown NMIs when running the watchdog. */
@@ -90,10 +109,10 @@ index d7fce28..bfe9777 100644
  static int __init parse_watchdog(const char *s)
  {
 diff --git a/xen/arch/x86/time.c b/xen/arch/x86/time.c
-index e5e825c..7a6b3cd 100644
+index b1dea37beb..c3c6135d9e 100644
 --- a/xen/arch/x86/time.c
 +++ b/xen/arch/x86/time.c
-@@ -900,7 +900,7 @@ static unsigned long get_cmos_time(void)
+@@ -903,7 +903,7 @@ static unsigned long get_cmos_time(void)
      unsigned long flags;
      struct rtc_time rtc;
      unsigned int seconds = 60;
@@ -103,7 +122,7 @@ index e5e825c..7a6b3cd 100644
  
      if ( likely(!(acpi_gbl_FADT.boot_flags & ACPI_FADT_NO_CMOS_RTC)) )
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 38df631..178a3a5 100644
+index 2cd5e2920b..d48a095b70 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
 @@ -86,11 +86,7 @@
@@ -119,10 +138,10 @@ index 38df631..178a3a5 100644
  
  DEFINE_PER_CPU(uint64_t, efer);
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index a58bce9..fda25d2 100644
+index 54e8a1e752..009f6e98aa 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -326,7 +326,7 @@ static int late_hwdom_init(struct domain *d)
+@@ -247,7 +247,7 @@ static int late_hwdom_init(struct domain *d)
  }
  
  static unsigned int __read_mostly extra_hwdom_irqs;
@@ -132,7 +151,7 @@ index a58bce9..fda25d2 100644
  static int __init parse_extra_guest_irqs(const char *s)
  {
 diff --git a/xen/common/efi/boot.c b/xen/common/efi/boot.c
-index 6ec7289..14b25ad 100644
+index 593eb19da0..9a89414661 100644
 --- a/xen/common/efi/boot.c
 +++ b/xen/common/efi/boot.c
 @@ -1386,7 +1386,7 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
@@ -145,10 +164,10 @@ index 6ec7289..14b25ad 100644
  static int __init parse_efi_param(const char *s)
  {
 diff --git a/xen/drivers/char/console.c b/xen/drivers/char/console.c
-index e1269aa..e458082 100644
+index 34ac36b109..4c522317aa 100644
 --- a/xen/drivers/char/console.c
 +++ b/xen/drivers/char/console.c
-@@ -72,16 +72,16 @@ enum con_timestamp_mode
+@@ -76,16 +76,16 @@ enum con_timestamp_mode
      TSM_RAW,           /* [XXXXXXXXXXXXXXXX] */
  };
  
