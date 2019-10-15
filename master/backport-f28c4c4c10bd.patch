@@ -1,0 +1,129 @@
+From f28c4c4c10bdacb1e49cc6e9de57eb1f973cbdf6 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Thu, 26 Sep 2019 18:04:09 +0200
+Subject: [PATCH] sched: don't let XEN_RUNSTATE_UPDATE leak into
+ vcpu_runstate_get()
+
+vcpu_runstate_get() should never return a state entry time with
+XEN_RUNSTATE_UPDATE set. To avoid this let update_runstate_area()
+operate on a local runstate copy.
+
+As it is required to first set the XEN_RUNSTATE_UPDATE indicator in
+guest memory, then update all the runstate data, and then at last
+clear the XEN_RUNSTATE_UPDATE again it is much less effort to have
+a local copy of the runstate data instead of keeping only a copy of
+state_entry_time.
+
+This problem was introduced with commit 2529c850ea48f036 ("add update
+indicator to vcpu_runstate_info").
+
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Julien Grall <julien.grall@arm.com>
+---
+ xen/arch/arm/domain.c | 13 ++++++++-----
+ xen/arch/x86/domain.c | 17 ++++++++++-------
+ 2 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/xen/arch/arm/domain.c b/xen/arch/arm/domain.c
+index 61d35cd..f0ee5a2 100644
+--- a/xen/arch/arm/domain.c
++++ b/xen/arch/arm/domain.c
+@@ -280,28 +280,31 @@ static void ctxt_switch_to(struct vcpu *n)
+ static void update_runstate_area(struct vcpu *v)
+ {
+     void __user *guest_handle = NULL;
++    struct vcpu_runstate_info runstate;
+ 
+     if ( guest_handle_is_null(runstate_guest(v)) )
+         return;
+ 
++    memcpy(&runstate, &v->runstate, sizeof(runstate));
++
+     if ( VM_ASSIST(v->domain, runstate_update_flag) )
+     {
+         guest_handle = &v->runstate_guest.p->state_entry_time + 1;
+         guest_handle--;
+-        v->runstate.state_entry_time |= XEN_RUNSTATE_UPDATE;
++        runstate.state_entry_time |= XEN_RUNSTATE_UPDATE;
+         __raw_copy_to_guest(guest_handle,
+-                            (void *)(&v->runstate.state_entry_time + 1) - 1, 1);
++                            (void *)(&runstate.state_entry_time + 1) - 1, 1);
+         smp_wmb();
+     }
+ 
+-    __copy_to_guest(runstate_guest(v), &v->runstate, 1);
++    __copy_to_guest(runstate_guest(v), &runstate, 1);
+ 
+     if ( guest_handle )
+     {
+-        v->runstate.state_entry_time &= ~XEN_RUNSTATE_UPDATE;
++        runstate.state_entry_time &= ~XEN_RUNSTATE_UPDATE;
+         smp_wmb();
+         __raw_copy_to_guest(guest_handle,
+-                            (void *)(&v->runstate.state_entry_time + 1) - 1, 1);
++                            (void *)(&runstate.state_entry_time + 1) - 1, 1);
+     }
+ }
+ 
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index c0faf68..c7fa224 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -1600,21 +1600,24 @@ bool update_runstate_area(struct vcpu *v)
+     bool rc;
+     struct guest_memory_policy policy = { .nested_guest_mode = false };
+     void __user *guest_handle = NULL;
++    struct vcpu_runstate_info runstate;
+ 
+     if ( guest_handle_is_null(runstate_guest(v)) )
+         return true;
+ 
+     update_guest_memory_policy(v, &policy);
+ 
++    memcpy(&runstate, &v->runstate, sizeof(runstate));
++
+     if ( VM_ASSIST(v->domain, runstate_update_flag) )
+     {
+         guest_handle = has_32bit_shinfo(v->domain)
+             ? &v->runstate_guest.compat.p->state_entry_time + 1
+             : &v->runstate_guest.native.p->state_entry_time + 1;
+         guest_handle--;
+-        v->runstate.state_entry_time |= XEN_RUNSTATE_UPDATE;
++        runstate.state_entry_time |= XEN_RUNSTATE_UPDATE;
+         __raw_copy_to_guest(guest_handle,
+-                            (void *)(&v->runstate.state_entry_time + 1) - 1, 1);
++                            (void *)(&runstate.state_entry_time + 1) - 1, 1);
+         smp_wmb();
+     }
+ 
+@@ -1622,20 +1625,20 @@ bool update_runstate_area(struct vcpu *v)
+     {
+         struct compat_vcpu_runstate_info info;
+ 
+-        XLAT_vcpu_runstate_info(&info, &v->runstate);
++        XLAT_vcpu_runstate_info(&info, &runstate);
+         __copy_to_guest(v->runstate_guest.compat, &info, 1);
+         rc = true;
+     }
+     else
+-        rc = __copy_to_guest(runstate_guest(v), &v->runstate, 1) !=
+-             sizeof(v->runstate);
++        rc = __copy_to_guest(runstate_guest(v), &runstate, 1) !=
++             sizeof(runstate);
+ 
+     if ( guest_handle )
+     {
+-        v->runstate.state_entry_time &= ~XEN_RUNSTATE_UPDATE;
++        runstate.state_entry_time &= ~XEN_RUNSTATE_UPDATE;
+         smp_wmb();
+         __raw_copy_to_guest(guest_handle,
+-                            (void *)(&v->runstate.state_entry_time + 1) - 1, 1);
++                            (void *)(&runstate.state_entry_time + 1) - 1, 1);
+     }
+ 
+     update_guest_memory_policy(v, &policy);
+-- 
+2.7.4
+
