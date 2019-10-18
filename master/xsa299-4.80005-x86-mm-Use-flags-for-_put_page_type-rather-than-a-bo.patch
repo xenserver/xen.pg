@@ -1,0 +1,115 @@
+From 13660d718ec3a119ff0ab1f1197d0796ca79c668 Mon Sep 17 00:00:00 2001
+From: George Dunlap <george.dunlap@citrix.com>
+Date: Thu, 10 Oct 2019 17:57:49 +0100
+Subject: [PATCH 05/12] x86/mm: Use flags for _put_page_type rather than a
+ boolean
+
+This is in mainly in preparation for _put_page_type taking the
+partial_flags value in the future.  It also makes it easier to read in
+the caller (since you see a flag name rather than `true` or `false`).
+
+No functional change intended.
+
+This is part of XSA-299.
+
+Signed-off-by: George Dunlap <george.dunlap@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 0ed1dd0..fe48025 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -1393,7 +1393,7 @@ get_page_from_l4e(
+             l3e_remove_flags((pl3e), _PAGE_USER|_PAGE_RW|_PAGE_ACCESSED);   \
+     } while ( 0 )
+ 
+-static int _put_page_type(struct page_info *page, bool_t preemptible,
++static int _put_page_type(struct page_info *page, unsigned int flags,
+                           struct page_info *ptpg);
+ 
+ void put_page_from_l1e(l1_pgentry_t l1e, struct domain *l1e_owner)
+@@ -1476,7 +1476,7 @@ static int put_page_from_l2e(l2_pgentry_t l2e, unsigned long pfn,
+               PTF_partial_set )
+         {
+             ASSERT(!(flags & PTF_defer));
+-            rc = _put_page_type(pg, 1, ptpg);
++            rc = _put_page_type(pg, PTF_preemptible, ptpg);
+         }
+         else if ( flags & PTF_defer )
+         {
+@@ -1485,7 +1485,7 @@ static int put_page_from_l2e(l2_pgentry_t l2e, unsigned long pfn,
+         }
+         else
+         {
+-            rc = _put_page_type(pg, 1, ptpg);
++            rc = _put_page_type(pg, PTF_preemptible, ptpg);
+             if ( likely(!rc) )
+                 put_page(pg);
+         }
+@@ -1522,7 +1522,7 @@ static int put_page_from_l3e(l3_pgentry_t l3e, unsigned long pfn,
+          PTF_partial_set )
+     {
+         ASSERT(!(flags & PTF_defer));
+-        return _put_page_type(pg, 1, mfn_to_page(pfn));
++        return _put_page_type(pg, PTF_preemptible, mfn_to_page(pfn));
+     }
+ 
+     if ( flags & PTF_defer )
+@@ -1532,7 +1532,7 @@ static int put_page_from_l3e(l3_pgentry_t l3e, unsigned long pfn,
+         return 0;
+     }
+ 
+-    rc = _put_page_type(pg, 1, mfn_to_page(pfn));
++    rc = _put_page_type(pg, PTF_preemptible, mfn_to_page(pfn));
+     if ( likely(!rc) )
+         put_page(pg);
+ 
+@@ -1553,7 +1553,7 @@ static int put_page_from_l4e(l4_pgentry_t l4e, unsigned long pfn,
+               PTF_partial_set )
+         {
+             ASSERT(!(flags & PTF_defer));
+-            return _put_page_type(pg, 1, mfn_to_page(pfn));
++            return _put_page_type(pg, PTF_preemptible, mfn_to_page(pfn));
+         }
+ 
+         if ( flags & PTF_defer )
+@@ -1563,7 +1563,7 @@ static int put_page_from_l4e(l4_pgentry_t l4e, unsigned long pfn,
+             return 0;
+         }
+ 
+-        rc = _put_page_type(pg, 1, mfn_to_page(pfn));
++        rc = _put_page_type(pg, PTF_preemptible, mfn_to_page(pfn));
+         if ( likely(!rc) )
+             put_page(pg);
+     }
+@@ -2830,11 +2830,12 @@ static int _put_final_page_type(struct page_info *page, unsigned long type,
+ }
+ 
+ 
+-static int _put_page_type(struct page_info *page, bool_t preemptible,
++static int _put_page_type(struct page_info *page, unsigned int flags,
+                           struct page_info *ptpg)
+ {
+     unsigned long nx, x, y = page->u.inuse.type_info;
+     int rc = 0;
++    bool preemptible = flags & PTF_preemptible;
+ 
+     for ( ; ; )
+     {
+@@ -3064,7 +3065,7 @@ int get_page_type(struct page_info *page, unsigned long type)
+ 
+ int put_page_type_preemptible(struct page_info *page)
+ {
+-    return _put_page_type(page, 1, NULL);
++    return _put_page_type(page, PTF_preemptible, NULL);
+ }
+ 
+ int get_page_type_preemptible(struct page_info *page, unsigned long type)
+@@ -3270,7 +3271,7 @@ int put_old_guest_table(struct vcpu *v)
+     if ( !v->arch.old_guest_table )
+         return 0;
+ 
+-    switch ( rc = _put_page_type(v->arch.old_guest_table, 1,
++    switch ( rc = _put_page_type(v->arch.old_guest_table, PTF_preemptible,
+                                  v->arch.old_guest_ptpg) )
+     {
+     case -EINTR:
