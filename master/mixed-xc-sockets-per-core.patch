@@ -2,12 +2,12 @@ Expose vcpus as multiple cores in a smaller number of sockets,
 by adjusting the cpuid responses appropriately.
 
 diff --git a/tools/flask/policy/modules/dom0.te b/tools/flask/policy/modules/dom0.te
-index 9497470..f223778 100644
+index 0eda6a5936..8aa72fd4b5 100644
 --- a/tools/flask/policy/modules/dom0.te
 +++ b/tools/flask/policy/modules/dom0.te
 @@ -40,7 +40,7 @@ allow dom0_t dom0_t:domain {
  allow dom0_t dom0_t:domain2 {
- 	set_cpuid gettsc settsc setscheduler set_vnumainfo
+ 	set_cpu_policy gettsc settsc setscheduler set_vnumainfo
  	get_vnumainfo psr_cmt_op psr_alloc get_cpu_policy
 -	get_runstate_info
 +	get_runstate_info setcorespersocket
@@ -15,11 +15,11 @@ index 9497470..f223778 100644
  allow dom0_t dom0_t:resource { add remove };
  
 diff --git a/tools/flask/policy/modules/xen.if b/tools/flask/policy/modules/xen.if
-index f6af818..409cd79 100644
+index 8c915b8381..3e07f4ca26 100644
 --- a/tools/flask/policy/modules/xen.if
 +++ b/tools/flask/policy/modules/xen.if
 @@ -53,7 +53,7 @@ define(`create_domain_common', `
- 	allow $1 $2:domain2 { set_cpuid settsc setscheduler setclaim
+ 	allow $1 $2:domain2 { set_cpu_policy settsc setscheduler setclaim
  			set_vnumainfo get_vnumainfo cacheflush
  			psr_cmt_op psr_alloc soft_reset
 -			get_runstate_info
@@ -28,10 +28,10 @@ index f6af818..409cd79 100644
  	allow $1 $2:security check_context;
  	allow $1 $2:shadow enable;
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index 4b85302..3618e82 100644
+index ca1ddb11df..6d0ac8e8c8 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
-@@ -1357,6 +1357,10 @@ int xc_domain_disable_migrate(xc_interface *xch, uint32_t domid);
+@@ -1359,6 +1359,10 @@ int xc_domain_disable_migrate(xc_interface *xch, uint32_t domid);
  int xc_domain_query_disable_migrate(xc_interface *xch, uint32_t domid,
                                      bool *migration_disabled);
  
@@ -43,7 +43,7 @@ index 4b85302..3618e82 100644
  
  int xc_domain_nr_gpfns(xc_interface *xch, uint32_t domid, xen_pfn_t *gpfns);
 diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
-index d503049..559ce89 100644
+index 83e841e198..5c43843d90 100644
 --- a/tools/libxc/xc_domain.c
 +++ b/tools/libxc/xc_domain.c
 @@ -892,6 +892,20 @@ int xc_domain_get_tsc_info(xc_interface *xch,
@@ -68,10 +68,10 @@ index d503049..559ce89 100644
  {
      long rc = do_memory_op(xch, XENMEM_maximum_gpfn, &domid, sizeof(domid));
 diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
-index d7ac2fe..546d4f4 100644
+index 1a0c5d0fb7..2ae91af9f8 100644
 --- a/xen/arch/x86/cpuid.c
 +++ b/xen/arch/x86/cpuid.c
-@@ -644,6 +644,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
+@@ -637,6 +637,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
  {
      const struct domain *d = v->domain;
      const struct cpuid_policy *p = d->arch.cpuid;
@@ -79,7 +79,7 @@ index d7ac2fe..546d4f4 100644
  
      *res = EMPTY_LEAF;
  
-@@ -767,6 +768,24 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
+@@ -760,6 +761,24 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
              /* OSXSAVE clear in policy.  Fast-forward CR4 back in. */
              if ( v->arch.hvm.guest_cr[4] & X86_CR4_OSXSAVE )
                  res->c |= cpufeat_mask(X86_FEATURE_OSXSAVE);
@@ -104,7 +104,7 @@ index d7ac2fe..546d4f4 100644
          }
          else /* PV domain */
          {
-@@ -877,6 +896,15 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
+@@ -872,6 +891,15 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
          }
          goto common_leaf1_adjustments;
  
@@ -120,7 +120,7 @@ index d7ac2fe..546d4f4 100644
      case 0x5:
          /*
           * Leak the hardware MONITOR leaf under the same conditions that the
-@@ -963,6 +991,9 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
+@@ -958,6 +986,9 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
               is_hvm_domain(d) && !hvm_long_mode_active(v) )
              res->d &= ~cpufeat_mask(X86_FEATURE_SYSCALL);
  
@@ -130,7 +130,7 @@ index d7ac2fe..546d4f4 100644
      common_leaf1_adjustments:
          if ( is_hvm_domain(d) )
          {
-@@ -1004,6 +1035,23 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
+@@ -999,6 +1030,23 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
                  res->d |= cpufeat_mask(X86_FEATURE_MTRR);
          }
          break;
@@ -155,10 +155,10 @@ index d7ac2fe..546d4f4 100644
  }
  
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index 16c7c56..8f4936b 100644
+index e07674e090..fbc8e4787b 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -1072,6 +1072,32 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+@@ -1061,6 +1061,32 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
          copyback = 1;
          break;
  
@@ -192,10 +192,10 @@ index 16c7c56..8f4936b 100644
          ret = arch_do_domctl(op, d, u_domctl);
          break;
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index fb5d8f6..69dd866 100644
+index 7aa5db0c09..d1526561c9 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1161,6 +1161,13 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
+@@ -1162,6 +1162,13 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
  /* Some vcpus are runnable, some are blocked */
  #define DOMAIN_RUNSTATE_partial_contention 5
  
@@ -209,7 +209,7 @@ index fb5d8f6..69dd866 100644
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1247,6 +1254,7 @@ struct xen_domctl {
+@@ -1249,6 +1256,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
  #define XEN_DOMCTL_gdbsx_domstatus             1003
@@ -217,7 +217,7 @@ index fb5d8f6..69dd866 100644
      uint32_t interface_version; /* XEN_DOMCTL_INTERFACE_VERSION */
      domid_t  domain;
      union {
-@@ -1295,6 +1303,7 @@ struct xen_domctl {
+@@ -1296,6 +1304,7 @@ struct xen_domctl {
          struct xen_domctl_audit_p2m         audit_p2m;
          struct xen_domctl_set_virq_handler  set_virq_handler;
          struct xen_domctl_runstate_info     domain_runstate;
@@ -226,10 +226,10 @@ index fb5d8f6..69dd866 100644
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index d113a48..2109a35 100644
+index 4f9572ba3e..e00d1d917f 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -498,6 +498,8 @@ struct domain
+@@ -536,6 +536,8 @@ struct domain
      spinlock_t runstate_lock;
      atomic_t runstate_missed_changes;
      domain_runstate_info_t runstate;
@@ -239,10 +239,10 @@ index d113a48..2109a35 100644
  
  /* Protect updates/reads (resp.) of domain_list and domain_hash. */
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
-index d009cb0..a533a56 100644
+index 52f6afbfd3..3da0de6180 100644
 --- a/xen/xsm/flask/hooks.c
 +++ b/xen/xsm/flask/hooks.c
-@@ -753,6 +753,9 @@ static int flask_domctl(struct domain *d, int cmd)
+@@ -750,6 +750,9 @@ static int flask_domctl(struct domain *d, int cmd)
      case XEN_DOMCTL_get_runstate_info:
          return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__GET_RUNSTATE_INFO);
  
@@ -253,10 +253,10 @@ index d009cb0..a533a56 100644
          return avc_unknown_permission("domctl", cmd);
      }
 diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
-index e134065..dcaf145 100644
+index 4ed4e435d1..6377d5aa9d 100644
 --- a/xen/xsm/flask/policy/access_vectors
 +++ b/xen/xsm/flask/policy/access_vectors
-@@ -248,6 +248,8 @@ class domain2
+@@ -247,6 +247,8 @@ class domain2
      resource_map
  # XEN_DOMCTL_get_runstate_info
      get_runstate_info

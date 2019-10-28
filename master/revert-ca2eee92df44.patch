@@ -1,64 +1,59 @@
 diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
-index 4afafce1a1..cdce926da0 100644
+index 312c481..dc81e2f 100644
 --- a/tools/libxc/xc_cpuid_x86.c
 +++ b/tools/libxc/xc_cpuid_x86.c
-@@ -329,15 +329,6 @@ static void amd_xc_cpuid_policy(xc_interface *xch,
-             regs[0] = DEF_MAX_AMDEXT;
-         break;
- 
--    case 0x80000008:
--        /*
--         * ECX[15:12] is ApicIdCoreSize: ECX[7:0] is NumberOfCores (minus one).
--         * Update to reflect vLAPIC_ID = vCPU_ID * 2.
--         */
--        regs[2] = ((regs[2] + (1u << 12)) & 0xf000u) |
--                  ((regs[2] & 0xffu) << 1) | 1u;
--        break;
--
-     case 0x8000000a: {
-         if ( !info->nestedhvm )
-         {
-@@ -377,12 +368,7 @@ static void intel_xc_cpuid_policy(xc_interface *xch,
-     switch ( input[0] )
-     {
-     case 0x00000004:
--        /*
--         * EAX[31:26] is Maximum Cores Per Package (minus one).
--         * Update to reflect vLAPIC_ID = vCPU_ID * 2.
--         */
--        regs[0] = (((regs[0] & 0x7c000000u) << 1) | 0x04000000u |
--                   (regs[0] & 0x3ffu));
-+        regs[0] &= 0x3ffu;
-         regs[3] &= 0x3ffu;
-         break;
- 
-@@ -394,11 +380,6 @@ static void intel_xc_cpuid_policy(xc_interface *xch,
-     case 0x80000005:
-         regs[0] = regs[1] = regs[2] = 0;
-         break;
--
--    case 0x80000008:
--        /* Mask AMD Number of Cores information. */
--        regs[2] = 0;
--        break;
+@@ -579,52 +579,19 @@ int xc_cpuid_apply_policy(xc_interface *xch, uint32_t domid,
      }
- }
- 
-@@ -527,15 +508,9 @@ static void xc_cpuid_hvm_policy(xc_interface *xch,
-         break;
- 
-     case 0x00000001:
+     else
+     {
 -        /*
--         * EBX[23:16] is Maximum Logical Processors Per Package.
--         * Update to reflect vLAPIC_ID = vCPU_ID * 2.
+-         * Topology for HVM guests is entirely controlled by Xen.  For now, we
+-         * hardcode APIC_ID = vcpu_id * 2 to give the illusion of no SMT.
 -         */
--        regs[1] = (regs[1] & 0x0000ffffu) | ((regs[1] & 0x007f0000u) << 1);
--
-         regs[2] = info->featureset[featureword_of(X86_FEATURE_SSE3)];
--        regs[3] = (info->featureset[featureword_of(X86_FEATURE_FPU)] |
--                   bitmaskof(X86_FEATURE_HTT));
-+        regs[3] = (info->featureset[featureword_of(X86_FEATURE_FPU)] &
-+                   ~bitmaskof(X86_FEATURE_HTT));
-         break;
+-        p->basic.htt = true;
++        p->basic.htt = false;
+         p->extd.cmp_legacy = false;
  
-     case 0x00000007: /* Intel-defined CPU features */
+-        /*
+-         * Leaf 1 EBX[23:16] is Maximum Logical Processors Per Package.
+-         * Update to reflect vLAPIC_ID = vCPU_ID * 2, but make sure to avoid
+-         * overflow.
+-         */
+-        if ( !(p->basic.lppp & 0x80) )
+-            p->basic.lppp *= 2;
+-
+         switch ( p->x86_vendor )
+         {
+         case X86_VENDOR_INTEL:
+             for ( i = 0; (p->cache.subleaf[i].type &&
+                           i < ARRAY_SIZE(p->cache.raw)); ++i )
+             {
+-                p->cache.subleaf[i].cores_per_package =
+-                    (p->cache.subleaf[i].cores_per_package << 1) | 1;
++                p->cache.subleaf[i].cores_per_package = 0;
+                 p->cache.subleaf[i].threads_per_cache = 0;
+             }
+             break;
+-
+-        case X86_VENDOR_AMD:
+-        case X86_VENDOR_HYGON:
+-            /*
+-             * Leaf 0x80000008 ECX[15:12] is ApicIdCoreSize.
+-             * Leaf 0x80000008 ECX[7:0] is NumberOfCores (minus one).
+-             * Update to reflect vLAPIC_ID = vCPU_ID * 2.  But avoid
+-             * - overflow,
+-             * - going out of sync with leaf 1 EBX[23:16],
+-             * - incrementing ApicIdCoreSize when it's zero (which changes the
+-             *   meaning of bits 7:0).
+-             */
+-            if ( p->extd.nc < 0x7f )
+-            {
+-                if ( p->extd.apic_id_size != 0 && p->extd.apic_id_size != 0xf )
+-                    p->extd.apic_id_size++;
+-
+-                p->extd.nc = (p->extd.nc << 1) | 1;
+-            }
+-            break;
+         }
+ 
+         /*

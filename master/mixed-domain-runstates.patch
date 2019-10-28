@@ -2,23 +2,23 @@ Collect domain runstate information in the hypervisor, and export
 through a domctl operation.
 
 diff --git a/tools/flask/policy/modules/dom0.te b/tools/flask/policy/modules/dom0.te
-index 6b446360b2..9497470d79 100644
+index 87dd54c065..0eda6a5936 100644
 --- a/tools/flask/policy/modules/dom0.te
 +++ b/tools/flask/policy/modules/dom0.te
 @@ -40,6 +40,7 @@ allow dom0_t dom0_t:domain {
  allow dom0_t dom0_t:domain2 {
- 	set_cpuid gettsc settsc setscheduler set_vnumainfo
+ 	set_cpu_policy gettsc settsc setscheduler set_vnumainfo
  	get_vnumainfo psr_cmt_op psr_alloc get_cpu_policy
 +	get_runstate_info
  };
  allow dom0_t dom0_t:resource { add remove };
  
 diff --git a/tools/flask/policy/modules/xen.if b/tools/flask/policy/modules/xen.if
-index de5fb331bf..f6af818166 100644
+index 8eb2293a52..8c915b8381 100644
 --- a/tools/flask/policy/modules/xen.if
 +++ b/tools/flask/policy/modules/xen.if
 @@ -53,6 +53,7 @@ define(`create_domain_common', `
- 	allow $1 $2:domain2 { set_cpuid settsc setscheduler setclaim
+ 	allow $1 $2:domain2 { set_cpu_policy settsc setscheduler setclaim
  			set_vnumainfo get_vnumainfo cacheflush
  			psr_cmt_op psr_alloc soft_reset
 +			get_runstate_info
@@ -26,7 +26,7 @@ index de5fb331bf..f6af818166 100644
  	allow $1 $2:security check_context;
  	allow $1 $2:shadow enable;
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index 697778ae79..79583d9c83 100644
+index 0d5942c3a2..ca1ddb11df 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
 @@ -469,6 +469,7 @@ typedef struct xc_dominfo {
@@ -79,10 +79,10 @@ index eca535a345..83e841e198 100644
                                  uint32_t domid,
                                  uint32_t first_port,
 diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
-index 52441b8458..f654aed7d4 100644
+index fbefed3af0..72b7216737 100644
 --- a/tools/ocaml/libs/xc/xenctrl.ml
 +++ b/tools/ocaml/libs/xc/xenctrl.ml
-@@ -70,6 +70,18 @@ type domctl_create_config =
+@@ -81,6 +81,18 @@ type domctl_create_config =
  	arch: arch_domainconfig;
  }
  
@@ -101,7 +101,7 @@ index 52441b8458..f654aed7d4 100644
  type domaininfo =
  {
  	domid             : domid;
-@@ -196,6 +208,8 @@ external domain_getinfo: handle -> domid -> domaininfo= "stub_xc_domain_getinfo"
+@@ -211,6 +223,8 @@ external domain_getinfo: handle -> domid -> domaininfo= "stub_xc_domain_getinfo"
  
  external domain_get_vcpuinfo: handle -> int -> int -> vcpuinfo
         = "stub_xc_vcpu_getinfo"
@@ -111,10 +111,10 @@ index 52441b8458..f654aed7d4 100644
  external domain_ioport_permission: handle -> domid -> int -> int -> bool -> unit
         = "stub_xc_domain_ioport_permission"
 diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
-index 8fe2b386c7..fcbf6e8d3c 100644
+index d271ad3a64..d3d617745e 100644
 --- a/tools/ocaml/libs/xc/xenctrl.mli
 +++ b/tools/ocaml/libs/xc/xenctrl.mli
-@@ -62,6 +62,18 @@ type domctl_create_config = {
+@@ -73,6 +73,18 @@ type domctl_create_config = {
    arch: arch_domainconfig;
  }
  
@@ -133,7 +133,7 @@ index 8fe2b386c7..fcbf6e8d3c 100644
  type domaininfo = {
    domid : domid;
    dying : bool;
-@@ -141,6 +153,8 @@ external domain_getinfo : handle -> domid -> domaininfo
+@@ -159,6 +171,8 @@ external domain_getinfo : handle -> domid -> domaininfo
    = "stub_xc_domain_getinfo"
  external domain_get_vcpuinfo : handle -> int -> int -> vcpuinfo
    = "stub_xc_vcpu_getinfo"
@@ -143,10 +143,10 @@ index 8fe2b386c7..fcbf6e8d3c 100644
         = "stub_xc_domain_ioport_permission"
  external domain_iomem_permission: handle -> domid -> nativeint -> nativeint -> bool -> unit
 diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
-index 09a0beeefd..29b40a1e8c 100644
+index ec27b51cd1..0169692b26 100644
 --- a/tools/ocaml/libs/xc/xenctrl_stubs.c
 +++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
-@@ -425,6 +425,37 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch, value domid, value vcpu)
+@@ -494,6 +494,37 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch, value domid, value vcpu)
  	CAMLreturn(result);
  }
  
@@ -185,10 +185,10 @@ index 09a0beeefd..29b40a1e8c 100644
                                          value cpu)
  {
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index 8a34c50327..283cc752d1 100644
+index 678bfd0cf0..cfd09d54fb 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -375,6 +375,7 @@ struct domain *domain_create(domid_t domid,
+@@ -463,6 +463,7 @@ struct domain *domain_create(domid_t domid,
      spin_lock_init_prof(d, domain_lock);
      spin_lock_init_prof(d, page_alloc_lock);
      spin_lock_init(&d->hypercall_deadlock_mutex);
@@ -315,10 +315,10 @@ index b940083a26..5d72819975 100644
  {
      struct vcpu_runstate_info state = { 0 };
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index fbb7b9bdb8..817aa29f05 100644
+index 67e2b72cd7..7aa5db0c09 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1109,6 +1109,46 @@ struct xen_domctl_vuart_op {
+@@ -1122,6 +1122,46 @@ struct xen_domctl_vuart_op {
                                   */
  };
  
@@ -365,15 +365,15 @@ index fbb7b9bdb8..817aa29f05 100644
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1190,6 +1230,7 @@ struct xen_domctl {
- #define XEN_DOMCTL_vuart_op                      81
+@@ -1204,6 +1244,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_get_cpu_policy                82
+ #define XEN_DOMCTL_set_cpu_policy                83
  #define XEN_DOMCTL_query_disable_migrate         97
 +#define XEN_DOMCTL_get_runstate_info             98
  #define XEN_DOMCTL_gdbsx_guestmemio            1000
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
-@@ -1241,6 +1282,7 @@ struct xen_domctl {
+@@ -1254,6 +1295,7 @@ struct xen_domctl {
          struct xen_domctl_set_access_required access_required;
          struct xen_domctl_audit_p2m         audit_p2m;
          struct xen_domctl_set_virq_handler  set_virq_handler;
@@ -382,7 +382,7 @@ index fbb7b9bdb8..817aa29f05 100644
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 14ad85b28d..7237ab7b55 100644
+index e3c129c7b1..4f9572ba3e 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
 @@ -345,6 +345,8 @@ struct vm_event_domain
@@ -406,7 +406,7 @@ index 14ad85b28d..7237ab7b55 100644
  };
  
  /* Protect updates/reads (resp.) of domain_list and domain_hash. */
-@@ -940,6 +947,8 @@ int vcpu_set_soft_affinity(struct vcpu *v, const cpumask_t *affinity);
+@@ -933,6 +940,8 @@ int vcpu_set_soft_affinity(struct vcpu *v, const cpumask_t *affinity);
  void restore_vcpu_affinity(struct domain *d);
  
  void vcpu_runstate_get(struct vcpu *v, struct vcpu_runstate_info *runstate);
@@ -416,7 +416,7 @@ index 14ad85b28d..7237ab7b55 100644
  void sched_guest_idle(void (*idle) (void), unsigned int cpu);
  void scheduler_enable(void);
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
-index dd52cbb2e0..0a22774938 100644
+index 0f1d003b0d..52f6afbfd3 100644
 --- a/xen/xsm/flask/hooks.c
 +++ b/xen/xsm/flask/hooks.c
 @@ -747,6 +747,9 @@ static int flask_domctl(struct domain *d, int cmd)
@@ -430,7 +430,7 @@ index dd52cbb2e0..0a22774938 100644
          return avc_unknown_permission("domctl", cmd);
      }
 diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
-index cbc06c600f..a88afa6283 100644
+index b949d98fc1..4ed4e435d1 100644
 --- a/xen/xsm/flask/policy/access_vectors
 +++ b/xen/xsm/flask/policy/access_vectors
 @@ -245,6 +245,8 @@ class domain2
