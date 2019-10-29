@@ -1,0 +1,56 @@
+From b144cf45d50b603c2909fc32c6abf7359f86f1aa Mon Sep 17 00:00:00 2001
+From: Paul Durrant <paul.durrant@citrix.com>
+Date: Fri, 31 May 2019 11:40:52 +0200
+Subject: [PATCH] x86/vhpet: avoid 'small' time diff test on resume
+
+It appears that even 64-bit versions of Windows 10, when not using syth-
+etic timers, will use 32-bit HPET non-periodic timers. There is a test
+in hpet_set_timer(), specific to 32-bit timers, that tries to disambiguate
+between a comparator value that is in the past and one that is sufficiently
+far in the future that it wraps. This is done by assuming that the delta
+between the main counter and comparator will be 'small' [1], if the
+comparator value is in the past. Unfortunately, more often than not, this
+is not the case if the timer is being re-started after a migrate and so
+the timer is set to fire far in the future (in excess of a minute in
+several observed cases) rather then set to fire immediately. This has a
+rather odd symptom where the guest console is alive enough to be able to
+deal with mouse pointer re-rendering, but any keyboard activity or mouse
+clicks yield no response.
+
+This patch simply adds an extra check of 'creation_finished' into
+hpet_set_timer() so that the 'small' time test is omitted when the function
+is called to restart timers after migration, and thus any negative delta
+causes a timer to fire immediately.
+
+[1] The number of ticks that equate to 0.9765625 milliseconds
+
+Signed-off-by: Paul Durrant <paul.durrant@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+---
+ xen/arch/x86/hvm/hpet.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/hpet.c b/xen/arch/x86/hvm/hpet.c
+index a916758..12f13f8 100644
+--- a/xen/arch/x86/hvm/hpet.c
++++ b/xen/arch/x86/hvm/hpet.c
+@@ -273,10 +273,14 @@ static void hpet_set_timer(HPETState *h, unsigned int tn,
+      * Detect time values set in the past. This is hard to do for 32-bit
+      * comparators as the timer does not have to be set that far in the future
+      * for the counter difference to wrap a 32-bit signed integer. We fudge
+-     * by looking for a 'small' time value in the past.
++     * by looking for a 'small' time value in the past. However, if we
++     * are restoring after migrate, treat any wrap as past since the value
++     * is unlikely to be 'small'.
+      */
+     if ( (int64_t)diff < 0 )
+-        diff = (timer_is_32bit(h, tn) && (-diff > HPET_TINY_TIME_SPAN))
++        diff = (timer_is_32bit(h, tn) &&
++                vhpet_domain(h)->creation_finished &&
++                (-diff > HPET_TINY_TIME_SPAN))
+             ? (uint32_t)diff : 0;
+ 
+     destroy_periodic_time(&h->pt[tn]);
+-- 
+2.7.4
+
