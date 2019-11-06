@@ -1,0 +1,111 @@
+From 1128dd7c631d6854687c4e04339fa53a1e5dc2cd Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Fri, 18 Oct 2019 10:13:03 +0100
+Subject: [PATCH] x86/e820: fix 640k - 1M region reservation logic
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Converting a guest from PV to PV-in-PVH makes the guest to have 384k
+less memory, which may confuse guest's balloon driver. This happens
+because Xen unconditionally reserves 640k - 1M region in E820 despite
+the fact that it's really a usable RAM in PVH boot mode.
+
+Fix this by skipping region type change in virtualised environments,
+trusting whatever memory map our hypervisor has provided.
+
+Take a refactoring opportunity to introduce early_cpu_has_hypervisor().
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 6c6bd63301..adedb557df 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -274,6 +274,15 @@ static inline u32 phys_pkg_id(u32 cpuid_apic, int index_msb)
+ 	return _phys_pkg_id(get_apic_id(), index_msb);
+ }
+ 
++/*
++ * Sometimes it's too early to use cpu_has_hypervisor which is available only
++ * after early_cpu_init().
++ */
++bool __init early_cpu_has_hypervisor(void)
++{
++	return cpuid_ecx(1) & cpufeat_mask(X86_FEATURE_HYPERVISOR);
++}
++
+ /* Do minimum CPU detection early.
+    Fields really needed: vendor, cpuid_level, family, model, mask, cache alignment.
+    The others are not touched to avoid unwanted side effects.
+diff --git a/xen/arch/x86/e820.c b/xen/arch/x86/e820.c
+index 8e8a2c4e1b..dbbe6cac0a 100644
+--- a/xen/arch/x86/e820.c
++++ b/xen/arch/x86/e820.c
+@@ -10,6 +10,7 @@
+ #include <asm/mtrr.h>
+ #include <asm/msr.h>
+ #include <asm/guest.h>
++#include <asm/setup.h>
+ 
+ /*
+  * opt_mem: Limit maximum address of physical RAM.
+@@ -318,9 +319,10 @@ static int __init copy_e820_map(struct e820entry * biosmap, unsigned int nr_map)
+ 
+         /*
+          * Some BIOSes claim RAM in the 640k - 1M region.
+-         * Not right. Fix it up.
++         * Not right. Fix it up, but only when running on bare metal.
+          */
+-        if (type == E820_RAM) {
++        if ( !early_cpu_has_hypervisor() && type == E820_RAM )
++        {
+             if (start < 0x100000ULL && end > 0xA0000ULL) {
+                 if (start < 0xA0000ULL)
+                     add_memory_region(start, 0xA0000ULL-start, type);
+diff --git a/xen/arch/x86/guest/xen.c b/xen/arch/x86/guest/xen.c
+index 7b7a5badab..48ea3224ea 100644
+--- a/xen/arch/x86/guest/xen.c
++++ b/xen/arch/x86/guest/xen.c
+@@ -31,6 +31,7 @@
+ #include <asm/guest.h>
+ #include <asm/msr.h>
+ #include <asm/processor.h>
++#include <asm/setup.h>
+ 
+ #include <public/arch-x86/cpuid.h>
+ #include <public/hvm/params.h>
+@@ -72,8 +73,7 @@ void __init probe_hypervisor(void)
+     if ( xen_guest )
+         return;
+ 
+-    /* Too early to use cpu_has_hypervisor */
+-    if ( !(cpuid_ecx(1) & cpufeat_mask(X86_FEATURE_HYPERVISOR)) )
++    if ( !early_cpu_has_hypervisor() )
+         return;
+ 
+     find_xen_leaves();
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 7fdebdb2a6..4b50f09972 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -6119,7 +6119,7 @@ const struct platform_bad_page *__init get_platform_badpages(unsigned int *array
+     case 0x000806e0: /* erratum KBL??? */
+     case 0x000906e0: /* errata KBL??? / KBW114 / CFW103 */
+         *array_size = (cpuid_eax(0) >= 7 &&
+-                       !(cpuid_ecx(1) & cpufeat_mask(X86_FEATURE_HYPERVISOR)) &&
++                       !early_cpu_has_hypervisor() &&
+                        (cpuid_count_ebx(7, 0) & cpufeat_mask(X86_FEATURE_HLE)));
+         return &hle_bad_page;
+     }
+diff --git a/xen/include/asm-x86/setup.h b/xen/include/asm-x86/setup.h
+index 861d46d6ac..ddd37907f1 100644
+--- a/xen/include/asm-x86/setup.h
++++ b/xen/include/asm-x86/setup.h
+@@ -16,6 +16,7 @@ extern unsigned long xenheap_initial_phys_start;
+ 
+ void early_cpu_init(void);
+ void early_time_init(void);
++bool early_cpu_has_hypervisor(void);
+ 
+ void set_nr_cpu_ids(unsigned int max_cpus);
+ 
