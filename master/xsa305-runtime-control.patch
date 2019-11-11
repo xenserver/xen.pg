@@ -1,0 +1,130 @@
+From 5769475c7960b7489aa49c4694e68e11f59b44d6 Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Mon, 11 Nov 2019 16:27:58 +0000
+Subject: [PATCH] CA-330156: Runtime controls for XSA-305
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+---
+ tools/misc/xen-spec-ctrl.c  |  6 +++-
+ xen/arch/x86/spec_ctrl.c    | 60 +++++++++++++++++++++++++++++++++++++
+ xen/include/public/sysctl.h |  2 ++
+ 3 files changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/tools/misc/xen-spec-ctrl.c b/tools/misc/xen-spec-ctrl.c
+index d5a7424fba..96d8847248 100644
+--- a/tools/misc/xen-spec-ctrl.c
++++ b/tools/misc/xen-spec-ctrl.c
+@@ -10,7 +10,7 @@ void show_help(void)
+ {
+     fprintf(stderr,
+             "xen-spec-ctrl: Xen speculation control tool\n"
+-            "Usage: xen-spec-ctrl { update | exec-sp-{on|off} }\n");
++            "Usage: xen-spec-ctrl { update | exec-sp-{on|off} | tsx-{on|off} }\n");
+ }
+ 
+ int main(int argc, char *argv[])
+@@ -31,6 +31,10 @@ int main(int argc, char *argv[])
+         sysctl.u.spec_ctrl.op = XENPF_spec_ctrl_exec_sp_on;
+     else if ( strcmp(argv[1], "exec-sp-off") == 0 )
+         sysctl.u.spec_ctrl.op = XENPF_spec_ctrl_exec_sp_off;
++    else if ( strcmp(argv[1], "tsx-on") == 0 )
++        sysctl.u.spec_ctrl.op = XENPF_spec_ctrl_tsx_on;
++    else if ( strcmp(argv[1], "tsx-off") == 0 )
++        sysctl.u.spec_ctrl.op = XENPF_spec_ctrl_tsx_off;
+     else
+         goto help;
+ 
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index 522d710180..e67458e51e 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -1328,6 +1328,58 @@ static int do_x86_caps_update(void *unused)
+     return 0;
+ }
+ 
++void set_opt_tsx(int8_t val)
++{
++    if ( val )
++        opt_tsx = 1;
++    else
++        opt_tsx = -2;
++}
++
++static int tsx_val;
++
++static int do_tsx_val_update(void *unused)
++{
++    set_opt_tsx(tsx_val);
++    tsx_init();
++
++    return 0;
++}
++
++static int tsx_val_update(int val)
++{
++    int ret;
++    uint64_t caps = 0;
++
++    /* ucode might have changed. Rescan. */
++    if ( boot_cpu_data.cpuid_level >= 7 &&
++         (cpuid_count_edx(7, 0) & cpufeat_mask(X86_FEATURE_ARCH_CAPS)) )
++        rdmsrl(MSR_ARCH_CAPABILITIES, caps);
++
++    cpu_has_tsx_ctrl = !!(caps & ARCH_CAPS_TSX_CTRL);
++
++    if ( !cpu_has_tsx_ctrl )
++    {
++        printk("XENPF_spec_ctrl_tsx error: CPU doesn't have "
++               "ARCH_CAPS_TSX_CTRL!\n");
++
++        return -EOPNOTSUPP;
++    }
++
++    tsx_val = val;
++
++    ret = stop_machine_run(do_tsx_val_update, NULL, NR_CPUS);
++    if ( !ret )
++    {
++        printk("XENPF_spec_ctrl_tsx: done\n");
++        *spec_ctrl_status = XENPF_spec_ctrl_success;
++    }
++    else
++        printk("stop_machine_run()\n failed!\n");
++
++    return ret;
++}
++
+ static int do_exec_sp_control(uint32_t op)
+ {
+     struct domain *d;
+@@ -1375,6 +1427,14 @@ int spec_ctrl_do_op(uint32_t op, uint32_t *status)
+     case XENPF_spec_ctrl_exec_sp_off:
+         ret = do_exec_sp_control(op);
+         break;
++    case XENPF_spec_ctrl_tsx_on:
++        printk("XENPF_spec_ctrl_tsx: trying to set tsx=1\n");
++        ret = tsx_val_update(1);
++        break;
++    case XENPF_spec_ctrl_tsx_off:
++        printk("XENPF_spec_ctrl_tsx: trying to set tsx=0\n");
++        ret = tsx_val_update(0);
++        break;
+     default:
+         ret = -EINVAL;
+         break;
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index 2f33f323ce..1891e076f4 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -1038,6 +1038,8 @@ struct xen_sysctl_spec_ctrl {
+ #define XENPF_spec_ctrl_exec_sp_on  1
+ /* Turn executable EPT superpage shattering off */
+ #define XENPF_spec_ctrl_exec_sp_off 2
++#define XENPF_spec_ctrl_tsx_on      3
++#define XENPF_spec_ctrl_tsx_off     4
+     uint32_t op;      /* IN */
+ #define XENPF_spec_ctrl_success 0 /* New mitigations have been applied.       */
+                                   /* This is returned in case if some H/W     */
+-- 
+2.17.1
+
