@@ -5,8 +5,8 @@
 %define with_sysv 0
 %define with_systemd 1
 
-# Pass '--without default_debug_hypervisor' to link to the production version by default
-%define default_debug_hypervisor %{?_without_default_debug_hypervisor:0}%{?!_without_default_debug_hypervisor:1}
+# Use the production hypervisor by default
+%define default_debug_hypervisor 0
 
 %define COMMON_OPTIONS DESTDIR=%{buildroot} %{?_smp_mflags}
 
@@ -28,7 +28,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.13.0
-Release: 8.0.17
+Release: 8.1
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
