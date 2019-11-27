@@ -1,0 +1,68 @@
+From 48599114d3ca24157c25f6684bb9322f6dca12bb Mon Sep 17 00:00:00 2001
+From: Anthony PERARD <anthony.perard@citrix.com>
+Date: Tue, 26 Nov 2019 14:16:09 +0100
+Subject: x86/domctl: have XEN_DOMCTL_getpageframeinfo3 preemptible
+
+This hypercall can take a long time to finish because it attempts to
+grab the `hostp2m' lock up to 1024 times. The accumulated wait for the
+lock can take several seconds.
+
+This can easily happen with a guest with 32 vcpus and plenty of RAM,
+during localhost migration.
+
+While the patch doesn't fix the problem with the lock contention and
+the fact that the `hostp2m' lock is currently global (and not on a
+single page), it is still an improvement to the hypercall. It will in
+particular, down the road, allow dropping the arbitrary limit of 1024
+entries per request.
+
+Signed-off-by: Anthony PERARD <anthony.perard@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Release-acked-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index 43e368d63b..b461aadbd6 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -425,6 +425,26 @@ long arch_do_domctl(
+                 ret = -EFAULT;
+                 break;
+             }
++
++            /*
++             * Avoid checking for preemption when the `hostp2m' lock isn't
++             * involve, i.e. non-translated guest, and avoid preemption on
++             * the last iteration.
++             */
++            if ( paging_mode_translate(d) &&
++                 likely((i + 1) < num) && hypercall_preempt_check() )
++            {
++                domctl->u.getpageframeinfo3.num = num - i - 1;
++                domctl->u.getpageframeinfo3.array.p =
++                    guest_handle + ((i + 1) * width);
++                if ( __copy_to_guest(u_domctl, domctl, 1) )
++                {
++                    ret = -EFAULT;
++                    break;
++                }
++                return hypercall_create_continuation(__HYPERVISOR_domctl,
++                                                     "h", u_domctl);
++            }
+         }
+ 
+         break;
+diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
+index a03e80e598..9f2cfd602c 100644
+--- a/xen/include/public/domctl.h
++++ b/xen/include/public/domctl.h
+@@ -163,6 +163,10 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_getdomaininfo_t);
+ #define XEN_DOMCTL_PFINFO_LTAB_MASK (0xfU<<28)
+ 
+ /* XEN_DOMCTL_getpageframeinfo3 */
++/*
++ * Both value `num' and `array' may get modified by the hypercall to allow
++ * preemption.
++ */
+ struct xen_domctl_getpageframeinfo3 {
+     /* IN variables. */
+     uint64_aligned_t num;
