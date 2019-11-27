@@ -1,0 +1,83 @@
+From 72580a8d3c7ac70859437b69570de67dab668d9f Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Wed, 27 Nov 2019 10:04:30 +0000
+Subject: x86/microcode: refuse to load the same revision ucode
+
+Currently if a user tries to live-load the same or older ucode revision
+than CPU already has, he will get a single message in Xen log like:
+
+    (XEN) 128 cores are to update their microcode
+
+No actual ucode loading will happen and this situation can be quite
+confusing. Fix this by starting ucode update only when the provided
+ucode revision is higher than the currently cached one (if any).
+This is based on the property that if microcode_cache exists, all CPUs
+in the system should have at least that ucode revision.
+
+Additionally, print a user friendly message if no matching or newer
+ucode can be found in the provided blob. This also requires ignoring
+-ENODATA in AMD-side code, otherwise the message given to the user is:
+
+    (XEN) Parsing microcode blob error -61
+
+Which actually means that a ucode blob was parsed fine, but no matching
+ucode was found.
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+Reviewed-by: Chao Gao <chao.gao@intel.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Release-acked-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
+index 65d1f41e7c..6ced293d88 100644
+--- a/xen/arch/x86/microcode.c
++++ b/xen/arch/x86/microcode.c
+@@ -640,10 +640,30 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+ 
+     if ( !patch )
+     {
++        printk(XENLOG_WARNING "microcode: couldn't find any matching ucode in "
++                              "the provided blob!\n");
+         ret = -ENOENT;
+         goto put;
+     }
+ 
++    /*
++     * If microcode_cache exists, all CPUs in the system should have at least
++     * that ucode revision.
++     */
++    spin_lock(&microcode_mutex);
++    if ( microcode_cache &&
++         microcode_ops->compare_patch(patch, microcode_cache) != NEW_UCODE )
++    {
++        spin_unlock(&microcode_mutex);
++        printk(XENLOG_WARNING "microcode: couldn't find any newer revision "
++                              "in the provided blob!\n");
++        microcode_free_patch(patch);
++        ret = -ENOENT;
++
++        goto put;
++    }
++    spin_unlock(&microcode_mutex);
++
+     if ( microcode_ops->start_update )
+     {
+         ret = microcode_ops->start_update();
+diff --git a/xen/arch/x86/microcode_amd.c b/xen/arch/x86/microcode_amd.c
+index 1e52f7f49a..00750f7bbb 100644
+--- a/xen/arch/x86/microcode_amd.c
++++ b/xen/arch/x86/microcode_amd.c
+@@ -502,6 +502,13 @@ static struct microcode_patch *cpu_request_microcode(const void *buf,
+ 
+     if ( error )
+     {
++        /*
++         * -ENODATA here means that the blob was parsed fine but no matching
++         * ucode was found. Don't return it to the caller.
++         */
++        if ( error == -ENODATA )
++            error = 0;
++
+         xfree(mc_amd->equiv_cpu_table);
+         xfree(mc_amd);
+         goto out;
