@@ -1,0 +1,220 @@
+From 5655ce8b1ec2a82ef080078e41c73bbd536174e1 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 28 Nov 2019 15:14:03 +0100
+Subject: x86/IRQ: make internally used IRQs also honor the pending EOI stack
+
+At the time the pending EOI stack was introduced there were no
+internally used IRQs which would have the LAPIC EOI issued from the
+->end() hook. This had then changed with the introduction of IOMMUs,
+but the interaction issue was presumably masked by
+irq_guest_eoi_timer_fn() frequently EOI-ing interrupts way too early
+(which got fixed by 359cf6f8a0ec ["x86/IRQ: don't keep EOI timer
+running without need"]).
+
+The problem is that with us re-enabling interrupts across handler
+invocation, a higher priority (guest) interrupt may trigger while
+handling a lower priority (internal) one. The EOI issued from
+->end() (for ACKTYPE_EOI kind interrupts) would then mistakenly
+EOI the higher priority (guest) interrupt, breaking (among other
+things) pending EOI stack logic's assumptions.
+
+Notes:
+
+- In principle we could get away without the check_eoi_deferral flag.
+  I've introduced it just to make sure there's as little change as
+  possible to unaffected paths.
+- Similarly the cpu_has_pending_apic_eoi() check in do_IRQ() isn't
+  strictly necessary.
+- The new function's name isn't very helpful with its use in
+  end_level_ioapic_irq_new(). I did also consider eoi_APIC_irq() (to
+  parallel ack_APIC_irq()), but then liked this even less.
+
+Reported-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Diagnosed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Tested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-acked-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/xen/arch/x86/io_apic.c b/xen/arch/x86/io_apic.c
+index 732b57995c..97cb2d154a 100644
+--- a/xen/arch/x86/io_apic.c
++++ b/xen/arch/x86/io_apic.c
+@@ -1734,7 +1734,7 @@ static void end_level_ioapic_irq_new(struct irq_desc *desc, u8 vector)
+ 
+     v = apic_read(APIC_TMR + ((i & ~0x1f) >> 1));
+ 
+-    ack_APIC_irq();
++    end_nonmaskable_irq(desc, vector);
+ 
+     if ( (desc->status & IRQ_MOVE_PENDING) &&
+          !io_apic_level_ack_pending(desc->irq) )
+diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
+index e9b65b1d64..5d0d94c66c 100644
+--- a/xen/arch/x86/irq.c
++++ b/xen/arch/x86/irq.c
+@@ -438,6 +438,7 @@ int __init init_irq_data(void)
+ }
+ 
+ static void __do_IRQ_guest(int vector);
++static void flush_ready_eoi(void);
+ 
+ static void ack_none(struct irq_desc *desc)
+ {
+@@ -865,6 +866,7 @@ void pirq_set_affinity(struct domain *d, int pirq, const cpumask_t *mask)
+ }
+ 
+ DEFINE_PER_CPU(unsigned int, irq_count);
++static DEFINE_PER_CPU(bool, check_eoi_deferral);
+ 
+ uint8_t alloc_hipriority_vector(void)
+ {
+@@ -1008,7 +1010,25 @@ void do_IRQ(struct cpu_user_regs *regs)
+ 
+  out:
+     if ( desc->handler->end )
++    {
++        /*
++         * If higher priority vectors still have their EOIs pending, we may
++         * not issue an EOI here, as this would EOI the highest priority one.
++         */
++        if ( cpu_has_pending_apic_eoi() )
++        {
++            this_cpu(check_eoi_deferral) = true;
++            desc->handler->end(desc, vector);
++            this_cpu(check_eoi_deferral) = false;
++
++            spin_unlock(&desc->lock);
++            flush_ready_eoi();
++            goto out_no_unlock;
++        }
++
+         desc->handler->end(desc, vector);
++    }
++
+  out_no_end:
+     spin_unlock(&desc->lock);
+  out_no_unlock:
+@@ -1163,6 +1183,29 @@ bool cpu_has_pending_apic_eoi(void)
+     return pending_eoi_sp(this_cpu(pending_eoi)) != 0;
+ }
+ 
++void end_nonmaskable_irq(struct irq_desc *desc, uint8_t vector)
++{
++    struct pending_eoi *peoi = this_cpu(pending_eoi);
++    unsigned int sp = pending_eoi_sp(peoi);
++
++    if ( !this_cpu(check_eoi_deferral) || !sp || peoi[sp - 1].vector < vector )
++    {
++        ack_APIC_irq();
++        return;
++    }
++
++    /* Defer this vector's EOI until all higher ones have been EOI-ed. */
++    pending_eoi_sp(peoi) = sp + 1;
++    do {
++        peoi[sp] = peoi[sp - 1];
++    } while ( --sp && peoi[sp - 1].vector > vector );
++    ASSERT(!sp || peoi[sp - 1].vector < vector);
++
++    peoi[sp].irq = desc->irq;
++    peoi[sp].vector = vector;
++    peoi[sp].ready = 1;
++}
++
+ static inline void set_pirq_eoi(struct domain *d, unsigned int irq)
+ {
+     if ( d->arch.pirq_eoi_map )
+diff --git a/xen/arch/x86/msi.c b/xen/arch/x86/msi.c
+index c239a00fb1..54d13aecf7 100644
+--- a/xen/arch/x86/msi.c
++++ b/xen/arch/x86/msi.c
+@@ -512,11 +512,6 @@ static void ack_maskable_msi_irq(struct irq_desc *desc)
+     ack_APIC_irq(); /* ACKTYPE_NONE */
+ }
+ 
+-void end_nonmaskable_msi_irq(struct irq_desc *desc, u8 vector)
+-{
+-    ack_APIC_irq(); /* ACKTYPE_EOI */
+-}
+-
+ /*
+  * IRQ chip for MSI PCI/PCI-X/PCI-Express devices,
+  * which implement the MSI or MSI-X capability structure.
+@@ -539,7 +534,7 @@ static hw_irq_controller pci_msi_nonmaskable = {
+     .enable       = irq_enable_none,
+     .disable      = irq_disable_none,
+     .ack          = ack_nonmaskable_msi_irq,
+-    .end          = end_nonmaskable_msi_irq,
++    .end          = end_nonmaskable_irq,
+     .set_affinity = set_msi_affinity
+ };
+ 
+diff --git a/xen/drivers/passthrough/amd/iommu_init.c b/xen/drivers/passthrough/amd/iommu_init.c
+index 2b81e38f16..566e6defa1 100644
+--- a/xen/drivers/passthrough/amd/iommu_init.c
++++ b/xen/drivers/passthrough/amd/iommu_init.c
+@@ -427,7 +427,7 @@ static unsigned int iommu_msi_startup(struct irq_desc *desc)
+ static void iommu_msi_end(struct irq_desc *desc, u8 vector)
+ {
+     iommu_msi_unmask(desc);
+-    ack_APIC_irq();
++    end_nonmaskable_irq(desc, vector);
+ }
+ 
+ 
+@@ -460,7 +460,7 @@ static void iommu_maskable_msi_shutdown(struct irq_desc *desc)
+  * maskable flavors here, as we want the ACK to be issued in ->end().
+  */
+ #define iommu_maskable_msi_ack ack_nonmaskable_msi_irq
+-#define iommu_maskable_msi_end end_nonmaskable_msi_irq
++#define iommu_maskable_msi_end end_nonmaskable_irq
+ 
+ static hw_irq_controller iommu_maskable_msi_type = {
+     .typename = "IOMMU-M-MSI",
+@@ -507,7 +507,7 @@ static hw_irq_controller iommu_x2apic_type = {
+     .enable       = irq_enable_none,
+     .disable      = irq_disable_none,
+     .ack          = ack_nonmaskable_msi_irq,
+-    .end          = end_nonmaskable_msi_irq,
++    .end          = end_nonmaskable_irq,
+     .set_affinity = set_x2apic_affinity,
+ };
+ 
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index 25ad649c34..a0e26d3f23 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -1042,7 +1042,7 @@ static void dma_msi_ack(struct irq_desc *desc)
+ static void dma_msi_end(struct irq_desc *desc, u8 vector)
+ {
+     dma_msi_unmask(desc);
+-    ack_APIC_irq();
++    end_nonmaskable_irq(desc, vector);
+ }
+ 
+ static void dma_msi_set_affinity(struct irq_desc *desc, const cpumask_t *mask)
+diff --git a/xen/include/asm-x86/irq.h b/xen/include/asm-x86/irq.h
+index 5f720d30d1..640d54370e 100644
+--- a/xen/include/asm-x86/irq.h
++++ b/xen/include/asm-x86/irq.h
+@@ -188,6 +188,7 @@ void move_masked_irq(struct irq_desc *);
+ 
+ int bind_irq_vector(int irq, int vector, const cpumask_t *);
+ 
++void end_nonmaskable_irq(struct irq_desc *, uint8_t vector);
+ void irq_set_affinity(struct irq_desc *, const cpumask_t *mask);
+ 
+ int init_domain_irq_mapping(struct domain *);
+diff --git a/xen/include/asm-x86/msi.h b/xen/include/asm-x86/msi.h
+index 6e35713ec7..18cf2de61e 100644
+--- a/xen/include/asm-x86/msi.h
++++ b/xen/include/asm-x86/msi.h
+@@ -250,7 +250,6 @@ void mask_msi_irq(struct irq_desc *);
+ void unmask_msi_irq(struct irq_desc *);
+ void guest_mask_msi_irq(struct irq_desc *, bool mask);
+ void ack_nonmaskable_msi_irq(struct irq_desc *);
+-void end_nonmaskable_msi_irq(struct irq_desc *, u8 vector);
+ void set_msi_affinity(struct irq_desc *, const cpumask_t *);
+ 
+ #endif /* __ASM_MSI_H */
