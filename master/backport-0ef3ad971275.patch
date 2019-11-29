@@ -1,0 +1,64 @@
+From 0ef3ad971275c30355245299998faddfada51726 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 29 Nov 2019 17:09:16 +0100
+Subject: console: avoid buffer overrun in guest_console_write()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+conring_puts() has been requiring a nul-terminated string, which the
+local kbuf[] doesn't get set for anymore. Add a length parameter to the
+function, just like was done for others, thus allowing embedded nul to
+also be read through XEN_SYSCTL_readconsole.
+
+While there drop a stray cast: Both operands of - are already uint32_t.
+
+Fixes: ea601ec9995b ("xen/console: Rework HYPERCALL_console_io interface")
+Reported-by: Jürgen Groß <jgross@suse.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+Acked-by: Julien Grall <julien@xen.org>
+
+diff --git a/xen/drivers/char/console.c b/xen/drivers/char/console.c
+index aa72bd1244..844c5de74e 100644
+--- a/xen/drivers/char/console.c
++++ b/xen/drivers/char/console.c
+@@ -257,16 +257,14 @@ static void do_dec_thresh(unsigned char key, struct cpu_user_regs *regs)
+  * ********************************************************
+  */
+ 
+-static void conring_puts(const char *str)
++static void conring_puts(const char *str, size_t len)
+ {
+-    char c;
+-
+     ASSERT(spin_is_locked(&console_lock));
+ 
+-    while ( (c = *str++) != '\0' )
+-        conring[CONRING_IDX_MASK(conringp++)] = c;
++    while ( len-- )
++        conring[CONRING_IDX_MASK(conringp++)] = *str++;
+ 
+-    if ( (uint32_t)(conringp - conringc) > conring_size )
++    if ( conringp - conringc > conring_size )
+         conringc = conringp - conring_size;
+ }
+ 
+@@ -562,7 +560,7 @@ static long guest_console_write(XEN_GUEST_HANDLE_PARAM(char) buffer,
+ 
+             if ( opt_console_to_ring )
+             {
+-                conring_puts(kbuf);
++                conring_puts(kbuf, kcount);
+                 tasklet_schedule(&notify_dom0_con_ring_tasklet);
+             }
+ 
+@@ -687,7 +685,7 @@ static void __putstr(const char *str)
+     }
+ #endif
+ 
+-    conring_puts(str);
++    conring_puts(str, len);
+ 
+     if ( !console_locks_busted )
+         tasklet_schedule(&notify_dom0_con_ring_tasklet);
