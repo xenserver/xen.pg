@@ -206,6 +206,7 @@ cp %{SOURCE4} .
            --disable-seabios \
            --disable-stubdom \
            --disable-xsmpolicy \
+           --disable-pvshim \
            --enable-rombios \
            --enable-systemd \
            --with-xenstored=oxenstored \
@@ -249,6 +250,30 @@ cp buildconfigs/config-debug %{buildroot}/boot/%{name}-%{version}-%{release}-d.c
 
 # do not strip the hypervisor-debuginfo targerts
 chmod -x %{buildroot}/boot/xen-syms-*
+
+# Regular build of PV shim
+cp buildconfigs/config-pvshim-release xen/arch/x86/configs/pvshim_defconfig
+%{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir xen-shim
+%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim \
+    %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim-release
+%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim-syms \
+    %{buildroot}/usr/lib/debug/%{_libexecdir}/%{name}/boot/xen-shim-syms-release
+
+# Debug build of PV shim
+%{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir clean
+cp buildconfigs/config-pvshim-debug xen/arch/x86/configs/pvshim_defconfig
+%{?cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir xen-shim
+%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim \
+    %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim-debug
+%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim-syms \
+    %{buildroot}/usr/lib/debug/%{_libexecdir}/%{name}/boot/xen-shim-syms-debug
+
+# choose between debug and release PV shim build
+%if %{default_debug_hypervisor}
+ln -sf xen-shim-debug %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
+%else
+ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
+%endif
 
 # Build tools and man pages
 %{?cov_wrap} %{__make} %{TOOLS_OPTIONS} install-tools
@@ -507,6 +532,8 @@ chmod -x %{buildroot}/boot/xen-syms-*
 %{_libexecdir}/%{name}/bin/xenpvnetboot
 %{_libexecdir}/%{name}/boot/hvmloader
 %{_libexecdir}/%{name}/boot/xen-shim
+%{_libexecdir}/%{name}/boot/xen-shim-release
+%{_libexecdir}/%{name}/boot/xen-shim-debug
 %{_sbindir}/flask-get-bool
 %{_sbindir}/flask-getenforce
 %{_sbindir}/flask-label-pci
