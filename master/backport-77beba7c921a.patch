@@ -1,0 +1,83 @@
+From 77beba7c921a286c31a2a76f26500047f353614a Mon Sep 17 00:00:00 2001
+From: George Dunlap <george.dunlap@citrix.com>
+Date: Fri, 22 Nov 2019 18:52:02 +0000
+Subject: [PATCH] x86/mm: Adjust linear uses / entries when a page loses
+ validation
+
+"Linear pagetables" is a technique which involves either pointing a
+pagetable at itself, or to another pagetable the same or higher level.
+Xen has limited support for linear pagetables: A page may either point
+to itself, or point to another page of the same level (i.e., L2 to L2,
+L3 to L3, and so on).
+
+XSA-240 introduced an additional restriction that limited the "depth"
+of such chains by allowing pages to either *point to* other pages of
+the same level, or *be pointed to* by other pages of the same level,
+but not both.  To implement this, we keep track of the number of
+outstanding times a page points to or is pointed to another page
+table, to prevent both from happening at the same time.
+
+Additionally, XSA-299 introduced a mode whereby if a page was known to
+have been only partially validated, _put_page_type() would be called
+with PTF_partial_set, indicating that if the page had been
+de-validated by someone else, the type count should be left alone.
+
+Unfortunately, this change did not account for the required accounting
+for linear page table uses and entries; in the case that a previously
+partially-devalidated pagetable was fully-devalidated by someone else,
+the linear_pt_counts are not updated.
+
+This could happen in one of two places:
+
+1. In the case a partially-devalidated page was re-validated by
+someone else
+
+2. During domain tear-down, when pages are force-invalidated while
+leaving the type count intact.
+
+The second could be ignored, since at that point the pages can no
+longer be abused; but the first requires handling.  Note however that
+this would not be a security issue: having the counts be too high is
+overly strict (i.e., will prevent a page from being used in a way
+which is perfectly safe), but shouldn't cause any other issues.
+
+Fix this by adjusting the linear counts when a page loses validation,
+regardless of whether the de-validation completed or was only partial.
+
+Signed-off-by: George Dunlap <george.dunlap@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Release-acked-by: Juergen Gross <jgross@suse.com>
+---
+ xen/arch/x86/mm.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index bd8182f40f..7d4dd80a85 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -2780,14 +2780,17 @@ static int _put_final_page_type(struct page_info *page, unsigned long type,
+ {
+     int rc = free_page_type(page, type, preemptible);
+ 
++    if ( ptpg && PGT_type_equal(type, ptpg->u.inuse.type_info) &&
++         (type & PGT_validated) && rc != -EINTR )
++    {
++        /* Any time we begin de-validation of a page, adjust linear counts */
++        dec_linear_uses(page);
++        dec_linear_entries(ptpg);
++    }
++
+     /* No need for atomic update of type_info here: noone else updates it. */
+     if ( rc == 0 )
+     {
+-        if ( ptpg && PGT_type_equal(type, ptpg->u.inuse.type_info) )
+-        {
+-            dec_linear_uses(page);
+-            dec_linear_entries(ptpg);
+-        }
+         ASSERT(!page->linear_pt_count || page_get_owner(page)->is_dying);
+         set_tlbflush_timestamp(page);
+         smp_wmb();
+-- 
+2.17.1
+
