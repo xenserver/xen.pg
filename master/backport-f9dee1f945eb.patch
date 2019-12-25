@@ -1,0 +1,73 @@
+From f9dee1f945ebb6fb5f9df6f5d95b15c25727f48e Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Fri, 20 Dec 2019 16:44:38 +0100
+Subject: x86/time: update vtsc_last with cmpxchg and drop vtsc_lock
+
+Now that vtsc_last is the only entity protected by vtsc_lock we can
+simply update it using a single atomic operation and drop the spinlock
+entirely. This is extremely important for the case of running nested
+(e.g. shim instance with lots of vCPUs assigned) since if preemption
+happens somewhere inside the critical section that would immediately
+mean that other vCPU stop progressing (and probably being preempted
+as well) waiting for the spinlock to be freed.
+
+This fixes constant shim guest boot lockups with ~32 vCPUs if there is
+vCPU overcommit present (which increases the likelihood of preemption).
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 7cb7fd3..d9c6337 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -539,7 +539,6 @@ int arch_domain_create(struct domain *d,
+     INIT_PAGE_LIST_HEAD(&d->arch.relmem_list);
+ 
+     spin_lock_init(&d->arch.e820_lock);
+-    spin_lock_init(&d->arch.vtsc_lock);
+ 
+     /* Minimal initialisation for the idle domain. */
+     if ( unlikely(is_idle_domain(d)) )
+diff --git a/xen/arch/x86/time.c b/xen/arch/x86/time.c
+index 216169a..63dd5a2 100644
+--- a/xen/arch/x86/time.c
++++ b/xen/arch/x86/time.c
+@@ -2130,19 +2130,15 @@ u64 gtsc_to_gtime(struct domain *d, u64 tsc)
+ 
+ uint64_t pv_soft_rdtsc(const struct vcpu *v, const struct cpu_user_regs *regs)
+ {
+-    s_time_t now = get_s_time();
++    s_time_t old, new, now = get_s_time();
+     struct domain *d = v->domain;
+ 
+-    spin_lock(&d->arch.vtsc_lock);
+-
+-    if ( (int64_t)(now - d->arch.vtsc_last) > 0 )
+-        d->arch.vtsc_last = now;
+-    else
+-        now = ++d->arch.vtsc_last;
+-
+-    spin_unlock(&d->arch.vtsc_lock);
++    do {
++        old = d->arch.vtsc_last;
++        new = now > d->arch.vtsc_last ? now : old + 1;
++    } while ( cmpxchg(&d->arch.vtsc_last, old, new) != old );
+ 
+-    return gtime_to_gtsc(d, now);
++    return gtime_to_gtsc(d, new);
+ }
+ 
+ bool clocksource_is_tsc(void)
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index 3780287..e4da373 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -364,7 +364,6 @@ struct arch_domain
+     int tsc_mode;            /* see include/asm-x86/time.h */
+     bool_t vtsc;             /* tsc is emulated (may change after migrate) */
+     s_time_t vtsc_last;      /* previous TSC value (guarantee monotonicity) */
+-    spinlock_t vtsc_lock;
+     uint64_t vtsc_offset;    /* adjustment for save/restore/migrate */
+     uint32_t tsc_khz;        /* cached guest khz for certain emulated or
+                                 hardware TSC scaling cases */

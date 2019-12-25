@@ -1,0 +1,116 @@
+From 6dd95b02ea27f70384d79a5f9c5ffdf66463a05f Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Fri, 13 Dec 2019 22:48:01 +0000
+Subject: x86/time: drop vtsc_{kern, user}count debug counters
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+They either need to be transformed to atomics to work correctly
+(currently they left unprotected for HVM domains) or dropped entirely
+as taking a per-domain spinlock is too expensive for high-vCPU count
+domains even for debug build given this lock is taken too often.
+
+Choose the latter as they are not extremely important anyway.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 47573f7..614ed60 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -3405,37 +3405,9 @@ int hvm_vmexit_cpuid(struct cpu_user_regs *regs, unsigned int inst_len)
+     return hvm_monitor_cpuid(inst_len, leaf, subleaf);
+ }
+ 
+-static uint64_t _hvm_rdtsc_intercept(void)
+-{
+-    struct vcpu *curr = current;
+-#if !defined(NDEBUG) || defined(CONFIG_PERF_COUNTERS)
+-    struct domain *currd = curr->domain;
+-
+-    if ( currd->arch.vtsc )
+-        switch ( hvm_guest_x86_mode(curr) )
+-        {
+-        case 8:
+-        case 4:
+-        case 2:
+-            if ( unlikely(hvm_get_cpl(curr)) )
+-            {
+-        case 1:
+-                currd->arch.vtsc_usercount++;
+-                break;
+-            }
+-            /* fall through */
+-        case 0:
+-            currd->arch.vtsc_kerncount++;
+-            break;
+-        }
+-#endif
+-
+-    return hvm_get_guest_tsc(curr);
+-}
+-
+ void hvm_rdtsc_intercept(struct cpu_user_regs *regs)
+ {
+-    msr_split(regs, _hvm_rdtsc_intercept());
++    msr_split(regs, hvm_get_guest_tsc(current));
+ 
+     HVMTRACE_2D(RDTSC, regs->eax, regs->edx);
+ }
+@@ -3464,7 +3436,7 @@ int hvm_msr_read_intercept(unsigned int msr, uint64_t *msr_content)
+         break;
+ 
+     case MSR_IA32_TSC:
+-        *msr_content = _hvm_rdtsc_intercept();
++        *msr_content = hvm_get_guest_tsc(v);
+         break;
+ 
+     case MSR_IA32_TSC_ADJUST:
+diff --git a/xen/arch/x86/time.c b/xen/arch/x86/time.c
+index 27a3a10..216169a 100644
+--- a/xen/arch/x86/time.c
++++ b/xen/arch/x86/time.c
+@@ -2135,13 +2135,6 @@ uint64_t pv_soft_rdtsc(const struct vcpu *v, const struct cpu_user_regs *regs)
+ 
+     spin_lock(&d->arch.vtsc_lock);
+ 
+-#if !defined(NDEBUG) || defined(CONFIG_PERF_COUNTERS)
+-    if ( guest_kernel_mode(v, regs) )
+-        d->arch.vtsc_kerncount++;
+-    else
+-        d->arch.vtsc_usercount++;
+-#endif
+-
+     if ( (int64_t)(now - d->arch.vtsc_last) > 0 )
+         d->arch.vtsc_last = now;
+     else
+@@ -2318,11 +2311,6 @@ static void dump_softtsc(unsigned char key)
+             printk(",khz=%"PRIu32, d->arch.tsc_khz);
+         if ( d->arch.incarnation )
+             printk(",inc=%"PRIu32, d->arch.incarnation);
+-#if !defined(NDEBUG) || defined(CONFIG_PERF_COUNTERS)
+-        if ( d->arch.vtsc_kerncount | d->arch.vtsc_usercount )
+-            printk(",vtsc count: %"PRIu64" kernel,%"PRIu64" user",
+-                   d->arch.vtsc_kerncount, d->arch.vtsc_usercount);
+-#endif
+         printk("\n");
+         domcnt++;
+     }
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index 212303f..3780287 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -374,10 +374,6 @@ struct arch_domain
+                                      hardware TSC scaling cases */
+     uint32_t incarnation;    /* incremented every restore or live migrate
+                                 (possibly other cases in the future */
+-#if !defined(NDEBUG) || defined(CONFIG_PERF_COUNTERS)
+-    uint64_t vtsc_kerncount;
+-    uint64_t vtsc_usercount;
+-#endif
+ 
+     /* Pseudophysical e820 map (XENMEM_memory_map).  */
+     spinlock_t e820_lock;
