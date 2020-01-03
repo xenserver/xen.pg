@@ -1,0 +1,200 @@
+From 1171a93b6ca71894f17715050e9289befff0951d Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 3 Jan 2020 17:06:51 +0000
+Subject: tools/restore: Drop unused parameters from xc_domain_restore()
+
+The hvm and pae parameters are a remnant of legacy migration.  They have 0
+passed in from libxl_stream_read.c's process_record(), and are discarded in
+xc_domain_restore().
+
+While dropping these, update the doxygen comment to be accurate, and simplify
+the other hvm vs pv handling in xc_domain_restore().
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Ian Jackson <ian.jackson@eu.citrix.com>
+
+diff --git a/tools/libxc/include/xenguest.h b/tools/libxc/include/xenguest.h
+index b4b2e19619..fdb03e32da 100644
+--- a/tools/libxc/include/xenguest.h
++++ b/tools/libxc/include/xenguest.h
+@@ -181,23 +181,27 @@ struct restore_callbacks {
+  *
+  * Domain is restored in a suspended state ready to be unpaused.
+  *
+- * @parm xch a handle to an open hypervisor interface
+- * @parm fd the file descriptor to restore a domain from
+- * @parm dom the id of the domain
+- * @parm store_evtchn the store event channel for this domain to use
+- * @parm store_mfn returned with the mfn of the store page
+- * @parm hvm non-zero if this is a HVM restore
+- * @parm pae non-zero if this HVM domain has PAE support enabled
+- * @parm stream_type non-zero if the far end of the stream is using checkpointing
+- * @parm callbacks non-NULL to receive a callback to restore toolstack
+- *       specific data
++ * @param xch a handle to an open hypervisor interface
++ * @param io_fd the file descriptor to restore a domain from
++ * @param dom the id of the domain
++ * @param store_evtchn the xenstore event channel for this domain to use
++ * @param store_mfn filled with the gfn of the store page
++ * @param store_domid the backend domain for xenstore
++ * @param console_evtchn the console event channel for this domain to use
++ * @param console_mfn filled with the gfn of the console page
++ * @param console_domid the backend domain for xenconsole
++ * @param stream_type XC_MIG_STREAM_NONE if the far end of the stream is using
++ *        checkpointing
++ * @param callbacks non-NULL to receive a callback to restore toolstack
++ *        specific data
++ * @param recv_df Only used for XC_MIG_STREAM_COLO.  Contains backchannel to
++ *        the source side.
+  * @return 0 on success, -1 on failure
+  */
+ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+                       unsigned int store_evtchn, unsigned long *store_mfn,
+                       uint32_t store_domid, unsigned int console_evtchn,
+                       unsigned long *console_mfn, uint32_t console_domid,
+-                      unsigned int hvm, unsigned int pae,
+                       xc_migration_stream_t stream_type,
+                       struct restore_callbacks *callbacks, int send_back_fd);
+ 
+diff --git a/tools/libxc/xc_nomigrate.c b/tools/libxc/xc_nomigrate.c
+index 6d6169d5ad..c4dca88eb0 100644
+--- a/tools/libxc/xc_nomigrate.c
++++ b/tools/libxc/xc_nomigrate.c
+@@ -32,7 +32,6 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+                       unsigned int store_evtchn, unsigned long *store_mfn,
+                       uint32_t store_domid, unsigned int console_evtchn,
+                       unsigned long *console_mfn, uint32_t console_domid,
+-                      unsigned int hvm, unsigned int pae,
+                       xc_migration_stream_t stream_type,
+                       struct restore_callbacks *callbacks, int send_back_fd)
+ {
+diff --git a/tools/libxc/xc_sr_restore.c b/tools/libxc/xc_sr_restore.c
+index ea7b0339ef..1259ef0bbd 100644
+--- a/tools/libxc/xc_sr_restore.c
++++ b/tools/libxc/xc_sr_restore.c
+@@ -827,7 +827,6 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+                       unsigned int store_evtchn, unsigned long *store_mfn,
+                       uint32_t store_domid, unsigned int console_evtchn,
+                       unsigned long *console_gfn, uint32_t console_domid,
+-                      unsigned int hvm, unsigned int pae,
+                       xc_migration_stream_t stream_type,
+                       struct restore_callbacks *callbacks, int send_back_fd)
+ {
+@@ -860,9 +859,6 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+                callbacks->restore_results);
+     }
+ 
+-    DPRINTF("fd %d, dom %u, hvm %u, pae %u, stream_type %d",
+-            io_fd, dom, hvm, pae, stream_type);
+-
+     if ( xc_domain_getinfo(xch, dom, 1, &ctx.dominfo) != 1 )
+     {
+         PERROR("Failed to get domain info");
+@@ -875,6 +871,9 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+         return -1;
+     }
+ 
++    DPRINTF("fd %d, dom %u, hvm %u, stream_type %d",
++            io_fd, dom, ctx.dominfo.hvm, stream_type);
++
+     ctx.domid = dom;
+ 
+     if ( read_headers(&ctx) )
+@@ -887,19 +886,11 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+     }
+ 
+     ctx.restore.p2m_size = nr_pfns;
++    ctx.restore.ops = ctx.dominfo.hvm
++        ? restore_ops_x86_hvm : restore_ops_x86_pv;
+ 
+-    if ( ctx.dominfo.hvm )
+-    {
+-        ctx.restore.ops = restore_ops_x86_hvm;
+-        if ( restore(&ctx) )
+-            return -1;
+-    }
+-    else
+-    {
+-        ctx.restore.ops = restore_ops_x86_pv;
+-        if ( restore(&ctx) )
+-            return -1;
+-    }
++    if ( restore(&ctx) )
++        return -1;
+ 
+     IPRINTF("XenStore: mfn %#"PRIpfn", dom %d, evt %u",
+             ctx.restore.xenstore_gfn,
+diff --git a/tools/libxl/libxl_internal.h b/tools/libxl/libxl_internal.h
+index b5adbfe4b7..a99f3627e4 100644
+--- a/tools/libxl/libxl_internal.h
++++ b/tools/libxl/libxl_internal.h
+@@ -4199,8 +4199,7 @@ _hidden int libxl__restore_emulator_xenstore_data
+ /* calls libxl__xc_domain_restore_done when done */
+ _hidden void libxl__xc_domain_restore(libxl__egc *egc,
+                                       libxl__domain_create_state *dcs,
+-                                      libxl__save_helper_state *shs,
+-                                      int hvm, int pae);
++                                      libxl__save_helper_state *shs);
+ /* If rc==0 then retval is the return value from xc_domain_save
+  * and errnoval is the errno value it provided.
+  * If rc!=0, retval and errnoval are undefined. */
+diff --git a/tools/libxl/libxl_save_callout.c b/tools/libxl/libxl_save_callout.c
+index 6452d70036..caa1396813 100644
+--- a/tools/libxl/libxl_save_callout.c
++++ b/tools/libxl/libxl_save_callout.c
+@@ -42,8 +42,7 @@ static void helper_done(libxl__egc *egc, libxl__save_helper_state *shs);
+ /*----- entrypoints -----*/
+ 
+ void libxl__xc_domain_restore(libxl__egc *egc, libxl__domain_create_state *dcs,
+-                              libxl__save_helper_state *shs,
+-                              int hvm, int pae)
++                              libxl__save_helper_state *shs)
+ {
+     STATE_AO_GC(dcs->ao);
+ 
+@@ -61,7 +60,6 @@ void libxl__xc_domain_restore(libxl__egc *egc, libxl__domain_create_state *dcs,
+         state->store_port,
+         state->store_domid, state->console_port,
+         state->console_domid,
+-        hvm, pae,
+         cbflags, dcs->restore_params.checkpointed_stream,
+     };
+ 
+diff --git a/tools/libxl/libxl_save_helper.c b/tools/libxl/libxl_save_helper.c
+index 38089a002d..cdad40be4f 100644
+--- a/tools/libxl/libxl_save_helper.c
++++ b/tools/libxl/libxl_save_helper.c
+@@ -275,8 +275,6 @@ int main(int argc, char **argv)
+         domid_t store_domid =               strtoul(NEXTARG,0,10);
+         unsigned console_evtchn =           strtoul(NEXTARG,0,10);
+         domid_t console_domid =             strtoul(NEXTARG,0,10);
+-        unsigned int hvm =                  strtoul(NEXTARG,0,10);
+-        unsigned int pae =                  strtoul(NEXTARG,0,10);
+         unsigned cbflags =                  strtoul(NEXTARG,0,10);
+         xc_migration_stream_t stream_type = strtoul(NEXTARG,0,10);
+         assert(!*++argv);
+@@ -291,8 +289,7 @@ int main(int argc, char **argv)
+ 
+         r = xc_domain_restore(xch, io_fd, dom, store_evtchn, &store_mfn,
+                               store_domid, console_evtchn, &console_mfn,
+-                              console_domid, hvm, pae,
+-                              stream_type,
++                              console_domid, stream_type,
+                               &helper_restore_callbacks, send_back_fd);
+         helper_stub_restore_results(store_mfn,console_mfn,0);
+         complete(r);
+diff --git a/tools/libxl/libxl_stream_read.c b/tools/libxl/libxl_stream_read.c
+index fcb39ee7d5..514f6d9f89 100644
+--- a/tools/libxl/libxl_stream_read.c
++++ b/tools/libxl/libxl_stream_read.c
+@@ -580,7 +580,7 @@ static bool process_record(libxl__egc *egc,
+         break;
+ 
+     case REC_TYPE_LIBXC_CONTEXT:
+-        libxl__xc_domain_restore(egc, dcs, &stream->shs, 0, 0);
++        libxl__xc_domain_restore(egc, dcs, &stream->shs);
+         break;
+ 
+     case REC_TYPE_EMULATOR_XENSTORE_DATA:
