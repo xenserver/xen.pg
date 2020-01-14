@@ -1,0 +1,61 @@
+From c08cbf7fb891943508956d85a83b8c1799b7dc2c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Fri, 20 Dec 2019 16:27:48 +0100
+Subject: x86/apic: force phys mode if interrupt remapping is disabled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cluster mode can only be used with interrupt remapping support, since
+the top 16bits of the APIC ID are filled with the cluster ID, and
+hence on systems where the physical ID is still smaller than 255 the
+cluster ID is not. Force x2APIC to use physical mode if there's no
+interrupt remapping support.
+
+Note that this requires a further patch in order to enable x2APIC
+without interrupt remapping support.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
+index cb54a00..981a5e2 100644
+--- a/docs/misc/xen-command-line.pandoc
++++ b/docs/misc/xen-command-line.pandoc
+@@ -2322,7 +2322,8 @@ Permit use of x2apic setup for SMP environments.
+ ### x2apic_phys (x86)
+ > `= <boolean>`
+ 
+-> Default: `true` if **FADT** mandates physical mode, `false` otherwise.
++> Default: `true` if **FADT** mandates physical mode or if interrupt remapping
++>          is not available, `false` otherwise.
+ 
+ In the case that x2apic is in use, this option switches between physical and
+ clustered mode.  The default, given no hint from the **FADT**, is cluster
+diff --git a/xen/arch/x86/genapic/x2apic.c b/xen/arch/x86/genapic/x2apic.c
+index d5a17f1..1cb16bc 100644
+--- a/xen/arch/x86/genapic/x2apic.c
++++ b/xen/arch/x86/genapic/x2apic.c
+@@ -226,7 +226,21 @@ boolean_param("x2apic_phys", x2apic_phys);
+ const struct genapic *__init apic_x2apic_probe(void)
+ {
+     if ( x2apic_phys < 0 )
+-        x2apic_phys = !!(acpi_gbl_FADT.flags & ACPI_FADT_APIC_PHYSICAL);
++    {
++        /*
++         * Force physical mode if there's no interrupt remapping support: The
++         * ID in clustered mode requires a 32 bit destination field due to
++         * the usage of the high 16 bits to hold the cluster ID.
++         */
++        x2apic_phys = !iommu_intremap ||
++                      (acpi_gbl_FADT.flags & ACPI_FADT_APIC_PHYSICAL);
++    }
++    else if ( !x2apic_phys && !iommu_intremap )
++    {
++        printk("WARNING: x2APIC cluster mode is not supported without interrupt remapping\n"
++               "x2APIC: forcing phys mode\n");
++        x2apic_phys = true;
++    }
+ 
+     if ( x2apic_phys )
+         return &apic_x2apic_phys;

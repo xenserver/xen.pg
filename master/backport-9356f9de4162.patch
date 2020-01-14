@@ -1,0 +1,73 @@
+From 9356f9de41628f0675dd3458540b3558c52c4a8a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Fri, 20 Dec 2019 16:26:09 +0100
+Subject: x86/ioapic: only use dest32 with x2apic and interrupt remapping
+ enabled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The IO-APIC code assumes that x2apic being enabled also implies
+interrupt remapping being enabled, and hence will use the 32bit
+destination field in the IO-APIC entry.
+
+This is safe now, but there's no reason to not enable x2APIC even
+without interrupt remapping, and hence the IO-APIC code needs to use
+the 32 bit destination field only when both interrupt remapping and
+x2APIC are enabled.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/io_apic.c b/xen/arch/x86/io_apic.c
+index 97cb2d1..6238df4 100644
+--- a/xen/arch/x86/io_apic.c
++++ b/xen/arch/x86/io_apic.c
+@@ -562,7 +562,7 @@ set_ioapic_affinity_irq(struct irq_desc *desc, const cpumask_t *mask)
+ 
+     dest = set_desc_affinity(desc, mask);
+     if (dest != BAD_APICID) {
+-        if ( !x2apic_enabled )
++        if ( !iommu_intremap || !x2apic_enabled )
+             dest = SET_APIC_LOGICAL_ID(dest);
+         entry = irq_2_pin + irq;
+         for (;;) {
+@@ -964,7 +964,7 @@ static hw_irq_controller ioapic_edge_type;
+ #define IOAPIC_LEVEL	1
+ 
+ #define SET_DEST(ent, mode, val) do { \
+-    if (x2apic_enabled) \
++    if (x2apic_enabled && iommu_intremap) \
+         (ent).dest.dest32 = (val); \
+     else \
+         (ent).dest.mode.mode##_dest = (val); \
+@@ -1194,14 +1194,14 @@ static void /*__init*/ __print_IO_APIC(bool boot)
+ 	printk(KERN_DEBUG ".... IRQ redirection table:\n");
+ 
+ 	printk(KERN_DEBUG " NR %s Msk Trg IRR Pol Stat DstM DelM Vec\n",
+-               x2apic_enabled ? " DestID" : "Dst");
++               (x2apic_enabled && iommu_intremap) ? " DestID" : "Dst");
+ 
+ 	for (i = 0; i <= reg_01.bits.entries; i++) {
+             struct IO_APIC_route_entry entry;
+ 
+             entry = ioapic_read_entry(apic, i, 0);
+ 
+-            if ( x2apic_enabled )
++            if ( x2apic_enabled && iommu_intremap )
+                 printk(KERN_DEBUG " %02x %08x", i, entry.dest.dest32);
+             else
+                 printk(KERN_DEBUG " %02x  %02x ", i,
+@@ -2504,9 +2504,9 @@ void dump_ioapic_irq_info(void)
+                    rte.dest_mode ? 'L' : 'P',
+                    rte.delivery_status, rte.polarity, rte.irr,
+                    rte.trigger ? 'L' : 'E', rte.mask,
+-                   x2apic_enabled ? 8 : 2,
+-                   x2apic_enabled ? rte.dest.dest32
+-                                  : rte.dest.logical.logical_dest);
++                   (x2apic_enabled && iommu_intremap) ? 8 : 2,
++                   (x2apic_enabled && iommu_intremap) ?
++                       rte.dest.dest32 : rte.dest.logical.logical_dest);
+ 
+             if ( entry->next == 0 )
+                 break;
