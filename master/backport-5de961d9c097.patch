@@ -1,0 +1,115 @@
+From 5de961d9c0976f0a03d830956a4e7ac3e9d887ff Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Tue, 10 Dec 2019 11:34:00 +0100
+Subject: x86: do not enable global pages when virtualized on AMD or Hygon
+ hardware
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When using global pages a full tlb flush can only be performed by
+toggling the PGE bit in CR4, which is usually quite expensive in terms
+of performance when running virtualized. This is specially relevant on
+AMD or Hygon hardware, which doesn't have the ability to do selective
+CR4 trapping, but can also be relevant on e.g. Intel if the underlying
+hypervisor also traps accesses to the PGE CR4 bit.
+
+In order to avoid this performance penalty, do not use global pages
+when running virtualized on AMD or Hygon hardware. A command line option
+'global-pages' is provided in order to allow the user to select whether
+global pages will be enabled for PV guests.
+
+The above figures are from a PV shim running on AMD hardware with
+32 vCPUs:
+
+PGE enabled, x2APIC mode:
+
+(XEN) Global lock flush_lock: addr=ffff82d0804b01c0, lockval=1adb1adb, not locked
+(XEN)   lock:1841883(1375128998543), block:1658716(10193054890781)
+
+Average lock time:   746588ns
+Average block time: 6145147ns
+
+PGE disabled, x2APIC mode:
+
+(XEN) Global lock flush_lock: addr=ffff82d0804af1c0, lockval=a8bfa8bf, not locked
+(XEN)   lock:2730175(657505389886), block:2039716(2963768247738)
+
+Average lock time:   240829ns
+Average block time: 1453029ns
+
+As seen from the above figures the lock and block time of the flush
+lock is reduced to approximately 1/3 of the original value.
+
+Note that XEN_MINIMAL_CR4 and mmu_cr4_features are not modified, and
+thus global pages are left enabled for the hypervisor. This is not an
+issue because the code to switch the control registers (cr3 and cr4)
+already takes into account such situation and performs the necessary
+flushes. The same already happens when using XPTI or PCIDE, as the
+guest cr4 doesn't have global pages enabled in that case either.
+
+Also note that the suspend and resume code is correct in writing
+mmu_cr4_features into cr4 on resume, since that's the cr4 used by the
+idle vCPU which is the context used by the suspend and resume routine.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
+index 891d2d4..7a1be84 100644
+--- a/docs/misc/xen-command-line.pandoc
++++ b/docs/misc/xen-command-line.pandoc
+@@ -1087,6 +1087,19 @@ value settable via Xen tools.
+ 
+ Dom0 is using this value for sizing its maptrack table.
+ 
++### global-pages (x86)
++> `= <boolean>`
++
++> Default: `true` unless running virtualized on AMD or Hygon hardware
++
++Set whether the PGE bit in CR4 will be enabled for PV guests. This controls the
++usage of global pages, and thus the need to perform tlb flushes by writing to
++CR4.
++
++Note it's disabled by default when running virtualized on AMD or Hygon hardware
++since AMD SVM doesn't support selective trapping of CR4, so global pages are
++not enabled in order to reduce the overhead of TLB flushes.
++
+ ### guest_loglvl
+ > `= <level>[/<rate-limited level>]` where level is `none | error | warning | info | debug | all`
+ 
+diff --git a/xen/arch/x86/pv/domain.c b/xen/arch/x86/pv/domain.c
+index 4b6f48d..e6e1c51 100644
+--- a/xen/arch/x86/pv/domain.c
++++ b/xen/arch/x86/pv/domain.c
+@@ -118,6 +118,20 @@ unsigned long pv_fixup_guest_cr4(const struct vcpu *v, unsigned long cr4)
+             (mmu_cr4_features & PV_CR4_GUEST_VISIBLE_MASK));
+ }
+ 
++static int8_t __read_mostly opt_global_pages = -1;
++boolean_runtime_param("global-pages", opt_global_pages);
++
++static int __init pge_init(void)
++{
++    if ( opt_global_pages == -1 )
++        opt_global_pages = !cpu_has_hypervisor ||
++                           (boot_cpu_data.x86_vendor &
++                            (X86_VENDOR_AMD | X86_VENDOR_HYGON));
++
++    return 0;
++}
++__initcall(pge_init);
++
+ unsigned long pv_make_cr4(const struct vcpu *v)
+ {
+     const struct domain *d = v->domain;
+@@ -130,7 +144,7 @@ unsigned long pv_make_cr4(const struct vcpu *v)
+      */
+     if ( d->arch.pv.pcid )
+         cr4 |= X86_CR4_PCIDE;
+-    else if ( !d->arch.pv.xpti )
++    else if ( !d->arch.pv.xpti && opt_global_pages )
+         cr4 |= X86_CR4_PGE;
+ 
+     /*

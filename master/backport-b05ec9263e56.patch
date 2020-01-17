@@ -1,0 +1,96 @@
+From b05ec9263e56ef0784da766e829cfe08569d1d88 Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Fri, 17 Jan 2020 16:18:20 +0100
+Subject: x86/sm{e, a}p: do not enable SMEP/SMAP in PV shim by default on AMD
+
+Due to AMD and Hygon being unable to selectively trap CR4 bit modifications
+running 32-bit PV guest inside PV shim comes with significant performance
+hit. Moreover, for SMEP in particular every time CR4.SMEP changes on context
+switch to/from 32-bit PV guest, it gets trapped by L0 Xen which then
+tries to perform global TLB invalidation for PV shim domain. This usually
+results in eventual hang of a PV shim with at least several vCPUs.
+
+Since the overall security risk is generally lower for shim Xen as it being
+there more of a defense-in-depth mechanism, choose to disable SMEP/SMAP in
+it by default on AMD and Hygon unless a user chose otherwise.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
+index 981a5e2..e0e16fb 100644
+--- a/docs/misc/xen-command-line.pandoc
++++ b/docs/misc/xen-command-line.pandoc
+@@ -1936,19 +1936,25 @@ is 1MB.
+ ### smap (x86)
+ > `= <boolean> | hvm`
+ 
+-> Default: `true`
++> Default: `true` unless running in pv-shim mode on AMD or Hygon hardware
+ 
+ Flag to enable Supervisor Mode Access Prevention
+ Use `smap=hvm` to allow SMAP use by HVM guests only.
+ 
++In PV shim mode on AMD or Hygon hardware due to significant performance impact
++in some cases and generally lower security risk the option defaults to false.
++
+ ### smep (x86)
+ > `= <boolean> | hvm`
+ 
+-> Default: `true`
++> Default: `true` unless running in pv-shim mode on AMD or Hygon hardware
+ 
+ Flag to enable Supervisor Mode Execution Protection
+ Use `smep=hvm` to allow SMEP use by HVM guests only.
+ 
++In PV shim mode on AMD or Hygon hardware due to significant performance impact
++in some cases and generally lower security risk the option defaults to false.
++
+ ### smt (x86)
+ > `= <boolean>`
+ 
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 5bdc229..d858883 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -105,9 +105,9 @@ struct cpuinfo_x86 __read_mostly boot_cpu_data = { 0, 0, 0, 0, -1 };
+ 
+ unsigned long __read_mostly mmu_cr4_features = XEN_MINIMAL_CR4;
+ 
+-/* smep: Enable/disable Supervisor Mode Execution Protection (default on). */
+-#define SMEP_HVM_ONLY (-1)
+-static s8 __initdata opt_smep = 1;
++/* smep: Enable/disable Supervisor Mode Execution Protection */
++#define SMEP_HVM_ONLY (-2)
++static s8 __initdata opt_smep = -1;
+ 
+ /*
+  * Initial domain place holder. Needs to be global so it can be created in
+@@ -142,9 +142,9 @@ static int __init parse_smep_param(const char *s)
+ }
+ custom_param("smep", parse_smep_param);
+ 
+-/* smap: Enable/disable Supervisor Mode Access Prevention (default on). */
+-#define SMAP_HVM_ONLY (-1)
+-static s8 __initdata opt_smap = 1;
++/* smap: Enable/disable Supervisor Mode Access Prevention */
++#define SMAP_HVM_ONLY (-2)
++static s8 __initdata opt_smap = -1;
+ 
+ static int __init parse_smap_param(const char *s)
+ {
+@@ -1616,6 +1616,14 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+ 
+     set_in_cr4(X86_CR4_OSFXSR | X86_CR4_OSXMMEXCPT);
+ 
++    /* Do not enable SMEP/SMAP in PV shim on AMD and Hygon by default */
++    if ( opt_smep == -1 )
++        opt_smep = !pv_shim || !(boot_cpu_data.x86_vendor &
++                                 (X86_VENDOR_AMD | X86_VENDOR_HYGON));
++    if ( opt_smap == -1 )
++        opt_smap = !pv_shim || !(boot_cpu_data.x86_vendor &
++                                 (X86_VENDOR_AMD | X86_VENDOR_HYGON));
++
+     if ( !opt_smep )
+         setup_clear_cpu_cap(X86_FEATURE_SMEP);
+     if ( cpu_has_smep && opt_smep != SMEP_HVM_ONLY )
