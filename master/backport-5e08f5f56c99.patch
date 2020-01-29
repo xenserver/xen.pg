@@ -1,0 +1,51 @@
+From 5e08f5f56c9955d853c26c985b6fb1fb45d0355d Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Wed, 29 Jan 2020 15:06:10 +0100
+Subject: x86/suspend: disable watchdog before calling console_start_sync()
+
+... and enable it after exiting S-state. Otherwise accumulated
+output in serial buffer might easily trigger the watchdog if it's
+still enabled after entering sync transmission mode.
+
+The issue observed on machines which, unfortunately, generate non-0
+output in CPU offline callbacks.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/acpi/power.c b/xen/arch/x86/acpi/power.c
+index 732c8d8..7d381a6 100644
+--- a/xen/arch/x86/acpi/power.c
++++ b/xen/arch/x86/acpi/power.c
+@@ -24,6 +24,7 @@
+ #include <xen/domain.h>
+ #include <xen/console.h>
+ #include <xen/iommu.h>
++#include <xen/watchdog.h>
+ #include <xen/cpu.h>
+ #include <public/platform.h>
+ #include <asm/tboot.h>
+@@ -161,6 +162,7 @@ static int enter_state(u32 state)
+ 
+     acpi_sleep_prepare(state);
+ 
++    watchdog_disable();
+     console_start_sync();
+     printk("Entering ACPI S%d state.\n", state);
+ 
+@@ -172,6 +174,7 @@ static int enter_state(u32 state)
+         printk(XENLOG_ERR "Some devices failed to power down.");
+         system_state = SYS_STATE_resume;
+         console_end_sync();
++        watchdog_enable();
+         goto done;
+     }
+ 
+@@ -215,6 +218,7 @@ static int enter_state(u32 state)
+         tboot_s3_error(error);
+ 
+     console_end_sync();
++    watchdog_enable();
+ 
+     early_microcode_update_cpu();
+ 
