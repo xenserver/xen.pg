@@ -1,0 +1,88 @@
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index 0d5942c3a2..540d6ab938 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1805,7 +1805,8 @@ int xc_cpuid_set(xc_interface *xch,
+ int xc_cpuid_apply_policy(xc_interface *xch,
+                           uint32_t domid,
+                           const uint32_t *featureset,
+-                          unsigned int nr_features);
++                          unsigned int nr_features,
++                          unsigned int cps);
+ int xc_mca_op(xc_interface *xch, struct xen_mc *mc);
+ int xc_mca_op_inject_v2(xc_interface *xch, unsigned int flags,
+                         xc_cpumap_t cpumap, unsigned int nr_cpus);
+diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
+index b66858d273..c0fc0d387b 100644
+--- a/tools/libxc/xc_cpuid_x86.c
++++ b/tools/libxc/xc_cpuid_x86.c
+@@ -455,7 +455,8 @@ int xc_cpuid_set(
+ }
+ 
+ int xc_cpuid_apply_policy(xc_interface *xch, uint32_t domid,
+-                          const uint32_t *featureset, unsigned int nr_features)
++                          const uint32_t *featureset, unsigned int nr_features,
++                          unsigned int cps)
+ {
+     int rc;
+     xc_dominfo_t di;
+@@ -626,6 +627,46 @@ int xc_cpuid_apply_policy(xc_interface *xch, uint32_t domid,
+             goto out;
+         if ( val )
+             p->basic.x2apic = false;
++
++        /*
++         * BODGE: XenServer legacy cores-per-socket.  Needs to remain like
++         * this for backwards compatibility with migration streams which lack
++         * CPUID data.
++         */
++        if ( cps > 0 )
++        {
++            p->basic.htt = true;
++
++            /*
++             * This (cps * 2) is wrong, and contrary to the statement in the
++             * AMD manual.  However, Xen unconditionally offers Intel-style
++             * APIC IDs (odd IDs for hyperthreads) which breaks the AMD APIC
++             * Enumeration Requirements.
++             *
++             * Fake up cores-per-socket as a socket with twice as many cores
++             * as expected, with every odd core offline.
++             */
++            p->basic.lppp = cps * 2;
++
++            switch ( p->x86_vendor )
++            {
++            case X86_VENDOR_INTEL:
++                for ( i = 0; (p->cache.subleaf[i].type &&
++                              i < ARRAY_SIZE(p->cache.raw)); ++i )
++                {
++                    p->cache.subleaf[i].cores_per_package = (cps * 2) - 1;
++                    p->cache.subleaf[i].threads_per_cache = 0;
++                }
++                break;
++
++            case X86_VENDOR_AMD:
++            case X86_VENDOR_HYGON:
++                p->extd.cmp_legacy = true;
++                p->extd.apic_id_size = 0;
++                p->extd.nc = (cps * 2) - 1;
++                break;
++            }
++        }
+     }
+ 
+     rc = x86_cpuid_copy_to_buffer(p, leaves, &nr_leaves);
+diff --git a/tools/libxl/libxl_cpuid.c b/tools/libxl/libxl_cpuid.c
+index 953a3bbd8c..6e0cec774f 100644
+--- a/tools/libxl/libxl_cpuid.c
++++ b/tools/libxl/libxl_cpuid.c
+@@ -411,7 +411,7 @@ int libxl_cpuid_parse_config_xend(libxl_cpuid_policy_list *cpuid,
+ 
+ void libxl_cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid)
+ {
+-    xc_cpuid_apply_policy(ctx->xch, domid, NULL, 0);
++    xc_cpuid_apply_policy(ctx->xch, domid, NULL, 0, 0);
+ }
+ 
+ void libxl_cpuid_set(libxl_ctx *ctx, uint32_t domid,

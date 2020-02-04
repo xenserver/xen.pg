@@ -834,10 +834,10 @@ index 0000000000..835d05eb88
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000000..b54a17fc47
+index 0000000000..5c6bd6d289
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1817 @@
+@@ -0,0 +1,1808 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1150,7 +1150,8 @@ index 0000000000..b54a17fc47
 +    if ( f->nomigrate && test_bit(X86_FEATURE_ITSC, host_featureset) )
 +        set_bit(X86_FEATURE_ITSC, featureset);
 +
-+    rc = xc_cpuid_apply_policy(xch, domid, featureset, nr_features);
++    rc = xc_cpuid_apply_policy(xch, domid, featureset, nr_features,
++                               f->cores_per_socket);
 +
 + out:
 +    free(featureset);
@@ -1243,9 +1244,26 @@ index 0000000000..b54a17fc47
 +    f->apic     = xenstore_get("platform/apic");
 +    f->pae      = xenstore_get("platform/pae");
 +    f->tsc_mode = xenstore_get("platform/tsc_mode");
-+    f->cores_per_socket = xenstore_get("platform/cores-per-socket");
 +    f->x87_fip_width = xenstore_get("platform/x87-fip-width");
 +    f->nomigrate = xenstore_get("platform/nomigrate");
++
++    if ( f->dominfo.hvm )
++    {
++        unsigned int cps = xenstore_get("platform/cores-per-socket");
++
++        if ( !cps || (f->vcpus % cps) != 0 )
++        {
++            xg_err("Bad cores/socket setting: %u (nr vcpus %u)\n",
++                   cps, f->vcpus);
++            exit(1);
++        }
++
++        /*
++         * Must remain 0 for compatiblity with PV guests, which previously
++         * ignores their cores-per-socket setting.
++         */
++        f->cores_per_socket = cps;
++    }
 +
 +    /*
 +     * Follow 'nested-virt' if present.  Fall back to checking
@@ -1791,20 +1809,6 @@ index 0000000000..b54a17fc47
 +        xc_hvm_param_get(xch, domid, HVM_PARAM_X87_FIP_WIDTH, &old);
 +        if ( !old )
 +            xc_hvm_param_set(xch, domid, HVM_PARAM_X87_FIP_WIDTH, f->x87_fip_width);
-+    }
-+
-+    if ( f->cores_per_socket > 0 )
-+        rc = xc_domain_set_cores_per_socket(xch, domid, f->cores_per_socket);
-+
-+    if ( rc )
-+    {
-+        if ( errno == ENOSYS )
-+        {
-+            rc = 0;
-+            xg_info("XEN_DOMCTL_set_cores_per_socket not implemented - skipping");
-+        }
-+        else
-+            failwith_oss_xc("xc_domain_set_cores_per_socket");
 +    }
 +
 +    rc = xc_domain_set_time_offset(xch, domid, f->timeoffset);
@@ -2585,19 +2589,6 @@ index 0000000000..b54a17fc47
 +    if ( hvm )
 +    {
 +        xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f.hpet);
-+        if ( f.cores_per_socket > 0 )
-+            r = xc_domain_set_cores_per_socket(xch, domid, f.cores_per_socket);
-+
-+        if ( r )
-+        {
-+            if ( errno == ENOSYS )
-+            {
-+                r = 0;
-+                xg_info("XEN_DOMCTL_set_cores_per_socket not implemented - skipping");
-+            }
-+            else
-+                failwith_oss_xc("xc_domain_set_cores_per_socket");
-+        }
 +
 +        r = xc_domain_set_time_offset(xch, domid, f.timeoffset);
 +
