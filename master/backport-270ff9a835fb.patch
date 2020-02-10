@@ -1,0 +1,124 @@
+From 270ff9a835fb4bcfead85a84d0f384b77bde93c0 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 28 Jan 2020 15:36:23 +0000
+Subject: tools/ocaml: Drop cpuid helpers
+
+These have no callers, and the underlying infrastructure is about to be
+rewritten completely.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index e00a74d48d..497ded7ce2 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -256,13 +256,6 @@ external domain_set_memmap_limit: handle -> domid -> int64 -> unit
+ external domain_memory_increase_reservation: handle -> domid -> int64 -> unit
+        = "stub_xc_domain_memory_increase_reservation"
+ 
+-external domain_cpuid_set: handle -> domid -> (int64 * (int64 option))
+-                        -> string option array
+-                        -> string option array
+-       = "stub_xc_domain_cpuid_set"
+-external domain_cpuid_apply_policy: handle -> domid -> unit
+-       = "stub_xc_domain_cpuid_apply_policy"
+-
+ external map_foreign_range: handle -> domid -> int
+                          -> nativeint -> Xenmmap.mmap_interface
+        = "stub_map_foreign_range"
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index 0e7049d708..26ec7e59b1 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -219,10 +219,3 @@ external pages_to_kib : int64 -> int64 = "stub_pages_to_kib"
+ val pages_to_mib : int64 -> int64
+ external watchdog : handle -> int -> int32 -> int
+   = "stub_xc_watchdog"
+-
+-external domain_cpuid_set: handle -> domid -> (int64 * (int64 option))
+-                        -> string option array
+-                        -> string option array
+-       = "stub_xc_domain_cpuid_set"
+-external domain_cpuid_apply_policy: handle -> domid -> unit
+-       = "stub_xc_domain_cpuid_apply_policy"
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index 48f39f81d5..904da45c4f 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -48,12 +48,6 @@
+ #define string_of_option_array(array, index) \
+ 	((Field(array, index) == Val_none) ? NULL : String_val(Field(Field(array, index), 0)))
+ 
+-/* maybe here we should check the range of the input instead of blindly
+- * casting it to uint32 */
+-#define cpuid_input_of_val(i1, i2, input) \
+-	i1 = (uint32_t) Int64_val(Field(input, 0)); \
+-	i2 = ((Field(input, 1) == Val_none) ? 0xffffffff : (uint32_t) Int64_val(Field(Field(input, 1), 0)));
+-
+ static void Noreturn failwith_xc(xc_interface *xch)
+ {
+ 	char error_str[XC_MAX_ERROR_MSG_LEN + 6];
+@@ -826,62 +820,6 @@ CAMLprim value stub_xc_domain_memory_increase_reservation(value xch,
+ 	CAMLreturn(Val_unit);
+ }
+ 
+-CAMLprim value stub_xc_domain_cpuid_set(value xch, value domid,
+-                                        value input,
+-                                        value config)
+-{
+-	CAMLparam4(xch, domid, input, config);
+-	CAMLlocal2(array, tmp);
+-#if defined(__i386__) || defined(__x86_64__)
+-	int r;
+-	unsigned int c_input[2];
+-	char *c_config[4], *out_config[4];
+-
+-	c_config[0] = string_of_option_array(config, 0);
+-	c_config[1] = string_of_option_array(config, 1);
+-	c_config[2] = string_of_option_array(config, 2);
+-	c_config[3] = string_of_option_array(config, 3);
+-
+-	cpuid_input_of_val(c_input[0], c_input[1], input);
+-
+-	array = caml_alloc(4, 0);
+-	for (r = 0; r < 4; r++) {
+-		tmp = Val_none;
+-		if (c_config[r]) {
+-			tmp = caml_alloc_small(1, 0);
+-			Field(tmp, 0) = caml_alloc_string(32);
+-		}
+-		Store_field(array, r, tmp);
+-	}
+-
+-	for (r = 0; r < 4; r++)
+-		out_config[r] = (c_config[r]) ? String_val(Field(Field(array, r), 0)) : NULL;
+-
+-	r = xc_cpuid_set(_H(xch), _D(domid),
+-			 c_input, (const char **)c_config, out_config);
+-	if (r < 0)
+-		failwith_xc(_H(xch));
+-#else
+-	caml_failwith("xc_domain_cpuid_set: not implemented");
+-#endif
+-	CAMLreturn(array);
+-}
+-
+-CAMLprim value stub_xc_domain_cpuid_apply_policy(value xch, value domid)
+-{
+-	CAMLparam2(xch, domid);
+-#if defined(__i386__) || defined(__x86_64__)
+-	int r;
+-
+-	r = xc_cpuid_apply_policy(_H(xch), _D(domid), NULL, 0);
+-	if (r < 0)
+-		failwith_xc(_H(xch));
+-#else
+-	caml_failwith("xc_domain_cpuid_apply_policy: not implemented");
+-#endif
+-	CAMLreturn(Val_unit);
+-}
+-
+ CAMLprim value stub_xc_version_version(value xch)
+ {
+ 	CAMLparam1(xch);
