@@ -1,0 +1,130 @@
+From dacb80f9757c011161cec6609f39837c9ea8caa8 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 8 Jan 2020 12:53:49 +0000
+Subject: tools/libxl: Remove libxl_cpuid_{set,apply_policy}() from the API
+
+These functions should never have been exposed.  They don't have external
+users, and can't usefully be used for several reasons.
+
+Move libxl_cpuid_{set,apply_policy}() to being internal functions, and leave
+an equivalent of the nop stubs in the API for caller compatibility.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Ian Jackson <ian.jackson@eu.citrix.com>
+
+diff --git a/tools/libxl/libxl.h b/tools/libxl/libxl.h
+index 54abb9db1f..a02548f595 100644
+--- a/tools/libxl/libxl.h
++++ b/tools/libxl/libxl.h
+@@ -665,7 +665,7 @@ typedef struct libxl__ctx libxl_ctx;
+ #if LIBXL_API_VERSION != 0x040200 && LIBXL_API_VERSION != 0x040300 && \
+     LIBXL_API_VERSION != 0x040400 && LIBXL_API_VERSION != 0x040500 && \
+     LIBXL_API_VERSION != 0x040700 && LIBXL_API_VERSION != 0x040800 && \
+-    LIBXL_API_VERSION != 0x041300
++    LIBXL_API_VERSION != 0x041300 && LIBXL_API_VERSION != 0x041400
+ #error Unknown LIBXL_API_VERSION
+ #endif
+ #endif
+@@ -2323,9 +2323,27 @@ libxl_device_pci *libxl_device_pci_assignable_list(libxl_ctx *ctx, int *num);
+ int libxl_cpuid_parse_config(libxl_cpuid_policy_list *cpuid, const char* str);
+ int libxl_cpuid_parse_config_xend(libxl_cpuid_policy_list *cpuid,
+                                   const char* str);
+-void libxl_cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid);
+-void libxl_cpuid_set(libxl_ctx *ctx, uint32_t domid,
+-                     libxl_cpuid_policy_list cpuid);
++#if LIBXL_API_VERSION < 0x041400
++/*
++ * Dropped from the API in Xen 4.14.  At the time of writing, these functions
++ * don't appear to ever have had external callers.
++ *
++ * These have always been used internally during domain construction, and
++ * can't easily be used externally because of their implicit parameters in
++ * other pieces of global state.
++ *
++ * Furthermore, an API user can't usefully determine whether they get
++ * libxl_cpuid (the real implementation) or libxl_nocpuid (no-op stubs).
++ *
++ * The internal behaviour of these functions also needs to change.  Therefore
++ * for simplicitly, provide the no-op stubs.  Yes technically this is an API
++ * change in some cases for existing software, but there is 0 of that in
++ * practice.
++ */
++static inline void libxl_cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid) {}
++static inline void libxl_cpuid_set(libxl_ctx *ctx, uint32_t domid,
++                                   libxl_cpuid_policy_list cpuid) {}
++#endif
+ 
+ /*
+  * Functions for allowing users of libxl to store private data
+diff --git a/tools/libxl/libxl_cpuid.c b/tools/libxl/libxl_cpuid.c
+index 953a3bbd8c..8430bc8c71 100644
+--- a/tools/libxl/libxl_cpuid.c
++++ b/tools/libxl/libxl_cpuid.c
+@@ -409,13 +409,13 @@ int libxl_cpuid_parse_config_xend(libxl_cpuid_policy_list *cpuid,
+     return 0;
+ }
+ 
+-void libxl_cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid)
++void libxl__cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid)
+ {
+     xc_cpuid_apply_policy(ctx->xch, domid, NULL, 0);
+ }
+ 
+-void libxl_cpuid_set(libxl_ctx *ctx, uint32_t domid,
+-                     libxl_cpuid_policy_list cpuid)
++void libxl__cpuid_set(libxl_ctx *ctx, uint32_t domid,
++                      libxl_cpuid_policy_list cpuid)
+ {
+     int i;
+     char *cpuid_res[4];
+diff --git a/tools/libxl/libxl_dom.c b/tools/libxl/libxl_dom.c
+index cdb294ab8d..e2926cf190 100644
+--- a/tools/libxl/libxl_dom.c
++++ b/tools/libxl/libxl_dom.c
+@@ -625,9 +625,9 @@ int libxl__build_post(libxl__gc *gc, uint32_t domid,
+     if (rc)
+         return rc;
+ 
+-    libxl_cpuid_apply_policy(ctx, domid);
++    libxl__cpuid_apply_policy(ctx, domid);
+     if (info->cpuid != NULL)
+-        libxl_cpuid_set(ctx, domid, info->cpuid);
++        libxl__cpuid_set(ctx, domid, info->cpuid);
+ 
+     if (info->type == LIBXL_DOMAIN_TYPE_HVM
+         && !libxl_ms_vm_genid_is_zero(&info->u.hvm.ms_vm_genid)) {
+diff --git a/tools/libxl/libxl_internal.h b/tools/libxl/libxl_internal.h
+index ba8c9b41ab..3194702284 100644
+--- a/tools/libxl/libxl_internal.h
++++ b/tools/libxl/libxl_internal.h
+@@ -2042,6 +2042,10 @@ struct libxl__cpuid_policy {
+     char *policy[4];
+ };
+ 
++_hidden void libxl__cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid);
++_hidden void libxl__cpuid_set(libxl_ctx *ctx, uint32_t domid,
++                              libxl_cpuid_policy_list cpuid);
++
+ /* Calls poll() again - useful to check whether a signaled condition
+  * is still true.  Cannot fail.  Returns currently-true revents. */
+ _hidden short libxl__fd_poll_recheck(libxl__egc *egc, int fd, short events);
+diff --git a/tools/libxl/libxl_nocpuid.c b/tools/libxl/libxl_nocpuid.c
+index ef1161c434..a39babe754 100644
+--- a/tools/libxl/libxl_nocpuid.c
++++ b/tools/libxl/libxl_nocpuid.c
+@@ -34,12 +34,12 @@ int libxl_cpuid_parse_config_xend(libxl_cpuid_policy_list *cpuid,
+     return 0;
+ }
+ 
+-void libxl_cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid)
++void libxl__cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid)
+ {
+ }
+ 
+-void libxl_cpuid_set(libxl_ctx *ctx, uint32_t domid,
+-                     libxl_cpuid_policy_list cpuid)
++void libxl__cpuid_set(libxl_ctx *ctx, uint32_t domid,
++                      libxl_cpuid_policy_list cpuid)
+ {
+ }
+ 

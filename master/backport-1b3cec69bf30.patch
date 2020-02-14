@@ -1,0 +1,97 @@
+From 1b3cec69bf300e012a0269f0a4f28cca1ebf22c9 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 5 Feb 2020 15:25:21 +0000
+Subject: tools/libxl: Combine legacy CPUID handling logic
+
+While we are in the process of overhauling boot time CPUID/MSR handling, the
+existing logic is going to have to remain in roughly this form for backwards
+compatibility.
+
+Fold libxl__cpuid_apply_policy() and libxl__cpuid_set() together into a single
+libxl__cpuid_legacy() to reduce the complexity for callers.
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Ian Jackson <ian.jackson@eu.citrix.com>
+
+diff --git a/tools/libxl/libxl_cpuid.c b/tools/libxl/libxl_cpuid.c
+index 8430bc8c71..eeae8b49de 100644
+--- a/tools/libxl/libxl_cpuid.c
++++ b/tools/libxl/libxl_cpuid.c
+@@ -409,17 +409,18 @@ int libxl_cpuid_parse_config_xend(libxl_cpuid_policy_list *cpuid,
+     return 0;
+ }
+ 
+-void libxl__cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid)
+-{
+-    xc_cpuid_apply_policy(ctx->xch, domid, NULL, 0);
+-}
+-
+-void libxl__cpuid_set(libxl_ctx *ctx, uint32_t domid,
+-                      libxl_cpuid_policy_list cpuid)
++void libxl__cpuid_legacy(libxl_ctx *ctx, uint32_t domid,
++                         libxl_domain_build_info *info)
+ {
++    libxl_cpuid_policy_list cpuid = info->cpuid;
+     int i;
+     char *cpuid_res[4];
+ 
++    xc_cpuid_apply_policy(ctx->xch, domid, NULL, 0);
++
++    if (!cpuid)
++        return;
++
+     for (i = 0; cpuid[i].input[0] != XEN_CPUID_INPUT_UNUSED; i++)
+         xc_cpuid_set(ctx->xch, domid, cpuid[i].input,
+                      (const char**)(cpuid[i].policy), cpuid_res);
+diff --git a/tools/libxl/libxl_dom.c b/tools/libxl/libxl_dom.c
+index e2926cf190..2112007bef 100644
+--- a/tools/libxl/libxl_dom.c
++++ b/tools/libxl/libxl_dom.c
+@@ -625,9 +625,7 @@ int libxl__build_post(libxl__gc *gc, uint32_t domid,
+     if (rc)
+         return rc;
+ 
+-    libxl__cpuid_apply_policy(ctx, domid);
+-    if (info->cpuid != NULL)
+-        libxl__cpuid_set(ctx, domid, info->cpuid);
++    libxl__cpuid_legacy(ctx, domid, info);
+ 
+     if (info->type == LIBXL_DOMAIN_TYPE_HVM
+         && !libxl_ms_vm_genid_is_zero(&info->u.hvm.ms_vm_genid)) {
+diff --git a/tools/libxl/libxl_internal.h b/tools/libxl/libxl_internal.h
+index 3194702284..69b7346d8e 100644
+--- a/tools/libxl/libxl_internal.h
++++ b/tools/libxl/libxl_internal.h
+@@ -2042,9 +2042,8 @@ struct libxl__cpuid_policy {
+     char *policy[4];
+ };
+ 
+-_hidden void libxl__cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid);
+-_hidden void libxl__cpuid_set(libxl_ctx *ctx, uint32_t domid,
+-                              libxl_cpuid_policy_list cpuid);
++_hidden void libxl__cpuid_legacy(libxl_ctx *ctx, uint32_t domid,
++                                 libxl_domain_build_info *info);
+ 
+ /* Calls poll() again - useful to check whether a signaled condition
+  * is still true.  Cannot fail.  Returns currently-true revents. */
+diff --git a/tools/libxl/libxl_nocpuid.c b/tools/libxl/libxl_nocpuid.c
+index a39babe754..3f30e148be 100644
+--- a/tools/libxl/libxl_nocpuid.c
++++ b/tools/libxl/libxl_nocpuid.c
+@@ -34,12 +34,8 @@ int libxl_cpuid_parse_config_xend(libxl_cpuid_policy_list *cpuid,
+     return 0;
+ }
+ 
+-void libxl__cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid)
+-{
+-}
+-
+-void libxl__cpuid_set(libxl_ctx *ctx, uint32_t domid,
+-                      libxl_cpuid_policy_list cpuid)
++void libxl__cpuid_legacy(libxl_ctx *ctx, uint32_t domid,
++                         libxl_domain_build_info *info)
+ {
+ }
+ 
