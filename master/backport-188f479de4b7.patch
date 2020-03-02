@@ -1,0 +1,146 @@
+From 188f479de4b77e5493a7df258974a0a9d119fb0c Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 28 Feb 2020 18:13:48 +0100
+Subject: xen: make sure stop_machine_run() is always called in a tasklet
+
+With core scheduling active it is mandatory for stop_machine_run() to
+be called in idle context only (so either during boot or in a tasklet),
+as otherwise a scheduling deadlock would occur: stop_machine_run()
+does a cpu rendezvous by activating a tasklet on all other cpus. In
+case stop_machine_run() was not called in an idle vcpu it would block
+scheduling the idle vcpu on its siblings with core scheduling being
+active, resulting in a hang.
+
+Put a BUG_ON() into stop_machine_run() to test for being called in an
+idle vcpu only and adapt the missing call site (ucode loading) to use a
+tasklet for calling stop_machine_run().
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/microcode.c b/xen/arch/x86/microcode.c
+index 35c1d36cdc..6907b312cf 100644
+--- a/xen/arch/x86/microcode.c
++++ b/xen/arch/x86/microcode.c
+@@ -562,30 +562,18 @@ static int do_microcode_update(void *patch)
+     return ret;
+ }
+ 
+-int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
++struct ucode_buf {
++    unsigned int len;
++    char buffer[];
++};
++
++static long microcode_update_helper(void *data)
+ {
+     int ret;
+-    void *buffer;
++    struct ucode_buf *buffer = data;
+     unsigned int cpu, updated;
+     struct microcode_patch *patch;
+ 
+-    if ( len != (uint32_t)len )
+-        return -E2BIG;
+-
+-    if ( microcode_ops == NULL )
+-        return -EINVAL;
+-
+-    buffer = xmalloc_bytes(len);
+-    if ( !buffer )
+-        return -ENOMEM;
+-
+-    ret = copy_from_guest(buffer, buf, len);
+-    if ( ret )
+-    {
+-        xfree(buffer);
+-        return -EFAULT;
+-    }
+-
+     /* cpu_online_map must not change during update */
+     if ( !get_cpu_maps() )
+     {
+@@ -607,7 +595,7 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+         return -EPERM;
+     }
+ 
+-    patch = parse_blob(buffer, len);
++    patch = parse_blob(buffer->buffer, buffer->len);
+     xfree(buffer);
+     if ( IS_ERR(patch) )
+     {
+@@ -700,6 +688,33 @@ int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
+     return ret;
+ }
+ 
++int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void) buf, unsigned long len)
++{
++    int ret;
++    struct ucode_buf *buffer;
++
++    if ( len != (uint32_t)len )
++        return -E2BIG;
++
++    if ( microcode_ops == NULL )
++        return -EINVAL;
++
++    buffer = xmalloc_flex_struct(struct ucode_buf, buffer, len);
++    if ( !buffer )
++        return -ENOMEM;
++
++    ret = copy_from_guest(buffer->buffer, buf, len);
++    if ( ret )
++    {
++        xfree(buffer);
++        return -EFAULT;
++    }
++    buffer->len = len;
++
++    return continue_hypercall_on_cpu(smp_processor_id(),
++                                     microcode_update_helper, buffer);
++}
++
+ static int __init microcode_init(void)
+ {
+     /*
+diff --git a/xen/common/rcupdate.c b/xen/common/rcupdate.c
+index 91d4ad0fd8..d76b991627 100644
+--- a/xen/common/rcupdate.c
++++ b/xen/common/rcupdate.c
+@@ -178,6 +178,10 @@ static int rcu_barrier_action(void *_cpu_count)
+     return 0;
+ }
+ 
++/*
++ * As rcu_barrier() is using stop_machine_run() it is allowed to be used in
++ * idle context only (see comment for stop_machine_run()).
++ */
+ int rcu_barrier(void)
+ {
+     atomic_t cpu_count = ATOMIC_INIT(0);
+diff --git a/xen/common/stop_machine.c b/xen/common/stop_machine.c
+index 33d9602217..2d5f6aef61 100644
+--- a/xen/common/stop_machine.c
++++ b/xen/common/stop_machine.c
+@@ -67,6 +67,12 @@ static void stopmachine_wait_state(void)
+         cpu_relax();
+ }
+ 
++/*
++ * Sync all processors and call a function on one or all of them.
++ * As stop_machine_run() is using a tasklet for syncing the processors it is
++ * mandatory to be called only on an idle vcpu, as otherwise active core
++ * scheduling might hang.
++ */
+ int stop_machine_run(int (*fn)(void *), void *data, unsigned int cpu)
+ {
+     unsigned int i, nr_cpus;
+@@ -74,6 +80,7 @@ int stop_machine_run(int (*fn)(void *), void *data, unsigned int cpu)
+     int ret;
+ 
+     BUG_ON(!local_irq_is_enabled());
++    BUG_ON(!is_idle_vcpu(current));
+ 
+     /* cpu_online_map must not change. */
+     if ( !get_cpu_maps() )
