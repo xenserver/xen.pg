@@ -1,8 +1,8 @@
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 40877b2..a29fccd 100644
+index 87270dd..b23bd99 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -2489,6 +2489,9 @@ static int relinquish_memory(
+@@ -2591,6 +2591,9 @@ static int relinquish_memory(
          if ( test_and_clear_bit(_PGC_pinned_by_tools, &page->count_info) )
              put_page(page);
  
@@ -13,22 +13,22 @@ index 40877b2..a29fccd 100644
              ret = put_page_and_type_preemptible(page);
          switch ( ret )
 diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
-index 5fbf550..eb509fc 100644
+index b0ad357..47eb8b8 100644
 --- a/xen/common/pv_iommu.c
 +++ b/xen/common/pv_iommu.c
-@@ -21,7 +21,11 @@
+@@ -21,6 +21,11 @@
  #include <asm/event.h>
  #include <xen/guest_access.h>
  #include <public/pv-iommu.h>
 +#include <xsm/xsm.h>
- 
++
 +#ifdef CONFIG_X86
 +#include <asm/setup.h>
 +#endif
+ 
  #define ret_t long
  
- static int get_paged_frame(unsigned long gfn, unsigned long *frame,
-@@ -182,7 +186,221 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
+@@ -198,7 +203,210 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
              op->status = 0;
              break;
          }
@@ -39,8 +39,8 @@ index 5fbf550..eb509fc 100644
 +            unsigned int flags = 0;
 +            struct page_info *page = NULL;
 +
-+            /* Check if calling domain is Dom0 and can create IOMMU mappings */
-+            if ( !is_hardware_domain(d) || !can_use_iommu_check(d) )
++            /* Check if can create IOMMU mappings */
++            if ( !can_use_iommu_check(d) )
 +            {
 +                op->status = -EPERM;
 +                goto finish;
@@ -52,7 +52,7 @@ index 5fbf550..eb509fc 100644
 +                op->status = -ENXIO;
 +                goto finish;
 +            }
- 
++
 +            /* Only HVM domains can have their pages foreign mapped */
 +            if ( is_pv_domain(rd) )
 +            {
@@ -66,7 +66,7 @@ index 5fbf550..eb509fc 100644
 +                op->status = -EPERM;
 +                goto finish;
 +            }
-+
+ 
 +            /* Check for privilege over remote domain*/
 +            if ( xsm_iommu_control(XSM_DM_PRIV, rd, op->subop_id) )
 +            {
@@ -131,13 +131,6 @@ index 5fbf550..eb509fc 100644
 +            struct page_info *page = NULL;
 +            int rc;
 +
-+            /* Check if calling domain is Dom0 */
-+            if ( !is_hardware_domain(d) )
-+            {
-+                op->status = -EPERM;
-+                goto finish;
-+            }
-+
 +            if ( d->domain_id == op->u.lookup_foreign_page.domid ||
 +                 op->u.lookup_foreign_page.domid == DOMID_SELF )
 +            {
@@ -183,14 +176,14 @@ index 5fbf550..eb509fc 100644
 +                    goto finish;
 +            }
 +
++            if ( test_and_set_bit(_PGC_foreign_map, &page->count_info) )
++                put_page(page);
++
 +            /* Check if IOMMU is disabled/bypassed */
 +            if ( !can_use_iommu_check(d) )
-+            {
-+                if ( test_and_set_bit(_PGC_foreign_map, &page->count_info) )
-+                    put_page(page);
-+
 +                op->u.lookup_foreign_page.bfn = mfn;
-+            }
++            else
++                op->u.lookup_foreign_page.bfn = mfn + bfn_foreign_offset;
 +
 +            op->status = 0;
 +            break;
@@ -199,13 +192,6 @@ index 5fbf550..eb509fc 100644
 +        {
 +            struct page_info *page;
 +            unsigned long mfn;
-+
-+            /* Check if calling domain is Dom0 */
-+            if ( !is_hardware_domain(d) )
-+            {
-+                op->status = -EPERM;
-+                goto finish;
-+            }
 +
 +            if ( !can_use_iommu_check(d) )
 +            {
@@ -238,6 +224,9 @@ index 5fbf550..eb509fc 100644
 +            if ( !can_use_iommu_check(d) )
 +                goto foreign_unmap_done;
 +
++            if ( op->u.unmap_foreign_page.bfn == mfn + bfn_foreign_offset )
++                goto foreign_unmap_done;
++
 +            if ( iommu_unmap_page(d, op->u.map_foreign_page.bfn) )
 +                domain_crash(d);
 +foreign_unmap_done:
@@ -251,10 +240,10 @@ index 5fbf550..eb509fc 100644
              op->status = -ENODEV;
              break;
 diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
-index 185f651..cd84618 100644
+index c1a28c5..6413a54 100644
 --- a/xen/include/asm-x86/mm.h
 +++ b/xen/include/asm-x86/mm.h
-@@ -246,8 +246,12 @@ struct page_info
+@@ -253,8 +253,12 @@ struct page_info
  #define _PGC_pinned_by_tools PG_shift(10)
  #define PGC_pinned_by_tools PG_mask(1, 10)
  
@@ -269,7 +258,7 @@ index 185f651..cd84618 100644
  
  struct spage_info
 diff --git a/xen/include/public/pv-iommu.h b/xen/include/public/pv-iommu.h
-index 0f19f96..366037c 100644
+index f598a8f..e704a9d 100644
 --- a/xen/include/public/pv-iommu.h
 +++ b/xen/include/public/pv-iommu.h
 @@ -26,6 +26,9 @@
@@ -282,7 +271,7 @@ index 0f19f96..366037c 100644
  
  struct pv_iommu_op {
      uint16_t subop_id;
-@@ -49,6 +52,25 @@ struct pv_iommu_op {
+@@ -53,6 +56,25 @@ struct pv_iommu_op {
          struct {
              uint64_t bfn;
          } unmap_page;
@@ -326,7 +315,7 @@ index 69d3a0d..76c3215 100644
  static XSM_INLINE int xsm_mem_access(XSM_DEFAULT_ARG struct domain *d)
  {
 diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
-index 5dc59dd..9861d73 100644
+index 90c88f4..cb0c939 100644
 --- a/xen/include/xsm/xsm.h
 +++ b/xen/include/xsm/xsm.h
 @@ -106,6 +106,7 @@ struct xsm_operations {

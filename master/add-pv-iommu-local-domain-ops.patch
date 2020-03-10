@@ -1,8 +1,21 @@
+diff --git a/xen/arch/x86/domain_build.c b/xen/arch/x86/domain_build.c
+index bdc45e7..35ebd62 100644
+--- a/xen/arch/x86/domain_build.c
++++ b/xen/arch/x86/domain_build.c
+@@ -996,6 +996,8 @@ int __init construct_dom0(
+             rc = -EINVAL;
+             goto out;
+         }
++        if ( !test_bit(XENFEAT_pv_iommu, parms.f_supported) )
++            bfn_foreign_offset = 0;
+     }
+ 
+     if ( compat32 )
 diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
-index 304fccf..5fbf550 100644
+index 304fccf..d6f2336 100644
 --- a/xen/common/pv_iommu.c
 +++ b/xen/common/pv_iommu.c
-@@ -17,13 +17,238 @@
+@@ -17,13 +17,254 @@
   * along with this program; If not, see <http://www.gnu.org/licenses/>.
   */
  
@@ -13,6 +26,18 @@ index 304fccf..5fbf550 100644
  
  #define ret_t long
  
++/*
++ * The bfn_foreign_offset is where the 1:1 BFN:MFN region starts.
++ * This value must be after the Dom0 1:1 PFN:MFN range.
++ * The default for bfn_foreign_offset is calculated as follows:
++ * 1 TB (40 address bits on some GPUs) - 768 G (max host memory that we
++ * want to support and have everything fit under 1 T) - 4 G (MMIO hole)
++ * - 4 G ("wiggle room").
++ */
++
++uint64_t __read_mostly bfn_foreign_offset = (248ULL << 30) >> PAGE_SHIFT;
++size_param("xen_pviommu_foreign_offset", bfn_foreign_offset);
++
 +static int get_paged_frame(unsigned long gfn, unsigned long *frame,
 +                           struct page_info **page, int readonly,
 +                           struct domain *rd)
@@ -55,7 +80,10 @@ index 304fccf..5fbf550 100644
 +    if ( !iommu_enabled || (!is_hardware_domain(d) && !need_iommu(d)) )
 +        return 0;
 +
-+    if ( is_hardware_domain(d) && iommu_passthrough )
++    if ( is_hardware_domain(d) && (iommu_passthrough || !bfn_foreign_offset) )
++        return 0;
++
++    if ( is_hardware_domain(d) && paging_mode_translate(d) )
 +        return 0;
 +
 +    if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
@@ -83,7 +111,10 @@ index 304fccf..5fbf550 100644
 +            op->flags = 0;
 +            op->status = 0;
 +            if ( can_use_iommu_check(d) )
-+                op->flags |= IOMMU_QUERY_map_cap;
++            {
++                op->flags |= IOMMU_QUERY_map_cap | IOMMU_QUERY_map_all_mfns;
++                op->u.query_caps.offset = bfn_foreign_offset;
++            }
 +
 +            break;
 +        }
@@ -95,14 +126,6 @@ index 304fccf..5fbf550 100644
 +
 +            /* Check if calling domain can create IOMMU mappings */
 +            if ( !can_use_iommu_check(d) )
-+            {
-+                op->status = -EPERM;
-+                goto finish;
-+            }
-+
-+            /* Check we are the owner of the page */
-+            if ( !is_hardware_domain(d) &&
-+                 ( maddr_get_owner(op->u.map_page.gfn) != d ) )
 +            {
 +                op->status = -EPERM;
 +                goto finish;
@@ -153,6 +176,7 @@ index 304fccf..5fbf550 100644
 +
 +        case IOMMUOP_unmap_page:
 +        {
++            struct page_info *page;
 +            unsigned long mfn;
 +
 +            /* Check if there is a valid BFN mapping for this domain */
@@ -167,6 +191,11 @@ index 304fccf..5fbf550 100644
 +                op->status = -EIO;
 +                goto finish;
 +            }
++
++            /* Use MFN from B2M mapping to lookup page */
++            page = mfn_to_page(mfn);
++            if ( !(op->flags & IOMMU_MAP_OP_no_ref_cnt) )
++                put_page(page);
 +
 +            op->status = 0;
 +            break;
@@ -242,12 +271,48 @@ index 304fccf..5fbf550 100644
  }
  
  /*
+diff --git a/xen/drivers/passthrough/vtd/x86/vtd.c b/xen/drivers/passthrough/vtd/x86/vtd.c
+index c0d6aab..c962c66 100644
+--- a/xen/drivers/passthrough/vtd/x86/vtd.c
++++ b/xen/drivers/passthrough/vtd/x86/vtd.c
+@@ -111,6 +111,7 @@ void hvm_dpci_isairq_eoi(struct domain *d, unsigned int isairq)
+ void __hwdom_init vtd_set_hwdom_mapping(struct domain *d)
+ {
+     unsigned long i, j, tmp, top;
++    unsigned long ram_offset = can_use_iommu_check(d) ? bfn_foreign_offset : 0;
+ 
+     BUG_ON(!is_hardware_domain(d));
+ 
+@@ -125,6 +126,7 @@ void __hwdom_init vtd_set_hwdom_mapping(struct domain *d)
+          * ranges.
+          */
+         unsigned long pfn = pdx_to_pfn(i);
++        unsigned long offset = 0;
+ 
+         if ( pfn > (0xffffffffUL >> PAGE_SHIFT) ?
+              (!mfn_valid(pfn) ||
+@@ -138,9 +140,14 @@ void __hwdom_init vtd_set_hwdom_mapping(struct domain *d)
+         if ( xen_in_range(pfn) )
+             continue;
+ 
++        if ( page_is_ram_type(pfn, RAM_TYPE_CONVENTIONAL) )
++            offset = ram_offset;
++        else if ( ram_offset && pfn >= ram_offset )
++            continue;
++
+         tmp = 1 << (PAGE_SHIFT - PAGE_SHIFT_4K);
+         for ( j = 0; j < tmp; j++ )
+-            iommu_map_page(d, pfn * tmp + j, pfn * tmp + j,
++            iommu_map_page(d, (pfn * tmp + j) + offset, pfn * tmp + j,
+                            IOMMUF_readable|IOMMUF_writable);
+ 
+         if (!(i & (0xfffff >> (PAGE_SHIFT - PAGE_SHIFT_4K))))
 diff --git a/xen/include/public/pv-iommu.h b/xen/include/public/pv-iommu.h
 new file mode 100644
-index 0000000..0f19f96
+index 0000000..f598a8f
 --- /dev/null
 +++ b/xen/include/public/pv-iommu.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,73 @@
 +/*
 + * Permission is hereby granted, free of charge, to any person obtaining a copy
 + * of this software and associated documentation files (the "Software"), to
@@ -292,6 +357,10 @@ index 0000000..0f19f96
 +
 +    union {
 +        struct {
++            uint64_t offset;
++        } query_caps;
++
++        struct {
 +            uint64_t bfn;
 +            uint64_t gfn;
 +        } map_page;
@@ -317,3 +386,15 @@ index 0000000..0f19f96
 + * indent-tabs-mode: nil
 + * End:
 + */
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index 4b022b8..7fede62 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -220,4 +220,7 @@ DECLARE_PER_CPU(bool_t, iommu_dont_flush_iotlb);
+ extern struct spinlock iommu_pt_cleanup_lock;
+ extern struct page_list_head iommu_pt_cleanup_list;
+ 
++extern uint64_t bfn_foreign_offset;
++int can_use_iommu_check(struct domain *d);
++
+ #endif /* _IOMMU_H_ */
