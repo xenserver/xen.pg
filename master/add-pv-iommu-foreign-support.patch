@@ -1,8 +1,8 @@
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 0ff80b1..45ce325 100644
+index d42a32c..a25b436 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
-@@ -1839,6 +1839,9 @@ static int relinquish_memory(
+@@ -1967,6 +1967,9 @@ static int relinquish_memory(
              continue;
          }
  
@@ -13,7 +13,7 @@ index 0ff80b1..45ce325 100644
              ret = put_page_and_type_preemptible(page);
          switch ( ret )
 diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
-index 952614f..f1c4cfa 100644
+index 63a6a57..47090e5 100644
 --- a/xen/common/pv_iommu.c
 +++ b/xen/common/pv_iommu.c
 @@ -21,7 +21,11 @@
@@ -27,8 +27,8 @@ index 952614f..f1c4cfa 100644
 +#endif
  #define ret_t long
  
- static int get_paged_frame(unsigned long gfn, mfn_t *mfn,
-@@ -187,7 +191,226 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
+ /*
+@@ -202,6 +206,215 @@ void do_iommu_sub_op(struct pv_iommu_op *op)
              op->status = 0;
              break;
          }
@@ -39,8 +39,8 @@ index 952614f..f1c4cfa 100644
 +            unsigned int flags;
 +            struct page_info *page = NULL;
 +
-+            /* Check if calling domain is Dom0 and can create IOMMU mappings */
-+            if ( !is_hardware_domain(d) || !can_use_iommu_check(d) )
++            /* Check if can create IOMMU mappings */
++            if ( !can_use_iommu_check(d) )
 +            {
 +                op->status = -EPERM;
 +                goto finish;
@@ -134,13 +134,6 @@ index 952614f..f1c4cfa 100644
 +            struct page_info *page = NULL;
 +            int rc;
 +
-+            /* Check if calling domain is Dom0 */
-+            if ( !is_hardware_domain(d) )
-+            {
-+                op->status = -EPERM;
-+                goto finish;
-+            }
-+
 +            if ( d->domain_id == op->u.lookup_foreign_page.domid ||
 +                 op->u.lookup_foreign_page.domid == DOMID_SELF )
 +            {
@@ -186,14 +179,14 @@ index 952614f..f1c4cfa 100644
 +                    goto finish;
 +            }
 +
++            if ( test_and_set_bit(_PGC_foreign_map, &page->count_info) )
++                put_page(page);
++
 +            /* Check if IOMMU is disabled/bypassed */
 +            if ( !can_use_iommu_check(d) )
-+            {
-+                if ( test_and_set_bit(_PGC_foreign_map, &page->count_info) )
-+                    put_page(page);
-+
 +                op->u.lookup_foreign_page.bfn = mfn_x(mfn);
-+            }
++            else
++                op->u.lookup_foreign_page.bfn = mfn_x(mfn) + bfn_foreign_offset;
 +
 +            op->status = 0;
 +            break;
@@ -203,13 +196,6 @@ index 952614f..f1c4cfa 100644
 +            struct page_info *page;
 +            mfn_t mfn;
 +            unsigned int flags;
- 
-+            /* Check if calling domain is Dom0 */
-+            if ( !is_hardware_domain(d) )
-+            {
-+                op->status = -EPERM;
-+                goto finish;
-+            }
 +
 +            if ( !can_use_iommu_check(d) )
 +            {
@@ -242,6 +228,9 @@ index 952614f..f1c4cfa 100644
 +            if ( !can_use_iommu_check(d) )
 +                goto foreign_unmap_done;
 +
++            if ( op->u.unmap_foreign_page.bfn == mfn_x(mfn) + bfn_foreign_offset )
++                goto foreign_unmap_done;
++
 +            if ( iommu_legacy_unmap(d, _dfn(op->u.unmap_foreign_page.bfn),
 +                                    PAGE_ORDER_4K) )
 +                domain_crash(d);
@@ -256,7 +245,7 @@ index 952614f..f1c4cfa 100644
              op->status = -ENODEV;
              break;
 diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
-index 6faa563..23a5411 100644
+index 320c6cd..9495cc8 100644
 --- a/xen/include/asm-x86/mm.h
 +++ b/xen/include/asm-x86/mm.h
 @@ -78,8 +78,12 @@
@@ -274,7 +263,7 @@ index 6faa563..23a5411 100644
  
  /*
 diff --git a/xen/include/public/pv-iommu.h b/xen/include/public/pv-iommu.h
-index 0f19f96..366037c 100644
+index f598a8f..e704a9d 100644
 --- a/xen/include/public/pv-iommu.h
 +++ b/xen/include/public/pv-iommu.h
 @@ -26,6 +26,9 @@
@@ -287,7 +276,7 @@ index 0f19f96..366037c 100644
  
  struct pv_iommu_op {
      uint16_t subop_id;
-@@ -49,6 +52,25 @@ struct pv_iommu_op {
+@@ -53,6 +56,25 @@ struct pv_iommu_op {
          struct {
              uint64_t bfn;
          } unmap_page;
@@ -314,10 +303,10 @@ index 0f19f96..366037c 100644
  };
  
 diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
-index a29d1ef..67808f6 100644
+index 4a1a1bf..c86022d 100644
 --- a/xen/include/xsm/dummy.h
 +++ b/xen/include/xsm/dummy.h
-@@ -587,6 +587,12 @@ static XSM_INLINE int xsm_vm_event_control(XSM_DEFAULT_ARG struct domain *d, int
+@@ -581,6 +581,12 @@ static XSM_INLINE int xsm_vm_event_control(XSM_DEFAULT_ARG struct domain *d, int
      return xsm_default_action(action, current->domain, d);
  }
  
@@ -331,7 +320,7 @@ index a29d1ef..67808f6 100644
  static XSM_INLINE int xsm_mem_access(XSM_DEFAULT_ARG struct domain *d)
  {
 diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
-index 3b192b5..0670953 100644
+index e22d616..dfa1d6f 100644
 --- a/xen/include/xsm/xsm.h
 +++ b/xen/include/xsm/xsm.h
 @@ -106,6 +106,7 @@ struct xsm_operations {
@@ -342,7 +331,7 @@ index 3b192b5..0670953 100644
  
  #if defined(CONFIG_HAS_PASSTHROUGH) && defined(CONFIG_HAS_PCI)
      int (*get_device_group) (uint32_t machine_bdf);
-@@ -582,6 +583,11 @@ static inline int xsm_vm_event_control (xsm_default_t def, struct domain *d, int
+@@ -583,6 +584,11 @@ static inline int xsm_vm_event_control (xsm_default_t def, struct domain *d, int
      return xsm_ops->vm_event_control(d, mode, op);
  }
  
@@ -355,10 +344,10 @@ index 3b192b5..0670953 100644
  static inline int xsm_mem_access (xsm_default_t def, struct domain *d)
  {
 diff --git a/xen/xsm/dummy.c b/xen/xsm/dummy.c
-index 5701047..4819566 100644
+index 5705e52..6dd7b66 100644
 --- a/xen/xsm/dummy.c
 +++ b/xen/xsm/dummy.c
-@@ -111,6 +111,7 @@ void __init xsm_fixup_ops (struct xsm_operations *ops)
+@@ -110,6 +110,7 @@ void __init xsm_fixup_ops (struct xsm_operations *ops)
      set_to_dummy_if_null(ops, hvm_altp2mhvm_op);
  
      set_to_dummy_if_null(ops, do_xsm_op);
