@@ -1,0 +1,68 @@
+From a798bac54fe87a7d69fb7be7f125b8c97f767ff6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Fri, 6 Mar 2020 10:18:13 +0100
+Subject: x86/hvm: allow ASID flush when v != current
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Current implementation of hvm_asid_flush_vcpu is not safe to use
+unless the target vCPU is either paused or the currently running one,
+as it modifies the generation without any locking.
+
+Fix this by using atomic operations when accessing the generation
+field, both in hvm_asid_flush_vcpu_asid and other ASID functions. This
+allows to safely flush the current ASID generation. Note that for the
+flush to take effect if the vCPU is currently running a vmexit is
+required.
+
+Compilers will normally do such writes and reads as a single
+instruction, so the usage of atomic operations is mostly used as a
+safety measure.
+
+Note the same could be achieved by introducing an extra field to
+hvm_vcpu_asid that signals hvm_asid_handle_vmenter the need to call
+hvm_asid_flush_vcpu on the given vCPU before vmentry, this however
+seems unnecessary as hvm_asid_flush_vcpu itself only sets two vCPU
+fields to 0, so there's no need to delay this to the vmentry ASID
+helper.
+
+This is not a bugfix as no callers that would violate the assumptions
+listed in the first paragraph have been found, but a preparatory
+change in order to allow remote flushing of HVM vCPUs.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Wei Liu <wl@xen.org>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/hvm/asid.c b/xen/arch/x86/hvm/asid.c
+index d61d7fc..1fd2770 100644
+--- a/xen/arch/x86/hvm/asid.c
++++ b/xen/arch/x86/hvm/asid.c
+@@ -83,7 +83,7 @@ void hvm_asid_init(int nasids)
+ 
+ void hvm_asid_flush_vcpu_asid(struct hvm_vcpu_asid *asid)
+ {
+-    asid->generation = 0;
++    write_atomic(&asid->generation, 0);
+ }
+ 
+ void hvm_asid_flush_vcpu(struct vcpu *v)
+@@ -121,7 +121,7 @@ bool_t hvm_asid_handle_vmenter(struct hvm_vcpu_asid *asid)
+         goto disabled;
+ 
+     /* Test if VCPU has valid ASID. */
+-    if ( asid->generation == data->core_asid_generation )
++    if ( read_atomic(&asid->generation) == data->core_asid_generation )
+         return 0;
+ 
+     /* If there are no free ASIDs, need to go to a new generation */
+@@ -135,7 +135,7 @@ bool_t hvm_asid_handle_vmenter(struct hvm_vcpu_asid *asid)
+ 
+     /* Now guaranteed to be a free ASID. */
+     asid->asid = data->next_asid++;
+-    asid->generation = data->core_asid_generation;
++    write_atomic(&asid->generation, data->core_asid_generation);
+ 
+     /*
+      * When we assign ASID 1, flush all TLB entries as we are starting a new
