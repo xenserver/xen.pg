@@ -88,6 +88,9 @@ BuildRequires: systemd-devel
 # To placate ./configure
 BuildRequires: gettext-devel glib2-devel curl-devel gnutls-devel
 
+# Need cov-analysis if coverity is enabled
+%{?_cov_buildrequires}
+
 %description
 Xen Hypervisor.
 
@@ -194,6 +197,7 @@ the XenServer installer environment.
 
 %prep
 %autosetup -p1
+%{?_cov_prepare}
 
 base_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info)
 pq_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info-pq)
@@ -238,7 +242,7 @@ cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{release}.c
 %{__make} %{HVSOR_OPTIONS} -C xen clean
 %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug olddefconfig
-%{?cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+%{?_cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug build
 %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug MAP
@@ -262,7 +266,7 @@ cp buildconfigs/config-pvshim-release xen/arch/x86/configs/pvshim_defconfig
 # Debug build of PV shim
 %{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir clean
 cp buildconfigs/config-pvshim-debug xen/arch/x86/configs/pvshim_defconfig
-%{?cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir xen-shim
+%{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir xen-shim
 %{__install} -D -m 644 tools/firmware/xen-dir/xen-shim \
     %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim-debug
 %{__install} -D -m 644 tools/firmware/xen-dir/xen-shim-syms \
@@ -276,13 +280,14 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %endif
 
 # Build tools and man pages
-%{?cov_wrap} %{__make} %{TOOLS_OPTIONS} install-tools
+%{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} install-tools
 %{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
-%{?cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/tests/mce-test/tools install
+%{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/tests/mce-test/tools install
 
 %{__install} -D -m 644 %{SOURCE1} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
 %{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/xen/xl.conf
 %{__install} -D -m 644 %{SOURCE3} %{buildroot}%{_sysconfdir}/logrotate.d/xen-tools
+%{?_cov_install}
 
 %files hypervisor
 /boot/%{name}-%{version}-%{release}.gz
@@ -826,4 +831,6 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
 %systemd_postun xenconsoled.service
 %systemd_postun xenstored.service
 %endif
+
+%{?_cov_results_package}
 
