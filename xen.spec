@@ -22,7 +22,7 @@
 %define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 debug=n
 %endif
 
-%define base_cset d3f3e447676667ef30b48708d359c8f8b13a9a03
+%define base_cset b66ce5058ec9ce84418cedd39b2bf07b7c5a1f65
 %define base_dir  %{name}-%{version}
 
 Summary: Xen is a virtual machine monitor
