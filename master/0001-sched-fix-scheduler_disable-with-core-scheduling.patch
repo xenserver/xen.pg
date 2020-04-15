@@ -1,0 +1,47 @@
+From b99e62a7521fb7580310532fca2a472d6b615805 Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Tue, 7 Apr 2020 14:18:08 +0100
+Subject: [PATCH] sched: fix scheduler_disable() with core scheduling
+
+In core-scheduling mode, Xen might crash when entering ACPI S5 state.
+This happens in sched_slave() during is_idle_unit(next) check because
+next->vcpu_list is stale and points to an already freed memory.
+
+This situation happens shortly after scheduler_disable() is called if
+some CPU is still inside sched_slave() softirq. Current logic simply
+returns prev->next_task from sched_wait_rendezvous_in() which causes
+the described crash because next_task->vcpu_list has become invalid.
+
+Fix the crash by returning NULL from sched_wait_rendezvous_in() in
+the case when scheduler_disable() has been called.
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 820bd5050c..c740584388 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -2297,19 +2297,15 @@ static struct sched_unit *sched_wait_rendezvous_in(struct sched_unit *prev,
+ 
+         *lock = pcpu_schedule_lock_irq(cpu);
+ 
+-        if ( unlikely(!scheduler_active) )
+-        {
+-            ASSERT(is_idle_unit(prev));
+-            atomic_set(&prev->next_task->rendezvous_out_cnt, 0);
+-            prev->rendezvous_in_cnt = 0;
+-        }
+-
+         /*
+          * Check for scheduling resource switched. This happens when we are
+          * moved away from our cpupool and cpus are subject of the idle
+          * scheduler now.
++         *
++         * This is also a bail out case when scheduler_disable() has been
++         * called.
+          */
+-        if ( unlikely(sr != get_sched_res(cpu)) )
++        if ( unlikely(sr != get_sched_res(cpu) || !scheduler_active) )
+         {
+             ASSERT(is_idle_unit(prev));
+             atomic_set(&prev->next_task->rendezvous_out_cnt, 0);
