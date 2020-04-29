@@ -1,5 +1,5 @@
 diff --git a/.gitignore b/.gitignore
-index 3ada0c4f0b..d522fa4638 100644
+index 3ada0c4..d522fa4 100644
 --- a/.gitignore
 +++ b/.gitignore
 @@ -251,6 +251,9 @@ tools/xcutils/lsevtchn
@@ -13,7 +13,7 @@ index 3ada0c4f0b..d522fa4638 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/tools/Makefile b/tools/Makefile
-index 7b1f6c4d28..2a477c96ac 100644
+index 7b1f6c4..2a477c9 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
 @@ -23,6 +23,7 @@ SUBDIRS-$(CONFIG_Linux) += memshr
@@ -26,7 +26,7 @@ index 7b1f6c4d28..2a477c96ac 100644
  ifneq "$(MAKECMDGOALS)" "distclean"
 diff --git a/tools/xenguest/Makefile b/tools/xenguest/Makefile
 new file mode 100644
-index 0000000000..a3e4ce15a0
+index 0000000..a3e4ce1
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,45 @@
@@ -77,7 +77,7 @@ index 0000000000..a3e4ce15a0
 +-include $(DEPS)
 diff --git a/tools/xenguest/xenguest.c b/tools/xenguest/xenguest.c
 new file mode 100644
-index 0000000000..835d05eb88
+index 0000000..835d05e
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
 @@ -0,0 +1,751 @@
@@ -834,10 +834,10 @@ index 0000000000..835d05eb88
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000000..7d3b9c23db
+index 0000000..921386e
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1793 @@
+@@ -0,0 +1,1829 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -2010,6 +2010,8 @@ index 0000000000..7d3b9c23db
 +
 +#define MAX_RMRR_DEVICES E820MAX
 +#define ALLOW_MEMORY_RELOCATE 1
++#define VRAM_RESERVED_ADDR_INIT 0xfb000000lu
++#define VRAM_RESERVED_SIZE 0x1000000lu
 +
 +int hvm_build_setup_mem(struct xc_dom_image *dom, uint64_t max_mem_mib,
 +                        uint64_t max_start_mib)
@@ -2131,7 +2133,7 @@ index 0000000000..7d3b9c23db
 +    /* RDM mapping */
 +    for (i = 0; i < nr_rmrr_devs; i++)
 +    {
-+        for (j = 0; j < nr_rdm_entries[i] && nr < E820MAX; j++)
++        for (j = 0; j < nr_rdm_entries[i] && nr < E820MAX - 2; j++)
 +        {
 +            e820[nr].addr = xrdm[i][j].start_pfn << XC_PAGE_SHIFT;
 +            e820[nr].size = xrdm[i][j].nr_pages << XC_PAGE_SHIFT;
@@ -2145,7 +2147,7 @@ index 0000000000..7d3b9c23db
 +        }
 +        free(xrdm[i]);
 +    }
-+    if ( nr == E820MAX )
++    if ( nr == E820MAX - 2 )
 +    {
 +        xg_err("Error: too many E820 reserved entries for domain\n");
 +        exit(1);
@@ -2162,6 +2164,40 @@ index 0000000000..7d3b9c23db
 +        e820[nr].size = highmem_end - e820[nr].addr;
 +        e820[nr].type = E820_RAM;
 +        nr++;
++    }
++
++    /* Select VRAM reserved region for vGPU within MMIO hole */
++    if ( opt_vgpu )
++    {
++        uint64_t vram_reserved_addr = VRAM_RESERVED_ADDR_INIT;
++
++        while ( vram_reserved_addr >= mmio_start )
++        {
++            for ( i = 0; i < nr; i++ )
++                if ( (vram_reserved_addr + VRAM_RESERVED_SIZE > e820[i].addr) &&
++                     (vram_reserved_addr < e820[i].addr + e820[i].size) )
++                    break;
++            if ( i == nr )
++                break;
++            vram_reserved_addr -= VRAM_RESERVED_SIZE;
++        }
++        if ( vram_reserved_addr < mmio_start )
++        {
++            xg_err("Error: failed to allocate VRAM reserved region\n");
++            exit(1);
++        }
++
++        e820[nr].addr = vram_reserved_addr;
++        e820[nr].size = VRAM_RESERVED_SIZE;
++        e820[nr].type = E820_RESERVED;
++        nr++;
++
++        xg_info("Reserve VRAM region at 0x%lx size 0x%lx for vGPU\n",
++                vram_reserved_addr, VRAM_RESERVED_SIZE);
++        /* Put VRAM reserved region address and size to Xenstore so we could
++         * read it later from DEMU */
++        xenstore_putsv("vm-data/vram-reserved-addr", "%lx", vram_reserved_addr);
++        xenstore_putsv("vm-data/vram-reserved-size", "%lu", VRAM_RESERVED_SIZE);
 +    }
 +
 +    dom->lowmem_end = lowmem_end;
@@ -3064,7 +3100,7 @@ index 0000000..a85d56d
 +}
 diff --git a/tools/xenguest/xg_internal.h b/tools/xenguest/xg_internal.h
 new file mode 100644
-index 0000000000..256472986a
+index 0000000..2564729
 --- /dev/null
 +++ b/tools/xenguest/xg_internal.h
 @@ -0,0 +1,124 @@
