@@ -28,7 +28,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.13.0
-Release: 9.0.6
+Release: 9.0.7
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -198,6 +198,8 @@ the XenServer installer environment.
 %prep
 %autosetup -p1
 %{?_cov_prepare}
+%{?_coverity:cp misc/coverity/nodefs.h %{_cov_dir}/config/user_nodefs.h}
+%{?_cov_make_model:%{_cov_make_model misc/coverity/model.c}}
 
 base_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info)
 pq_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info-pq)
