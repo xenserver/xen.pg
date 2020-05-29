@@ -1,0 +1,89 @@
+From 620fb21486801f95cff28878ac74b4b93258e968 Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Fri, 29 May 2020 01:08:41 +0100
+Subject: [PATCH] x86/svm: do not try to handle recalc NPT faults immediately
+
+A recalculation NPT fault doesn't always require additional handling
+in hvm_hap_nested_page_fault(), moreover in general case if there is no
+explicit handling done there - the fault is wrongly considered fatal.
+
+Instead of trying to be opportunistic - use safer approach and handle
+P2M recalculation in a separate NPT fault by attempting to retry after
+making the necessary adjustments. This is aligned with Intel behavior
+where there are separate VMEXITs for recalculation and EPT violations
+(faults) and only faults are handled in hvm_hap_nested_page_fault().
+Do it by also unifying do_recalc return code with Intel implementation
+where returning 1 means P2M was actually changed.
+
+This covers a specific case of migration with vGPU assigned on AMD:
+global log-dirty is enabled and causes immediate recalculation NPT
+fault in MMIO area upon access.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+---
+This is a safer alternative to:
+https://lists.xenproject.org/archives/html/xen-devel/2020-05/msg01662.html
+and more correct approach from my PoV.
+---
+ xen/arch/x86/hvm/svm/svm.c | 5 +++--
+ xen/arch/x86/mm/p2m-pt.c   | 8 ++++++--
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index 46a1aac..7f6f578 100644
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -2923,9 +2923,10 @@ void svm_vmexit_handler(struct cpu_user_regs *regs)
+             v->arch.hvm.svm.cached_insn_len = vmcb->guest_ins_len & 0xf;
+         rc = vmcb->exitinfo1 & PFEC_page_present
+              ? p2m_pt_handle_deferred_changes(vmcb->exitinfo2) : 0;
+-        if ( rc >= 0 )
++        if ( rc == 0 )
++            /* If no recal adjustments were being made - handle this fault */
+             svm_do_nested_pgfault(v, regs, vmcb->exitinfo1, vmcb->exitinfo2);
+-        else
++        else if ( rc < 0 )
+         {
+             printk(XENLOG_G_ERR
+                    "%pv: Error %d handling NPF (gpa=%08lx ec=%04lx)\n",
+diff --git a/xen/arch/x86/mm/p2m-pt.c b/xen/arch/x86/mm/p2m-pt.c
+index 5c05017..377565b 100644
+--- a/xen/arch/x86/mm/p2m-pt.c
++++ b/xen/arch/x86/mm/p2m-pt.c
+@@ -340,7 +340,7 @@ static int do_recalc(struct p2m_domain *p2m, unsigned long gfn)
+     unsigned long gfn_remainder = gfn;
+     unsigned int level = 4;
+     l1_pgentry_t *pent;
+-    int err = 0;
++    int err = 0, rc = 0;
+ 
+     table = map_domain_page(pagetable_get_mfn(p2m_get_pagetable(p2m)));
+     while ( --level )
+@@ -402,6 +402,8 @@ static int do_recalc(struct p2m_domain *p2m, unsigned long gfn)
+                 clear_recalc(l1, e);
+                 err = p2m->write_p2m_entry(p2m, gfn, pent, e, level + 1);
+                 ASSERT(!err);
++
++                rc = 1;
+             }
+         }
+         unmap_domain_page((void *)((unsigned long)pent & PAGE_MASK));
+@@ -448,12 +450,14 @@ static int do_recalc(struct p2m_domain *p2m, unsigned long gfn)
+             clear_recalc(l1, e);
+         err = p2m->write_p2m_entry(p2m, gfn, pent, e, level + 1);
+         ASSERT(!err);
++
++        rc = 1;
+     }
+ 
+  out:
+     unmap_domain_page(table);
+ 
+-    return err;
++    return err ? err : rc;
+ }
+ 
+ int p2m_pt_handle_deferred_changes(uint64_t gpa)
+-- 
+2.7.4
+
