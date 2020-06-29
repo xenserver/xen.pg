@@ -1,0 +1,99 @@
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Subject: x86/spec-ctrl: Allow the RDRAND/RDSEED features to be hidden
+
+RDRAND/RDSEED can be hidden using cpuid= to mitigate SRBDS if microcode
+isn't available.
+
+Extend libxl's table of named parameters to include RDRAND/RDSEED, and
+have the compiler construct it in .rodata, rather than on the stack at runtime
+each time it is called.
+
+This is part of XSA-320 / CVE-2020-0543.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Julien Grall <jgrall@amazon.com>
+
+diff --git a/docs/misc/xen-command-line.markdown b/docs/misc/xen-command-line.markdown
+index 66e9234..513b7f0 100644
+--- a/docs/misc/xen-command-line.markdown
++++ b/docs/misc/xen-command-line.markdown
+@@ -440,12 +440,18 @@ choice of `dom0-kernel` is deprecated and not supported by all Dom0 kernels.
+ This option allows for fine tuning of the facilities Xen will use, after
+ accounting for hardware capabilities as enumerated via CPUID.
+ 
++Unless otherwise noted, options only have any effect in their negative form,
++to hide the named feature(s).  Ignoring a feature using this mechanism will
++cause Xen not to use the feature, nor offer them as usable to guests.
++
+ Currently accepted:
+ 
+ The Speculation Control hardware features `srbds-ctrl`, `md-clear`, `ibrsb`,
+ `stibp`, `ibpb`, `l1d-flush` and `ssbd` are used by default if available and
+-applicable.  They can be ignored, e.g. `no-ibrsb`, at which point Xen won't
+-use them itself, and won't offer them to guests.
++applicable.  They can all be ignored.
++
++`rdrand` and `rdseed` can be ignored, as a mitigation to XSA-320 /
++CVE-2020-0543.
+ 
+ ### cpuid\_mask\_cpu (AMD only)
+ > `= fam_0f_rev_c | fam_0f_rev_d | fam_0f_rev_e | fam_0f_rev_f | fam_0f_rev_g | fam_10_rev_b | fam_10_rev_c | fam_11_rev_b`
+diff --git a/tools/libxl/libxl_cpuid.c b/tools/libxl/libxl_cpuid.c
+index 5f41806..d63b4b5 100644
+--- a/tools/libxl/libxl_cpuid.c
++++ b/tools/libxl/libxl_cpuid.c
+@@ -89,7 +89,7 @@ static libxl_cpuid_policy_list cpuid_find_match(libxl_cpuid_policy_list *list,
+ int libxl_cpuid_parse_config(libxl_cpuid_policy_list *cpuid, const char* str)
+ {
+ #define NA XEN_CPUID_INPUT_UNUSED
+-    struct cpuid_flags cpuid_flags[] = {
++    static const struct cpuid_flags cpuid_flags[] = {
+         {"maxleaf",      0x00000000, NA, CPUID_REG_EAX,  0, 32},
+       /* the following two entries are subject to tweaking later in the code */
+         {"family",       0x00000001, NA, CPUID_REG_EAX,  8,  8},
+@@ -100,6 +100,7 @@ int libxl_cpuid_parse_config(libxl_cpuid_policy_list *cpuid, const char* str)
+         {"clflush",      0x00000001, NA, CPUID_REG_EBX,  8,  8},
+         {"brandid",      0x00000001, NA, CPUID_REG_EBX,  0,  8},
+         {"hypervisor",   0x00000001, NA, CPUID_REG_ECX, 31,  1},
++        {"rdrand",       0x00000001, NA, CPUID_REG_ECX, 30,  1},
+         {"f16c",         0x00000001, NA, CPUID_REG_ECX, 29,  1},
+         {"avx",          0x00000001, NA, CPUID_REG_ECX, 28,  1},
+         {"osxsave",      0x00000001, NA, CPUID_REG_ECX, 27,  1},
+@@ -160,6 +161,7 @@ int libxl_cpuid_parse_config(libxl_cpuid_policy_list *cpuid, const char* str)
+         {"fpu",          0x00000001, NA, CPUID_REG_EDX,  0,  1},
+         {"srbds-ctrl",   0x00000007,  0, CPUID_REG_EDX,  9,  1},
+         {"md-clear",     0x00000007,  0, CPUID_REG_EDX, 10,  1},
++        {"rdseed",       0x00000007,  0, CPUID_REG_EBX, 18,  1},
+         {"ibrsb",        0x00000007,  0, CPUID_REG_EDX, 26,  1},
+         {"stibp",        0x00000007,  0, CPUID_REG_EDX, 27,  1},
+         {"l1d-flush",    0x00000007,  0, CPUID_REG_EDX, 28,  1},
+@@ -211,7 +213,7 @@ int libxl_cpuid_parse_config(libxl_cpuid_policy_list *cpuid, const char* str)
+ #undef NA
+     char *sep, *val, *endptr;
+     int i;
+-    struct cpuid_flags *flag;
++    const struct cpuid_flags *flag;
+     struct libxl__cpuid_policy *entry;
+     unsigned long num;
+     char flags[33], *resstr;
+diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
+index 7c2a8af..329790d 100644
+--- a/xen/arch/x86/cpuid.c
++++ b/xen/arch/x86/cpuid.c
+@@ -57,6 +57,16 @@ static int __init parse_xen_cpuid(const char *s)
+             if ( !val )
+                 setup_clear_cpu_cap(X86_FEATURE_SSBD);
+         }
++        else if ( (val = parse_boolean("rdrand", s, ss)) >= 0 )
++        {
++            if ( !val )
++                setup_clear_cpu_cap(X86_FEATURE_RDRAND);
++        }
++        else if ( (val = parse_boolean("rdseed", s, ss)) >= 0 )
++        {
++            if ( !val )
++                setup_clear_cpu_cap(X86_FEATURE_RDSEED);
++        }
+         else
+             rc = -EINVAL;
+ 
