@@ -1,0 +1,181 @@
+From: <security@xenproject.org>
+Subject: vtd: prune (and rename) cache flush functions
+
+Rename __iommu_flush_cache to iommu_sync_cache and remove
+iommu_flush_cache_page. Also remove the iommu_flush_cache_entry
+wrapper and just use iommu_sync_cache instead. Note the _entry suffix
+was meaningless as the wrapper was already taking a size parameter in
+bytes. While there also constify the addr parameter.
+
+No functional change intended.
+
+This is part of XSA-321.
+
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/drivers/passthrough/vtd/extern.h b/xen/drivers/passthrough/vtd/extern.h
+index a72ee6d..bab97e2 100644
+--- a/xen/drivers/passthrough/vtd/extern.h
++++ b/xen/drivers/passthrough/vtd/extern.h
+@@ -36,8 +36,7 @@ void disable_qinval(struct iommu *iommu);
+ int enable_intremap(struct iommu *iommu, int eim);
+ void disable_intremap(struct iommu *iommu);
+ 
+-void iommu_flush_cache_entry(void *addr, unsigned int size);
+-void iommu_flush_cache_page(void *addr, unsigned long npages);
++void iommu_sync_cache(const void *addr, unsigned int size);
+ int iommu_alloc(struct acpi_drhd_unit *drhd);
+ void iommu_free(struct acpi_drhd_unit *drhd);
+ 
+diff --git a/xen/drivers/passthrough/vtd/intremap.c b/xen/drivers/passthrough/vtd/intremap.c
+index 1b307c5..16160a9 100644
+--- a/xen/drivers/passthrough/vtd/intremap.c
++++ b/xen/drivers/passthrough/vtd/intremap.c
+@@ -184,7 +184,7 @@ static void free_remap_entry(struct iommu *iommu, int index)
+                      iremap_entries, iremap_entry);
+ 
+     memset(iremap_entry, 0, sizeof(struct iremap_entry));
+-    iommu_flush_cache_entry(iremap_entry, sizeof(struct iremap_entry));
++    iommu_sync_cache(iremap_entry, sizeof(struct iremap_entry));
+     iommu_flush_iec_index(iommu, 0, index);
+ 
+     unmap_vtd_domain_page(iremap_entries);
+@@ -355,7 +355,7 @@ static int ioapic_rte_to_remap_entry(struct iommu *iommu,
+     }
+ 
+     memcpy(iremap_entry, &new_ire, sizeof(struct iremap_entry));
+-    iommu_flush_cache_entry(iremap_entry, sizeof(struct iremap_entry));
++    iommu_sync_cache(iremap_entry, sizeof(struct iremap_entry));
+     iommu_flush_iec_index(iommu, 0, index);
+ 
+     unmap_vtd_domain_page(iremap_entries);
+@@ -640,7 +640,7 @@ static int msi_msg_to_remap_entry(
+     remap_rte->data = index - i;
+ 
+     memcpy(iremap_entry, &new_ire, sizeof(struct iremap_entry));
+-    iommu_flush_cache_entry(iremap_entry, sizeof(struct iremap_entry));
++    iommu_sync_cache(iremap_entry, sizeof(struct iremap_entry));
+     iommu_flush_iec_index(iommu, 0, index);
+ 
+     unmap_vtd_domain_page(iremap_entries);
+@@ -1017,7 +1017,7 @@ int pi_update_irte(const struct vcpu *v, const struct pirq *pirq,
+      */
+     ASSERT(ret == old_ire.val);
+ 
+-    iommu_flush_cache_entry(p, sizeof(*p));
++    iommu_sync_cache(p, sizeof(*p));
+     iommu_flush_iec_index(iommu, 0, remap_index);
+ 
+     unmap_vtd_domain_page(iremap_entries);
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index 0290c2e..4f1c531 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -157,7 +157,8 @@ static void __init free_intel_iommu(struct intel_iommu *intel)
+ }
+ 
+ static int iommus_incoherent;
+-static void __iommu_flush_cache(void *addr, unsigned int size)
++
++void iommu_sync_cache(const void *addr, unsigned int size)
+ {
+     int i;
+     static unsigned int clflush_size = 0;
+@@ -172,16 +173,6 @@ static void __iommu_flush_cache(void *addr, unsigned int size)
+         cacheline_flush((char *)addr + i);
+ }
+ 
+-void iommu_flush_cache_entry(void *addr, unsigned int size)
+-{
+-    __iommu_flush_cache(addr, size);
+-}
+-
+-void iommu_flush_cache_page(void *addr, unsigned long npages)
+-{
+-    __iommu_flush_cache(addr, PAGE_SIZE * npages);
+-}
+-
+ /* Allocate page table, return its machine address */
+ u64 alloc_pgtable_maddr(struct acpi_drhd_unit *drhd, unsigned long npages)
+ {
+@@ -206,7 +197,7 @@ u64 alloc_pgtable_maddr(struct acpi_drhd_unit *drhd, unsigned long npages)
+         vaddr = __map_domain_page(cur_pg);
+         memset(vaddr, 0, PAGE_SIZE);
+ 
+-        iommu_flush_cache_page(vaddr, 1);
++        iommu_sync_cache(vaddr, PAGE_SIZE);
+         unmap_domain_page(vaddr);
+         cur_pg++;
+     }
+@@ -241,7 +232,7 @@ static u64 bus_to_context_maddr(struct iommu *iommu, u8 bus)
+         }
+         set_root_value(*root, maddr);
+         set_root_present(*root);
+-        iommu_flush_cache_entry(root, sizeof(struct root_entry));
++        iommu_sync_cache(root, sizeof(struct root_entry));
+     }
+     maddr = (u64) get_context_addr(*root);
+     unmap_vtd_domain_page(root_entries);
+@@ -299,7 +290,7 @@ static u64 addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc)
+              */
+             dma_set_pte_readable(*pte);
+             dma_set_pte_writable(*pte);
+-            iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
++            iommu_sync_cache(pte, sizeof(struct dma_pte));
+         }
+ 
+         if ( level == 2 )
+@@ -638,7 +629,7 @@ static void dma_pte_clear_one(struct domain *domain, u64 addr)
+ 
+     dma_clear_pte(*pte);
+     spin_unlock(&hd->arch.mapping_lock);
+-    iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
++    iommu_sync_cache(pte, sizeof(struct dma_pte));
+ 
+     if ( !this_cpu(iommu_dont_flush_iotlb) )
+         __intel_iommu_iotlb_flush(domain, addr >> PAGE_SHIFT_4K, 1, 1);
+@@ -678,7 +669,7 @@ static void iommu_free_page_table(struct page_info *pg)
+             iommu_free_pagetable(dma_pte_addr(*pte), next_level);
+ 
+         dma_clear_pte(*pte);
+-        iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
++        iommu_sync_cache(pte, sizeof(struct dma_pte));
+     }
+ 
+     unmap_vtd_domain_page(pt_vaddr);
+@@ -1405,7 +1396,7 @@ int domain_context_mapping_one(
+     context_set_address_width(*context, agaw);
+     context_set_fault_enable(*context);
+     context_set_present(*context);
+-    iommu_flush_cache_entry(context, sizeof(struct context_entry));
++    iommu_sync_cache(context, sizeof(struct context_entry));
+     spin_unlock(&iommu->lock);
+ 
+     /* Context entry was previously non-present (with domid 0). */
+@@ -1541,7 +1532,7 @@ int domain_context_unmap_one(
+ 
+     context_clear_present(*context);
+     context_clear_entry(*context);
+-    iommu_flush_cache_entry(context, sizeof(struct context_entry));
++    iommu_sync_cache(context, sizeof(struct context_entry));
+ 
+     iommu_domid= domain_iommu_domid(domain, iommu);
+     if ( iommu_domid == -1 )
+@@ -1755,7 +1746,7 @@ static int intel_iommu_map_page(
+     }
+     *pte = new;
+ 
+-    iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
++    iommu_sync_cache(pte, sizeof(struct dma_pte));
+     spin_unlock(&hd->arch.mapping_lock);
+     unmap_vtd_domain_page(page);
+ 
+@@ -1815,7 +1806,7 @@ void iommu_pte_flush(struct domain *d, u64 gfn, u64 *pte,
+     int flush_dev_iotlb;
+     int iommu_domid;
+ 
+-    iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
++    iommu_sync_cache(pte, sizeof(struct dma_pte));
+ 
+     for_each_drhd_unit ( drhd )
+     {
