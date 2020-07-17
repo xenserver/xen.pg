@@ -1,0 +1,42 @@
+When kdump is invoked on a vCPU != 0 the next kernel will try to test
+PIT timer interrupts that on real hardware are supposed to be routed
+through IOAPIC with PIC disabled. With vPIT series applied it's now
+possible to correctly route these interrupts through IOAPIC. But vPT
+susbystem still assigns vPIT timer to a global timer vCPU target which
+now equals to i8259 target. That means if this vCPU target is suddenly
+offline (what is actually happening on kdump) then timers are not
+processed at all.
+
+For now instead of always choosing vCPU0 as a default i8259 target -
+pick the first online vCPU instead. That will guarantee timers are
+kept processed even when vCPU0 is going offline on kdump. Additionally,
+recalculate i8259 target on vCPU offline.
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 07e97fb..3e5c6d4 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -1627,6 +1627,8 @@ void hvm_vcpu_down(struct vcpu *v)
+     for_each_vcpu ( d, v )
+         if ( !(v->pause_flags & VPF_down) )
+             online_count++;
++
++    vlapic_adjust_i8259_target(d);
+     domain_unlock(d);
+ 
+     /* ... Shut down the domain if not. */
+diff --git a/xen/arch/x86/hvm/vlapic.c b/xen/arch/x86/hvm/vlapic.c
+index 9b8afb7..fb1eac2 100644
+--- a/xen/arch/x86/hvm/vlapic.c
++++ b/xen/arch/x86/hvm/vlapic.c
+@@ -1290,6 +1290,10 @@ void vlapic_adjust_i8259_target(struct domain *d)
+         if ( __vlapic_accept_pic_intr(v) )
+             goto found;
+ 
++    for_each_vcpu ( d, v )
++        if ( is_vcpu_online(v) )
++            goto found;
++
+     v = d->vcpu ? d->vcpu[0] : NULL;
+ 
+  found:
