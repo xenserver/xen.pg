@@ -1,0 +1,58 @@
+From ab5bfc049e8e04bca66d591ab439d2341623f83c Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Mon, 27 Jul 2020 19:05:36 +0200
+Subject: x86/hvm: don't force vCPU 0 for IRQ 0 when using fixed destination
+ mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the IO APIC pin mapped to the ISA IRQ 0 has been configured to
+use fixed delivery mode, do not forcefully route interrupts to vCPU 0,
+as the OS might have setup those interrupts to be injected to a
+different vCPU, and injecting to vCPU 0 can cause the OS to miss such
+interrupts or errors to happen due to unexpected vectors being
+injected on vCPU 0.
+
+In order to fix remove such handling altogether for fixed destination
+mode pins and just inject them according to the data setup in the
+IO-APIC entry.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/hvm/vioapic.c b/xen/arch/x86/hvm/vioapic.c
+index b00037e..123191d 100644
+--- a/xen/arch/x86/hvm/vioapic.c
++++ b/xen/arch/x86/hvm/vioapic.c
+@@ -438,26 +438,11 @@ static void vioapic_deliver(struct hvm_vioapic *vioapic, unsigned int pin)
+     }
+ 
+     case dest_Fixed:
+-    {
+-#ifdef IRQ0_SPECIAL_ROUTING
+-        /* Do not deliver timer interrupts to VCPU != 0 */
+-        if ( (irq == hvm_isa_irq_to_gsi(0)) && pt_active(&d->arch.vpit.pt0) )
+-        {
+-            if ( (v = d->vcpu ? d->vcpu[0] : NULL) != NULL )
+-                ioapic_inj_irq(vioapic, vcpu_vlapic(v), vector,
+-                               trig_mode, delivery_mode);
+-        }
+-        else
+-#endif
+-        {
+-            for_each_vcpu ( d, v )
+-                if ( vlapic_match_dest(vcpu_vlapic(v), NULL,
+-                                       0, dest, dest_mode) )
+-                    ioapic_inj_irq(vioapic, vcpu_vlapic(v), vector,
+-                                   trig_mode, delivery_mode);
+-        }
++        for_each_vcpu ( d, v )
++            if ( vlapic_match_dest(vcpu_vlapic(v), NULL, 0, dest, dest_mode) )
++                ioapic_inj_irq(vioapic, vcpu_vlapic(v), vector, trig_mode,
++                               delivery_mode);
+         break;
+-    }
+ 
+     case dest_NMI:
+     {
