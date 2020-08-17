@@ -1,7 +1,5 @@
 # -*- rpm-spec -*-
 
-%{!?python_sitearch: %define python_sitearch %(%{__python} -c "from distutils.sysconfig import get_python_lib; print get_python_lib(1)")}
-
 %define with_sysv 0
 %define with_systemd 1
 
@@ -44,6 +42,20 @@ ExclusiveArch: i686 x86_64
 BuildRequires: gcc-x86_64-linux-gnu binutils-x86_64-linux-gnu
 %endif
 
+## Pull in the correct RPM macros for the distributon
+## (Any fedora which is still in support uses python3)
+%if 0%{?centos} > 7 || 0%{?rhel} > 7 || 0%{?fedora} > 0
+BuildRequires: python3-devel
+BuildRequires: python3-rpm-macros
+%global py_sitearch %{python3_sitearch}
+%global __python %{__python3}
+%else
+BuildRequires: python2-devel
+BuildRequires: python2-rpm-macros
+%global py_sitearch %{python2_sitearch}
+%global __python %{__python2}
+%endif
+
 # For HVMLoader and 16/32bit firmware
 BuildRequires: /usr/include/gnu/stubs-32.h
 BuildRequires: dev86 iasl
@@ -54,9 +66,6 @@ BuildRequires: openssl-devel
 
 # For libxl
 BuildRequires: yajl-devel libuuid-devel perl
-
-# For python stubs
-BuildRequires: python-devel
 
 # For ocaml stubs
 BuildRequires: ocaml ocaml-findlib
@@ -317,9 +326,9 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_bindir}/xenstore-rm
 %{_bindir}/xenstore-watch
 %{_bindir}/xenstore-write
-%{python_sitearch}/%{name}/__init__.py*
-%{python_sitearch}/%{name}/lowlevel/__init__.py*
-%{python_sitearch}/%{name}/lowlevel/xs.so
+%{py_sitearch}/%{name}/__init__.py*
+%{py_sitearch}/%{name}/lowlevel/__init__.py*
+%{py_sitearch}/%{name}/lowlevel/xs.so
 
 %files devel
 %{_includedir}/%{name}/COPYING
@@ -505,24 +514,24 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_bindir}/xencons
 %{_bindir}/xencov_split
 %{_bindir}/xentrace_format
-%{python_sitearch}/xenfsimage.so
-%{python_sitearch}/grub/ExtLinuxConf.py*
-%{python_sitearch}/grub/GrubConf.py*
-%{python_sitearch}/grub/LiloConf.py*
-%{python_sitearch}/grub/__init__.py*
-%{python_sitearch}/pygrub-*.egg-info
-%{python_sitearch}/xen-*.egg-info
-#{python_sitearch}/xen/__init__.py*           - Must not duplicate xen-tools
-#{python_sitearch}/xen/lowlevel/__init__.py*  - Must not duplicate xen-tools
-%{python_sitearch}/xen/lowlevel/xc.so
-%{python_sitearch}/xen/migration/__init__.py*
-%{python_sitearch}/xen/migration/legacy.py*
-%{python_sitearch}/xen/migration/libxc.py*
-%{python_sitearch}/xen/migration/libxl.py*
-%{python_sitearch}/xen/migration/public.py*
-%{python_sitearch}/xen/migration/tests.py*
-%{python_sitearch}/xen/migration/verify.py*
-%{python_sitearch}/xen/migration/xl.py*
+%{py_sitearch}/xenfsimage.so
+%{py_sitearch}/grub/ExtLinuxConf.py*
+%{py_sitearch}/grub/GrubConf.py*
+%{py_sitearch}/grub/LiloConf.py*
+%{py_sitearch}/grub/__init__.py*
+%{py_sitearch}/pygrub-*.egg-info
+%{py_sitearch}/xen-*.egg-info
+#{py_sitearch}/xen/__init__.py*           - Must not duplicate xen-tools
+#{py_sitearch}/xen/lowlevel/__init__.py*  - Must not duplicate xen-tools
+%{py_sitearch}/xen/lowlevel/xc.so
+%{py_sitearch}/xen/migration/__init__.py*
+%{py_sitearch}/xen/migration/legacy.py*
+%{py_sitearch}/xen/migration/libxc.py*
+%{py_sitearch}/xen/migration/libxl.py*
+%{py_sitearch}/xen/migration/public.py*
+%{py_sitearch}/xen/migration/tests.py*
+%{py_sitearch}/xen/migration/verify.py*
+%{py_sitearch}/xen/migration/xl.py*
 %{_libexecdir}/%{name}/bin/convert-legacy-stream
 %{_libexecdir}/%{name}/bin/init-xenstore-domain
 %{_libexecdir}/%{name}/bin/libxl-save-helper
@@ -771,9 +780,9 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenctrl.so.4.13.0
 %{_libdir}/libxenguest.so.4.13
 %{_libdir}/libxenguest.so.4.13.0
-%{python_sitearch}/xen/__init__.py*
-%{python_sitearch}/xen/lowlevel/__init__.py*
-%{python_sitearch}/xen/lowlevel/xc.so
+%{py_sitearch}/xen/__init__.py*
+%{py_sitearch}/xen/lowlevel/__init__.py*
+%{py_sitearch}/xen/lowlevel/xc.so
 
 %doc
 
