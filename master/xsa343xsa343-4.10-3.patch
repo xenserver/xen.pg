@@ -1,0 +1,376 @@
+From: Jan Beulich <jbeulich@suse.com>
+Subject: evtchn: address races with evtchn_reset()
+
+Neither d->evtchn_port_ops nor max_evtchns(d) may be used in an entirely
+lock-less manner, as both may change by a racing evtchn_reset(). In the
+common case, at least one of the domain's event lock or the per-channel
+lock needs to be held. In the specific case of the inter-domain sending
+by evtchn_send() and notify_via_xen_event_channel() holding the other
+side's per-channel lock is sufficient, as the channel can't change state
+without both per-channel locks held. Without such a channel changing
+state, evtchn_reset() can't complete successfully.
+
+Lock-free accesses continue to be permitted for the shim (calling some
+otherwise internal event channel functions), as this happens while the
+domain is in effectively single-threaded mode. Special care also needs
+taking for the shim's marking of in-use ports as ECS_RESERVED (allowing
+use of such ports in the shim case is okay because switching into and
+hence also out of FIFO mode is impossible there).
+
+As a side effect, certain operations on Xen bound event channels which
+were mistakenly permitted so far (e.g. unmask or poll) will be refused
+now.
+
+This is part of XSA-343.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Julien Grall <jgrall@amazon.com>
+
+diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
+index 3cdf6b3..a2c7173 100644
+--- a/xen/arch/x86/irq.c
++++ b/xen/arch/x86/irq.c
+@@ -2312,14 +2312,24 @@ static void dump_irqs(unsigned char key)
+ 
+             for ( i = 0; i < action->nr_guests; i++ )
+             {
++                struct evtchn *evtchn;
++                unsigned int pending = 2, masked = 2;
++
+                 d = action->guest[i];
+                 pirq = domain_irq_to_pirq(d, irq);
+                 info = pirq_info(d, pirq);
++                evtchn = evtchn_from_port(d, info->evtchn);
++                local_irq_disable();
++                if ( spin_trylock(&evtchn->lock) )
++                {
++                    pending = evtchn_is_pending(d, evtchn);
++                    masked = evtchn_is_masked(d, evtchn);
++                    spin_unlock(&evtchn->lock);
++                }
++                local_irq_enable();
+                 printk("%u:%3d(%c%c%c)",
+-                       d->domain_id, pirq,
+-                       evtchn_port_is_pending(d, info->evtchn) ? 'P' : '-',
+-                       evtchn_port_is_masked(d, info->evtchn) ? 'M' : '-',
+-                       (info->masked ? 'M' : '-'));
++                       d->domain_id, pirq, "P-?"[pending],
++                       "M-?"[masked], info->masked ? 'M' : '-');
+                 if ( i != action->nr_guests )
+                     printk(",");
+             }
+diff --git a/xen/common/event_2l.c b/xen/common/event_2l.c
+index 256220f..9a972ab 100644
+--- a/xen/common/event_2l.c
++++ b/xen/common/event_2l.c
+@@ -62,16 +62,20 @@ static void evtchn_2l_unmask(struct domain *d, struct evtchn *evtchn)
+     }
+ }
+ 
+-static bool_t evtchn_2l_is_pending(struct domain *d, evtchn_port_t port)
++static bool evtchn_2l_is_pending(const struct domain *d,
++                                 const struct evtchn *evtchn)
+ {
++    evtchn_port_t port = evtchn->port;
+     unsigned int max_ports = BITS_PER_EVTCHN_WORD(d) * BITS_PER_EVTCHN_WORD(d);
+ 
+     ASSERT(port < max_ports);
+     return port < max_ports && test_bit(port, &shared_info(d, evtchn_pending));
+ }
+ 
+-static bool_t evtchn_2l_is_masked(struct domain *d, evtchn_port_t port)
++static bool evtchn_2l_is_masked(const struct domain *d,
++                                const struct evtchn *evtchn)
+ {
++    evtchn_port_t port = evtchn->port;
+     unsigned int max_ports = BITS_PER_EVTCHN_WORD(d) * BITS_PER_EVTCHN_WORD(d);
+ 
+     ASSERT(port < max_ports);
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index 1e2989d..2633b74 100644
+--- a/xen/common/event_channel.c
++++ b/xen/common/event_channel.c
+@@ -170,8 +170,9 @@ static int get_free_port(struct domain *d)
+     {
+         if ( port > d->max_evtchn_port )
+             return -ENOSPC;
++
+         if ( evtchn_from_port(d, port)->state == ECS_FREE
+-             && !evtchn_port_is_busy(d, port) )
++             && !evtchn_is_busy(d, evtchn_from_port(d, port)) )
+         {
+             write_atomic(&d->active_evtchns, d->active_evtchns + 1);
+             return port;
+@@ -754,6 +755,7 @@ void send_guest_vcpu_virq(struct vcpu *v, uint32_t virq)
+     unsigned long flags;
+     int port;
+     struct domain *d;
++    struct evtchn *chn;
+ 
+     ASSERT(!virq_is_global(virq));
+ 
+@@ -764,7 +766,10 @@ void send_guest_vcpu_virq(struct vcpu *v, uint32_t virq)
+         goto out;
+ 
+     d = v->domain;
+-    evtchn_port_set_pending(d, v->vcpu_id, evtchn_from_port(d, port));
++    chn = evtchn_from_port(d, port);
++    spin_lock(&chn->lock);
++    evtchn_port_set_pending(d, v->vcpu_id, chn);
++    spin_unlock(&chn->lock);
+ 
+  out:
+     spin_unlock_irqrestore(&v->virq_lock, flags);
+@@ -793,7 +798,9 @@ static void send_guest_global_virq(struct domain *d, uint32_t virq)
+         goto out;
+ 
+     chn = evtchn_from_port(d, port);
++    spin_lock(&chn->lock);
+     evtchn_port_set_pending(d, chn->notify_vcpu_id, chn);
++    spin_unlock(&chn->lock);
+ 
+  out:
+     spin_unlock_irqrestore(&v->virq_lock, flags);
+@@ -803,6 +810,7 @@ void send_guest_pirq(struct domain *d, const struct pirq *pirq)
+ {
+     int port;
+     struct evtchn *chn;
++    unsigned long flags;
+ 
+     /*
+      * PV guests: It should not be possible to race with __evtchn_close(). The
+@@ -817,7 +825,9 @@ void send_guest_pirq(struct domain *d, const struct pirq *pirq)
+     }
+ 
+     chn = evtchn_from_port(d, port);
++    spin_lock_irqsave(&chn->lock, flags);
+     evtchn_port_set_pending(d, chn->notify_vcpu_id, chn);
++    spin_unlock_irqrestore(&chn->lock, flags);
+ }
+ 
+ static struct domain *global_virq_handlers[NR_VIRQS] __read_mostly;
+@@ -1013,12 +1023,15 @@ int evtchn_unmask(unsigned int port)
+ {
+     struct domain *d = current->domain;
+     struct evtchn *evtchn;
++    unsigned long flags;
+ 
+     if ( unlikely(!port_is_valid(d, port)) )
+         return -EINVAL;
+ 
+     evtchn = evtchn_from_port(d, port);
++    spin_lock_irqsave(&evtchn->lock, flags);
+     evtchn_port_unmask(d, evtchn);
++    spin_unlock_irqrestore(&evtchn->lock, flags);
+ 
+     return 0;
+ }
+@@ -1431,8 +1444,8 @@ static void domain_dump_evtchn_info(struct domain *d)
+ 
+         printk("    %4u [%d/%d/",
+                port,
+-               evtchn_port_is_pending(d, port),
+-               evtchn_port_is_masked(d, port));
++               evtchn_is_pending(d, chn),
++               evtchn_is_masked(d, chn));
+         evtchn_port_print_state(d, chn);
+         printk("]: s=%d n=%d x=%d",
+                chn->state, chn->notify_vcpu_id, chn->xen_consumer);
+diff --git a/xen/common/event_fifo.c b/xen/common/event_fifo.c
+index 2cb151f..cda7e4a 100644
+--- a/xen/common/event_fifo.c
++++ b/xen/common/event_fifo.c
+@@ -20,7 +20,7 @@
+ 
+ #include <public/event_channel.h>
+ 
+-static inline event_word_t *evtchn_fifo_word_from_port(struct domain *d,
++static inline event_word_t *evtchn_fifo_word_from_port(const struct domain *d,
+                                                        unsigned int port)
+ {
+     unsigned int p, w;
+@@ -294,33 +294,33 @@ static void evtchn_fifo_unmask(struct domain *d, struct evtchn *evtchn)
+         evtchn_fifo_set_pending(v, evtchn);
+ }
+ 
+-static bool_t evtchn_fifo_is_pending(struct domain *d, evtchn_port_t port)
++static bool evtchn_fifo_is_pending(const struct domain *d,
++                                   const struct evtchn *evtchn)
+ {
+-    event_word_t *word;
++    const event_word_t *word = evtchn_fifo_word_from_port(d, evtchn->port);
+ 
+-    word = evtchn_fifo_word_from_port(d, port);
+     if ( unlikely(!word) )
+         return 0;
+ 
+     return test_bit(EVTCHN_FIFO_PENDING, word);
+ }
+ 
+-static bool_t evtchn_fifo_is_masked(struct domain *d, evtchn_port_t port)
++static bool evtchn_fifo_is_masked(const struct domain *d,
++                                  const struct evtchn *evtchn)
+ {
+-    event_word_t *word;
++    const event_word_t *word = evtchn_fifo_word_from_port(d, evtchn->port);
+ 
+-    word = evtchn_fifo_word_from_port(d, port);
+     if ( unlikely(!word) )
+         return 1;
+ 
+     return test_bit(EVTCHN_FIFO_MASKED, word);
+ }
+ 
+-static bool_t evtchn_fifo_is_busy(struct domain *d, evtchn_port_t port)
++static bool evtchn_fifo_is_busy(const struct domain *d,
++                                  const struct evtchn *evtchn)
+ {
+-    event_word_t *word;
++    const event_word_t *word = evtchn_fifo_word_from_port(d, evtchn->port);
+ 
+-    word = evtchn_fifo_word_from_port(d, port);
+     if ( unlikely(!word) )
+         return 0;
+ 
+diff --git a/xen/include/xen/event.h b/xen/include/xen/event.h
+index 49f6b06..f14316b 100644
+--- a/xen/include/xen/event.h
++++ b/xen/include/xen/event.h
+@@ -113,6 +113,19 @@ static inline struct evtchn *evtchn_from_port(struct domain *d, unsigned int p)
+     return bucket_from_port(d, p) + (p % EVTCHNS_PER_BUCKET);
+ }
+ 
++/*
++ * "usable" as in "by a guest", i.e. Xen consumed channels are assumed to be
++ * taken care of separately where used for Xen's internal purposes.
++ */
++static bool evtchn_usable(const struct evtchn *evtchn)
++{
++    if ( evtchn->xen_consumer )
++        return false;
++
++    BUILD_BUG_ON(ECS_FREE > ECS_RESERVED);
++    return evtchn->state > ECS_RESERVED;
++}
++
+ /* Wait on a Xen-attached event channel. */
+ #define wait_on_xen_event_channel(port, condition)                      \
+     do {                                                                \
+@@ -145,19 +158,24 @@ int evtchn_reset(struct domain *d);
+ 
+ /*
+  * Low-level event channel port ops.
++ *
++ * All hooks have to be called with a lock held which prevents the channel
++ * from changing state. This may be the domain event lock, the per-channel
++ * lock, or in the case of sending interdomain events also the other side's
++ * per-channel lock. Exceptions apply in certain cases for the PV shim.
+  */
+ struct evtchn_port_ops {
+     void (*init)(struct domain *d, struct evtchn *evtchn);
+     void (*set_pending)(struct vcpu *v, struct evtchn *evtchn);
+     void (*clear_pending)(struct domain *d, struct evtchn *evtchn);
+     void (*unmask)(struct domain *d, struct evtchn *evtchn);
+-    bool_t (*is_pending)(struct domain *d, evtchn_port_t port);
+-    bool_t (*is_masked)(struct domain *d, evtchn_port_t port);
++    bool (*is_pending)(const struct domain *d, const struct evtchn *evtchn);
++    bool (*is_masked)(const struct domain *d, const struct evtchn *evtchn);
+     /*
+      * Is the port unavailable because it's still being cleaned up
+      * after being closed?
+      */
+-    bool_t (*is_busy)(struct domain *d, evtchn_port_t port);
++    bool (*is_busy)(const struct domain *d, const struct evtchn *evtchn);
+     int (*set_priority)(struct domain *d, struct evtchn *evtchn,
+                         unsigned int priority);
+     void (*print_state)(struct domain *d, const struct evtchn *evtchn);
+@@ -173,38 +191,67 @@ static inline void evtchn_port_set_pending(struct domain *d,
+                                            unsigned int vcpu_id,
+                                            struct evtchn *evtchn)
+ {
+-    d->evtchn_port_ops->set_pending(d->vcpu[vcpu_id], evtchn);
++    if ( evtchn_usable(evtchn) )
++        d->evtchn_port_ops->set_pending(d->vcpu[vcpu_id], evtchn);
+ }
+ 
+ static inline void evtchn_port_clear_pending(struct domain *d,
+                                              struct evtchn *evtchn)
+ {
+-    d->evtchn_port_ops->clear_pending(d, evtchn);
++    if ( evtchn_usable(evtchn) )
++        d->evtchn_port_ops->clear_pending(d, evtchn);
+ }
+ 
+ static inline void evtchn_port_unmask(struct domain *d,
+                                       struct evtchn *evtchn)
+ {
+-    d->evtchn_port_ops->unmask(d, evtchn);
++    if ( evtchn_usable(evtchn) )
++        d->evtchn_port_ops->unmask(d, evtchn);
++}
++
++static inline bool evtchn_is_pending(const struct domain *d,
++                                     const struct evtchn *evtchn)
++{
++    return evtchn_usable(evtchn) && d->evtchn_port_ops->is_pending(d, evtchn);
+ }
+ 
+-static inline bool_t evtchn_port_is_pending(struct domain *d,
+-                                            evtchn_port_t port)
++static inline bool evtchn_port_is_pending(struct domain *d, evtchn_port_t port)
+ {
+-    return d->evtchn_port_ops->is_pending(d, port);
++    struct evtchn *evtchn = evtchn_from_port(d, port);
++    bool rc;
++    unsigned long flags;
++
++    spin_lock_irqsave(&evtchn->lock, flags);
++    rc = evtchn_is_pending(d, evtchn);
++    spin_unlock_irqrestore(&evtchn->lock, flags);
++
++    return rc;
+ }
+ 
+-static inline bool_t evtchn_port_is_masked(struct domain *d,
+-                                           evtchn_port_t port)
++static inline bool evtchn_is_masked(const struct domain *d,
++                                    const struct evtchn *evtchn)
+ {
+-    return d->evtchn_port_ops->is_masked(d, port);
++    return !evtchn_usable(evtchn) || d->evtchn_port_ops->is_masked(d, evtchn);
++}
++
++static inline bool evtchn_port_is_masked(struct domain *d, evtchn_port_t port)
++{
++    struct evtchn *evtchn = evtchn_from_port(d, port);
++    bool rc;
++    unsigned long flags;
++
++    spin_lock_irqsave(&evtchn->lock, flags);
++    rc = evtchn_is_masked(d, evtchn);
++    spin_unlock_irqrestore(&evtchn->lock, flags);
++
++    return rc;
+ }
+ 
+-static inline bool_t evtchn_port_is_busy(struct domain *d, evtchn_port_t port)
++static inline bool evtchn_is_busy(const struct domain *d,
++                                  const struct evtchn *evtchn)
+ {
+-    if ( d->evtchn_port_ops->is_busy )
+-        return d->evtchn_port_ops->is_busy(d, port);
+-    return 0;
++    return d->evtchn_port_ops->is_busy &&
++           d->evtchn_port_ops->is_busy(d, evtchn);
+ }
+ 
+ static inline int evtchn_port_set_priority(struct domain *d,
+@@ -213,6 +260,8 @@ static inline int evtchn_port_set_priority(struct domain *d,
+ {
+     if ( !d->evtchn_port_ops->set_priority )
+         return -ENOSYS;
++    if ( !evtchn_usable(evtchn) )
++        return -EACCES;
+     return d->evtchn_port_ops->set_priority(d, evtchn, priority);
+ }
+ 
