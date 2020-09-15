@@ -23,20 +23,11 @@ This is part of XSA-343.
 Reported-by: Julien Grall <jgrall@amazon.com>
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
 Acked-by: Julien Grall <jgrall@amazon.com>
----
-v8: Add BUILD_BUG_ON() in evtchn_usable().
-v7: Add locking related comment ahead of struct evtchn_port_ops.
-v6: New.
----
-TBD: I've been considering to move some of the wrappers from xen/event.h
-     into event_channel.c (or even drop them altogether), when they
-     require external locking (e.g. evtchn_port_init() or
-     evtchn_port_set_priority()). Does anyone have a strong opinion
-     either way?
-
+diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
+index 7d320e5df8..4b3a70415f 100644
 --- a/xen/arch/x86/irq.c
 +++ b/xen/arch/x86/irq.c
-@@ -2488,14 +2488,24 @@ static void dump_irqs(unsigned char key)
+@@ -2474,14 +2474,24 @@ static void dump_irqs(unsigned char key)
  
              for ( i = 0; i < action->nr_guests; )
              {
@@ -65,9 +56,11 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
                         i < action->nr_guests ? ',' : '\n');
              }
          }
+diff --git a/xen/arch/x86/pv/shim.c b/xen/arch/x86/pv/shim.c
+index 9a578b179d..1600b00f21 100644
 --- a/xen/arch/x86/pv/shim.c
 +++ b/xen/arch/x86/pv/shim.c
-@@ -660,8 +660,11 @@ void pv_shim_inject_evtchn(unsigned int
+@@ -660,8 +660,11 @@ void pv_shim_inject_evtchn(unsigned int port)
      if ( port_is_valid(guest, port) )
      {
          struct evtchn *chn = evtchn_from_port(guest, port);
@@ -79,9 +72,11 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
      }
  }
  
+diff --git a/xen/common/event_2l.c b/xen/common/event_2l.c
+index a229d35271..083d04be3c 100644
 --- a/xen/common/event_2l.c
 +++ b/xen/common/event_2l.c
-@@ -63,8 +63,10 @@ static void evtchn_2l_unmask(struct doma
+@@ -63,8 +63,10 @@ static void evtchn_2l_unmask(struct domain *d, struct evtchn *evtchn)
      }
  }
  
@@ -93,7 +88,7 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
      unsigned int max_ports = BITS_PER_EVTCHN_WORD(d) * BITS_PER_EVTCHN_WORD(d);
  
      ASSERT(port < max_ports);
-@@ -72,8 +74,10 @@ static bool evtchn_2l_is_pending(const s
+@@ -72,8 +74,10 @@ static bool evtchn_2l_is_pending(const struct domain *d, evtchn_port_t port)
              guest_test_bit(d, port, &shared_info(d, evtchn_pending)));
  }
  
@@ -105,9 +100,11 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
      unsigned int max_ports = BITS_PER_EVTCHN_WORD(d) * BITS_PER_EVTCHN_WORD(d);
  
      ASSERT(port < max_ports);
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index 0e550e9c7a..878e4250ed 100644
 --- a/xen/common/event_channel.c
 +++ b/xen/common/event_channel.c
-@@ -156,8 +156,9 @@ int evtchn_allocate_port(struct domain *
+@@ -156,8 +156,9 @@ int evtchn_allocate_port(struct domain *d, evtchn_port_t port)
  
      if ( port_is_valid(d, port) )
      {
@@ -119,7 +116,7 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
              return -EBUSY;
      }
      else
-@@ -774,6 +775,7 @@ void send_guest_vcpu_virq(struct vcpu *v
+@@ -774,6 +775,7 @@ void send_guest_vcpu_virq(struct vcpu *v, uint32_t virq)
      unsigned long flags;
      int port;
      struct domain *d;
@@ -127,7 +124,7 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
  
      ASSERT(!virq_is_global(virq));
  
-@@ -784,7 +786,10 @@ void send_guest_vcpu_virq(struct vcpu *v
+@@ -784,7 +786,10 @@ void send_guest_vcpu_virq(struct vcpu *v, uint32_t virq)
          goto out;
  
      d = v->domain;
@@ -139,7 +136,7 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
  
   out:
      spin_unlock_irqrestore(&v->virq_lock, flags);
-@@ -813,7 +818,9 @@ void send_guest_global_virq(struct domai
+@@ -813,7 +818,9 @@ void send_guest_global_virq(struct domain *d, uint32_t virq)
          goto out;
  
      chn = evtchn_from_port(d, port);
@@ -149,7 +146,7 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
  
   out:
      spin_unlock_irqrestore(&v->virq_lock, flags);
-@@ -823,6 +830,7 @@ void send_guest_pirq(struct domain *d, c
+@@ -823,6 +830,7 @@ void send_guest_pirq(struct domain *d, const struct pirq *pirq)
  {
      int port;
      struct evtchn *chn;
@@ -157,7 +154,7 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
  
      /*
       * PV guests: It should not be possible to race with __evtchn_close(). The
-@@ -837,7 +845,9 @@ void send_guest_pirq(struct domain *d, c
+@@ -837,7 +845,9 @@ void send_guest_pirq(struct domain *d, const struct pirq *pirq)
      }
  
      chn = evtchn_from_port(d, port);
@@ -183,7 +180,7 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
  
      return 0;
  }
-@@ -1449,8 +1462,8 @@ static void domain_dump_evtchn_info(stru
+@@ -1449,8 +1462,8 @@ static void domain_dump_evtchn_info(struct domain *d)
  
          printk("    %4u [%d/%d/",
                 port,
@@ -194,9 +191,11 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
          evtchn_port_print_state(d, chn);
          printk("]: s=%d n=%d x=%d",
                 chn->state, chn->notify_vcpu_id, chn->xen_consumer);
+diff --git a/xen/common/event_fifo.c b/xen/common/event_fifo.c
+index 2f13d92128..68d0c7a632 100644
 --- a/xen/common/event_fifo.c
 +++ b/xen/common/event_fifo.c
-@@ -296,23 +296,26 @@ static void evtchn_fifo_unmask(struct do
+@@ -296,23 +296,26 @@ static void evtchn_fifo_unmask(struct domain *d, struct evtchn *evtchn)
          evtchn_fifo_set_pending(v, evtchn);
  }
  
@@ -229,9 +228,26 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
  
      return word && guest_test_bit(d, EVTCHN_FIFO_LINKED, word);
  }
+diff --git a/xen/include/asm-x86/event.h b/xen/include/asm-x86/event.h
+index 98a85233cb..5e09ede6d7 100644
+--- a/xen/include/asm-x86/event.h
++++ b/xen/include/asm-x86/event.h
+@@ -47,4 +47,10 @@ static inline bool arch_virq_is_global(unsigned int virq)
+     return true;
+ }
+ 
++#ifdef CONFIG_PV_SHIM
++# include <asm/pv/shim.h>
++# define arch_evtchn_is_special(chn) \
++             (pv_shim && (chn)->port && (chn)->state == ECS_RESERVED)
++#endif
++
+ #endif
+diff --git a/xen/include/xen/event.h b/xen/include/xen/event.h
+index e1b299e8df..bc9aa68650 100644
 --- a/xen/include/xen/event.h
 +++ b/xen/include/xen/event.h
-@@ -133,6 +133,16 @@ static inline struct evtchn *evtchn_from
+@@ -133,6 +133,24 @@ static inline struct evtchn *evtchn_from_port(struct domain *d, unsigned int p)
      return bucket_from_port(d, p) + (p % EVTCHNS_PER_BUCKET);
  }
  
@@ -241,14 +257,22 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
 + */
 +static bool evtchn_usable(const struct evtchn *evtchn)
 +{
++    if ( evtchn->xen_consumer )
++        return false;
++
++#ifdef arch_evtchn_is_special
++    if ( arch_evtchn_is_special(evtchn) )
++        return true;
++#endif
++
 +    BUILD_BUG_ON(ECS_FREE > ECS_RESERVED);
-+    return evtchn->state > ECS_RESERVED && !evtchn->xen_consumer;
++    return evtchn->state > ECS_RESERVED;
 +}
 +
  /* Wait on a Xen-attached event channel. */
  #define wait_on_xen_event_channel(port, condition)                      \
      do {                                                                \
-@@ -165,19 +175,24 @@ int evtchn_reset(struct domain *d);
+@@ -165,19 +183,24 @@ int evtchn_reset(struct domain *d);
  
  /*
   * Low-level event channel port ops.
@@ -276,7 +300,7 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
      int (*set_priority)(struct domain *d, struct evtchn *evtchn,
                          unsigned int priority);
      void (*print_state)(struct domain *d, const struct evtchn *evtchn);
-@@ -193,38 +208,67 @@ static inline void evtchn_port_set_pendi
+@@ -193,38 +216,67 @@ static inline void evtchn_port_set_pending(struct domain *d,
                                             unsigned int vcpu_id,
                                             struct evtchn *evtchn)
  {
@@ -356,7 +380,7 @@ TBD: I've been considering to move some of the wrappers from xen/event.h
  }
  
  static inline int evtchn_port_set_priority(struct domain *d,
-@@ -233,6 +277,8 @@ static inline int evtchn_port_set_priori
+@@ -233,6 +285,8 @@ static inline int evtchn_port_set_priority(struct domain *d,
  {
      if ( !d->evtchn_port_ops->set_priority )
          return -ENOSYS;
