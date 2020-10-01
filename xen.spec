@@ -33,7 +33,7 @@ Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
-Source4: https://repo.citrite.net/list/ctx-local-contrib/citrix/branding/Citrix_Logo_Black.png
+Source4: https://repo.citrite.net/list/ctx-local-contrib/citrix/branding2020/Citrix_Logo_Black.png
 
 ExclusiveArch: i686 x86_64
 
