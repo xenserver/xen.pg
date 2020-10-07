@@ -1,0 +1,45 @@
+From cbc6cce549b1b095813f55185b8a5e8ff45302f8 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 28 Sep 2020 12:57:08 +0200
+Subject: [PATCH] evtchn: don't call Xen consumer callback with per-channel
+ lock held
+
+While there don't look to be any problems with this right now, the lock
+order implications from holding the lock can be very difficult to follow
+(and may be easy to violate unknowingly). The present callbacks don't
+(and no such callback should) have any need for the lock to be held.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+---
+ xen/common/event_channel.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index d2ee83b..7b095c4 100644
+--- a/xen/common/event_channel.c
++++ b/xen/common/event_channel.c
+@@ -745,9 +745,18 @@ int evtchn_send(struct domain *ld, unsigned int lport)
+         rport = lchn->u.interdomain.remote_port;
+         rchn  = evtchn_from_port(rd, rport);
+         if ( consumer_is_xen(rchn) )
+-            xen_notification_fn(rchn)(rd->vcpu[rchn->notify_vcpu_id], rport);
+-        else
+-            evtchn_port_set_pending(rd, rchn->notify_vcpu_id, rchn);
++        {
++            /* Don't keep holding the lock for the call below. */
++            xen_event_channel_notification_t fn = xen_notification_fn(rchn);
++            struct vcpu *rv = rd->vcpu[rchn->notify_vcpu_id];
++
++            rcu_lock_domain(rd);
++            spin_unlock_irqrestore(&lchn->lock, flags);
++            fn(rv, rport);
++            rcu_unlock_domain(rd);
++            return 0;
++        }
++        evtchn_port_set_pending(rd, rchn->notify_vcpu_id, rchn);
+         break;
+     case ECS_IPI:
+         evtchn_port_set_pending(ld, lchn->notify_vcpu_id, lchn);
+-- 
+2.7.4
+
