@@ -1,0 +1,175 @@
+From 9968e19d0faa270e1f1108262ae89c8f2665b35d Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 29 Sep 2020 18:04:34 +0200
+Subject: [PATCH 5/7] x86/mm: avoid using linear page tables in
+ guest_get_eff_kern_l1e()
+
+First of all drop guest_get_eff_l1e() entirely - there's no actual user
+of it: pv_ro_page_fault() has a guest_kernel_mode() conditional around
+its only call site.
+
+Then replace the linear L1 table access by an actual page walk.
+
+This is part of XSA-286.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: George Dunlap <george.dunlap@citrix.com>
+---
+ xen/arch/x86/pv/mm.c            | 21 ---------------
+ xen/arch/x86/pv/mm.h            | 16 +++++------
+ xen/arch/x86/pv/ro-page-fault.c |  2 +-
+ xen/arch/x86/x86_64/mm.c        | 48 +++++++++++++++++++++++++++++++++
+ xen/include/asm-x86/mm.h        |  1 +
+ 5 files changed, 58 insertions(+), 30 deletions(-)
+
+diff --git a/xen/arch/x86/pv/mm.c b/xen/arch/x86/pv/mm.c
+index acebf9e957..7624447246 100644
+--- a/xen/arch/x86/pv/mm.c
++++ b/xen/arch/x86/pv/mm.c
+@@ -58,27 +58,6 @@ l1_pgentry_t *map_guest_l1e(unsigned long linear, mfn_t *gl1mfn)
+     return (l1_pgentry_t *)map_domain_page(*gl1mfn) + l1_table_offset(linear);
+ }
+ 
+-/*
+- * Read the guest's l1e that maps this address, from the kernel-mode
+- * page tables.
+- */
+-static l1_pgentry_t guest_get_eff_kern_l1e(unsigned long linear)
+-{
+-    struct vcpu *curr = current;
+-    const bool user_mode = !(curr->arch.flags & TF_kernel_mode);
+-    l1_pgentry_t l1e;
+-
+-    if ( user_mode )
+-        toggle_guest_pt(curr);
+-
+-    l1e = guest_get_eff_l1e(linear);
+-
+-    if ( user_mode )
+-        toggle_guest_pt(curr);
+-
+-    return l1e;
+-}
+-
+ /*
+  * Map a guest's LDT page (covering the byte at @offset from start of the LDT)
+  * into Xen's virtual range.  Returns true if the mapping changed, false
+diff --git a/xen/arch/x86/pv/mm.h b/xen/arch/x86/pv/mm.h
+index a1bd473b29..43d33a1fd1 100644
+--- a/xen/arch/x86/pv/mm.h
++++ b/xen/arch/x86/pv/mm.h
+@@ -5,19 +5,19 @@ l1_pgentry_t *map_guest_l1e(unsigned long linear, mfn_t *gl1mfn);
+ 
+ int new_guest_cr3(mfn_t mfn);
+ 
+-/* Read a PV guest's l1e that maps this linear address. */
+-static inline l1_pgentry_t guest_get_eff_l1e(unsigned long linear)
++/*
++ * Read the guest's l1e that maps this address, from the kernel-mode
++ * page tables.
++ */
++static inline l1_pgentry_t guest_get_eff_kern_l1e(unsigned long linear)
+ {
+-    l1_pgentry_t l1e;
++    l1_pgentry_t l1e = l1e_empty();
+ 
+     ASSERT(!paging_mode_translate(current->domain));
+     ASSERT(!paging_mode_external(current->domain));
+ 
+-    if ( unlikely(!__addr_ok(linear)) ||
+-         __copy_from_user(&l1e,
+-                          &__linear_l1_table[l1_linear_offset(linear)],
+-                          sizeof(l1_pgentry_t)) )
+-        l1e = l1e_empty();
++    if ( likely(__addr_ok(linear)) )
++        l1e = page_walk_get_l1e(current->arch.guest_table, linear);
+ 
+     return l1e;
+ }
+diff --git a/xen/arch/x86/pv/ro-page-fault.c b/xen/arch/x86/pv/ro-page-fault.c
+index a920fb5e15..2bf4497a16 100644
+--- a/xen/arch/x86/pv/ro-page-fault.c
++++ b/xen/arch/x86/pv/ro-page-fault.c
+@@ -357,7 +357,7 @@ int pv_ro_page_fault(unsigned long addr, struct cpu_user_regs *regs)
+     bool mmio_ro;
+ 
+     /* Attempt to read the PTE that maps the VA being accessed. */
+-    pte = guest_get_eff_l1e(addr);
++    pte = guest_get_eff_kern_l1e(addr);
+ 
+     /* We are only looking for read-only mappings */
+     if ( ((l1e_get_flags(pte) & (_PAGE_PRESENT | _PAGE_RW)) != _PAGE_PRESENT) )
+diff --git a/xen/arch/x86/x86_64/mm.c b/xen/arch/x86/x86_64/mm.c
+index 9671757fd0..1a76a4ee4f 100644
+--- a/xen/arch/x86/x86_64/mm.c
++++ b/xen/arch/x86/x86_64/mm.c
+@@ -173,6 +173,54 @@ l2_pgentry_t page_walk_get_l2e(pagetable_t root, unsigned long addr)
+     return l2e;
+ }
+ 
++l1_pgentry_t page_walk_get_l1e(pagetable_t root, unsigned long addr)
++{
++    l2_pgentry_t l2e = page_walk_get_l2e(root, addr);
++    mfn_t mfn = l2e_get_mfn(l2e);
++    struct page_info *pg;
++    l1_pgentry_t l1e = l1e_empty();
++
++    if ( !(l2e_get_flags(l2e) & _PAGE_PRESENT) ||
++         (l2e_get_flags(l2e) & _PAGE_PSE) )
++        return l1e_empty();
++
++    pg = mfn_to_page(mfn);
++    if ( !page_lock(pg) )
++        return l1e_empty();
++
++    if ( (pg->u.inuse.type_info & PGT_type_mask) == PGT_l1_page_table )
++    {
++        l1_pgentry_t *l1t = map_domain_page(mfn);
++
++        l1e = l1t[l1_table_offset(addr)];
++
++        if ( !(l1e_get_flags(l1e) & _PAGE_ACCESSED) )
++        {
++            l1_pgentry_t ol1e = l1e;
++
++            l1e_add_flags(l1e, _PAGE_ACCESSED);
++            /*
++             * Best effort only; with the lock held the page shouldn't
++             * change anyway, except for the dirty bit to perhaps become set.
++             */
++            while ( cmpxchg(&l1e_get_intpte(l1t[l1_table_offset(addr)]),
++                            l1e_get_intpte(ol1e), l1e_get_intpte(l1e)) !=
++                    l1e_get_intpte(ol1e) &&
++                    !(l1e_get_flags(l1e) & _PAGE_DIRTY) )
++            {
++                l1e_add_flags(ol1e, _PAGE_DIRTY);
++                l1e_add_flags(l1e, _PAGE_DIRTY);
++            }
++        }
++
++        unmap_domain_page(l1t);
++    }
++
++    page_unlock(pg);
++
++    return l1e;
++}
++
+ void *do_page_walk(struct vcpu *v, unsigned long addr)
+ {
+     l3_pgentry_t l3e;
+diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
+index cd3e7ec501..865db999c1 100644
+--- a/xen/include/asm-x86/mm.h
++++ b/xen/include/asm-x86/mm.h
+@@ -580,6 +580,7 @@ int vcpu_destroy_pagetables(struct vcpu *);
+ 
+ void *do_page_walk(struct vcpu *v, unsigned long addr);
+ l2_pgentry_t page_walk_get_l2e(pagetable_t root, unsigned long addr);
++l1_pgentry_t page_walk_get_l1e(pagetable_t root, unsigned long addr);
+ 
+ int __sync_local_execstate(void);
+ 
+-- 
+2.25.1
+
