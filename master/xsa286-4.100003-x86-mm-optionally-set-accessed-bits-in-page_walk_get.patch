@@ -1,0 +1,91 @@
+From e1a9a4a6643c4eb98abd6b9002e4b4de46a43386 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 29 Sep 2020 18:04:05 +0200
+Subject: [PATCH 3/7] x86/mm: optionally set accessed bits in
+ page_walk_get_l{3,4}e()
+
+Allow (future) callers to request the setting of accessed bits.
+
+This is part of XSA-286.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: George Dunlap <george.dunlap@citrix.com>
+diff --git a/xen/arch/x86/x86_64/mm.c b/xen/arch/x86/x86_64/mm.c
+index 956def2a39..452ccc9037 100644
+--- a/xen/arch/x86/x86_64/mm.c
++++ b/xen/arch/x86/x86_64/mm.c
+@@ -44,7 +44,8 @@ unsigned int __read_mostly m2p_compat_vstart = __HYPERVISOR_COMPAT_VIRT_START;
+ 
+ l2_pgentry_t *compat_idle_pg_table_l2;
+ 
+-static l4_pgentry_t page_walk_get_l4e(pagetable_t root, unsigned long addr)
++static l4_pgentry_t page_walk_get_l4e(pagetable_t root, unsigned long addr,
++                                      bool set_accessed)
+ {
+     mfn_t mfn = pagetable_get_mfn(root);
+     /* current's root page table can't disappear under our feet. */
+@@ -64,6 +65,21 @@ static l4_pgentry_t page_walk_get_l4e(pagetable_t root, unsigned long addr)
+         l4_pgentry_t *l4t = map_domain_page(mfn);
+ 
+         l4e = l4t[l4_table_offset(addr)];
++
++        if ( set_accessed && !(l4e_get_flags(l4e) & _PAGE_ACCESSED) )
++        {
++            l4_pgentry_t ol4e = l4e;
++
++            l4e_add_flags(l4e, _PAGE_ACCESSED);
++            /*
++             * Best effort only. It's safe to modify this entry even when not
++             * holding the page lock because we're only modifying the accessed
++             * bit, and doing so atomically (just like a hardware walk would).
++             */
++            cmpxchg(&l4e_get_intpte(l4t[l4_table_offset(addr)]),
++                    l4e_get_intpte(ol4e), l4e_get_intpte(l4e));
++        }
++
+         unmap_domain_page(l4t);
+     }
+ 
+@@ -73,9 +89,10 @@ static l4_pgentry_t page_walk_get_l4e(pagetable_t root, unsigned long addr)
+     return l4e;
+ }
+ 
+-static l3_pgentry_t page_walk_get_l3e(pagetable_t root, unsigned long addr)
++static l3_pgentry_t page_walk_get_l3e(pagetable_t root, unsigned long addr,
++                                      bool set_accessed)
+ {
+-    l4_pgentry_t l4e = page_walk_get_l4e(root, addr);
++    l4_pgentry_t l4e = page_walk_get_l4e(root, addr, set_accessed);
+     mfn_t mfn = l4e_get_mfn(l4e);
+     struct page_info *pg;
+     l3_pgentry_t l3e = l3e_empty();
+@@ -92,6 +109,20 @@ static l3_pgentry_t page_walk_get_l3e(pagetable_t root, unsigned long addr)
+         l3_pgentry_t *l3t = map_domain_page(mfn);
+ 
+         l3e = l3t[l3_table_offset(addr)];
++
++        if ( set_accessed && !(l3e_get_flags(l3e) & _PAGE_ACCESSED) )
++        {
++            l3_pgentry_t ol3e = l3e;
++
++            l3e_add_flags(l3e, _PAGE_ACCESSED);
++            /*
++             * Best effort only; with the lock held the page shouldn't
++             * change anyway.
++             */
++            cmpxchg(&l3e_get_intpte(l3t[l3_table_offset(addr)]),
++                    l3e_get_intpte(ol3e), l3e_get_intpte(l3e));
++        }
++
+         unmap_domain_page(l3t);
+     }
+ 
+@@ -111,7 +142,7 @@ void *do_page_walk(struct vcpu *v, unsigned long addr)
+     if ( !is_pv_vcpu(v) )
+         return NULL;
+ 
+-    l3e = page_walk_get_l3e(v->arch.guest_table, addr);
++    l3e = page_walk_get_l3e(v->arch.guest_table, addr, false);
+     mfn = l3e_get_mfn(l3e);
+     if ( !(l3e_get_flags(l3e) & _PAGE_PRESENT) || !mfn_valid(mfn_x(mfn)) )
+         return NULL;

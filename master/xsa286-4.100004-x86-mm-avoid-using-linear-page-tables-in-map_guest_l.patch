@@ -1,0 +1,101 @@
+From fdb7a6a6aeb45cff9653dd0465874863d0cdcffc Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 29 Sep 2020 18:04:20 +0200
+Subject: [PATCH 4/7] x86/mm: avoid using linear page tables in map_guest_l1e()
+
+Replace the linear L2 table access by an actual page walk.
+
+This is part of XSA-286.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: George Dunlap <george.dunlap@citrix.com>
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 416d7cba22..16c53c134c 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -583,11 +583,14 @@ static l1_pgentry_t *guest_map_l1e(unsigned long addr, unsigned long *gl1mfn)
+     if ( unlikely(!__addr_ok(addr)) )
+         return NULL;
+ 
+-    /* Find this l1e and its enclosing l1mfn in the linear map. */
+-    if ( __copy_from_user(&l2e,
+-                          &__linear_l2_table[l2_linear_offset(addr)],
+-                          sizeof(l2_pgentry_t)) )
++    if ( unlikely(!(current->arch.flags & TF_kernel_mode)) )
++    {
++        ASSERT_UNREACHABLE();
+         return NULL;
++    }
++
++    /* Find this l1e and its enclosing l1mfn. */
++    l2e = page_walk_get_l2e(current->arch.guest_table, addr);
+ 
+     /* Check flags that it will be safe to read the l1e. */
+     if ( (l2e_get_flags(l2e) & (_PAGE_PRESENT | _PAGE_PSE)) != _PAGE_PRESENT )
+diff --git a/xen/arch/x86/x86_64/mm.c b/xen/arch/x86/x86_64/mm.c
+index 452ccc9037..8bf880f5fe 100644
+--- a/xen/arch/x86/x86_64/mm.c
++++ b/xen/arch/x86/x86_64/mm.c
+@@ -131,6 +131,48 @@ static l3_pgentry_t page_walk_get_l3e(pagetable_t root, unsigned long addr,
+     return l3e;
+ }
+ 
++l2_pgentry_t page_walk_get_l2e(pagetable_t root, unsigned long addr)
++{
++    l3_pgentry_t l3e = page_walk_get_l3e(root, addr, true);
++    mfn_t mfn = l3e_get_mfn(l3e);
++    struct page_info *pg;
++    l2_pgentry_t l2e = l2e_empty();
++
++    if ( !(l3e_get_flags(l3e) & _PAGE_PRESENT) ||
++         (l3e_get_flags(l3e) & _PAGE_PSE) )
++        return l2e_empty();
++
++    pg = mfn_to_page(mfn_x(mfn));
++    if ( !page_lock(pg) )
++        return l2e_empty();
++
++    if ( (pg->u.inuse.type_info & PGT_type_mask) == PGT_l2_page_table )
++    {
++        l2_pgentry_t *l2t = map_domain_page(mfn);
++
++        l2e = l2t[l2_table_offset(addr)];
++
++        if ( !(l2e_get_flags(l2e) & _PAGE_ACCESSED) )
++        {
++            l2_pgentry_t ol2e = l2e;
++
++            l2e_add_flags(l2e, _PAGE_ACCESSED);
++            /*
++             * Best effort only; with the lock held the page shouldn't
++             * change anyway.
++             */
++            cmpxchg(&l2e_get_intpte(l2t[l2_table_offset(addr)]),
++                    l2e_get_intpte(ol2e), l2e_get_intpte(l2e));
++        }
++
++        unmap_domain_page(l2t);
++    }
++
++    page_unlock(pg);
++
++    return l2e;
++}
++
+ void *do_page_walk(struct vcpu *v, unsigned long addr)
+ {
+     l3_pgentry_t l3e;
+diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
+index a34a88a7b3..ad5c3a5074 100644
+--- a/xen/include/asm-x86/mm.h
++++ b/xen/include/asm-x86/mm.h
+@@ -587,7 +587,9 @@ void make_cr3(struct vcpu *v, unsigned long mfn);
+ void update_cr3(struct vcpu *v);
+ int vcpu_destroy_pagetables(struct vcpu *);
+ struct trap_bounce *propagate_page_fault(unsigned long addr, u16 error_code);
++
+ void *do_page_walk(struct vcpu *v, unsigned long addr);
++l2_pgentry_t page_walk_get_l2e(pagetable_t root, unsigned long addr);
+ 
+ int __sync_local_execstate(void);
+ 
