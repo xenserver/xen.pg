@@ -1,0 +1,54 @@
+From: Jan Beulich <jbeulich@suse.com>
+Subject: AMD/IOMMU: update live PTEs atomically
+
+Updating a live PTE word by word allows the IOMMU to see a partially
+updated entry. Construct the new entry fully in a local variable and
+then write the new entry by a single insn.
+
+This is part of XSA-347.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Paul Durrant <paul@xen.org>
+
+diff --git a/xen/drivers/passthrough/amd/iommu_map.c b/xen/drivers/passthrough/amd/iommu_map.c
+index 4154eebfda..09b362a5da 100644
+--- a/xen/drivers/passthrough/amd/iommu_map.c
++++ b/xen/drivers/passthrough/amd/iommu_map.c
+@@ -42,7 +42,7 @@ static void clear_iommu_pte_present(unsigned long l1_mfn, unsigned long gfn)
+ 
+     table = map_domain_page(_mfn(l1_mfn));
+     pte = table + pfn_to_pde_idx(gfn, IOMMU_PAGING_MODE_LEVEL_1);
+-    *pte = 0;
++    write_atomic(pte, 0);
+     unmap_domain_page(table);
+ }
+ 
+@@ -50,7 +50,7 @@ static bool_t set_iommu_pde_present(u32 *pde, unsigned long next_mfn,
+                                     unsigned int next_level,
+                                     bool_t iw, bool_t ir)
+ {
+-    uint64_t addr_lo, addr_hi, maddr_next;
++    uint64_t addr_lo, addr_hi, maddr_next, full;
+     u32 entry;
+     bool_t need_flush = 0, old_present;
+ 
+@@ -107,7 +107,7 @@ static bool_t set_iommu_pde_present(u32 *pde, unsigned long next_mfn,
+     if ( next_level == IOMMU_PAGING_MODE_LEVEL_0 )
+         set_field_in_reg_u32(IOMMU_CONTROL_ENABLED, entry,
+                              IOMMU_PTE_FC_MASK, IOMMU_PTE_FC_SHIFT, &entry);
+-    pde[1] = entry;
++    full = (uint64_t)entry << 32;
+ 
+     /* mark next level as 'present' */
+     set_field_in_reg_u32((u32)addr_lo >> PAGE_SHIFT, 0,
+@@ -119,7 +119,9 @@ static bool_t set_iommu_pde_present(u32 *pde, unsigned long next_mfn,
+     set_field_in_reg_u32(IOMMU_CONTROL_ENABLED, entry,
+                          IOMMU_PDE_PRESENT_MASK,
+                          IOMMU_PDE_PRESENT_SHIFT, &entry);
+-    pde[0] = entry;
++    full |= entry;
++
++    write_atomic((uint64_t *)pde, full);
+ 
+     return need_flush;
+ }
