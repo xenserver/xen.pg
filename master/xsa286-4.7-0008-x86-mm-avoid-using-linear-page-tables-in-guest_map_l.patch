@@ -1,16 +1,21 @@
-From fdb7a6a6aeb45cff9653dd0465874863d0cdcffc Mon Sep 17 00:00:00 2001
+From 67ced859fcb0dca7994f1d8099f7734749237fd3 Mon Sep 17 00:00:00 2001
 From: Jan Beulich <jbeulich@suse.com>
 Date: Tue, 29 Sep 2020 18:04:20 +0200
-Subject: [PATCH 4/7] x86/mm: avoid using linear page tables in map_guest_l1e()
+Subject: x86/mm: avoid using linear page tables in guest_map_l1e()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Replace the linear L2 table access by an actual page walk.
 
 This is part of XSA-286.
 
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
 Reviewed-by: George Dunlap <george.dunlap@citrix.com>
+
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 416d7cba22..16c53c134c 100644
+index ecbf61f815..44a6657341 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
 @@ -583,11 +583,14 @@ static l1_pgentry_t *guest_map_l1e(unsigned long addr, unsigned long *gl1mfn)
@@ -33,17 +38,17 @@ index 416d7cba22..16c53c134c 100644
      /* Check flags that it will be safe to read the l1e. */
      if ( (l2e_get_flags(l2e) & (_PAGE_PRESENT | _PAGE_PSE)) != _PAGE_PRESENT )
 diff --git a/xen/arch/x86/x86_64/mm.c b/xen/arch/x86/x86_64/mm.c
-index 451e624c2d..481f4518ae 100644
+index 3e29873323..aa0c5f5869 100644
 --- a/xen/arch/x86/x86_64/mm.c
 +++ b/xen/arch/x86/x86_64/mm.c
-@@ -135,6 +135,49 @@ static l3_pgentry_t page_walk_get_l3e(pagetable_t root, unsigned long addr,
+@@ -100,6 +100,34 @@ static l3_pgentry_t page_walk_get_l3e(pagetable_t root, unsigned long addr)
      return l3e;
  }
  
 +l2_pgentry_t page_walk_get_l2e(pagetable_t root, unsigned long addr)
 +{
-+    l3_pgentry_t l3e = page_walk_get_l3e(root, addr, true);
-+    mfn_t mfn = l3e_get_mfn(l3e);
++    l3_pgentry_t l3e = page_walk_get_l3e(root, addr);
++    unsigned long mfn = l3e_get_pfn(l3e);
 +    struct page_info *pg;
 +    l2_pgentry_t l2e = l2e_empty();
 +
@@ -51,30 +56,15 @@ index 451e624c2d..481f4518ae 100644
 +         (l3e_get_flags(l3e) & _PAGE_PSE) )
 +        return l2e_empty();
 +
-+    pg = mfn_to_page(mfn_x(mfn));
++    pg = mfn_to_page(mfn);
 +    if ( !page_lock(pg) )
 +        return l2e_empty();
 +
 +    if ( (pg->u.inuse.type_info & PGT_type_mask) == PGT_l2_page_table )
 +    {
-+        l2_pgentry_t *l2t = map_domain_page(mfn);
++        l2_pgentry_t *l2t = map_domain_page(_mfn(mfn));
 +
 +        l2e = l2t[l2_table_offset(addr)];
-+
-+        if ( (l2e_get_flags(l2e) & (_PAGE_ACCESSED | _PAGE_PRESENT)) ==
-+             _PAGE_PRESENT  )
-+        {
-+            l2_pgentry_t ol2e = l2e;
-+
-+            l2e_add_flags(l2e, _PAGE_ACCESSED);
-+            /*
-+             * Best effort only; with the lock held the page shouldn't
-+             * change anyway.
-+             */
-+            cmpxchg(&l2e_get_intpte(l2t[l2_table_offset(addr)]),
-+                    l2e_get_intpte(ol2e), l2e_get_intpte(l2e));
-+        }
-+
 +        unmap_domain_page(l2t);
 +    }
 +

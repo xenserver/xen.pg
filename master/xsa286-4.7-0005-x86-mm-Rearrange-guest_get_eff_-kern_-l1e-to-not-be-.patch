@@ -1,0 +1,105 @@
+From eab57146747ef1be505d3106b0f8acd5d8cb609f Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 30 Aug 2017 14:18:01 +0100
+Subject: x86/mm: Rearrange guest_get_eff_{,kern_}l1e() to not be void
+
+Coverity complains that gl1e.l1 may be used while uninitialised in
+map_ldt_shadow_page().  This isn't actually accurate as guest_get_eff_l1e()
+will always write to its parameter.
+
+However, having a void function which returns a 64bit value via pointer is
+rather silly.  Rearrange the functions to return l1_pgentry_t.
+
+No functional change, but hopefully should help Coverity not to come to the
+wrong conclusion.
+
+Bloat-o-meter also reports a modest improvement:
+  add/remove: 0/0 grow/shrink: 0/4 up/down: 0/-71 (-71)
+  function                                     old     new   delta
+  guest_get_eff_l1e                             82      75      -7
+  mmio_ro_do_page_fault                        530     514     -16
+  map_ldt_shadow_page                          501     485     -16
+  ptwr_do_page_fault                           615     583     -32
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index eeba6395a6..ecbf61f815 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -606,34 +606,41 @@ static inline void guest_unmap_l1e(void *p)
+ }
+ 
+ /* Read a PV guest's l1e that maps this linear address. */
+-static void guest_get_eff_l1e(unsigned long linear, l1_pgentry_t *eff_l1e)
++static l1_pgentry_t guest_get_eff_l1e(unsigned long linear)
+ {
++    l1_pgentry_t l1e;
++
+     ASSERT(!paging_mode_translate(current->domain));
+     ASSERT(!paging_mode_external(current->domain));
+ 
+     if ( unlikely(!__addr_ok(linear)) ||
+-         __copy_from_user(eff_l1e,
++         __copy_from_user(&l1e,
+                           &__linear_l1_table[l1_linear_offset(linear)],
+                           sizeof(l1_pgentry_t)) )
+-        *eff_l1e = l1e_empty();
++        l1e = l1e_empty();
++
++    return l1e;
+ }
+ 
+ /*
+  * Read the guest's l1e that maps this address, from the kernel-mode
+  * page tables.
+  */
+-static void guest_get_eff_kern_l1e(unsigned long linear, l1_pgentry_t *eff_l1e)
++static l1_pgentry_t guest_get_eff_kern_l1e(unsigned long linear)
+ {
+     struct vcpu *curr = current;
+     const bool_t user_mode = !(curr->arch.flags & TF_kernel_mode);
++    l1_pgentry_t l1e;
+ 
+     if ( user_mode )
+         toggle_guest_mode(curr);
+ 
+-    guest_get_eff_l1e(linear, eff_l1e);
++    l1e = guest_get_eff_l1e(linear);
+ 
+     if ( user_mode )
+         toggle_guest_mode(curr);
++
++    return l1e;
+ }
+ 
+ const char __section(".bss.page_aligned.const") zero_page[PAGE_SIZE];
+@@ -717,7 +724,7 @@ int map_ldt_shadow_page(unsigned int off)
+ 
+     if ( is_pv_32bit_domain(d) )
+         gva = (u32)gva;
+-    guest_get_eff_kern_l1e(gva, &l1e);
++    l1e = guest_get_eff_kern_l1e(gva);
+     if ( unlikely(!(l1e_get_flags(l1e) & _PAGE_PRESENT)) )
+         return 0;
+ 
+@@ -6212,7 +6219,7 @@ int ptwr_do_page_fault(struct vcpu *v, unsigned long addr,
+     int rc;
+ 
+     /* Attempt to read the PTE that maps the VA being accessed. */
+-    guest_get_eff_l1e(addr, &pte);
++    pte = guest_get_eff_l1e(addr);
+ 
+     /* We are looking only for read-only mappings of p.t. pages. */
+     if ( ((l1e_get_flags(pte) & (_PAGE_PRESENT|_PAGE_RW)) != _PAGE_PRESENT) ||
+@@ -6347,7 +6354,7 @@ int mmio_ro_do_page_fault(struct vcpu *v, unsigned long addr,
+     int rc;
+ 
+     /* Attempt to read the PTE that maps the VA being accessed. */
+-    guest_get_eff_l1e(addr, &pte);
++    pte = guest_get_eff_l1e(addr);
+ 
+     /* We are looking only for read-only mappings of MMIO pages. */
+     if ( ((l1e_get_flags(pte) & (_PAGE_PRESENT|_PAGE_RW)) != _PAGE_PRESENT) )

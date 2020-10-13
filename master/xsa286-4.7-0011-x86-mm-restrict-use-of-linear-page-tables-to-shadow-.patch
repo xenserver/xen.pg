@@ -1,0 +1,122 @@
+From ad3ef542c62308a81d7d77a15bb250325202c8eb Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 29 Sep 2020 18:05:13 +0200
+Subject: x86/mm: restrict use of linear page tables to shadow mode code
+
+Other code does not require them to be set up anymore, so restrict when
+to populate the respective L4 slot and reduce visibility of the
+accessors.
+
+While with the removal of all uses the vulnerability is actually fixed,
+removing the creation of the linear mapping adds an extra layer of
+protection. Similarly reducing visibility of the accessors mostly
+eliminates the risk of undue re-introduction of uses of the linear
+mappings.
+
+This is (not strictly) part of XSA-286.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: George Dunlap <george.dunlap@citrix.com>
+
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 0c3aed7609..625024fd22 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -1899,8 +1899,6 @@ void init_guest_l4_table(l4_pgentry_t l4tab[], const struct domain *d,
+         l4tab[ROOT_PAGETABLE_FIRST_XEN_SLOT + root_pgt_pv_xen_slots] =
+             split_l4e;
+ #endif
+-    l4tab[l4_table_offset(LINEAR_PT_VIRT_START)] =
+-        l4e_from_pfn(domain_page_map_to_mfn(l4tab), __PAGE_HYPERVISOR);
+     l4tab[l4_table_offset(PERDOMAIN_VIRT_START)] =
+         l4e_from_page(d->arch.perdomain_l3_pg, __PAGE_HYPERVISOR);
+     if ( zap_ro_mpt || is_pv_32bit_domain(d) || paging_mode_refcounts(d) )
+diff --git a/xen/arch/x86/mm/hap/hap.c b/xen/arch/x86/mm/hap/hap.c
+index 004122e436..aa043e30b0 100644
+--- a/xen/arch/x86/mm/hap/hap.c
++++ b/xen/arch/x86/mm/hap/hap.c
+@@ -407,10 +407,6 @@ static void hap_install_xen_entries_in_l4(struct vcpu *v, mfn_t l4mfn)
+         l4e_from_pfn(mfn_x(page_to_mfn(d->arch.perdomain_l3_pg)),
+                      __PAGE_HYPERVISOR);
+ 
+-    /* Install a linear mapping */
+-    l4e[l4_table_offset(LINEAR_PT_VIRT_START)] =
+-        l4e_from_pfn(mfn_x(l4mfn), __PAGE_HYPERVISOR);
+-
+     unmap_domain_page(l4e);
+ }
+ 
+diff --git a/xen/arch/x86/mm/shadow/multi.c b/xen/arch/x86/mm/shadow/multi.c
+index c8861bf49e..30916b93b4 100644
+--- a/xen/arch/x86/mm/shadow/multi.c
++++ b/xen/arch/x86/mm/shadow/multi.c
+@@ -1511,8 +1511,9 @@ void sh_install_xen_entries_in_l4(struct domain *d, mfn_t gl4mfn, mfn_t sl4mfn)
+             shadow_l4e_from_mfn(sl4mfn, __PAGE_HYPERVISOR);
+     }
+ 
+-    sl4e[shadow_l4_table_offset(LINEAR_PT_VIRT_START)] =
+-        shadow_l4e_from_mfn(gl4mfn, __PAGE_HYPERVISOR);
++    if ( shadow_mode_external(d) )
++        sl4e[shadow_l4_table_offset(LINEAR_PT_VIRT_START)] =
++            shadow_l4e_from_mfn(gl4mfn, __PAGE_HYPERVISOR);
+ 
+     unmap_domain_page(sl4e);
+ }
+diff --git a/xen/arch/x86/mm/shadow/private.h b/xen/arch/x86/mm/shadow/private.h
+index 9cb6d69f0a..fa067b0bc2 100644
+--- a/xen/arch/x86/mm/shadow/private.h
++++ b/xen/arch/x86/mm/shadow/private.h
+@@ -137,6 +137,15 @@ enum {
+ # define GUEST_PTE_SIZE 4
+ #endif
+ 
++/* Where to find each level of the linear mapping */
++#define __linear_l1_table ((l1_pgentry_t *)(LINEAR_PT_VIRT_START))
++#define __linear_l2_table \
++ ((l2_pgentry_t *)(__linear_l1_table + l1_linear_offset(LINEAR_PT_VIRT_START)))
++#define __linear_l3_table \
++ ((l3_pgentry_t *)(__linear_l2_table + l2_linear_offset(LINEAR_PT_VIRT_START)))
++#define __linear_l4_table \
++ ((l4_pgentry_t *)(__linear_l3_table + l3_linear_offset(LINEAR_PT_VIRT_START)))
++
+ /******************************************************************************
+  * Auditing routines
+  */
+diff --git a/xen/arch/x86/x86_64/mm.c b/xen/arch/x86/x86_64/mm.c
+index 1bd2049d94..abead18d48 100644
+--- a/xen/arch/x86/x86_64/mm.c
++++ b/xen/arch/x86/x86_64/mm.c
+@@ -803,9 +803,6 @@ void __init paging_init(void)
+ 
+     machine_to_phys_mapping_valid = 1;
+ 
+-    /* Set up linear page table mapping. */
+-    l4e_write(&idle_pg_table[l4_table_offset(LINEAR_PT_VIRT_START)],
+-              l4e_from_paddr(__pa(idle_pg_table), __PAGE_HYPERVISOR));
+     return;
+ 
+  nomem:
+diff --git a/xen/include/asm-x86/page.h b/xen/include/asm-x86/page.h
+index 4ae387fb21..657e982875 100644
+--- a/xen/include/asm-x86/page.h
++++ b/xen/include/asm-x86/page.h
+@@ -271,19 +271,6 @@ void copy_page_sse2(void *, const void *);
+ #define vmap_to_mfn(va)     l1e_get_pfn(*virt_to_xen_l1e((unsigned long)(va)))
+ #define vmap_to_page(va)    mfn_to_page(vmap_to_mfn(va))
+ 
+-#endif /* !defined(__ASSEMBLY__) */
+-
+-/* Where to find each level of the linear mapping */
+-#define __linear_l1_table ((l1_pgentry_t *)(LINEAR_PT_VIRT_START))
+-#define __linear_l2_table \
+- ((l2_pgentry_t *)(__linear_l1_table + l1_linear_offset(LINEAR_PT_VIRT_START)))
+-#define __linear_l3_table \
+- ((l3_pgentry_t *)(__linear_l2_table + l2_linear_offset(LINEAR_PT_VIRT_START)))
+-#define __linear_l4_table \
+- ((l4_pgentry_t *)(__linear_l3_table + l3_linear_offset(LINEAR_PT_VIRT_START)))
+-
+-
+-#ifndef __ASSEMBLY__
+ extern root_pgentry_t idle_pg_table[ROOT_PAGETABLE_ENTRIES];
+ extern l2_pgentry_t  *compat_idle_pg_table_l2;
+ extern unsigned int   m2p_compat_vstart;
