@@ -1,0 +1,64 @@
+From b5f48eaf72e730f9d42baf35723c757f8507c86c Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 5 Apr 2019 15:40:42 +0200
+Subject: x86: don't allow clearing of TF_kernel_mode for other than 64-bit PV
+
+The flag is really only meant for those, both HVM and 32-bit PV tell
+kernel from user mode based on CPL/RPL. Remove the all-question-marks
+comment and let's be on the safe side here and also suppress clearing
+for 32-bit PV (this isn't a fast path after all).
+
+Remove no longer necessary is_pv_32bit_*() from sh_update_cr3() and
+sh_walk_guest_tables(). Note that shadow_one_bit_disable() already
+assumes the new behavior.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+Acked-by: George Dunlap <george.dunlap@citrix.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index af4a82a147..d2cd196132 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -1115,9 +1115,15 @@ int arch_set_info_guest(
+ 
+     v->fpu_initialised = !!(flags & VGCF_I387_VALID);
+ 
+-    v->arch.flags &= ~TF_kernel_mode;
+-    if ( (flags & VGCF_in_kernel) || has_hvm_container_domain(d)/*???*/ )
+-        v->arch.flags |= TF_kernel_mode;
++    v->arch.flags |= TF_kernel_mode;
++    if ( unlikely(!(flags & VGCF_in_kernel)) &&
++         /*
++          * TF_kernel_mode is only allowed to be clear for 64-bit PV. See
++          * update_cr3(), sh_update_cr3(), sh_walk_guest_tables(), and
++          * shadow_one_bit_disable() for why that is.
++          */
++         !has_hvm_container_domain(d) && !is_pv_32bit_domain(d) )
++        v->arch.flags &= ~TF_kernel_mode;
+ 
+     v->arch.vgc_flags = flags;
+ 
+diff --git a/xen/arch/x86/mm/shadow/multi.c b/xen/arch/x86/mm/shadow/multi.c
+index c8861bf49e..0f215f2f38 100644
+--- a/xen/arch/x86/mm/shadow/multi.c
++++ b/xen/arch/x86/mm/shadow/multi.c
+@@ -180,7 +180,7 @@ sh_walk_guest_tables(struct vcpu *v, unsigned long va, walk_t *gw,
+                              _mfn(INVALID_MFN), v->arch.paging.shadow.gl3e);
+ #else /* 32 or 64 */
+     const struct domain *d = v->domain;
+-    mfn_t root_mfn = ((v->arch.flags & TF_kernel_mode) || is_pv_32bit_domain(d)
++    mfn_t root_mfn = (v->arch.flags & TF_kernel_mode
+                       ? pagetable_get_mfn(v->arch.guest_table)
+                       : pagetable_get_mfn(v->arch.guest_table_user));
+     void *root_map = map_domain_page(root_mfn);
+@@ -4004,7 +4004,7 @@ sh_update_cr3(struct vcpu *v, int do_locking, bool noflush)
+                    (unsigned long)pagetable_get_pfn(v->arch.guest_table));
+ 
+ #if GUEST_PAGING_LEVELS == 4
+-    if ( !(v->arch.flags & TF_kernel_mode) && !is_pv_32bit_domain(d) )
++    if ( !(v->arch.flags & TF_kernel_mode) )
+         gmfn = pagetable_get_mfn(v->arch.guest_table_user);
+     else
+ #endif
