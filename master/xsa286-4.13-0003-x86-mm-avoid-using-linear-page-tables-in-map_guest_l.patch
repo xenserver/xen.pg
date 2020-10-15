@@ -1,7 +1,7 @@
-From 96ed8917680530e42aeeb7af4bb74ba51c1324e1 Mon Sep 17 00:00:00 2001
+From 4b98ee43beef1b3509b08114d7a414ad755b9d85 Mon Sep 17 00:00:00 2001
 From: Jan Beulich <jbeulich@suse.com>
-Date: Tue, 29 Sep 2020 18:04:20 +0200
-Subject: [PATCH 4/7] x86/mm: avoid using linear page tables in map_guest_l1e()
+Date: Thu, 15 Oct 2020 15:45:19 +0100
+Subject: x86/mm: avoid using linear page tables in map_guest_l1e()
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -13,11 +13,7 @@ This is part of XSA-286.
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
 Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
 Reviewed-by: George Dunlap <george.dunlap@citrix.com>
----
- xen/arch/x86/pv/mm.c     | 11 ++++++----
- xen/arch/x86/x86_64/mm.c | 43 ++++++++++++++++++++++++++++++++++++++++
- xen/include/asm-x86/mm.h |  2 ++
- 3 files changed, 52 insertions(+), 4 deletions(-)
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
 
 diff --git a/xen/arch/x86/pv/mm.c b/xen/arch/x86/pv/mm.c
 index 2b0dadc8da..acebf9e957 100644
@@ -43,16 +39,16 @@ index 2b0dadc8da..acebf9e957 100644
      /* Check flags that it will be safe to read the l1e. */
      if ( (l2e_get_flags(l2e) & (_PAGE_PRESENT | _PAGE_PSE)) != _PAGE_PRESENT )
 diff --git a/xen/arch/x86/x86_64/mm.c b/xen/arch/x86/x86_64/mm.c
-index b6c3f0bc9f..0d12b340f1 100644
+index c010c75639..2a286c5559 100644
 --- a/xen/arch/x86/x86_64/mm.c
 +++ b/xen/arch/x86/x86_64/mm.c
-@@ -135,6 +135,49 @@ static l3_pgentry_t page_walk_get_l3e(pagetable_t root, unsigned long addr,
+@@ -100,6 +100,34 @@ static l3_pgentry_t page_walk_get_l3e(pagetable_t root, unsigned long addr)
      return l3e;
  }
  
 +l2_pgentry_t page_walk_get_l2e(pagetable_t root, unsigned long addr)
 +{
-+    l3_pgentry_t l3e = page_walk_get_l3e(root, addr, true);
++    l3_pgentry_t l3e = page_walk_get_l3e(root, addr);
 +    mfn_t mfn = l3e_get_mfn(l3e);
 +    struct page_info *pg;
 +    l2_pgentry_t l2e = l2e_empty();
@@ -70,21 +66,6 @@ index b6c3f0bc9f..0d12b340f1 100644
 +        l2_pgentry_t *l2t = map_domain_page(mfn);
 +
 +        l2e = l2t[l2_table_offset(addr)];
-+
-+        if ( (l2e_get_flags(l2e) & (_PAGE_ACCESSED | _PAGE_PRESENT)) ==
-+             _PAGE_PRESENT  )
-+        {
-+            l2_pgentry_t ol2e = l2e;
-+
-+            l2e_add_flags(l2e, _PAGE_ACCESSED);
-+            /*
-+             * Best effort only; with the lock held the page shouldn't
-+             * change anyway.
-+             */
-+            cmpxchg(&l2e_get_intpte(l2t[l2_table_offset(addr)]),
-+                    l2e_get_intpte(ol2e), l2e_get_intpte(l2e));
-+        }
-+
 +        unmap_domain_page(l2t);
 +    }
 +
@@ -97,10 +78,10 @@ index b6c3f0bc9f..0d12b340f1 100644
  {
      l3_pgentry_t l3e;
 diff --git a/xen/include/asm-x86/mm.h b/xen/include/asm-x86/mm.h
-index 320c6cd196..cd3e7ec501 100644
+index 9495cc8aa1..3ac684f76f 100644
 --- a/xen/include/asm-x86/mm.h
 +++ b/xen/include/asm-x86/mm.h
-@@ -577,7 +577,9 @@ void audit_domains(void);
+@@ -581,7 +581,9 @@ void audit_domains(void);
  void make_cr3(struct vcpu *v, mfn_t mfn);
  void update_cr3(struct vcpu *v);
  int vcpu_destroy_pagetables(struct vcpu *);
@@ -110,6 +91,3 @@ index 320c6cd196..cd3e7ec501 100644
  
  int __sync_local_execstate(void);
  
--- 
-2.25.1
-
