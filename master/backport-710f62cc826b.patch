@@ -1,0 +1,56 @@
+From 710f62cc826bb8c7ead99f9d6b6b269e39ff3e98 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Fri, 23 Oct 2020 10:13:14 +0200
+Subject: pci: cleanup MSI interrupts before removing device from IOMMU
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Doing the MSI cleanup after removing the device from the IOMMU leads
+to the following panic on AMD hardware:
+
+Assertion 'table.ptr && (index < intremap_table_entries(table.ptr, iommu))' failed at iommu_intr.c:172
+----[ Xen-4.13.1-10.0.3-d  x86_64  debug=y   Not tainted ]----
+CPU:    3
+RIP:    e008:[<ffff82d08026ae3c>] drivers/passthrough/amd/iommu_intr.c#get_intremap_entry+0x52/0x7b
+[...]
+Xen call trace:
+   [<ffff82d08026ae3c>] R drivers/passthrough/amd/iommu_intr.c#get_intremap_entry+0x52/0x7b
+   [<ffff82d08026af25>] F drivers/passthrough/amd/iommu_intr.c#update_intremap_entry_from_msi_msg+0xc0/0x342
+   [<ffff82d08026ba65>] F amd_iommu_msi_msg_update_ire+0x98/0x129
+   [<ffff82d08025dd36>] F iommu_update_ire_from_msi+0x1e/0x21
+   [<ffff82d080286862>] F msi_free_irq+0x55/0x1a0
+   [<ffff82d080286f25>] F pci_cleanup_msi+0x8c/0xb0
+   [<ffff82d08025cf52>] F pci_remove_device+0x1af/0x2da
+   [<ffff82d0802a42d1>] F do_physdev_op+0xd18/0x1187
+   [<ffff82d080383925>] F pv_hypercall+0x1f5/0x567
+   [<ffff82d08038a432>] F lstar_enter+0x112/0x120
+
+That's because the call to iommu_remove_device on AMD hardware will
+remove the per-device interrupt remapping table, and hence the call to
+pci_cleanup_msi done afterwards will find a null intremap table and
+crash.
+
+Reorder the calls so that MSI interrupts are torn down before removing
+the device from the IOMMU.
+
+Fixes: d7cfeb7c13ed ("AMD/IOMMU: don't blindly allocate interrupt remapping tables")
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index 7d47929..b84495e 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -842,10 +842,10 @@ int pci_remove_device(u16 seg, u8 bus, u8 devfn)
+     list_for_each_entry ( pdev, &pseg->alldevs_list, alldevs_list )
+         if ( pdev->bus == bus && pdev->devfn == devfn )
+         {
++            pci_cleanup_msi(pdev);
+             ret = iommu_remove_device(pdev);
+             if ( pdev->domain )
+                 list_del(&pdev->domain_list);
+-            pci_cleanup_msi(pdev);
+             free_pdev(pseg, pdev);
+             printk(XENLOG_DEBUG "PCI remove device %04x:%02x:%02x.%u\n",
+                    seg, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
