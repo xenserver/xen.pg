@@ -1,0 +1,2 @@
+sources:
+	xenpkg --cimode makesources

@@ -1,5 +1,7 @@
 # -*- rpm-spec -*-
 
+%global package_srccommit RELEASE-4.13.2
+
 %define with_sysv 0
 %define with_systemd 1
 
@@ -26,7 +28,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.13.2
-Release: 10.0.4
+Release: 10.0.5
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
