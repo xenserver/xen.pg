@@ -3,6 +3,10 @@
 # Commitish for Source0, required by tooling.
 %global package_srccommit RELEASE-4.13.2
 
+# Full hash from the HEAD commit of this repo during processing, usually
+# provided by the environment.  Default to ??? if not set.
+%{!?package_speccommit: %global package_speccommit ???}
+
 %define with_sysv 0
 %define with_systemd 1
 
@@ -198,7 +202,7 @@ the XenServer installer environment.
 %{?_cov_make_model:%{_cov_make_model misc/coverity/model.c}}
 
 base_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info)
-pq_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info-pq)
+pq_cset="%{package_speccommit}"
 echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
 cp %{SOURCE4} .
 
