@@ -1,5 +1,6 @@
 # -*- rpm-spec -*-
 
+# Commitish for Source0, required by tooling.
 %global package_srccommit RELEASE-4.13.2
 
 %define with_sysv 0
@@ -22,7 +23,6 @@
 %define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 debug=n
 %endif
 
-%define base_cset RELEASE-%{version}
 %define base_dir  %{name}-%{version}
 
 Summary: Xen is a virtual machine monitor
@@ -31,7 +31,7 @@ Version: 4.13.2
 Release: 10.0.5
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
-Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
+Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{package_srccommit}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
