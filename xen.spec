@@ -10,18 +10,8 @@
 %define default_debug_hypervisor %{?_without_default_debug_hypervisor:0}%{?!_without_default_debug_hypervisor:1}
 
 %define COMMON_OPTIONS DESTDIR=%{buildroot} %{?_smp_mflags}
-
-# For 32bit dom0 userspace, we need to cross compile a 64bit Xen
-%ifarch %ix86
-%define HVSOR_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 CROSS_COMPILE=x86_64-linux-gnu-
-%define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_32 debug=n
-%endif
-
-# For 64bit
-%ifarch x86_64
 %define HVSOR_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64
 %define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 debug=n
-%endif
 
 %define base_dir  %{name}-%{version}
 
@@ -37,12 +27,7 @@ Source2: xl.conf
 Source3: logrotate-xen-tools
 Source4: https://repo.citrite.net/list/ctx-local-contrib/citrix/branding2020/Citrix_Logo_Black.png
 
-ExclusiveArch: i686 x86_64
-
-#Cross complier
-%ifarch %ix86
-BuildRequires: gcc-x86_64-linux-gnu binutils-x86_64-linux-gnu
-%endif
+ExclusiveArch: x86_64
 
 ## Pull in the correct RPM macros for the distributon
 ## (Any fedora which is still in support uses python3)
