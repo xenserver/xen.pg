@@ -3,9 +3,17 @@
 # Commitish for Source0, required by tooling.
 %global package_srccommit RELEASE-4.13.2
 
+# Hypervisor release.  Should match the tag in the repository and would be in
+# the Release field if it weren't for the %%{xsrel} automagic.
+%global hv_rel 10.0.5
+
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
 %{!?package_speccommit: %global package_speccommit ???}
+
+# Normally derived from the tag and provided by the environment.  May be a
+# `git describe` when not building an from a tagged changeset.
+%{!?xsrel: %global xsrel %{hv_rel}}
 
 %define with_sysv 0
 %define with_systemd 1
@@ -22,7 +30,7 @@
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.13.2
-Release: 10.0.5
+Release: %{?xsrel}%{?dist}
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{package_srccommit}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -228,31 +236,31 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 mkdir -p %{buildroot}/boot/
 
 # Regular build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel} \
     KCONFIG_CONFIG=../buildconfigs/config-release olddefconfig
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel} \
     KCONFIG_CONFIG=../buildconfigs/config-release build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel} \
     KCONFIG_CONFIG=../buildconfigs/config-release MAP
 
-cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}.gz
-cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{release}.map
-cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{release}
-cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{release}.config
+cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.gz
+cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.map
+cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{hv_rel}
+cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.config
 
 # Debug build of Xen
 %{__make} %{HVSOR_OPTIONS} -C xen clean
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug olddefconfig
-%{?_cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+%{?_cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
+%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug MAP
 
-cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}-d.gz
-cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{release}-d.map
-cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{release}-d
-cp buildconfigs/config-debug %{buildroot}/boot/%{name}-%{version}-%{release}-d.config
+cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{hv_rel}-d.gz
+cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{hv_rel}-d.map
+cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{hv_rel}-d
+cp buildconfigs/config-debug %{buildroot}/boot/%{name}-%{version}-%{hv_rel}-d.config
 
 # do not strip the hypervisor-debuginfo targerts
 chmod -x %{buildroot}/boot/xen-syms-*
@@ -292,19 +300,19 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{?_cov_install}
 
 %files hypervisor
-/boot/%{name}-%{version}-%{release}.gz
-/boot/%{name}-%{version}-%{release}.map
-/boot/%{name}-%{version}-%{release}.config
-/boot/%{name}-%{version}-%{release}-d.gz
-/boot/%{name}-%{version}-%{release}-d.map
-/boot/%{name}-%{version}-%{release}-d.config
+/boot/%{name}-%{version}-%{hv_rel}.gz
+/boot/%{name}-%{version}-%{hv_rel}.map
+/boot/%{name}-%{version}-%{hv_rel}.config
+/boot/%{name}-%{version}-%{hv_rel}-d.gz
+/boot/%{name}-%{version}-%{hv_rel}-d.map
+/boot/%{name}-%{version}-%{hv_rel}-d.config
 %config %{_sysconfdir}/sysconfig/kernel-xen
 %doc Citrix_Logo_Black.png
 %ghost %attr(0644,root,root) %{_sysconfdir}/sysconfig/kernel-xen-args
 
 %files hypervisor-debuginfo
-/boot/%{name}-syms-%{version}-%{release}
-/boot/%{name}-syms-%{version}-%{release}-d
+/boot/%{name}-syms-%{version}-%{hv_rel}
+/boot/%{name}-syms-%{version}-%{hv_rel}-d
 
 %files tools
 %{_bindir}/xenstore
@@ -779,25 +787,25 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 
 %post hypervisor
 # Update the debug and release symlinks
-ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen-debug.gz
-ln -sf %{name}-%{version}-%{release}.gz /boot/xen-release.gz
+ln -sf %{name}-%{version}-%{hv_rel}-d.gz /boot/xen-debug.gz
+ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen-release.gz
 
 # Point /boot/xen.gz appropriately
 if [ ! -e /boot/xen.gz ]; then
 %if %{default_debug_hypervisor}
     # Use a debug hypervisor by default
-    ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen.gz
+    ln -sf %{name}-%{version}-%{hv_rel}-d.gz /boot/xen.gz
 %else
     # Use a production hypervisor by default
-    ln -sf %{name}-%{version}-%{release}.gz /boot/xen.gz
+    ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
 %endif
 else
     # Else look at the current link, and whether it is debug
     path="`readlink -f /boot/xen.gz`"
     if [ ${path} != ${path%%-d.gz} ]; then
-        ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen.gz
+        ln -sf %{name}-%{version}-%{hv_rel}-d.gz /boot/xen.gz
     else
-        ln -sf %{name}-%{version}-%{release}.gz /boot/xen.gz
+        ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
     fi
 fi
 
@@ -806,7 +814,7 @@ if [ -e %{_sysconfdir}/sysconfig/kernel ] && ! grep -q '^HYPERVISOR' %{_sysconfd
 fi
 
 mkdir -p %{_rundir}/reboot-required.d/%{name}
-touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
+touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 
 %if %with_systemd
 %post dom0-tools
