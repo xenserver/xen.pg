@@ -1,0 +1,58 @@
+From 496673a2ada93c201fbe1cc83146c8bd8e79169d Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 31 Oct 2016 13:21:56 +0000
+Subject: tools/oxenstored: Fix transaction handling in 32bit builds
+
+In a 32bit build, the ocaml code 'proposed_id >= 0x7fffffff' compiles to:
+
+  8055eac:       83 fb ff                cmp    $0xffffffff,%ebx
+  8055eaf:       7d 0f                   jge    8055ec0 <...+0x20>
+
+which in C is 'proposed_id >= INT_MIN', or in other words, tautologically
+true.  As a result, 32bit builds of oxenstored always try to allocate the
+transaction id 1, and fall into an infinite loop of trying the next id if
+transaction 1 is already in use.
+
+Restrict the range down to 1 billion, to sit in the positive half of a 31 bit
+ocaml integer.  The compiled code is now:
+
+  8055eac:       b9 ff ff ff 7f          mov    $0x7fffffff,%ecx
+  8055eb1:       39 cb                   cmp    %ecx,%ebx
+  8055eb3:       7d 0b                   jge    8055ec0 <...+0x20>
+
+which (other than non-optimal code generation because of the unnecessary use
+of %ecx), isn't unconditionally true.
+
+In principle, the check could be changed to 'proposed_id == 0x7fffffff' which
+would still allow for 2 billion transaction in 32bit builds.  However, in
+64bit builds, this reintroduces a risk that if proposed_id is initially
+greater than 0x7fffffff, it will not be clipped suitably into range.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+Acked-by: David Scott <dave@recoil.org>
+Release-acked-by: Wei Liu <wei.liu2@citrix.com>
+
+diff --git a/tools/ocaml/xenstored/connection.ml b/tools/ocaml/xenstored/connection.ml
+index 5efa26ebbd..a66d2f7db5 100644
+--- a/tools/ocaml/xenstored/connection.ml
++++ b/tools/ocaml/xenstored/connection.ml
+@@ -218,8 +218,16 @@ let fire_watch watch path =
+ 
+ (* Search for a valid unused transaction id. *)
+ let rec valid_transaction_id con proposed_id =
+-	(* Clip proposed_id to the range [1, 0x7ffffffe] *)
+-	let id = if proposed_id <= 0 || proposed_id >= 0x7fffffff then 1 else proposed_id in
++	(*
++	 * Clip proposed_id to the range [1, 0x3ffffffe]
++	 *
++	 * The chosen id must not trucate when written into the uint32_t tx_id
++	 * field, and needs to fit within the positive range of a 31 bit ocaml
++	 * integer to function when compiled as 32bit.
++	 *
++	 * Oxenstored therefore supports only 1 billion open transactions.
++	 *)
++	let id = if proposed_id <= 0 || proposed_id >= 0x3fffffff then 1 else proposed_id in
+ 
+ 	if Hashtbl.mem con.transactions id then (
+ 		(* Outstanding transaction with this id.  Try the next. *)

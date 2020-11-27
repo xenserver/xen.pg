@@ -1,0 +1,61 @@
+From 0897514b4b376a167f968f79c6ea0dee1061458e Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 26 Oct 2016 10:34:21 +0100
+Subject: tools/oxenstored: Avoid allocating invalid transaction ids
+
+The transaction id of 0 is reserved, meaning "not in a transaction".  It is up
+to the xenstored server to allocate transaction ids.  While oxenstored starts
+its ids at 1, but insufficient care is taken with truncation cases.
+
+A 32bit oxenstored has an int with 31 bits of width, meaning that the
+transaction id will wrap around to 0 after 2 billion transactions.
+
+A 64bit oxenstored has an int with 63 bits of width, meaning that once 4
+billion transactions are used, the allocated id will be truncated when written
+into the uin32_t field in the ring.  This causes the client to reply with the
+truncated id, breaking any further attempt to use any transactions.
+
+Limit all transaction ids to the range between 1 and 0x7ffffffe.  This is the
+best which can be done without making oxenstored depend on Stdint or Cstruct,
+yet still work for 32bit builds.
+
+Also check that the proposed new transaction id isn't currently in use.  For
+the first 2 billion transactions there is no chance of a collision, and after
+that, the chance is at most 20 (the default open transaction quota) in 2
+billion.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: David Scott <dave@recoil.org>
+Release-acked-by: Wei Liu <wei.liu2@citrix.com>
+
+diff --git a/tools/ocaml/xenstored/connection.ml b/tools/ocaml/xenstored/connection.ml
+index 8a8d152548..5efa26ebbd 100644
+--- a/tools/ocaml/xenstored/connection.ml
++++ b/tools/ocaml/xenstored/connection.ml
+@@ -216,14 +216,23 @@ let fire_watch watch path =
+ 	let data = Utils.join_by_null [ new_path; watch.token; "" ] in
+ 	send_reply watch.con Transaction.none 0 Xenbus.Xb.Op.Watchevent data
+ 
+-let find_next_tid con =
+-	let ret = con.next_tid in con.next_tid <- con.next_tid + 1; ret
++(* Search for a valid unused transaction id. *)
++let rec valid_transaction_id con proposed_id =
++	(* Clip proposed_id to the range [1, 0x7ffffffe] *)
++	let id = if proposed_id <= 0 || proposed_id >= 0x7fffffff then 1 else proposed_id in
++
++	if Hashtbl.mem con.transactions id then (
++		(* Outstanding transaction with this id.  Try the next. *)
++		valid_transaction_id con (id + 1)
++	) else
++		id
+ 
+ let start_transaction con store =
+ 	if !Define.maxtransaction > 0 && not (is_dom0 con)
+ 	&& Hashtbl.length con.transactions > !Define.maxtransaction then
+ 		raise Quota.Transaction_opened;
+-	let id = find_next_tid con in
++	let id = valid_transaction_id con con.next_tid in
++	con.next_tid <- id + 1;
+ 	let ntrans = Transaction.make id store in
+ 	Hashtbl.add con.transactions id ntrans;
+ 	Logging.start_transaction ~tid:id ~con:(get_domstr con);
