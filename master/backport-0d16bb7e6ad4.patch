@@ -1,0 +1,266 @@
+From 0d16bb7e6ad4834c66366d84d419555c384485d9 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Thu, 9 Apr 2020 09:04:19 +0200
+Subject: xen: do live patching only from main idle loop
+
+One of the main design goals of core scheduling is to avoid actions
+which are not directly related to the domain currently running on a
+given cpu or core. Live patching is one of those actions which are
+allowed taking place on a cpu only when the idle scheduling unit is
+active on that cpu.
+
+Unfortunately live patching tries to force the cpus into the idle loop
+just by raising the schedule softirq, which will no longer be
+guaranteed to work with core scheduling active. Additionally there are
+still some places in the hypervisor calling check_for_livepatch_work()
+without being in the idle loop.
+
+It is easy to force a cpu into the main idle loop by scheduling a
+tasklet on it. So switch live patching to use tasklets for switching to
+idle and raising scheduling events. Additionally the calls of
+check_for_livepatch_work() outside the main idle loop can be dropped.
+
+As tasklets are only running on idle vcpus and stop_machine_run()
+is activating tasklets on all cpus but the one it has been called on
+to rendezvous, it is mandatory for stop_machine_run() to be called on
+an idle vcpu, too, as otherwise there is no way for scheduling to
+activate the idle vcpu for the tasklet on the sibling of the cpu
+stop_machine_run() has been called on.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Acked-by: Julien Grall <jgrall@amazon.com>
+Reviewed-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Tested-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Acked-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+master commit: 005de45c887e0fefde59570686877afeda2c7b4e
+master date: 2020-03-02 18:36:50 +0000
+
+diff --git a/xen/arch/arm/domain.c b/xen/arch/arm/domain.c
+index c0a13aa0ab..283eb6bb43 100644
+--- a/xen/arch/arm/domain.c
++++ b/xen/arch/arm/domain.c
+@@ -72,7 +72,11 @@ void idle_loop(void)
+ 
+         /* Are we here for running vcpu context tasklets, or for idling? */
+         if ( unlikely(tasklet_work_to_do(cpu)) )
++        {
+             do_tasklet();
++            /* Livepatch work is always kicked off via a tasklet. */
++            check_for_livepatch_work();
++        }
+         /*
+          * Test softirqs twice --- first to see if should even try scrubbing
+          * and then, after it is done, whether softirqs became pending
+@@ -83,11 +87,6 @@ void idle_loop(void)
+             do_idle();
+ 
+         do_softirq();
+-        /*
+-         * We MUST be last (or before dsb, wfi). Otherwise after we get the
+-         * softirq we would execute dsb,wfi (and sleep) and not patch.
+-         */
+-        check_for_livepatch_work();
+     }
+ }
+ 
+diff --git a/xen/arch/arm/traps.c b/xen/arch/arm/traps.c
+index d028ec9224..1d2b762e22 100644
+--- a/xen/arch/arm/traps.c
++++ b/xen/arch/arm/traps.c
+@@ -23,7 +23,6 @@
+ #include <xen/iocap.h>
+ #include <xen/irq.h>
+ #include <xen/lib.h>
+-#include <xen/livepatch.h>
+ #include <xen/mem_access.h>
+ #include <xen/mm.h>
+ #include <xen/perfc.h>
+@@ -2231,11 +2230,6 @@ static void check_for_pcpu_work(void)
+     {
+         local_irq_enable();
+         do_softirq();
+-        /*
+-         * Must be the last one - as the IPI will trigger us to come here
+-         * and we want to patch the hypervisor with almost no stack.
+-         */
+-        check_for_livepatch_work();
+         local_irq_disable();
+     }
+ }
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 2ce00fb26f..d42a32c8a9 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -141,7 +141,11 @@ static void idle_loop(void)
+ 
+         /* Are we here for running vcpu context tasklets, or for idling? */
+         if ( unlikely(tasklet_work_to_do(cpu)) )
++        {
+             do_tasklet();
++            /* Livepatch work is always kicked off via a tasklet. */
++            check_for_livepatch_work();
++        }
+         /*
+          * Test softirqs twice --- first to see if should even try scrubbing
+          * and then, after it is done, whether softirqs became pending
+@@ -151,11 +155,6 @@ static void idle_loop(void)
+                     !softirq_pending(cpu) )
+             pm_idle();
+         do_softirq();
+-        /*
+-         * We MUST be last (or before pm_idle). Otherwise after we get the
+-         * softirq we would execute pm_idle (and sleep) and not patch.
+-         */
+-        check_for_livepatch_work();
+     }
+ }
+ 
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index 6ae43999ff..dc1bd32b9b 100644
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -1032,7 +1032,7 @@ static void noreturn svm_do_resume(struct vcpu *v)
+ 
+     hvm_do_resume(v);
+ 
+-    reset_stack_and_jump(svm_asm_do_resume);
++    reset_stack_and_jump_nolp(svm_asm_do_resume);
+ }
+ 
+ void svm_vmenter_helper(const struct cpu_user_regs *regs)
+diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
+index f10f6b78ec..d53eceb23a 100644
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -1889,7 +1889,7 @@ void vmx_do_resume(struct vcpu *v)
+     if ( host_cr4 != read_cr4() )
+         __vmwrite(HOST_CR4, read_cr4());
+ 
+-    reset_stack_and_jump(vmx_asm_do_vmentry);
++    reset_stack_and_jump_nolp(vmx_asm_do_vmentry);
+ }
+ 
+ static inline unsigned long vmr(unsigned long field)
+diff --git a/xen/arch/x86/pv/domain.c b/xen/arch/x86/pv/domain.c
+index ed5111fc47..3308b6b7d4 100644
+--- a/xen/arch/x86/pv/domain.c
++++ b/xen/arch/x86/pv/domain.c
+@@ -61,7 +61,7 @@ custom_runtime_param("pcid", parse_pcid);
+ static void noreturn continue_nonidle_domain(struct vcpu *v)
+ {
+     check_wakeup_from_wait();
+-    reset_stack_and_jump(ret_from_intr);
++    reset_stack_and_jump_nolp(ret_from_intr);
+ }
+ 
+ static int setup_compat_l4(struct vcpu *v)
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index cc7274eae6..ae61e93024 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -631,7 +631,7 @@ static void __init noreturn reinit_bsp_stack(void)
+     stack_base[0] = stack;
+     memguard_guard_stack(stack);
+ 
+-    reset_stack_and_jump(init_done);
++    reset_stack_and_jump_nolp(init_done);
+ }
+ 
+ /*
+diff --git a/xen/common/livepatch.c b/xen/common/livepatch.c
+index 7ab1f82290..1f89984c9a 100644
+--- a/xen/common/livepatch.c
++++ b/xen/common/livepatch.c
+@@ -17,6 +17,7 @@
+ #include <xen/spinlock.h>
+ #include <xen/string.h>
+ #include <xen/symbols.h>
++#include <xen/tasklet.h>
+ #include <xen/version.h>
+ #include <xen/virtual_region.h>
+ #include <xen/vmap.h>
+@@ -103,6 +104,7 @@ static struct livepatch_work livepatch_work;
+  * Having an per-cpu lessens the load.
+  */
+ static DEFINE_PER_CPU(bool_t, work_to_do);
++static DEFINE_PER_CPU(struct tasklet, livepatch_tasklet);
+ 
+ static int get_name(const struct xen_livepatch_name *name, char *n)
+ {
+@@ -1247,17 +1249,16 @@ static int schedule_work(struct payload *data, uint32_t cmd, uint32_t timeout)
+     smp_wmb();
+ 
+     livepatch_work.do_work = 1;
+-    this_cpu(work_to_do) = 1;
++    tasklet_schedule_on_cpu(&this_cpu(livepatch_tasklet), smp_processor_id());
+ 
+     put_cpu_maps();
+ 
+     return 0;
+ }
+ 
+-static void reschedule_fn(void *unused)
++static void tasklet_fn(unsigned long unused)
+ {
+     this_cpu(work_to_do) = 1;
+-    raise_softirq(SCHEDULE_SOFTIRQ);
+ }
+ 
+ static int livepatch_spin(atomic_t *counter, s_time_t timeout,
+@@ -1317,7 +1318,7 @@ void check_for_livepatch_work(void)
+     if ( atomic_inc_and_test(&livepatch_work.semaphore) )
+     {
+         struct payload *p;
+-        unsigned int cpus;
++        unsigned int cpus, i;
+ 
+         p = livepatch_work.data;
+         if ( !get_cpu_maps() )
+@@ -1346,7 +1347,9 @@ void check_for_livepatch_work(void)
+         {
+             dprintk(XENLOG_DEBUG, LIVEPATCH "%s: CPU%u - IPIing the other %u CPUs\n",
+                     p->name, cpu, cpus);
+-            smp_call_function(reschedule_fn, NULL, 0);
++            for_each_online_cpu ( i )
++                if ( i != cpu )
++                    tasklet_schedule_on_cpu(&per_cpu(livepatch_tasklet, i), i);
+         }
+ 
+         timeout = livepatch_work.timeout + NOW();
+@@ -1668,8 +1671,34 @@ static void livepatch_printall(unsigned char key)
+     spin_unlock(&payload_lock);
+ }
+ 
++static int cpu_callback(
++    struct notifier_block *nfb, unsigned long action, void *hcpu)
++{
++    unsigned int cpu = (unsigned long)hcpu;
++
++    if ( action == CPU_UP_PREPARE )
++        tasklet_init(&per_cpu(livepatch_tasklet, cpu), tasklet_fn, 0);
++
++    return NOTIFY_DONE;
++}
++
++static struct notifier_block cpu_nfb = {
++    .notifier_call = cpu_callback
++};
++
+ static int __init livepatch_init(void)
+ {
++    unsigned int cpu;
++
++    for_each_online_cpu ( cpu )
++    {
++        void *hcpu = (void *)(long)cpu;
++
++        cpu_callback(&cpu_nfb, CPU_UP_PREPARE, hcpu);
++    }
++
++    register_cpu_notifier(&cpu_nfb);
++
+     register_keyhandler('x', livepatch_printall, "print livepatch info", 1);
+ 
+     arch_livepatch_init();
