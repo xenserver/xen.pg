@@ -1,0 +1,71 @@
+From b7c333016e3d6adf38e80b4e6b121950da092405 Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Mon, 7 Dec 2020 14:52:35 +0100
+Subject: x86/IRQ: allocate guest array of max size only for shareable IRQs
+
+... and increase default "irq-max-guests" to 32.
+
+It's not necessary to have an array of a size more than 1 for non-shareable
+IRQs and it might impact scalability in case of high "irq-max-guests"
+values being used - every IRQ in the system including MSIs would be
+supplied with an array of that size.
+
+Since it's now less impactful to use higher "irq-max-guests" value - bump
+the default to 32. That should give more headroom for future systems.
+
+Requested-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
+index 53e676b..f7db2b6 100644
+--- a/docs/misc/xen-command-line.pandoc
++++ b/docs/misc/xen-command-line.pandoc
+@@ -1644,7 +1644,7 @@ This option is ignored in **pv-shim** mode.
+ ### irq-max-guests (x86)
+ > `= <integer>`
+ 
+-> Default: `16`
++> Default: `32`
+ 
+ Maximum number of guests any individual IRQ could be shared between,
+ i.e. a limit on the number of guests it is possible to start each having
+diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
+index 1a60160..f82c93d 100644
+--- a/xen/arch/x86/irq.c
++++ b/xen/arch/x86/irq.c
+@@ -440,7 +440,7 @@ int __init init_irq_data(void)
+         irq_to_desc(irq)->irq = irq;
+ 
+     if ( !irq_max_guests )
+-        irq_max_guests = 16;
++        irq_max_guests = 32;
+ 
+ #ifdef CONFIG_PV
+     /* Never allocate the hypercall vector or Linux/BSD fast-trap vector. */
+@@ -1532,6 +1532,7 @@ int pirq_guest_bind(struct vcpu *v, struct pirq *pirq, int will_share)
+ {
+     struct irq_desc         *desc;
+     irq_guest_action_t *action, *newaction = NULL;
++    unsigned int        max_nr_guests = will_share ? irq_max_guests : 1;
+     int                 rc = 0;
+ 
+     WARN_ON(!spin_is_locked(&v->domain->event_lock));
+@@ -1560,7 +1561,7 @@ int pirq_guest_bind(struct vcpu *v, struct pirq *pirq, int will_share)
+         {
+             spin_unlock_irq(&desc->lock);
+             if ( (newaction = xmalloc_flex_struct(irq_guest_action_t, guest,
+-                                                  irq_max_guests)) != NULL &&
++                                                  max_nr_guests)) != NULL &&
+                  zalloc_cpumask_var(&newaction->cpu_eoi_map) )
+                 goto retry;
+             xfree(newaction);
+@@ -1629,7 +1630,7 @@ int pirq_guest_bind(struct vcpu *v, struct pirq *pirq, int will_share)
+         goto retry;
+     }
+ 
+-    if ( action->nr_guests == irq_max_guests )
++    if ( action->nr_guests >= max_nr_guests )
+     {
+         printk(XENLOG_G_INFO
+                "Cannot bind IRQ%d to %pd: already at max share %u"
