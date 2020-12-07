@@ -1,0 +1,225 @@
+From ab914e04a62727b75782e401eaf2e8b72f717f61 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 17 Feb 2017 15:51:03 +0100
+Subject: [PATCH] x86: package up context switch hook pointers
+
+They're all solely dependent on guest type, so we don't need to repeat
+all the same three pointers in every vCPU control structure. Instead use
+static const structures, and store pointers to them in the domain
+control structure.
+
+Since touching it anyway, take the opportunity and expand
+schedule_tail() in the only two places invoking it, allowing the macro
+to be dropped.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index af4a82a147..60a014f784 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -631,15 +631,9 @@ int vcpu_initialise(struct vcpu *v)
+ 
+         v->arch.pv_vcpu.ctrlreg[4] = pv_fixup_guest_cr4(v, 0);
+     }
+-
+-    v->arch.schedule_tail = continue_nonidle_domain;
+-    v->arch.ctxt_switch_from = paravirt_ctxt_switch_from;
+-    v->arch.ctxt_switch_to   = paravirt_ctxt_switch_to;
+-
+-    if ( is_idle_domain(d) )
++    else
+     {
+-        v->arch.schedule_tail = continue_idle_domain;
+-        v->arch.cr3           = __pa(idle_pg_table);
++        v->arch.cr3 = __pa(idle_pg_table);
+         v->arch.msr = ZERO_BLOCK_PTR; /* Catch stray misuses */
+     }
+ 
+@@ -848,12 +842,28 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags,
+         if ( (rc = hvm_domain_initialise(d)) != 0 )
+             goto fail;
+     }
+-    else if ( !is_idle_domain(d) )
++    else
+     {
+-        /* 64-bit PV guest by default. */
+-        d->arch.is_32bit_pv = d->arch.has_32bit_shinfo = 0;
++        static const struct arch_csw pv_csw = {
++            .from = paravirt_ctxt_switch_from,
++            .to   = paravirt_ctxt_switch_to,
++            .tail = continue_nonidle_domain,
++        };
++        static const struct arch_csw idle_csw = {
++            .from = paravirt_ctxt_switch_from,
++            .to   = paravirt_ctxt_switch_to,
++            .tail = continue_idle_domain,
++        };
+ 
+-        set_domain_xpti(d);
++        d->arch.ctxt_switch = is_idle_domain(d) ? &idle_csw : &pv_csw;
++
++        if ( !is_idle_domain(d) )
++        {
++            /* 64-bit PV guest by default. */
++            d->arch.is_32bit_pv = d->arch.has_32bit_shinfo = 0;
++
++            set_domain_xpti(d);
++        }
+     }
+ 
+     /* initialize default tsc behavior in case tools don't */
+@@ -2185,7 +2195,7 @@ static void __context_switch(void)
+     {
+         memcpy(&p->arch.user_regs, stack_regs, CTXT_SWITCH_STACK_BYTES);
+         vcpu_save_fpu(p);
+-        p->arch.ctxt_switch_from(p);
++        pd->arch.ctxt_switch->from(p);
+     }
+ 
+     /*
+@@ -2211,7 +2221,7 @@ static void __context_switch(void)
+                 set_msr_xss(n->arch.hvm_vcpu.msr_xss);
+         }
+         vcpu_restore_fpu_nonlazy(n, 0);
+-        n->arch.ctxt_switch_to(n);
++        nd->arch.ctxt_switch->to(n);
+     }
+ 
+     psr_ctxt_switch_to(nd);
+@@ -2361,12 +2371,20 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
+     /* Ensure that the vcpu has an up-to-date time base. */
+     update_vcpu_system_time(next);
+ 
+-    schedule_tail(next);
++    /*
++     * Schedule tail *should* be a terminal function pointer, but leave a
++     * bug frame around just in case it returns, to save going back into the
++     * context switching code and leaving a far more subtle crash to diagnose.
++     */
++    nextd->arch.ctxt_switch->tail(next);
++    BUG();
+ }
+ 
+ void continue_running(struct vcpu *same)
+ {
+-    schedule_tail(same);
++    /* See the comment above. */
++    same->domain->arch.ctxt_switch->tail(same);
++    BUG();
+ }
+ 
+ int __sync_local_execstate(void)
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index 8cfbdfba40..55513a3417 100644
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -1202,6 +1202,14 @@ void svm_host_osvw_init()
+ 
+ static int svm_domain_initialise(struct domain *d)
+ {
++    static const struct arch_csw csw = {
++        .from = svm_ctxt_switch_from,
++        .to   = svm_ctxt_switch_to,
++        .tail = svm_do_resume,
++    };
++
++    d->arch.ctxt_switch = &csw;
++
+     return 0;
+ }
+ 
+@@ -1213,10 +1221,6 @@ static int svm_vcpu_initialise(struct vcpu *v)
+ {
+     int rc;
+ 
+-    v->arch.schedule_tail    = svm_do_resume;
+-    v->arch.ctxt_switch_from = svm_ctxt_switch_from;
+-    v->arch.ctxt_switch_to   = svm_ctxt_switch_to;
+-
+     v->arch.hvm_svm.launch_core = -1;
+ 
+     if ( (rc = svm_create_vmcb(v)) != 0 )
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index c5aef429d9..f83173cf78 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -230,8 +230,15 @@ void vmx_pi_hooks_deassign(struct domain *d)
+ 
+ static int vmx_domain_initialise(struct domain *d)
+ {
++    static const struct arch_csw csw = {
++        .from = vmx_ctxt_switch_from,
++        .to   = vmx_ctxt_switch_to,
++        .tail = vmx_do_resume,
++    };
+     int rc;
+ 
++    d->arch.ctxt_switch = &csw;
++
+     if ( !has_vlapic(d) )
+         return 0;
+ 
+@@ -257,10 +264,6 @@ static int vmx_vcpu_initialise(struct vcpu *v)
+ 
+     INIT_LIST_HEAD(&v->arch.hvm_vmx.pi_blocking.list);
+ 
+-    v->arch.schedule_tail    = vmx_do_resume;
+-    v->arch.ctxt_switch_from = vmx_ctxt_switch_from;
+-    v->arch.ctxt_switch_to   = vmx_ctxt_switch_to;
+-
+     if ( (rc = vmx_create_vmcs(v)) != 0 )
+     {
+         dprintk(XENLOG_WARNING,
+diff --git a/xen/include/asm-x86/current.h b/xen/include/asm-x86/current.h
+index 8851552e11..0f5a716c1c 100644
+--- a/xen/include/asm-x86/current.h
++++ b/xen/include/asm-x86/current.h
+@@ -135,16 +135,6 @@ unsigned long get_stack_dump_bottom (unsigned long sp);
+         unreachable();                                                  \
+     })
+ 
+-/*
+- * Schedule tail *should* be a terminal function pointer, but leave a bugframe
+- * around just incase it returns, to save going back into the context
+- * switching code and leaving a far more subtle crash to diagnose.
+- */
+-#define schedule_tail(vcpu) do {                \
+-        (((vcpu)->arch.schedule_tail)(vcpu));   \
+-        BUG();                                  \
+-    } while (0)
+-
+ /*
+  * Which VCPU's state is currently running on each CPU?
+  * This is not necesasrily the same as 'current' as a CPU may be
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index 5e151dd626..d09f3030aa 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -360,6 +360,12 @@ struct arch_domain
+     } relmem;
+     struct page_list_head relmem_list;
+ 
++    const struct arch_csw {
++        void (*from)(struct vcpu *);
++        void (*to)(struct vcpu *);
++        void (*tail)(struct vcpu *);
++    } *ctxt_switch;
++
+     /* nestedhvm: translate l2 guest physical to host physical */
+     struct p2m_domain *nested_p2m[MAX_NESTEDP2M];
+     mm_lock_t nested_p2m_lock;
+@@ -562,11 +568,6 @@ struct arch_vcpu
+ 
+     unsigned long      flags; /* TF_ */
+ 
+-    void (*schedule_tail) (struct vcpu *);
+-
+-    void (*ctxt_switch_from) (struct vcpu *);
+-    void (*ctxt_switch_to) (struct vcpu *);
+-
+     struct vpmu_struct vpmu;
+ 
+     /* Virtual Machine Extensions */
