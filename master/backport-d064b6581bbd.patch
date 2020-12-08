@@ -1,0 +1,90 @@
+From d064b6581bbddf9ef4a8817a2f077dd2a0afa1da Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 1 Dec 2020 15:39:02 +0100
+Subject: xen/events: access last_priority and last_vcpu_id together
+
+The queue for a fifo event is depending on the vcpu_id and the
+priority of the event. When sending an event it might happen the
+event needs to change queues and the old queue needs to be kept for
+keeping the links between queue elements intact. For this purpose
+the event channel contains last_priority and last_vcpu_id values
+elements for being able to identify the old queue.
+
+In order to avoid races always access last_priority and last_vcpu_id
+with a single atomic operation avoiding any inconsistencies.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+master commit: 1277cb9dc5e966f1faf665bcded02b7533e38078
+master date: 2020-11-24 11:23:42 +0100
+
+diff --git a/xen/common/event_fifo.c b/xen/common/event_fifo.c
+index 27ab3a1c3f..2037b24196 100644
+--- a/xen/common/event_fifo.c
++++ b/xen/common/event_fifo.c
+@@ -21,6 +21,14 @@
+ 
+ #include <public/event_channel.h>
+ 
++union evtchn_fifo_lastq {
++    uint32_t raw;
++    struct {
++        uint8_t last_priority;
++        uint16_t last_vcpu_id;
++    };
++};
++
+ static inline event_word_t *evtchn_fifo_word_from_port(const struct domain *d,
+                                                        unsigned int port)
+ {
+@@ -65,16 +73,18 @@ static struct evtchn_fifo_queue *lock_old_queue(const struct domain *d,
+     struct vcpu *v;
+     struct evtchn_fifo_queue *q, *old_q;
+     unsigned int try;
++    union evtchn_fifo_lastq lastq;
+ 
+     for ( try = 0; try < 3; try++ )
+     {
+-        v = d->vcpu[evtchn->last_vcpu_id];
+-        old_q = &v->evtchn_fifo->queue[evtchn->last_priority];
++        lastq.raw = read_atomic(&evtchn->fifo_lastq);
++        v = d->vcpu[lastq.last_vcpu_id];
++        old_q = &v->evtchn_fifo->queue[lastq.last_priority];
+ 
+         spin_lock_irqsave(&old_q->lock, *flags);
+ 
+-        v = d->vcpu[evtchn->last_vcpu_id];
+-        q = &v->evtchn_fifo->queue[evtchn->last_priority];
++        v = d->vcpu[lastq.last_vcpu_id];
++        q = &v->evtchn_fifo->queue[lastq.last_priority];
+ 
+         if ( old_q == q )
+             return old_q;
+@@ -225,8 +235,11 @@ static void evtchn_fifo_set_pending(struct vcpu *v, struct evtchn *evtchn)
+         /* Moved to a different queue? */
+         if ( old_q != q )
+         {
+-            evtchn->last_vcpu_id = v->vcpu_id;
+-            evtchn->last_priority = q->priority;
++            union evtchn_fifo_lastq lastq = { };
++
++            lastq.last_vcpu_id = v->vcpu_id;
++            lastq.last_priority = q->priority;
++            write_atomic(&evtchn->fifo_lastq, lastq.raw);
+ 
+             spin_unlock_irqrestore(&old_q->lock, flags);
+             spin_lock_irqsave(&q->lock, flags);
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 187a3a9681..cd0913b0e6 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -115,8 +115,7 @@ struct evtchn
+ #ifndef NDEBUG
+     u8 old_state;      /* State when taking lock in write mode. */
+ #endif
+-    u8 last_priority;
+-    u16 last_vcpu_id;
++    u32 fifo_lastq;    /* Data for fifo events identifying last queue. */
+ #ifdef CONFIG_XSM
+     union {
+ #ifdef XSM_NEED_GENERIC_EVTCHN_SSID
