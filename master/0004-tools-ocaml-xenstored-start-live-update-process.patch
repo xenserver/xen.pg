@@ -1,0 +1,115 @@
+From 378d03e990419190fb55a47ac170184987a2f0d2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Thu, 3 Sep 2020 16:14:44 +0100
+Subject: [PATCH 4/5] tools/ocaml/xenstored: start live update process
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+diff --git a/tools/ocaml/xenstored/logging.ml b/tools/ocaml/xenstored/logging.ml
+index 6acf62bdf7..0804f08acf 100644
+--- a/tools/ocaml/xenstored/logging.ml
++++ b/tools/ocaml/xenstored/logging.ml
+@@ -340,6 +340,9 @@ let end_transaction ~tid ~con =
+ 	if !access_log_transaction_ops && tid <> 0
+ 	then access_logging ~tid ~con (XbOp Xenbus.Xb.Op.Transaction_end) ~level:Debug
+ 
++let live_update () =
++	xb_op ~tid:0 ~con:"" ~ty:Xenbus.Xb.Op.Debug "Live update begin"
++
+ let xb_answer ~tid ~con ~ty data =
+ 	let print, level = match ty with
+ 		| Xenbus.Xb.Op.Error when String.startswith "ENOENT" data -> !access_log_read_ops , Warn
+diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
+index c3c5dc58c0..3174d8ede5 100644
+--- a/tools/ocaml/xenstored/process.ml
++++ b/tools/ocaml/xenstored/process.ml
+@@ -112,6 +112,7 @@ let string_of_t t =
+ let launch_exn t =
+ 	let executable, rest = args_of_t t in
+ 	let args = Array.of_list (executable :: rest) in
++	info "Launching %s, args: %s" executable (String.concat " " rest);
+ 	Unix.execv args.(0) args
+ 
+ let validate_exn t =
+@@ -151,7 +152,7 @@ let parse_live_update args =
+ 		| "-s" :: _ ->
+ 			let timeout = ref 60 in
+ 			let force = ref false in
+-			Arg.parse_argv ~current:(ref 1) (Array.of_list args)
++			Arg.parse_argv ~current:(ref 0) (Array.of_list args)
+ 				[ ( "-t"
+ 				, Arg.Set_int timeout
+ 				, "timeout in seconds to wait for active transactions to finish"
+@@ -166,7 +167,7 @@ let parse_live_update args =
+ 				{!state with deadline = Unix.gettimeofday () +. float !timeout
+ 				; force= !force; pending= true}
+ 		| _ ->
+-			invalid_arg ("Unknown arguments: " ^ String.concat " " args)) ;
++			invalid_arg ("Unknown arguments: " ^ String.concat "," args)) ;
+ 	None
+ 	with
+ 	| Arg.Bad s | Arg.Help s | Invalid_argument s ->
+@@ -200,7 +201,8 @@ let do_debug con t _domains cons data =
+ 	then None
+ 	else try match split None '\000' data with
+ 	| "live-update" :: params ->
+-		LiveUpdate.parse_live_update params
++		let dropped_trailing_nul = params |> List.rev |> List.tl |> List.rev in
++		LiveUpdate.parse_live_update dropped_trailing_nul
+ 	| "print" :: msg :: _ ->
+ 		Logging.xb_op ~tid:0 ~ty:Xenbus.Xb.Op.Debug ~con:"=======>" msg;
+ 		None
+diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
+index ef731337b1..b6646fbbf9 100644
+--- a/tools/ocaml/xenstored/xenstored.ml
++++ b/tools/ocaml/xenstored/xenstored.ml
+@@ -314,6 +314,11 @@ let _ =
+ 		);
+ 	);
+ 
++	(* required for xenstore-control to detect availability of live-update *)
++	Store.mkdir store Perms.Connection.full_rights (Store.Path.of_string "/tool");
++	Store.write store Perms.Connection.full_rights
++		(Store.Path.of_string "/tool/xenstored") Sys.executable_name;
++
+ 	Select.use_poll (not cf.use_select);
+ 
+ 	Sys.set_signal Sys.sighup (Sys.Signal_handle sighup_handler);
+@@ -490,18 +495,28 @@ let _ =
+ 		in
+ 
+ 	Systemd.sd_notify_ready ();
++	let live_update = ref false in
+ 	while not (!quit && Connections.prevents_quit cons = [])
+ 	do
+ 		try
+-			main_loop ()
++			main_loop ();
++			live_update := Process.LiveUpdate.should_run cons;
++			if !live_update || !quit then begin
++				(* don't initiate live update if saving state fails *)
++				DB.to_file store cons Disk.xs_daemon_database;
++				quit := true;
++			end
+ 		with exc ->
+-			error "caught exception %s" (Printexc.to_string exc);
++			let bt = Printexc.get_backtrace () in
++			error "caught exception %s: %s" (Printexc.to_string exc) bt;
+ 			if cf.reraise_top_level then
+ 				raise exc
+ 	done;
+ 	info "stopping xenstored";
+-		DB.to_file store cons Disk.xs_daemon_database;
+-		(* unlink pidfile so that launch-xenstore works again *)
+-		Unixext.unlink_safe pidfile;
+-		(match cf.pidfile with Some pidfile -> Unixext.unlink_safe pidfile | None -> ());
+-	()
++	(* unlink pidfile so that launch-xenstore works again *)
++	Unixext.unlink_safe pidfile;
++	(match cf.pidfile with Some pidfile -> Unixext.unlink_safe pidfile | None -> ());
++	if !live_update then begin
++		 Logging.live_update ();
++		 Process.LiveUpdate.launch_exn !Process.LiveUpdate.state
++	end
