@@ -1,0 +1,63 @@
+From 506114e9183de1640f3c2e5b66f4980b596164f7 Mon Sep 17 00:00:00 2001
+Message-Id: <506114e9183de1640f3c2e5b66f4980b596164f7.1607508005.git.edvin.torok@citrix.com>
+From: Jonathan Davies <jonathan.davies@citrix.com>
+Date: Fri, 7 Apr 2017 14:27:19 +0100
+Subject: oxenstored: avoid leading slash in paths in saved store state
+
+Internally, paths are represented as lists of strings, where
+  * path "/" is represented by []
+  * path "/local/domain/0" is represented by ["local"; "domain"; "0"]
+(see comment for Store.Path.t).
+
+However, the traversal function generated paths like
+    [""; "local"; "domain"; "0"]
+because the name of the root node is "". Change it to generate paths
+correctly.
+
+Furthermore, the function passed to Store.dump_fct would render the node
+"foo" under the path [] as "//foo". Change this to return "/foo".
+
+Signed-off-by: Jonathan Davies <jonathan.davies@citrix.com>
+Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+Reviewed-by: Christian Lindig <christian.lindig@citrix.com>
+Release-acked-by: Julien Grall <julien.grall@arm.com>
+
+diff --git a/tools/ocaml/xenstored/store.ml b/tools/ocaml/xenstored/store.ml
+index f37c80a907..e20767372f 100644
+--- a/tools/ocaml/xenstored/store.ml
++++ b/tools/ocaml/xenstored/store.ml
+@@ -129,6 +129,11 @@ let of_string s =
+ 		| "" :: path when is_valid path -> path
+ 		| _ -> raise Define.Invalid_path
+ 
++let of_path_and_name path name =
++	match path, name with
++	| [], "" -> []
++	| _ -> path @ [name]
++
+ let create path connection_path =
+ 	of_string (Utils.path_validate path connection_path)
+ 
+@@ -360,7 +365,8 @@ let path_exists store path =
+ let traversal root_node f =
+ 	let rec _traversal path node =
+ 		f path node;
+-		List.iter (_traversal (path @ [ Symbol.to_string node.Node.name ])) node.Node.children
++		let node_path = Path.of_path_and_name path (Symbol.to_string node.Node.name) in
++		List.iter (_traversal node_path) node.Node.children
+ 		in
+ 	_traversal [] root_node
+ 
+diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
+index c69a868420..0f62a23a17 100644
+--- a/tools/ocaml/xenstored/xenstored.ml
++++ b/tools/ocaml/xenstored/xenstored.ml
+@@ -213,7 +213,7 @@ let to_channel store cons chan =
+ 	(* dump the store *)
+ 	Store.dump_fct store (fun path node ->
+ 		let name, perms, value = Store.Node.unpack node in
+-		let fullpath = (Store.Path.to_string path) ^ "/" ^ name in
++		let fullpath = Store.Path.to_string (Store.Path.of_path_and_name path name) in
+ 		let permstr = Perms.Node.to_string perms in
+ 		fprintf chan "store,%s,%s,%s\n" (hexify fullpath) (hexify permstr) (hexify value)
+ 	);

@@ -1,0 +1,83 @@
+From 2d78f78a14528752266982473c07118f1bc336e3 Mon Sep 17 00:00:00 2001
+Message-Id: <2d78f78a14528752266982473c07118f1bc336e3.1607539357.git.edvin.torok@citrix.com>
+From: Zhongze Liu <blackskygg@gmail.com>
+Date: Wed, 14 Jun 2017 09:11:48 +0800
+Subject: tools: fix several "format-truncation" warnings with GCC 7
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GCC 7.1.1 complains that several buffers passed to snprintf() in xenpmd
+and tools/ocmal/xc are too small to hold the largest possible resulting string,
+which is calculated by adding up the maximum length of all the substrings.
+
+The warnings are treated as errors by -Werror, and goes like this (abbreviated):
+
+xenpmd.c:94:36: error: ‘%s’ directive output may be truncated writing up to
+255 bytes into a region of size 13 [-Werror=format-truncation=]
+     #define BATTERY_INFO_FILE_PATH "/proc/acpi/battery/%s/info"
+                                    ^
+xenpmd.c:113:13: note: ‘snprintf’ output between 25 and 280 bytes into a
+destination of size 32
+
+xenpmd.c:95:37: error: ‘%s’ directive output may be truncated writing up to
+255 bytes into a region of size 13 [-Werror=format-truncation=]
+     #define BATTERY_STATE_FILE_PATH "/proc/acpi/battery/%s/state"
+                                     ^
+xenpmd.c:116:13: note: ‘snprintf’ output between 26 and 281 bytes into a
+destination of size 32
+
+xenctrl_stubs.c:65:15: error: ‘%s’ directive output may be truncated writing
+up to 1023 bytes into a region of size 252 [-Werror=format-truncation=]
+      "%d: %s: %s", error->code,
+               ^~
+xenctrl_stubs.c:64:4: note: ‘snprintf’ output 5 or more bytes (assuming 1028)
+into a destination of size 256
+
+Enlarge the size of these buffers as suggested by the complier
+(and slightly rounded) to fix the warnings.
+
+No functional changes.
+
+Signed-off-by: Zhongze Liu <blackskygg@gmail.com>
+Acked-by: Wei Liu <wei.liu2@citrix.com>
+
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index d09e421819..d65b5f3cf6 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -54,7 +54,7 @@
+ 
+ static void Noreturn failwith_xc(xc_interface *xch)
+ {
+-	char error_str[256];
++	char error_str[1028];
+ 	if (xch) {
+ 		const xc_error *error = xc_get_last_error(xch);
+ 		if (error->code == XC_ERROR_NONE)
+diff --git a/tools/xenpmd/xenpmd.c b/tools/xenpmd/xenpmd.c
+index b3a31062aa..689c8fd670 100644
+--- a/tools/xenpmd/xenpmd.c
++++ b/tools/xenpmd/xenpmd.c
+@@ -100,7 +100,7 @@ FILE *get_next_battery_file(DIR *battery_dir,
+ {
+     FILE *file = 0;
+     struct dirent *dir_entries;
+-    char file_name[32];
++    char file_name[284];
+     
+     do 
+     {
+@@ -110,10 +110,10 @@ FILE *get_next_battery_file(DIR *battery_dir,
+         if ( strlen(dir_entries->d_name) < 4 )
+             continue;
+         if ( battery_info_type == BIF ) 
+-            snprintf(file_name, 32, BATTERY_INFO_FILE_PATH,
++            snprintf(file_name, sizeof(file_name), BATTERY_INFO_FILE_PATH,
+                      dir_entries->d_name);
+         else 
+-            snprintf(file_name, 32, BATTERY_STATE_FILE_PATH,
++            snprintf(file_name, sizeof(file_name), BATTERY_STATE_FILE_PATH,
+                      dir_entries->d_name);
+         file = fopen(file_name, "r");
+     } while ( !file );

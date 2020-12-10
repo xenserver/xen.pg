@@ -1,0 +1,59 @@
+From f6cc37ea8ac71385b60507c034519f304da75f4c Mon Sep 17 00:00:00 2001
+Message-Id: <f6cc37ea8ac71385b60507c034519f304da75f4c.1607506357.git.edvin.torok@citrix.com>
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Mon, 19 Aug 2019 19:45:35 +0100
+Subject: tools/oxenstored: port XS_INTRODUCE evtchn rebind function from
+ cxenstored
+
+C version of xenstored had this ability since 61aaed0d5 ("Allow
+XS_INTRODUCE to be used for rebinding the xenstore evtchn.") from 2007.
+Copy it as is to Ocaml version.
+
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/xenstored/domain.ml b/tools/ocaml/xenstored/domain.ml
+index b0a01b06fa..aeb185ff7e 100644
+--- a/tools/ocaml/xenstored/domain.ml
++++ b/tools/ocaml/xenstored/domain.ml
+@@ -23,9 +23,9 @@ type t =
+ {
+ 	id: Xenctrl.domid;
+ 	mfn: nativeint;
+-	remote_port: int;
+ 	interface: Xenmmap.mmap_interface;
+ 	eventchn: Event.t;
++	mutable remote_port: int;
+ 	mutable port: Xeneventchn.t option;
+ 	mutable bad_client: bool;
+ 	mutable io_credit: int; (* the rounds of ring process left to do, default is 0,
+@@ -71,6 +71,10 @@ let notify dom = match dom.port with
+ 	Event.notify dom.eventchn port
+ 
+ let bind_interdomain dom =
++	begin match dom.port with
++	| None -> ()
++	| Some port -> Event.unbind dom.eventchn port
++	end;
+ 	dom.port <- Some (Event.bind_interdomain dom.eventchn dom.id dom.remote_port);
+ 	debug "bound domain %d remote port %d to local port %s" dom.id dom.remote_port (string_of_port dom.port)
+ 
+diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
+index 8a7e538893..ff5c9484fc 100644
+--- a/tools/ocaml/xenstored/process.ml
++++ b/tools/ocaml/xenstored/process.ml
+@@ -408,7 +408,13 @@ let do_introduce con _t domains cons data =
+ 		in
+ 	let dom =
+ 		if Domains.exist domains domid then
+-			Domains.find domains domid
++			let edom = Domains.find domains domid in
++			if (Domain.get_mfn edom) = mfn && (Connections.find_domain cons domid) != con then begin
++				(* Use XS_INTRODUCE for recreating the xenbus event-channel. *)
++				edom.remote_port <- port;
++				Domain.bind_interdomain edom;
++			end;
++			edom
+ 		else try
+ 			let ndom = Domains.create domains domid mfn port in
+ 			Connections.add_domain cons ndom;
