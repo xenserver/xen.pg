@@ -1,0 +1,135 @@
+From d430b0439e98598d1370de126f3ad323468bf51f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Mon, 7 Dec 2020 23:34:23 +0000
+Subject: [PATCH 1/5] tools/ocaml/xenstored: only quit on SIGTERM when a reload
+ is possible
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently when oxenstored receives SIGTERM it dumps its state and quits.
+It is possible to then restart it if --restart is given, however that is
+not always safe:
+
+* domains could have active transactions, and after a restart they would
+either reuse transaction IDs of already open transactions, or get an
+error back that the transaction doesn't exist
+
+* there could be pending data to send to a VM still in oxenstored's
+  queue which would be lost
+
+* there could be pending input to be processed from a VM in oxenstored's
+  queue which would be lost
+
+Prevent shutting down oxenstored via SIGTERM in the above situations.
+Also ignore domains marked as bad because oxenstored would never talk
+to them again.
+
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+diff --git a/tools/ocaml/xenstored/connection.ml b/tools/ocaml/xenstored/connection.ml
+index fa0d3c4d92..bd02060cd0 100644
+--- a/tools/ocaml/xenstored/connection.ml
++++ b/tools/ocaml/xenstored/connection.ml
+@@ -290,6 +290,41 @@ let has_new_output con = Xenbus.Xb.has_new_output con.xb
+ let peek_output con = Xenbus.Xb.peek_output con.xb
+ let do_output con = Xenbus.Xb.output con.xb
+ 
++let is_bad con = match con.dom with None -> false | Some dom -> Domain.is_bad_domain dom
++
++(* oxenstored currently only dumps limited information about its state.
++   A live update is only possible if any of the state that is not dumped would be empty.
++   Compared to https://xenbits.xen.org/docs/unstable/designs/xenstore-migration.html:
++     * GLOBAL_DATA: not strictly needed, systemd is giving the socket FDs to us
++     * CONNECTION_DATA: PARTIAL
++       * for domains: PARTIAL, see Connection.dump -> Domain.dump, only if data and tdomid is empty
++       * for sockets (Dom0 toolstack): NO
++     * WATCH_DATA: OK, see Connection.dump
++     * TRANSACTION_DATA: NO
++     * NODE_DATA: OK (except for transactions), see Store.dump_fct and DB.to_channel
++
++   Also xenstored will never talk to a Domain once it is marked as bad,
++   so treat it as idle for live-update.
++
++   Restrictions below can be relaxed once xenstored learns to dump more
++   of its live state in a safe way *)
++let has_extra_connection_data con =
++	let has_in = has_input con in
++	let has_out = has_output con in
++	let has_socket = con.dom = None in
++	let has_nondefault_perms = make_perm con.dom <> con.perm in
++	has_in || has_out
++	|| has_socket (* dom0 sockets not dumped yet *)
++	|| has_nondefault_perms (* set_target not dumped yet *)
++
++let has_transaction_data con =
++	let n = number_of_transactions con in
++	dbg "%s: number of transactions = %d" (get_domstr con) n;
++	n > 0
++
++let prevents_live_update con = not (is_bad con)
++	&& (has_extra_connection_data con || has_transaction_data con)
++
+ let has_more_work con =
+ 	has_more_input con || not (has_old_output con) && has_new_output con
+ 
+diff --git a/tools/ocaml/xenstored/connections.ml b/tools/ocaml/xenstored/connections.ml
+index 1a70d412d5..2749091bc1 100644
+--- a/tools/ocaml/xenstored/connections.ml
++++ b/tools/ocaml/xenstored/connections.ml
+@@ -194,3 +194,11 @@ let debug cons =
+ 	let anonymous = Hashtbl.fold (fun _ con accu -> Connection.debug con :: accu) cons.anonymous [] in
+ 	let domains = Hashtbl.fold (fun _ con accu -> Connection.debug con :: accu) cons.domains [] in
+ 	String.concat "" (domains @ anonymous)
++
++let filter ~f cons =
++	let fold _ v acc = if f v then v :: acc else acc in
++	[]
++	|> Hashtbl.fold fold cons.anonymous
++	|> Hashtbl.fold fold cons.domains
++
++let prevents_quit cons = filter ~f:Connection.prevents_live_update cons
+diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
+index 62fbd9db15..91d9386314 100644
+--- a/tools/ocaml/xenstored/xenstored.ml
++++ b/tools/ocaml/xenstored/xenstored.ml
+@@ -20,6 +20,7 @@ open Parse_arg
+ open Stdext
+ 
+ let error fmt = Logging.error "xenstored" fmt
++let warn fmt = Logging.warn "xenstored" fmt
+ let debug fmt = Logging.debug "xenstored" fmt
+ let info fmt = Logging.info "xenstored" fmt
+ 
+@@ -317,7 +318,9 @@ let _ =
+ 	Select.use_poll (not cf.use_select);
+ 
+ 	Sys.set_signal Sys.sighup (Sys.Signal_handle sighup_handler);
+-	Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun _ -> quit := true));
++	Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun _ ->
++		 info "Received SIGTERM";
++		 quit := true));
+ 	Sys.set_signal Sys.sigusr1 (Sys.Signal_handle (fun _ -> sigusr1_handler store));
+ 	Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+ 
+@@ -431,6 +434,12 @@ let _ =
+ 		);
+ 		let elapsed = Unix.gettimeofday () -. now in
+ 		debug "periodic_ops took %F seconds." elapsed;
++		if !quit then
++		(match Connections.prevents_quit cons with
++		| [] -> ()
++		| domains ->
++		    List.iter (fun con -> warn "%s prevents live update" (Connection.get_domstr con)) domains
++		);
+ 		delay_next_frequent_ops_by elapsed
+ 	in
+ 
+@@ -482,7 +491,7 @@ let _ =
+ 		in
+ 
+ 	Systemd.sd_notify_ready ();
+-	while not !quit
++	while not (!quit && Connections.prevents_quit cons = [])
+ 	do
+ 		try
+ 			main_loop ()
