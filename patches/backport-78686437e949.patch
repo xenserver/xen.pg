@@ -1,0 +1,69 @@
+From 78686437e949a85a207ae1a0d637efe2d3778bbe Mon Sep 17 00:00:00 2001
+From: Julien Grall <jgrall@amazon.com>
+Date: Mon, 30 Mar 2020 18:50:08 +0100
+Subject: [PATCH] tools/ocaml: libxb: Avoid to use String_val() when value is
+ bytes
+
+Commit ec7d54dd1a "ocaml/libs/xb: Use bytes in place of strings for
+mutable buffers" switch mutable buffers from string to bytes. However
+the C code were still using String_Val() to access them.
+
+While the underlying structure is the same between string and bytes, a
+string is meant to be immutable. OCaml 4.06.1 and later will enforce it.
+Therefore, it will not be possible to build the OCaml libs when using
+-safe-string. This is because String_val() will return a const value.
+
+To avoid plain cast in the code, the code is now switched to use
+Bytes_val(). As the macro is not defined in older OCaml version, we need
+to provide a stub.
+
+Take the opportunity to switch to const the buffer in
+ml_interface_write() as it should not be modified.
+
+Reported-by: Dario Faggioli <dfaggioli@suse.com>
+Signed-off-by: Julien Grall <jgrall@amazon.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+---
+ tools/ocaml/libs/xb/xs_ring_stubs.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/tools/ocaml/libs/xb/xs_ring_stubs.c b/tools/ocaml/libs/xb/xs_ring_stubs.c
+index 473787064a..7537a23949 100644
+--- a/tools/ocaml/libs/xb/xs_ring_stubs.c
++++ b/tools/ocaml/libs/xb/xs_ring_stubs.c
+@@ -36,6 +36,14 @@
+ 
+ #define GET_C_STRUCT(a) ((struct mmap_interface *) a)
+ 
++/*
++ * Bytes_val has been introduced by Ocaml 4.06.1. So define our own version
++ * if needed.
++ */
++#ifndef Bytes_val
++#define Bytes_val(x) ((unsigned char *) Bp_val(x))
++#endif
++
+ CAMLprim value ml_interface_read(value ml_interface,
+                                  value ml_buffer,
+                                  value ml_len)
+@@ -44,7 +52,7 @@ CAMLprim value ml_interface_read(value ml_interface,
+ 	CAMLlocal1(ml_result);
+ 
+ 	struct mmap_interface *interface = GET_C_STRUCT(ml_interface);
+-	char *buffer = String_val(ml_buffer);
++	unsigned char *buffer = Bytes_val(ml_buffer);
+ 	int len = Int_val(ml_len);
+ 	int result;
+ 
+@@ -103,7 +111,7 @@ CAMLprim value ml_interface_write(value ml_interface,
+ 	CAMLlocal1(ml_result);
+ 
+ 	struct mmap_interface *interface = GET_C_STRUCT(ml_interface);
+-	char *buffer = String_val(ml_buffer);
++	const unsigned char *buffer = Bytes_val(ml_buffer);
+ 	int len = Int_val(ml_len);
+ 	int result;
+ 
+-- 
+2.26.2
+
