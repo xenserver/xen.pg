@@ -1,0 +1,46 @@
+From 10c7c213bef26274684798deb3e351a6756046d2 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 15 Dec 2020 14:24:48 +0100
+Subject: evtchn/FIFO: add 2nd smp_rmb() to evtchn_fifo_word_from_port()
+
+Besides with add_page_to_event_array() the function also needs to
+synchronize with evtchn_fifo_init_control() setting both d->evtchn_fifo
+and (subsequently) d->evtchn_port_ops.
+
+This is XSA-359 / CVE-2020-29571.
+
+Reported-by: Julien Grall <jgrall@amazon.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+master commit: dc8b01affd7f6f36d34c3854f51df0847df3ec0e
+master date: 2020-12-15 13:42:51 +0100
+
+diff --git a/xen/common/event_fifo.c b/xen/common/event_fifo.c
+index 742ca31449..afbc8d21da 100644
+--- a/xen/common/event_fifo.c
++++ b/xen/common/event_fifo.c
+@@ -34,6 +34,13 @@ static inline event_word_t *evtchn_fifo_word_from_port(const struct domain *d,
+ {
+     unsigned int p, w;
+ 
++    /*
++     * Callers aren't required to hold d->event_lock, so we need to synchronize
++     * with evtchn_fifo_init_control() setting d->evtchn_port_ops /after/
++     * d->evtchn_fifo.
++     */
++    smp_rmb();
++
+     if ( unlikely(port >= d->evtchn_fifo->num_evtchns) )
+         return NULL;
+ 
+@@ -597,6 +604,10 @@ int evtchn_fifo_init_control(struct evtchn_init_control *init_control)
+         if ( rc < 0 )
+             goto error;
+ 
++        /*
++         * This call, as a side effect, synchronizes with
++         * evtchn_fifo_word_from_port().
++         */
+         rc = map_control_block(v, gfn, offset);
+         if ( rc < 0 )
+             goto error;

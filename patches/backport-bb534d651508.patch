@@ -1,0 +1,60 @@
+From bb534d6515080770178b6b750d1cb96968debbc6 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 15 Dec 2020 14:24:19 +0100
+Subject: evtchn/FIFO: re-order and synchronize (with) map_control_block()
+
+For evtchn_fifo_set_pending()'s check of the control block having been
+set to be effective, ordering of respective reads and writes needs to be
+ensured: The control block pointer needs to be recorded strictly after
+the setting of all the queue heads, and it needs checking strictly
+before any uses of them (this latter aspect was already guaranteed).
+
+This is XSA-358 / CVE-2020-29570.
+
+Reported-by: Julien Grall <jgrall@amazon.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Julien Grall <jgrall@amazon.com>
+master commit: c5e63651fdc706954d920a2d98f74f4a21b46a7e
+master date: 2020-12-15 13:46:37 +0100
+
+diff --git a/xen/common/event_fifo.c b/xen/common/event_fifo.c
+index 2f5e868b7a..742ca31449 100644
+--- a/xen/common/event_fifo.c
++++ b/xen/common/event_fifo.c
+@@ -228,6 +228,10 @@ static void evtchn_fifo_set_pending(struct vcpu *v, struct evtchn *evtchn)
+             goto unlock;
+         }
+ 
++        /*
++         * This also acts as the read counterpart of the smp_wmb() in
++         * map_control_block().
++         */
+         if ( guest_test_and_set_bit(d, EVTCHN_FIFO_LINKED, word) )
+             goto unlock;
+ 
+@@ -453,6 +457,7 @@ static int setup_control_block(struct vcpu *v)
+ static int map_control_block(struct vcpu *v, uint64_t gfn, uint32_t offset)
+ {
+     void *virt;
++    struct evtchn_fifo_control_block *control_block;
+     unsigned int i;
+     int rc;
+ 
+@@ -463,10 +468,15 @@ static int map_control_block(struct vcpu *v, uint64_t gfn, uint32_t offset)
+     if ( rc < 0 )
+         return rc;
+ 
+-    v->evtchn_fifo->control_block = virt + offset;
++    control_block = virt + offset;
+ 
+     for ( i = 0; i <= EVTCHN_FIFO_PRIORITY_MIN; i++ )
+-        v->evtchn_fifo->queue[i].head = &v->evtchn_fifo->control_block->head[i];
++        v->evtchn_fifo->queue[i].head = &control_block->head[i];
++
++    /* All queue heads must have been set before setting the control block. */
++    smp_wmb();
++
++    v->evtchn_fifo->control_block = control_block;
+ 
+     return 0;
+ }
