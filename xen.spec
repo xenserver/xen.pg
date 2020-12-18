@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.0.7
+%global hv_rel 10.1
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -844,3 +844,11 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 
 %{?_cov_results_package}
 
+%changelog
+* Fri Dec 18 2020 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.2-10.1
+- Backport changes for Ocaml 4.10 compatibility
+- Fixes for XSA-115 CVE-2020-29480, XSA-322 CVE-2020-29481, XSA-323
+  CVE-2020-29482, XSA-324 CVE-2020-29484, XSA-325 CVE-2020-29483, XSA-330
+  CVE-2020-29485, XSA-348 CVE-2020-29484, XSA-352 CVE-2020-29486, XSA-353
+  CVE-2020-29479, XSA-359 CVE-2020-29571
+- Prototype oxenstored live update support
