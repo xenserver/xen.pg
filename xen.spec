@@ -626,7 +626,7 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenctrl.so.4.13
 %{_libdir}/libxenctrl.so.4.13.0
 %{_libdir}/libxendevicemodel.so.1
-%{_libdir}/libxendevicemodel.so.1.3
+%{_libdir}/libxendevicemodel.so.1.4
 %{_libdir}/libxenforeignmemory.so.1
 %{_libdir}/libxenforeignmemory.so.1.3
 %{_libdir}/libxenfsimage.so.4.13
