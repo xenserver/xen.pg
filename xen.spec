@@ -56,7 +56,6 @@ BuildRequires: python2-rpm-macros
 %endif
 
 # For HVMLoader and 16/32bit firmware
-BuildRequires: /usr/include/gnu/stubs-32.h
 BuildRequires: dev86 iasl
 
 # For the domain builder (decompression and hashing)
