@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.1
+%global hv_rel 10.2
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -844,6 +844,19 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Mar 12 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.2-10.2
+- Fix a failure to boot of Windows Server vNext (build 20270).  Reduces the
+  upper limit of HVM vCPUs to 64, pending other bugfixes.
+- Advertise Viridian vCPU hotplug to guests as Xen already implements the
+  functionality.
+- Fixes for XSA-360 CVE-2021-3308.
+- Backport XEN_DMOP_nr_vcpus and stable library fixes.
+- Backport build system fix and drop 32bit libc as a build dependency.
+- Fix microcode loading on AMD Family 19h (Zen3) parts.
+- Fix HVM Shadow / migrating PV guests on IceLake parts.
+- Fix booting on IceLake when the IOMMU is left in a partially initialised
+  state by the firmware.
+
 * Fri Dec 18 2020 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.2-10.1
 - Backport changes for Ocaml 4.10 compatibility
 - Fixes for XSA-115 CVE-2020-29480, XSA-322 CVE-2020-29481, XSA-323
