@@ -1,0 +1,86 @@
+From 368096b9c4a273be58dd897e996e3e010bcfc21b Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 4 Mar 2021 22:30:00 +0000
+Subject: xen/dmop: Strip __XEN_TOOLS__ header guard from public ABI
+
+__XEN_TOOLS__ is really there to separate the unstable from stable hypercalls.
+Exactly as with c/s f40e1c52e4, stable interfaces shouldn't contain this
+guard.
+
+That change actually broke the build with:
+
+  include/xendevicemodel.h:52:5: error: unknown type name 'ioservid_t'
+       ioservid_t *id);
+       ^
+
+as libxendevicemodel.h now uses a type it can't see a typedef for.  However,
+nothing noticed because the header.chk logic is also broken (fixed
+subsequently).
+
+Strip the guard from the public header, and remove compensation from
+devicemodel's private.h.  Fix the dmop design doc to discuss both reasons
+behind the the ABI design.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Release-Acked-by: Ian Jackson <iwj@xenproject.org>
+
+diff --git a/docs/designs/dmop.pandoc b/docs/designs/dmop.pandoc
+index 8e9f95af47..49e52b1bcc 100644
+--- a/docs/designs/dmop.pandoc
++++ b/docs/designs/dmop.pandoc
+@@ -4,9 +4,15 @@ DMOP
+ Introduction
+ ------------
+ 
+-The aim of DMOP is to prevent a compromised device model from compromising
+-domains other than the one it is providing emulation for (which is therefore
+-likely already compromised).
++The DMOP hypercall has a new ABI design to solve problems in the Xen
++ecosystem.  First, the ABI is fully stable, to reduce the coupling between
++device models and the version of Xen.  Specifically, device model software
++using DMOP (be it user, stub domain or kernel software) need not be recompiled
++to match the version of the running hypervisor.
++
++Secondly, for device models in userspace, the ABI is designed specifically to
++allow a kernel to audit the memory ranges used, without having to know the
++internal structure of sub-ops.
+ 
+ The problem occurs when you a device model issues an hypercall that
+ includes references to user memory other than the operation structure
+diff --git a/tools/libs/devicemodel/private.h b/tools/libs/devicemodel/private.h
+index c4a225f8af..c24f3396bb 100644
+--- a/tools/libs/devicemodel/private.h
++++ b/tools/libs/devicemodel/private.h
+@@ -1,8 +1,6 @@
+ #ifndef XENDEVICEMODEL_PRIVATE_H
+ #define XENDEVICEMODEL_PRIVATE_H
+ 
+-#define __XEN_TOOLS__ 1
+-
+ #include <xentoollog.h>
+ #include <xendevicemodel.h>
+ #include <xencall.h>
+diff --git a/xen/include/public/hvm/dm_op.h b/xen/include/public/hvm/dm_op.h
+index 7e50d316d9..5177fe4d47 100644
+--- a/xen/include/public/hvm/dm_op.h
++++ b/xen/include/public/hvm/dm_op.h
+@@ -25,9 +25,6 @@
+ #define __XEN_PUBLIC_HVM_DM_OP_H__
+ 
+ #include "../xen.h"
+-
+-#if defined(__XEN__) || defined(__XEN_TOOLS__)
+-
+ #include "../event_channel.h"
+ 
+ #ifndef uint64_aligned_t
+@@ -473,8 +470,6 @@ struct xen_dm_op {
+     } u;
+ };
+ 
+-#endif /* __XEN__ || __XEN_TOOLS__ */
+-
+ struct xen_dm_op_buf {
+     XEN_GUEST_HANDLE(void) h;
+     xen_ulong_t size;
