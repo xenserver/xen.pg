@@ -1,11 +1,11 @@
 # -*- rpm-spec -*-
 
 # Commitish for Source0, required by tooling.
-%global package_srccommit RELEASE-4.13.2
+%global package_srccommit RELEASE-4.13.3
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.3
+%global hv_rel 10.4
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -29,7 +29,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.13.2
+Version: 4.13.3
 Release: %{?xsrel}%{?dist}
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
@@ -844,6 +844,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Tue Mar 23 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.4
+- Update to Xen 4.13.3.
+
 * Mon Mar 22 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.2-10.3
 - Fix library packaging so that autoreqprov doesn't cause xen-libs{,-devel} to
   depend on xen-dom0-libs{,devel}.
