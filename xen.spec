@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.2
+%global hv_rel 10.3
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -421,6 +421,8 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenstore.so.3.0.3
 %{_libdir}/libxentoolcore.so.1
 %{_libdir}/libxentoolcore.so.1.0
+%{_libdir}/libxentoollog.so.1
+%{_libdir}/libxentoollog.so.1.0
 %{_libdir}/libxenvchan.so.4.13
 %{_libdir}/libxenvchan.so.4.13.0
 
@@ -453,6 +455,11 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxentoolcore.a
 %{_libdir}/libxentoolcore.so
 %{_libdir}/pkgconfig/xentoolcore.pc
+
+%{_includedir}/xentoollog.h
+%{_libdir}/libxentoollog.a
+%{_libdir}/libxentoollog.so
+%{_libdir}/pkgconfig/xentoollog.pc
 
 # Lib Xen Vchan
 %{_includedir}/libxenvchan.h
@@ -636,8 +643,6 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenlight.so.4.13.0
 %{_libdir}/libxenstat.so.4.13
 %{_libdir}/libxenstat.so.4.13.0
-%{_libdir}/libxentoollog.so.1
-%{_libdir}/libxentoollog.so.1.0
 %{_libdir}/libxlutil.so.4.13
 %{_libdir}/libxlutil.so.4.13.0
 %{_libdir}/xenfsimage/btrfs/fsimage.so
@@ -680,11 +685,6 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenguest.a
 %{_libdir}/libxenguest.so
 %{_libdir}/pkgconfig/xenguest.pc
-
-%{_includedir}/xentoollog.h
-%{_libdir}/libxentoollog.a
-%{_libdir}/libxentoollog.so
-%{_libdir}/pkgconfig/xentoollog.pc
 
 %{_includedir}/_libxl_list.h
 %{_includedir}/_libxl_types.h
@@ -844,6 +844,10 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Mar 22 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.2-10.3
+- Fix library packaging so that autoreqprov doesn't cause xen-libs{,-devel} to
+  depend on xen-dom0-libs{,devel}.
+
 * Fri Mar 12 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.2-10.2
 - Fix a failure to boot of Windows Server vNext (build 20270).  Reduces the
   upper limit of HVM vCPUs to 64, pending other bugfixes.
