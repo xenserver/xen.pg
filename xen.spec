@@ -84,16 +84,13 @@ BuildRequires: lzo-devel
 BuildRequires: json-c-devel libempserver-devel
 
 # For manpages
-BuildRequires: perl pandoc
+BuildRequires: perl-podlators
 
 # Misc
 BuildRequires: libtool
 %if %with_systemd
 BuildRequires: systemd-devel
 %endif
-
-# To placate ./configure
-BuildRequires: gettext-devel glib2-devel curl-devel gnutls-devel
 
 # Need cov-analysis if coverity is enabled
 %{?_cov_buildrequires}
@@ -156,7 +153,6 @@ Requires: ipxe
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
-BuildRequires: systemd
 %endif
 Group: System/Base
 %description dom0-tools
@@ -173,9 +169,6 @@ This package contains the Xen Hypervisor control domain libraries.
 Summary: Xen Hypervisor Domain 0 headers
 Requires: xen-devel = %{version}
 Requires: xen-dom0-libs = %{version}
-
-# Temp until the build dependencies are properly propagated
-Provides: xen-dom0-devel = %{version}
 Group: Development/Libraries
 %description dom0-libs-devel
 This package contains the Xen Hypervisor control domain headers.
@@ -606,7 +599,6 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_mandir}/man7/xen-pci-device-reservations.7.gz
 %{_mandir}/man7/xen-pv-channel.7.gz
 %{_mandir}/man7/xen-tscmode.7.gz
-%{_mandir}/man7/xen-vbd-interface.7.gz
 %{_mandir}/man7/xl-numa-placement.7.gz
 %exclude %{_mandir}/man7/xen-vtpm.7.gz
 %exclude %{_mandir}/man7/xen-vtpmmgr.7.gz
