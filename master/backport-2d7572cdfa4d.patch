@@ -1,0 +1,46 @@
+From 2d7572cdfa4d481c1ca246aa1ce5239ccae7eb59 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 9 Dec 2019 14:01:25 +0100
+Subject: lz4: refine commit 9143a6c55ef7 for the 64-bit case
+
+I clearly went too far there: While the LZ4_WILDCOPY() instances indeed
+need prior guarding, LZ4_SECURECOPY() needs this only in the 32-bit case
+(where it simply aliases LZ4_WILDCOPY()). "cpy" can validly point
+(slightly) below "op" in these cases, due to
+
+		cpy = op + length - (STEPSIZE - 4);
+
+where length can be as low as 0 and STEPSIZE is 8. However, instead of
+removing the check via "#if !LZ4_ARCH64", refine it such that it would
+also properly work in the 64-bit case, aborting decompression instead
+of continuing on bogus input.
+
+Reported-by: Mark Pryor <pryorm09@gmail.com>
+Reported-by: Jeremi Piotrowski <jeremi.piotrowski@gmail.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Tested-by: Mark Pryor <pryorm09@gmail.com>
+Tested-by: Jeremi Piotrowski <jeremi.piotrowski@gmail.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/common/lz4/decompress.c b/xen/common/lz4/decompress.c
+index 94ad591331..e8636e193a 100644
+--- a/xen/common/lz4/decompress.c
++++ b/xen/common/lz4/decompress.c
+@@ -147,7 +147,7 @@ static int INIT lz4_uncompress(const unsigned char *source, unsigned char *dest,
+ 				goto _output_error;
+ 			continue;
+ 		}
+-		if (unlikely((unsigned long)cpy < (unsigned long)op))
++		if (unlikely((unsigned long)cpy < (unsigned long)op - (STEPSIZE - 4)))
+ 			goto _output_error;
+ 		LZ4_SECURECOPY(ref, op, cpy);
+ 		op = cpy; /* correction */
+@@ -279,7 +279,7 @@ static int lz4_uncompress_unknownoutputsize(const unsigned char *source,
+ 				goto _output_error;
+ 			continue;
+ 		}
+-		if (unlikely((unsigned long)cpy < (unsigned long)op))
++		if (unlikely((unsigned long)cpy < (unsigned long)op - (STEPSIZE - 4)))
+ 			goto _output_error;
+ 		LZ4_SECURECOPY(ref, op, cpy);
+ 		op = cpy; /* correction */
