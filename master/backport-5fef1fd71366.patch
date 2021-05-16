@@ -1,0 +1,108 @@
+From 5fef1fd713660406a6187ef352fbf79986abfe43 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Wed, 20 May 2020 12:48:37 +0200
+Subject: x86/idle: rework C6 EOI workaround
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Change the C6 EOI workaround (errata AAJ72) to use x86_match_cpu. Also
+call the workaround from mwait_idle, previously it was only used by
+the ACPI idle driver. Finally make sure the routine is called for all
+states equal or greater than ACPI_STATE_C3, note that the ACPI driver
+doesn't currently handle them, but the errata condition shouldn't be
+limited by that.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/acpi/cpu_idle.c b/xen/arch/x86/acpi/cpu_idle.c
+index b83446e..82f108d 100644
+--- a/xen/arch/x86/acpi/cpu_idle.c
++++ b/xen/arch/x86/acpi/cpu_idle.c
+@@ -548,26 +548,35 @@ void trace_exit_reason(u32 *irq_traced)
+     }
+ }
+ 
+-/*
+- * "AAJ72. EOI Transaction May Not be Sent if Software Enters Core C6 During 
+- * an Interrupt Service Routine"
+- * 
+- * There was an errata with some Core i7 processors that an EOI transaction 
+- * may not be sent if software enters core C6 during an interrupt service 
+- * routine. So we don't enter deep Cx state if there is an EOI pending.
+- */
+-static bool errata_c6_eoi_workaround(void)
++bool errata_c6_eoi_workaround(void)
+ {
+-    static int8_t fix_needed = -1;
++    static int8_t __read_mostly fix_needed = -1;
+ 
+     if ( unlikely(fix_needed == -1) )
+     {
+-        int model = boot_cpu_data.x86_model;
+-        fix_needed = (cpu_has_apic && !directed_eoi_enabled &&
+-                      (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) &&
+-                      (boot_cpu_data.x86 == 6) &&
+-                      ((model == 0x1a) || (model == 0x1e) || (model == 0x1f) ||
+-                       (model == 0x25) || (model == 0x2c) || (model == 0x2f)));
++#define INTEL_FAM6_MODEL(m) { X86_VENDOR_INTEL, 6, m, X86_FEATURE_ALWAYS }
++        /*
++         * Errata AAJ72: EOI Transaction May Not be Sent if Software Enters
++         * Core C6 During an Interrupt Service Routine"
++         *
++         * There was an errata with some Core i7 processors that an EOI
++         * transaction may not be sent if software enters core C6 during an
++         * interrupt service routine. So we don't enter deep Cx state if
++         * there is an EOI pending.
++         */
++        static const struct x86_cpu_id eoi_errata[] = {
++            INTEL_FAM6_MODEL(0x1a),
++            INTEL_FAM6_MODEL(0x1e),
++            INTEL_FAM6_MODEL(0x1f),
++            INTEL_FAM6_MODEL(0x25),
++            INTEL_FAM6_MODEL(0x2c),
++            INTEL_FAM6_MODEL(0x2f),
++            { }
++        };
++#undef INTEL_FAM6_MODEL
++
++        fix_needed = cpu_has_apic && !directed_eoi_enabled &&
++                     x86_match_cpu(eoi_errata);
+     }
+ 
+     return (fix_needed && cpu_has_pending_apic_eoi());
+@@ -676,7 +685,7 @@ static void acpi_processor_idle(void)
+         return;
+     }
+ 
+-    if ( (cx->type == ACPI_STATE_C3) && errata_c6_eoi_workaround() )
++    if ( (cx->type >= ACPI_STATE_C3) && errata_c6_eoi_workaround() )
+         cx = power->safe_state;
+ 
+ 
+diff --git a/xen/arch/x86/cpu/mwait-idle.c b/xen/arch/x86/cpu/mwait-idle.c
+index b819379..88a3e16 100644
+--- a/xen/arch/x86/cpu/mwait-idle.c
++++ b/xen/arch/x86/cpu/mwait-idle.c
+@@ -770,6 +770,9 @@ static void mwait_idle(void)
+ 		return;
+ 	}
+ 
++	if ((cx->type >= 3) && errata_c6_eoi_workaround())
++		cx = power->safe_state;
++
+ 	eax = cx->address;
+ 	cstate = ((eax >> MWAIT_SUBSTATE_SIZE) & MWAIT_CSTATE_MASK) + 1;
+ 
+diff --git a/xen/include/asm-x86/cpuidle.h b/xen/include/asm-x86/cpuidle.h
+index 5d7dffd..5136869 100644
+--- a/xen/include/asm-x86/cpuidle.h
++++ b/xen/include/asm-x86/cpuidle.h
+@@ -26,4 +26,6 @@ void update_idle_stats(struct acpi_processor_power *,
+ void update_last_cx_stat(struct acpi_processor_power *,
+                          struct acpi_processor_cx *, uint64_t);
+ 
++bool errata_c6_eoi_workaround(void);
++
+ #endif /* __X86_ASM_CPUIDLE_H__ */
