@@ -1,0 +1,161 @@
+From 3860d5534df401204ccf67cc5bbd2f7368b9bfaf Mon Sep 17 00:00:00 2001
+From: Norbert Manthey <nmanthey@amazon.de>
+Date: Thu, 14 Mar 2019 13:55:00 +0100
+Subject: spec: add l1tf-barrier
+
+To control the runtime behavior on L1TF vulnerable platforms better, the
+command line option l1tf-barrier is introduced. This option controls
+whether on vulnerable x86 platforms the lfence instruction is used to
+prevent speculative execution from bypassing the evaluation of
+conditionals that are protected with the evaluate_nospec macro.
+
+By now, Xen is capable of identifying L1TF vulnerable hardware. However,
+this information cannot be used for alternative patching, as a CPU feature
+is required. To control alternative patching with the command line option,
+a new x86 feature "X86_FEATURE_SC_L1TF_VULN" is introduced. This feature
+is used to patch the lfence instruction into the arch_barrier_nospec_true
+function. The feature is enabled only if L1TF vulnerable hardware is
+detected and the command line option does not prevent using this feature.
+
+The status of hyperthreading is considered when automatically enabling
+adding the lfence instruction. Since platforms without hyperthreading can
+still be vulnerable to L1TF in case the L1 cache is not flushed properly,
+the additional lfence instructions are patched in if either hyperthreading
+is enabled, or L1 cache flushing is missing.
+
+This is part of the speculative hardening effort.
+
+Signed-off-by: Norbert Manthey <nmanthey@amazon.de>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/docs/misc/xen-command-line.markdown b/docs/misc/xen-command-line.markdown
+index 513b7f0..c178119 100644
+--- a/docs/misc/xen-command-line.markdown
++++ b/docs/misc/xen-command-line.markdown
+@@ -447,8 +447,8 @@ cause Xen not to use the feature, nor offer them as usable to guests.
+ Currently accepted:
+ 
+ The Speculation Control hardware features `srbds-ctrl`, `md-clear`, `ibrsb`,
+-`stibp`, `ibpb`, `l1d-flush` and `ssbd` are used by default if available and
+-applicable.  They can all be ignored.
++`stibp`, `ibpb`, `l1d-flush`, `l1tf-barrier` and `ssbd` are used by default
++if available and applicable.  They can all be ignored.
+ 
+ `rdrand` and `rdseed` can be ignored, as a mitigation to XSA-320 /
+ CVE-2020-0543.
+@@ -1552,7 +1552,7 @@ false disable the quirk workaround, which is also the default.
+ ### spec-ctrl (x86)
+ > `= List of [ <bool>, xen=<bool>, {pv,hvm,msr-sc,rsb,mds}=<bool>,
+ >              bti-thunk=retpoline|lfence|jmp, {ibrs,ibpb,ssbd,eager-fpu,
+->              l1d-flush,srb-lock}=<bool> ]`
++>              l1d-flush,srb-lock,l1tf-barrier}=<bool> ]`
+ 
+ Controls for speculative execution sidechannel mitigations.  By default, Xen
+ will pick the most appropriate mitigations based on compiled in support,
+@@ -1626,6 +1626,12 @@ data. By default, Xen will enable this mitigation, except on parts where MDS
+ is fixed and TAA is fixed/mitigated (in which case, there is believed to be no
+ way for an attacker to obtain the stale data).
+ 
++On hardware vulnerable to L1TF, the `l1tf-barrier=` option can be used to force
++or prevent Xen from protecting evaluations inside the hypervisor with a barrier
++instruction to not load potentially secret information into L1 cache.  By
++default, Xen will enable this mitigation on hardware believed to be vulnerable
++to L1TF.
++
+ ### sync\_console
+ > `= <boolean>`
+ 
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index ac6ebe3..28eda43 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -25,6 +25,7 @@
+ 
+ #include <public/platform.h>
+ 
++#include <asm/cpuid.h>
+ #include <asm/delay.h>
+ #include <asm/domain.h>
+ #include <asm/microcode.h>
+@@ -58,6 +59,7 @@ bool_t __read_mostly opt_ibpb = 1;
+ bool_t __read_mostly opt_ssbd = 0;
+ int8_t __read_mostly opt_eager_fpu = -1;
+ int8_t __read_mostly opt_l1d_flush = -1;
++int8_t __read_mostly opt_l1tf_barrier = -1;
+ 
+ bool_t __initdata bsp_delay_spec_ctrl;
+ uint8_t __read_mostly default_xen_spec_ctrl;
+@@ -145,6 +147,8 @@ static int __init parse_spec_ctrl(char *s)
+             if ( opt_tsx == -1 )
+                 opt_tsx = -3;
+ 
++            opt_l1tf_barrier = 0;
++
+         disable_common:
+             opt_rsb_pv = 0;
+             opt_rsb_hvm = 0;
+@@ -222,6 +226,8 @@ static int __init parse_spec_ctrl(char *s)
+             opt_eager_fpu = val;
+         else if ( (val = parse_boolean("l1d-flush", s, ss)) >= 0 )
+             opt_l1d_flush = val;
++        else if ( (val = parse_boolean("l1tf-barrier", s, ss)) >= 0 )
++            opt_l1tf_barrier = val;
+         else if ( (val = parse_boolean("srb-lock", s, ss)) >= 0 )
+             opt_srb_lock = val;
+         else
+@@ -387,7 +393,7 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+                "\n");
+ 
+     /* Settings for Xen's protection, irrespective of guests. */
+-    printk("  Xen settings: BTI-Thunk %s, SPEC_CTRL: %s%s%s, Other:%s%s%s%s\n",
++    printk("  Xen settings: BTI-Thunk %s, SPEC_CTRL: %s%s%s, Other:%s%s%s%s%s\n",
+            thunk == THUNK_NONE      ? "N/A" :
+            thunk == THUNK_RETPOLINE ? "RETPOLINE" :
+            thunk == THUNK_LFENCE    ? "LFENCE" :
+@@ -402,7 +408,8 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+            opt_srb_lock                              ? " SRB_LOCK+" : " SRB_LOCK-",
+            opt_ibpb                                  ? " IBPB"  : "",
+            opt_l1d_flush                             ? " L1D_FLUSH" : "",
+-           opt_mds_pv || opt_mds_hvm                 ? " VERW"  : "");
++           opt_mds_pv || opt_mds_hvm                 ? " VERW"  : "",
++           opt_l1tf_barrier                          ? " L1TF_BARRIER" : "");
+ 
+     /* L1TF diagnostics, printed if vulnerable or PV shadowing is in use. */
+     if ( cpu_has_bug_l1tf || opt_pv_l1tf )
+@@ -1064,6 +1071,12 @@ void __init init_speculation_mitigations(void)
+     else if ( opt_l1d_flush == -1 )
+         opt_l1d_flush = cpu_has_bug_l1tf && !(caps & ARCH_CAPS_SKIP_L1DFL);
+ 
++    /* By default, enable L1TF_VULN on L1TF-vulnerable hardware */
++    if ( opt_l1tf_barrier == -1 )
++        opt_l1tf_barrier = cpu_has_bug_l1tf && (opt_smt || !opt_l1d_flush);
++    if ( opt_l1tf_barrier > 0 )
++        __set_bit(X86_FEATURE_SC_L1TF_VULN, boot_cpu_data.x86_capability);
++
+     /*
+      * We do not disable HT by default on affected hardware.
+      *
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index 3bb6505..8af3e80 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -40,6 +40,7 @@
+ #define X86_FEATURE_SC_VERW_PV		((FSCAPINTS+0)*32+ 21) /* VERW used by Xen for PV */
+ #define X86_FEATURE_SC_VERW_HVM		((FSCAPINTS+0)*32+ 22) /* VERW used by Xen for HVM */
+ #define X86_FEATURE_SC_VERW_IDLE	((FSCAPINTS+0)*32+ 23) /* VERW used by Xen for idle */
++#define X86_FEATURE_SC_L1TF_VULN	((FSCAPINTS+0)*32+ 24) /* L1TF protection required */
+ 
+ #define cpufeat_word(idx)	((idx) / 32)
+ #define cpufeat_bit(idx)	((idx) % 32)
+diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
+index 479f92b..26dcec0 100644
+--- a/xen/include/asm-x86/spec_ctrl.h
++++ b/xen/include/asm-x86/spec_ctrl.h
+@@ -30,6 +30,7 @@ extern bool_t opt_ibpb;
+ extern bool_t opt_ssbd;
+ extern int8_t opt_eager_fpu;
+ extern int8_t opt_l1d_flush;
++extern int8_t opt_l1tf_barrier;
+ 
+ extern bool_t bsp_delay_spec_ctrl;
+ extern uint8_t default_xen_spec_ctrl;
