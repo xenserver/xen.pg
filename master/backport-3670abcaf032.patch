@@ -1,0 +1,106 @@
+From 3670abcaf0324f2aedba0c4dc7939072b27efa1d Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 18 May 2021 14:53:56 +0100
+Subject: x86/tsx: Minor cleanup and improvements
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ * Introduce cpu_has_arch_caps and replace boot_cpu_has(X86_FEATURE_ARCH_CAPS)
+ * Read CPUID data into the appropriate boot_cpu_data.x86_capability[]
+   element, as subsequent changes are going to need more cpu_has_* logic.
+ * Use the hi/lo MSR helpers, which substantially improves code generation.
+
+No practical change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index e142eb1..c192148 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -2409,7 +2409,7 @@ static bool __init has_if_pschange_mc(void)
+     if ( cpu_has_hypervisor )
+         return false;
+ 
+-    if ( boot_cpu_has(X86_FEATURE_ARCH_CAPS) )
++    if ( cpu_has_arch_caps )
+         rdmsrl(MSR_ARCH_CAPABILITIES, caps);
+ 
+     if ( caps & ARCH_CAPS_IF_PSCHANGE_MC_NO )
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index dbd2325..4f29731 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -890,7 +890,7 @@ void __init init_speculation_mitigations(void)
+     bool cpu_has_bug_taa;
+     uint64_t caps = 0;
+ 
+-    if ( boot_cpu_has(X86_FEATURE_ARCH_CAPS) )
++    if ( cpu_has_arch_caps )
+         rdmsrl(MSR_ARCH_CAPABILITIES, caps);
+ 
+     hw_smt_enabled = check_smt_enabled();
+diff --git a/xen/arch/x86/tsx.c b/xen/arch/x86/tsx.c
+index a5d5944..0865912 100644
+--- a/xen/arch/x86/tsx.c
++++ b/xen/arch/x86/tsx.c
+@@ -32,15 +32,18 @@ void tsx_init(void)
+ {
+     /*
+      * This function is first called between microcode being loaded, and CPUID
+-     * being scanned generally.  Calculate from raw data whether MSR_TSX_CTRL
+-     * is available.
++     * being scanned generally.  Read into boot_cpu_data.x86_capability[] for
++     * the cpu_has_* bits we care about using here.
+      */
+     if ( unlikely(cpu_has_tsx_ctrl < 0) )
+     {
+         uint64_t caps = 0;
+ 
+-        if ( boot_cpu_data.cpuid_level >= 7 &&
+-             (cpuid_count_edx(7, 0) & cpufeat_mask(X86_FEATURE_ARCH_CAPS)) )
++        if ( boot_cpu_data.cpuid_level >= 7 )
++            boot_cpu_data.x86_capability[cpufeat_word(X86_FEATURE_ARCH_CAPS)]
++                = cpuid_count_edx(7, 0);
++
++        if ( cpu_has_arch_caps )
+             rdmsrl(MSR_ARCH_CAPABILITIES, caps);
+ 
+         cpu_has_tsx_ctrl = !!(caps & ARCH_CAPS_TSX_CTRL);
+@@ -72,16 +75,16 @@ void tsx_init(void)
+ 
+     if ( cpu_has_tsx_ctrl )
+     {
+-        uint64_t val;
++        uint32_t hi, lo;
+ 
+-        rdmsrl(MSR_TSX_CTRL, val);
++        rdmsr(MSR_TSX_CTRL, lo, hi);
+ 
+-        val &= ~(TSX_CTRL_RTM_DISABLE | TSX_CTRL_CPUID_CLEAR);
++        lo &= ~(TSX_CTRL_RTM_DISABLE | TSX_CTRL_CPUID_CLEAR);
+         /* Check bottom bit only.  Higher bits are various sentinals. */
+         if ( !(opt_tsx & 1) )
+-            val |= TSX_CTRL_RTM_DISABLE | TSX_CTRL_CPUID_CLEAR;
++            lo |= TSX_CTRL_RTM_DISABLE | TSX_CTRL_CPUID_CLEAR;
+ 
+-        wrmsrl(MSR_TSX_CTRL, val);
++        wrmsr(MSR_TSX_CTRL, lo, hi);
+     }
+     else if ( opt_tsx >= 0 )
+         printk_once(XENLOG_WARNING
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index fb8137e..8f0f177 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -128,6 +128,7 @@
+ #define cpu_has_avx512_4vnniw   boot_cpu_has(X86_FEATURE_AVX512_4VNNIW)
+ #define cpu_has_avx512_4fmaps   boot_cpu_has(X86_FEATURE_AVX512_4FMAPS)
+ #define cpu_has_tsx_force_abort boot_cpu_has(X86_FEATURE_TSX_FORCE_ABORT)
++#define cpu_has_arch_caps       boot_cpu_has(X86_FEATURE_ARCH_CAPS)
+ 
+ /* CPUID level 0x00000007:1.eax */
+ #define cpu_has_avx512_bf16     boot_cpu_has(X86_FEATURE_AVX512_BF16)
