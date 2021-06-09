@@ -1,0 +1,59 @@
+From 287f2292c38575dcf059358ce3d9a70294017554 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Fri, 4 Jun 2021 15:01:33 +0200
+Subject: x86/vhpet: fix RTC special casing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Restore setting the virtual timer callback private data to NULL if the
+timer is not level triggered. This fixes the special casing done in
+pt_update_irq so that the RTC interrupt when originating from the HPET
+is suspended if the interrupt source is masked.
+
+Note the RTC special casing done in pt_update_irq should only apply to
+the RTC interrupt originating from the emulated RTC device (which does
+set the callback private data), as in that case the callback itself
+will destroy the virtual timer if the interrupt is ignored.
+
+While there also use RTC_IRQ instead of 8 when the HPET is configured
+in LegacyReplacement Mode.
+
+Fixes: be07023be115 ("x86/vhpet: add support for level triggered interrupts")
+Reported-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: 472a13988a051e5ae84b95815c6caf4378062abe
+master date: 2021-05-07 10:43:29 +0200
+
+diff --git a/xen/arch/x86/hvm/hpet.c b/xen/arch/x86/hvm/hpet.c
+index 9fbdc5302b..1dcd38cebc 100644
+--- a/xen/arch/x86/hvm/hpet.c
++++ b/xen/arch/x86/hvm/hpet.c
+@@ -22,6 +22,7 @@
+ #include <asm/hvm/trace.h>
+ #include <asm/current.h>
+ #include <asm/hpet.h>
++#include <asm/mc146818rtc.h>
+ #include <xen/sched.h>
+ #include <xen/event.h>
+ #include <xen/trace.h>
+@@ -289,7 +290,7 @@ static void hpet_set_timer(HPETState *h, unsigned int tn,
+         /* if LegacyReplacementRoute bit is set, HPET specification requires
+            timer0 be routed to IRQ0 in NON-APIC or IRQ2 in the I/O APIC,
+            timer1 be routed to IRQ8 in NON-APIC or IRQ8 in the I/O APIC. */
+-        irq = (tn == 0) ? 0 : 8;
++        irq = (tn == 0) ? 0 : RTC_IRQ;
+         h->pt[tn].source = PTSRC_isa;
+     }
+     else
+@@ -317,7 +318,8 @@ static void hpet_set_timer(HPETState *h, unsigned int tn,
+                          hpet_tick_to_ns(h, diff),
+                          oneshot ? 0 : hpet_tick_to_ns(h, h->hpet.period[tn]),
+                          irq, timer_level(h, tn) ? hpet_timer_fired : NULL,
+-                         (void *)(unsigned long)tn, timer_level(h, tn));
++                         timer_level(h, tn) ? (void *)(unsigned long)tn : NULL,
++                         timer_level(h, tn));
+ }
+ 
+ static inline uint64_t hpet_fixup_reg(

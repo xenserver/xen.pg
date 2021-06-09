@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.6
+%global hv_rel 10.7
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -836,6 +836,16 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed Jun 9 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.7
+- LBR and PMU fixes for Icelake Server
+- Don't assume that VT-d Register based invalidation is available.  Expected
+  to be necessary to boot on Sapphire Rapids Server.
+- Fix the emulation of the PINSRW instruction.
+- Reduce lock contention for virtual periodic timers, to fix a perf regression
+  introduced by the XSA-336 fix.
+- Fixes for XSA-373 CVE-2021-28692, XSA-375 CVE-2021-0089 CVE-2021-26313,
+  XSA-377 CVE-2021-28690.
+
 * Fri Apr 16 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.6
 - Fix booting on Intel systems with static PIT clock gating.
 - Drop unnecessary build dependencies.

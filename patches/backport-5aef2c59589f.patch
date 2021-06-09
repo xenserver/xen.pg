@@ -1,0 +1,90 @@
+From 5aef2c59589fd84397a359c3561c0f3fdfe7baa0 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 20 Apr 2021 12:11:11 +0200
+Subject: x86emul: fix PINSRW and adjust other {,V}PINSR*
+
+The use of simd_packed_int together with no further update to op_bytes
+has lead to wrong signaling of #GP(0) for PINSRW without a 16-byte
+aligned memory operand. Use simd_none instead and override it after
+general decoding with simd_other, like is done for the B/D/Q siblings.
+
+While benign, for consistency also use DstImplicit instead of DstReg
+in x86_decode_twobyte().
+
+PINSR{B,D,Q} also had a stray (redundant) get_fpu() invocation, which
+gets dropped.
+
+For further consistency also
+- use src.bytes instead of op_bytes in relevant memcpy() invocations,
+- avoid the pointless updating of op_bytes (all we care about later is
+  that the value be less than 16).
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 06f0598b41f23c9e4cf7d8c5a05b282de92f3a35
+master date: 2020-10-23 18:03:18 +0200
+
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
+index a4e0341b25..bba6dd0187 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate/x86_emulate.c
+@@ -362,7 +362,7 @@ static const struct twobyte_table {
+     [0xc1] = { DstMem|SrcReg|ModRM },
+     [0xc2] = { DstImplicit|SrcImmByte|ModRM, simd_any_fp, d8s_vl },
+     [0xc3] = { DstMem|SrcReg|ModRM|Mov },
+-    [0xc4] = { DstReg|SrcImmByte|ModRM, simd_packed_int, 1 },
++    [0xc4] = { DstImplicit|SrcImmByte|ModRM, simd_none, 1 },
+     [0xc5] = { DstReg|SrcImmByte|ModRM|Mov },
+     [0xc6] = { DstImplicit|SrcImmByte|ModRM, simd_packed_fp, d8s_vl },
+     [0xc7] = { ImplicitOps|ModRM },
+@@ -2668,7 +2668,7 @@ x86_decode_twobyte(
+         /* fall through */
+     case X86EMUL_OPC_VEX_66(0, 0xc4): /* vpinsrw */
+     case X86EMUL_OPC_EVEX_66(0, 0xc4): /* vpinsrw */
+-        state->desc = DstReg | SrcMem16;
++        state->desc = DstImplicit | SrcMem16;
+         break;
+ 
+     case 0xf0:
+@@ -8158,6 +8158,7 @@ x86_emulate(
+         generate_exception_if(vex.l, EXC_UD);
+         memcpy(mmvalp, &src.val, 2);
+         ea.type = OP_MEM;
++        state->simd_size = simd_other;
+         goto simd_0f_int_imm8;
+ 
+     case X86EMUL_OPC_EVEX_66(0x0f, 0xc4):   /* vpinsrw $imm8,r32/m16,xmm,xmm */
+@@ -8170,9 +8171,8 @@ x86_emulate(
+             host_and_vcpu_must_have(avx512bw);
+         if ( !mode_64bit() )
+             evex.w = 0;
+-        memcpy(mmvalp, &src.val, op_bytes);
++        memcpy(mmvalp, &src.val, src.bytes);
+         ea.type = OP_MEM;
+-        op_bytes = src.bytes;
+         d = SrcMem16; /* Fake for the common SIMD code below. */
+         state->simd_size = simd_other;
+         goto avx512f_imm8_no_sae;
+@@ -10245,10 +10245,8 @@ x86_emulate(
+     case X86EMUL_OPC_66(0x0f3a, 0x20): /* pinsrb $imm8,r32/m8,xmm */
+     case X86EMUL_OPC_66(0x0f3a, 0x22): /* pinsr{d,q} $imm8,r/m,xmm */
+         host_and_vcpu_must_have(sse4_1);
+-        get_fpu(X86EMUL_FPU_xmm);
+-        memcpy(mmvalp, &src.val, op_bytes);
++        memcpy(mmvalp, &src.val, src.bytes);
+         ea.type = OP_MEM;
+-        op_bytes = src.bytes;
+         d = SrcMem16; /* Fake for the common SIMD code below. */
+         state->simd_size = simd_other;
+         goto simd_0f3a_common;
+@@ -10258,9 +10256,8 @@ x86_emulate(
+         generate_exception_if(vex.l, EXC_UD);
+         if ( !mode_64bit() )
+             vex.w = 0;
+-        memcpy(mmvalp, &src.val, op_bytes);
++        memcpy(mmvalp, &src.val, src.bytes);
+         ea.type = OP_MEM;
+-        op_bytes = src.bytes;
+         d = SrcMem16; /* Fake for the common SIMD code below. */
+         state->simd_size = simd_other;
+         goto simd_0f_int_imm8;
