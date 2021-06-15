@@ -195,6 +195,12 @@ Group: System Environment/Base
 This package contains the minimal subset of libraries and binaries required in
 the XenServer installer environment.
 
+%package dom0-tests
+Summary: Xen Hypervisor tests
+Group: System/Libraries
+%description dom0-tests
+This package contains test cases for the Xen Hypervisor.
+
 %prep
 %autosetup -p1
 %{?_cov_prepare}
@@ -284,7 +290,6 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 # Build tools and man pages
 %{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} install-tools
 %{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
-%{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/tests/mce-test/tools install
 
 %{__install} -D -m 644 %{SOURCE1} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
 %{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/xen/xl.conf
@@ -773,6 +778,11 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{py_sitearch}/xen/__init__.py*
 %{py_sitearch}/xen/lowlevel/__init__.py*
 %{py_sitearch}/xen/lowlevel/xc.so
+
+%files dom0-tests
+%{_libexecdir}/%{name}/bin/depriv-fd-checker
+%{_libexecdir}/%{name}/bin/test-cpu-policy
+%{_libexecdir}/%{name}/bin/xs-test
 
 %doc
 
