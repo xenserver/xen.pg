@@ -1,5 +1,5 @@
 diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
-index 20df46e214..b594af1e34 100644
+index 20df46e214..c725608af0 100644
 --- a/tools/libxc/xc_cpuid_x86.c
 +++ b/tools/libxc/xc_cpuid_x86.c
 @@ -55,8 +55,8 @@ int xc_get_cpu_levelling_caps(xc_interface *xch, uint32_t *caps)
@@ -13,7 +13,7 @@ index 20df46e214..b594af1e34 100644
  {
      DECLARE_SYSCTL;
      DECLARE_HYPERCALL_BOUNCE(featureset,
-@@ -82,6 +82,42 @@ int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
+@@ -82,6 +82,91 @@ int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
      return ret;
  }
  
@@ -21,6 +21,7 @@ index 20df46e214..b594af1e34 100644
 +                          uint32_t *nr_features, uint32_t *featureset)
 +{
 +    uint32_t host_fs[FEATURESET_NR_ENTRIES] = {}, host_sz = ARRAY_SIZE(host_fs);
++    unsigned int vendor;
 +    int ret;
 +
 +    if ( index != XEN_SYSCTL_cpu_featureset_pv_max &&
@@ -29,6 +30,9 @@ index 20df46e214..b594af1e34 100644
 +
 +    /*
 +     * Fake up a *_max featureset.  Obtain the host, and pv/hvm default.
++     *
++     * This is used by xenopsd to pass to the toolstack of the incoming
++     * domain, to allow it to establish migration safety.
 +     */
 +    ret = xc_get_cpu_featureset_(
 +        xch, XEN_SYSCTL_cpu_featureset_host, &host_sz, host_fs);
@@ -39,16 +43,61 @@ index 20df46e214..b594af1e34 100644
 +    if ( ret )
 +        return ret;
 +
++    /* Adjust the default policy to be a max policy. */
++
 +    /*
-+     * Adjust the default policy to be a max policy.
-+     *
-+     * Fold HLE/RTM in from the host policy.
++     * Xen 4.7 had the common features duplicated.  4.8 changed this, to only
++     * use the Intel range.  Undo this.
++     */
++    featureset[2] |= (featureset[0] & CPUID_COMMON_1D_FEATURES);
++
++    /*
++     * Advertise HTT, x2APIC and CMP_LEGACY.  They all impact topology,
++     * unconditionally leak into PV guests, and are fully emulated for HVM.
++     */
++    featureset[featureword_of(X86_FEATURE_HTT)] |=
++        bitmaskof(X86_FEATURE_HTT);
++    featureset[featureword_of(X86_FEATURE_X2APIC)] |=
++        bitmaskof(X86_FEATURE_X2APIC);
++    featureset[featureword_of(X86_FEATURE_CMP_LEGACY)] |=
++        bitmaskof(X86_FEATURE_CMP_LEGACY);
++
++    /*
++     * Feed HLE/RTM in from the host policy.  We can safely migrate in VMs
++     * which saw HLE/RTM, even if the RTM is disabled for errata/security
++     * reasons.
 +     */
 +    featureset[featureword_of(X86_FEATURE_HLE)] &=
 +        ~(bitmaskof(X86_FEATURE_HLE) | bitmaskof(X86_FEATURE_RTM));
 +    featureset[featureword_of(X86_FEATURE_HLE)] |=
 +        (host_fs[featureword_of(X86_FEATURE_HLE)] &
 +         (bitmaskof(X86_FEATURE_HLE) | bitmaskof(X86_FEATURE_RTM)));
++
++    if ( index == XEN_SYSCTL_cpu_featureset_hvm_max )
++    {
++        struct cpuid_leaf l;
++
++        cpuid_leaf(0, &l);
++        vendor = x86_cpuid_lookup_vendor(l.b, l.c, l.d);
++
++        /*
++         * Xen 4.7 used to falsely advertise IBS, and 4.8 fixed this.
++         * However, the old xenopsd workaround fix for this didn't limit the
++         * workaround to AMD systems, so the Last Boot Record of every HVM VM,
++         * even on Intel, is wrong.
++         */
++        featureset[featureword_of(X86_FEATURE_IBS)] |=
++            bitmaskof(X86_FEATURE_IBS);
++
++        /*
++         * In order to mitigate Spectre, AMD dropped the LWP feature in
++         * microcode, to make space for MSR_PRED_CMD.  Noone used LWP, but it
++         * was visible to guests at the time.
++         */
++        if ( vendor & (X86_VENDOR_AMD | X86_VENDOR_HYGON) )
++            featureset[featureword_of(X86_FEATURE_LWP)] |=
++                bitmaskof(X86_FEATURE_LWP);
++    }
 +
 +    return 0;
 +}
