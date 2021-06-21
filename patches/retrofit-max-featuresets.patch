@@ -1,0 +1,109 @@
+diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
+index 20df46e214..b594af1e34 100644
+--- a/tools/libxc/xc_cpuid_x86.c
++++ b/tools/libxc/xc_cpuid_x86.c
+@@ -55,8 +55,8 @@ int xc_get_cpu_levelling_caps(xc_interface *xch, uint32_t *caps)
+     return ret;
+ }
+ 
+-int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
+-                          uint32_t *nr_features, uint32_t *featureset)
++static int xc_get_cpu_featureset_(xc_interface *xch, uint32_t index,
++                                  uint32_t *nr_features, uint32_t *featureset)
+ {
+     DECLARE_SYSCTL;
+     DECLARE_HYPERCALL_BOUNCE(featureset,
+@@ -82,6 +82,42 @@ int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
+     return ret;
+ }
+ 
++int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
++                          uint32_t *nr_features, uint32_t *featureset)
++{
++    uint32_t host_fs[FEATURESET_NR_ENTRIES] = {}, host_sz = ARRAY_SIZE(host_fs);
++    int ret;
++
++    if ( index != XEN_SYSCTL_cpu_featureset_pv_max &&
++         index != XEN_SYSCTL_cpu_featureset_hvm_max )
++        return xc_get_cpu_featureset_(xch, index, nr_features, featureset);
++
++    /*
++     * Fake up a *_max featureset.  Obtain the host, and pv/hvm default.
++     */
++    ret = xc_get_cpu_featureset_(
++        xch, XEN_SYSCTL_cpu_featureset_host, &host_sz, host_fs);
++    if ( ret && errno != ENOBUFS )
++        return ret;
++
++    ret = xc_get_cpu_featureset_(xch, index - 2, &host_sz, host_fs);
++    if ( ret )
++        return ret;
++
++    /*
++     * Adjust the default policy to be a max policy.
++     *
++     * Fold HLE/RTM in from the host policy.
++     */
++    featureset[featureword_of(X86_FEATURE_HLE)] &=
++        ~(bitmaskof(X86_FEATURE_HLE) | bitmaskof(X86_FEATURE_RTM));
++    featureset[featureword_of(X86_FEATURE_HLE)] |=
++        (host_fs[featureword_of(X86_FEATURE_HLE)] &
++         (bitmaskof(X86_FEATURE_HLE) | bitmaskof(X86_FEATURE_RTM)));
++
++    return 0;
++}
++
+ uint32_t xc_get_cpu_featureset_size(void)
+ {
+     return FEATURESET_NR_ENTRIES;
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index 2aa818ece1..987a58c636 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -278,7 +278,13 @@ external version_changeset: handle -> string = "stub_xc_version_changeset"
+ external version_capabilities: handle -> string =
+   "stub_xc_version_capabilities"
+ 
+-type featureset_index = Featureset_raw | Featureset_host | Featureset_pv | Featureset_hvm
++type featureset_index =
++	| Featureset_raw
++	| Featureset_host
++	| Featureset_pv
++	| Featureset_hvm
++	| Featureset_pv_max
++	| Featureset_hvm_max
+ external get_cpu_featureset : handle -> featureset_index -> int64 array = "stub_xc_get_cpu_featureset"
+ 
+ external watchdog : handle -> int -> int32 -> int
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index d78c5151f8..07ae03b04f 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -214,7 +214,13 @@ external version_changeset : handle -> string = "stub_xc_version_changeset"
+ external version_capabilities : handle -> string
+   = "stub_xc_version_capabilities"
+ 
+-type featureset_index = Featureset_raw | Featureset_host | Featureset_pv | Featureset_hvm
++type featureset_index =
++  | Featureset_raw
++  | Featureset_host
++  | Featureset_pv
++  | Featureset_hvm
++  | Featureset_pv_max
++  | Featureset_hvm_max
+ external get_cpu_featureset : handle -> featureset_index -> int64 array = "stub_xc_get_cpu_featureset"
+ 
+ external pages_to_kib : int64 -> int64 = "stub_pages_to_kib"
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index 19457a4e30..d5d5976af5 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -802,6 +802,8 @@ struct xen_sysctl_cpu_featureset {
+ #define XEN_SYSCTL_cpu_featureset_host     1
+ #define XEN_SYSCTL_cpu_featureset_pv       2
+ #define XEN_SYSCTL_cpu_featureset_hvm      3
++#define XEN_SYSCTL_cpu_featureset_pv_max   4
++#define XEN_SYSCTL_cpu_featureset_hvm_max  5
+     uint32_t index;       /* IN: Which featureset to query? */
+     uint32_t nr_features; /* IN/OUT: Number of entries in/written to
+                            * 'features', or the maximum number of features if
