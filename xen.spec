@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.8
+%global hv_rel 10.9
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -846,6 +846,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Tue Jun 22 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.9
+- New xen-dom0-tests subpackage with unit and low level functional tests.
+- Logic to match the Intel June microcode, de-featuring TSX on client parts.
+- Prep work to move CPUID handling out of xenopsd and into libxc.
+- Hide MPX by default from VMs.
+
 * Mon Jun 14 2021 Igor Druzhinin <igor.druzhinin@citrix.com> - 4.13.3-10.8
 - Fix another race with vCPU timers
 
