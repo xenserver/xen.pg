@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.10
+%global hv_rel 10.11
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -846,6 +846,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed Jun 30 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.11
+- Fix migration of VMs which previously saw MPX.
+
 * Tue Jun 22 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.10
 - New xen-dom0-tests subpackage with unit and low level functional tests.
 - Logic to match the Intel June microcode, de-featuring TSX on client parts.
