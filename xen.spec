@@ -782,7 +782,7 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %files dom0-tests
 %{_libexecdir}/%{name}/bin/depriv-fd-checker
 %{_libexecdir}/%{name}/bin/test-cpu-policy
-%{_libexecdir}/%{name}/bin/xs-test
+%{_libexecdir}/%{name}/bin/test-xenstore
 
 %doc
 
