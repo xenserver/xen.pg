@@ -1,0 +1,69 @@
+From 1787cc167906f3fef547affb443a64762392c464 Mon Sep 17 00:00:00 2001
+From: Jane Malalane <jane.malalane@citrix.com>
+Date: Tue, 17 Aug 2021 16:19:24 +0100
+Subject: libs/guest: Move the guest ABI check earlier into
+ xc_dom_parse_image()
+
+Xen may not support 32-bit PV guest for a number of reasons (lack of
+CONFIG_PV32, explicit pv=no-32 command line argument, or implicitly
+due to CET being enabled) and advertises this to the toolstack via the
+absence of xen-3.0-x86_32p ABI.
+
+Currently, when trying to boot a 32-bit PV guest, the ABI check is too
+late and the build explodes in the following manner yielding an
+unhelpful error message:
+
+  xc: error: panic: xg_dom_boot.c:121: xc_dom_boot_mem_init: can't allocate low memory for domain: Out of memory
+  libxl: error: libxl_dom.c:586:libxl__build_dom: xc_dom_boot_mem_init failed: Operation not supported
+  libxl: error: libxl_create.c:1573:domcreate_rebuild_done: Domain 1:cannot (re-)build domain: -3
+  libxl: error: libxl_domain.c:1182:libxl__destroy_domid: Domain 1:Non-existant domain
+  libxl: error: libxl_domain.c:1136:domain_destroy_callback: Domain 1:Unable to destroy guest
+  libxl: error: libxl_domain.c:1063:domain_destroy_cb: Domain 1:Destruction of domain failed
+
+Move the ABI check earlier into xc_dom_parse_image() along with other
+ELF-note feature checks.  With this adjustment, it now looks like
+this:
+
+  xc: error: panic: xg_dom_boot.c:88: xc_dom_compat_check: guest type xen-3.0-x86_32p not supported by xen kernel, sorry: Invalid kernel
+  libxl: error: libxl_dom.c:571:libxl__build_dom: xc_dom_parse_image failed
+  domainbuilder: detail: xc_dom_release: called
+  libxl: error: libxl_create.c:1573:domcreate_rebuild_done: Domain 11:cannot (re-)build domain: -3
+  libxl: error: libxl_domain.c:1182:libxl__destroy_domid: Domain 11:Non-existant domain
+  libxl: error: libxl_domain.c:1136:domain_destroy_callback: Domain 11:Unable to destroy guest
+  libxl: error: libxl_domain.c:1063:domain_destroy_cb: Domain 11:Destruction of domain failed
+
+Suggested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jane Malalane <jane.malalane@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Ian Jackson <iwj@xenproject.org>
+
+diff --git a/tools/libxc/xc_dom_boot.c b/tools/libxc/xc_dom_boot.c
+index 918ee4d04573..bf19d56a0de1 100644
+--- a/tools/libxc/xc_dom_boot.c
++++ b/tools/libxc/xc_dom_boot.c
+@@ -192,10 +192,6 @@ int xc_dom_boot_image(struct xc_dom_image *dom)
+     }
+     dom->shared_info_mfn = info.shared_info_frame;
+ 
+-    /* sanity checks */
+-    if ( !xc_dom_compat_check(dom) )
+-        return -1;
+-
+     /* initial mm setup */
+     if ( (rc = xc_dom_update_guest_p2m(dom)) != 0 )
+         return rc;
+diff --git a/tools/libxc/xc_dom_core.c b/tools/libxc/xc_dom_core.c
+index 73fe09fe1864..2e8c3f3306be 100644
+--- a/tools/libxc/xc_dom_core.c
++++ b/tools/libxc/xc_dom_core.c
+@@ -917,6 +917,10 @@ int xc_dom_parse_image(struct xc_dom_image *dom)
+         goto err;
+     }
+ 
++    /* Check guest ABI */
++    if ( !xc_dom_compat_check(dom) )
++        return -1;
++
+     /* check features */
+     for ( i = 0; i < XENFEAT_NR_SUBMAPS; i++ )
+     {
