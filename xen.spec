@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.12
+%global hv_rel 10.13
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -846,6 +846,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Jul 26 2021 Igor Druzhinin <igor.druzhinin@citrix.com> - 4.13.3-10.13
+- Correctly handle IRQ > 255 on PCI passthrough
+- Reserve HyperTransport region properly on AMD Fam 17h+
+- More IOMMU error path fixes
+- Fix populating vbd.rd_sect in xentop
+
 * Wed Jul 21 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.12
 - Remove old workaround which causes a test-tsx failure on the hardware which
   the Intel June microcode de-featured TSX on.
