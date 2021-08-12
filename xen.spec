@@ -18,8 +18,8 @@
 %define with_sysv 0
 %define with_systemd 1
 
-# Pass '--without default_debug_hypervisor' to link to the production version by default
-%define default_debug_hypervisor %{?_without_default_debug_hypervisor:0}%{?!_without_default_debug_hypervisor:1}
+# Use the production hypervisor by default
+%define default_debug_hypervisor 0
 
 %define COMMON_OPTIONS DESTDIR=%{buildroot} %{?_smp_mflags}
 %define HVSOR_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64
