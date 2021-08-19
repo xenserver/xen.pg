@@ -1,0 +1,61 @@
+From: Jan Beulich <jbeulich@suse.com>
+Subject: x86/p2m: don't ignore p2m_remove_page()'s return value
+
+It's not very nice to return from guest_physmap_add_entry() after
+perhaps already having made some changes to the P2M, but this is pre-
+existing practice in the function, and imo better than ignoring errors.
+
+Take the liberty and replace an mfn_add() instance with a local variable
+already holding the result (as proven by the check immediately ahead).
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/mm/p2m.c b/xen/arch/x86/mm/p2m.c
+index 250ab94..d63e8d0 100644
+--- a/xen/arch/x86/mm/p2m.c
++++ b/xen/arch/x86/mm/p2m.c
+@@ -644,8 +644,7 @@ void p2m_final_teardown(struct domain *d)
+     p2m_teardown_hostp2m(d);
+ }
+ 
+-
+-static int
++static int __must_check
+ p2m_remove_page(struct p2m_domain *p2m, unsigned long gfn, unsigned long mfn,
+                 unsigned int page_order)
+ {
+@@ -825,8 +824,9 @@ guest_physmap_add_entry(struct domain *d, unsigned long gfn,
+                 ASSERT(mfn_valid(omfn));
+                 P2M_DEBUG("old gfn=%#lx -> mfn %#lx\n",
+                           ogfn , mfn_x(omfn));
+-                if ( mfn_x(omfn) == (mfn + i) )
+-                    p2m_remove_page(p2m, ogfn, mfn + i, 0);
++                if ( mfn_x(omfn) == (mfn + i) &&
++                     (rc = p2m_remove_page(p2m, ogfn, mfn_x(omfn), 0)) )
++                    goto out;
+             }
+         }
+     }
+@@ -847,6 +847,7 @@ guest_physmap_add_entry(struct domain *d, unsigned long gfn,
+         }
+     }
+ 
++ out:
+     p2m_unlock(p2m);
+ 
+     return rc;
+@@ -2828,9 +2829,9 @@ int p2m_change_altp2m_gfn(struct domain *d, unsigned int idx,
+ 
+     if ( gfn_x(new_gfn) == INVALID_GFN )
+     {
+-        if ( mfn_valid(mfn) )
+-            p2m_remove_page(ap2m, gfn_x(old_gfn), mfn_x(mfn), PAGE_ORDER_4K);
+-        rc = 0;
++        rc = mfn_valid(mfn)
++             ? p2m_remove_page(ap2m, gfn_x(old_gfn), mfn_x(mfn), PAGE_ORDER_4K)
++             : 0;
+         goto out;
+     }
+ 

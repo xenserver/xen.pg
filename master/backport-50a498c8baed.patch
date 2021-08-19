@@ -1,0 +1,138 @@
+From 50a498c8baed284455eca283d3852ccaa1d4ce2e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Thu, 9 Feb 2017 11:01:35 +0100
+Subject: x86/iommu: add IOMMU entries for p2m_mmio_direct pages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There's nothing wrong with allowing the domain to perform DMA transfers to
+MMIO areas that it already can access from the CPU, and this allows us to
+remove the hack in set_identity_p2m_entry for PVH Dom0.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: George Dunlap <george.dunlap@citrix.com>
+
+diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
+index 72ff85a..ef93404 100644
+--- a/xen/arch/x86/mm/p2m-ept.c
++++ b/xen/arch/x86/mm/p2m-ept.c
+@@ -672,7 +672,7 @@ ept_set_entry(struct p2m_domain *p2m, unsigned long gfn, mfn_t mfn,
+     uint8_t ipat = 0;
+     bool_t need_modify_vtd_table = 1;
+     bool_t vtd_pte_present = 0;
+-    unsigned int iommu_flags = p2m_get_iommu_flags(p2mt);
++    unsigned int iommu_flags = p2m_get_iommu_flags(p2mt, mfn);
+     bool_t needs_sync = 1;
+     ept_entry_t old_entry = { .epte = 0 };
+     ept_entry_t new_entry = { .epte = 0 };
+@@ -798,7 +798,8 @@ ept_set_entry(struct p2m_domain *p2m, unsigned long gfn, mfn_t mfn,
+ 
+         /* Safe to read-then-write because we hold the p2m lock */
+         if ( ept_entry->mfn == new_entry.mfn &&
+-             p2m_get_iommu_flags(ept_entry->sa_p2mt) == iommu_flags )
++             p2m_get_iommu_flags(ept_entry->sa_p2mt, _mfn(ept_entry->mfn)) ==
++             iommu_flags )
+             need_modify_vtd_table = 0;
+ 
+         ept_p2m_type_to_flags(p2m, &new_entry, p2mt, p2ma);
+diff --git a/xen/arch/x86/mm/p2m-pt.c b/xen/arch/x86/mm/p2m-pt.c
+index 3b025d5..a23d0bd 100644
+--- a/xen/arch/x86/mm/p2m-pt.c
++++ b/xen/arch/x86/mm/p2m-pt.c
+@@ -499,7 +499,7 @@ p2m_pt_set_entry(struct p2m_domain *p2m, unsigned long gfn, mfn_t mfn,
+     l2_pgentry_t l2e_content;
+     l3_pgentry_t l3e_content;
+     int rc;
+-    unsigned int iommu_pte_flags = p2m_get_iommu_flags(p2mt);
++    unsigned int iommu_pte_flags = p2m_get_iommu_flags(p2mt, mfn);
+     /*
+      * old_mfn and iommu_old_flags control possible flush/update needs on the
+      * IOMMU: We need to flush when MFN or flags (i.e. permissions) change.
+@@ -565,9 +565,10 @@ p2m_pt_set_entry(struct p2m_domain *p2m, unsigned long gfn, mfn_t mfn,
+         {
+             if ( flags & _PAGE_PSE )
+             {
+-                iommu_old_flags =
+-                    p2m_get_iommu_flags(p2m_flags_to_type(flags));
+                 old_mfn = l1e_get_pfn(*p2m_entry);
++                iommu_old_flags =
++                    p2m_get_iommu_flags(p2m_flags_to_type(flags),
++                                        _mfn(old_mfn));
+             }
+             else
+             {
+@@ -609,9 +610,10 @@ p2m_pt_set_entry(struct p2m_domain *p2m, unsigned long gfn, mfn_t mfn,
+         p2m_entry = p2m_find_entry(table, &gfn_remainder, gfn,
+                                    0, L1_PAGETABLE_ENTRIES);
+         ASSERT(p2m_entry);
+-        iommu_old_flags =
+-            p2m_get_iommu_flags(p2m_flags_to_type(l1e_get_flags(*p2m_entry)));
+         old_mfn = l1e_get_pfn(*p2m_entry);
++        iommu_old_flags =
++            p2m_get_iommu_flags(p2m_flags_to_type(l1e_get_flags(*p2m_entry)),
++                                _mfn(old_mfn));
+ 
+         if ( mfn_valid(mfn) || p2m_allows_invalid_mfn(p2mt) )
+             entry_content = p2m_l1e_from_pfn(mfn_x(mfn),
+@@ -637,9 +639,10 @@ p2m_pt_set_entry(struct p2m_domain *p2m, unsigned long gfn, mfn_t mfn,
+         {
+             if ( flags & _PAGE_PSE )
+             {
+-                iommu_old_flags =
+-                    p2m_get_iommu_flags(p2m_flags_to_type(flags));
+                 old_mfn = l1e_get_pfn(*p2m_entry);
++                iommu_old_flags =
++                    p2m_get_iommu_flags(p2m_flags_to_type(flags),
++                                        _mfn(old_mfn));
+             }
+             else
+             {
+diff --git a/xen/arch/x86/mm/p2m.c b/xen/arch/x86/mm/p2m.c
+index c0bab4a..874fae9 100644
+--- a/xen/arch/x86/mm/p2m.c
++++ b/xen/arch/x86/mm/p2m.c
+@@ -1053,16 +1053,7 @@ int set_identity_p2m_entry(struct domain *d, unsigned long gfn,
+         ret = p2m_set_entry(p2m, gfn, _mfn(gfn), PAGE_ORDER_4K,
+                             p2m_mmio_direct, p2ma);
+     else if ( mfn_x(mfn) == gfn && p2mt == p2m_mmio_direct && a == p2ma )
+-    {
+         ret = 0;
+-        /*
+-         * PVH fixme: during Dom0 PVH construction, p2m entries are being set
+-         * but iomem regions are not mapped with IOMMU. This makes sure that
+-         * RMRRs are correctly mapped with IOMMU.
+-         */
+-        if ( is_hardware_domain(d) && !iommu_use_hap_pt(d) )
+-            ret = iommu_map_page(d, gfn, gfn, IOMMUF_readable|IOMMUF_writable);
+-    }
+     else
+     {
+         if ( flag & XEN_DOMCTL_DEV_RDM_RELAXED )
+diff --git a/xen/include/asm-x86/p2m.h b/xen/include/asm-x86/p2m.h
+index f720f83..173a6f8 100644
+--- a/xen/include/asm-x86/p2m.h
++++ b/xen/include/asm-x86/p2m.h
+@@ -799,7 +799,7 @@ void p2m_altp2m_propagate_change(struct domain *d, gfn_t gfn,
+ /*
+  * p2m type to IOMMU flags
+  */
+-static inline unsigned int p2m_get_iommu_flags(p2m_type_t p2mt)
++static inline unsigned int p2m_get_iommu_flags(p2m_type_t p2mt, mfn_t mfn)
+ {
+     unsigned int flags;
+ 
+@@ -815,6 +815,10 @@ static inline unsigned int p2m_get_iommu_flags(p2m_type_t p2mt)
+     case p2m_grant_map_ro:
+         flags = IOMMUF_readable;
+         break;
++    case p2m_mmio_direct:
++        flags = IOMMUF_readable;
++        if ( !rangeset_contains_singleton(mmio_ro_ranges, mfn_x(mfn)) )
++            flags |= IOMMUF_writable;
+     default:
+         flags = 0;
+         break;
