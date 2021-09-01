@@ -1,0 +1,55 @@
+From e93d2786725aa6d2a8211ba47af2f2b0504cd750 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 20 Apr 2021 12:12:58 +0200
+Subject: VT-d: leave FECTL write to vtd_resume()
+
+We shouldn't blindly unmask the interrupt when resuming. vtd_resume()
+will restore the intended state.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+master commit: 0d597e7bd1bd8a57619690d457f79769777a5834
+master date: 2021-03-30 14:39:23 +0200
+
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index a328239375..abbeb13988 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -2109,7 +2109,7 @@ static int adjust_vtd_irq_affinities(void)
+ }
+ __initcall(adjust_vtd_irq_affinities);
+ 
+-static int __must_check init_vtd_hw(void)
++static int __must_check init_vtd_hw(bool resume)
+ {
+     struct acpi_drhd_unit *drhd;
+     struct vtd_iommu *iommu;
+@@ -2138,6 +2138,10 @@ static int __must_check init_vtd_hw(void)
+             disable_qinval(iommu);
+         }
+ 
++        if ( resume )
++            /* FECTL write done by vtd_resume(). */
++            continue;
++
+         spin_lock_irqsave(&iommu->register_lock, flags);
+         sts = dmar_readl(iommu->reg, DMAR_FECTL_REG);
+         sts &= ~DMA_FECTL_IM;
+@@ -2329,7 +2333,7 @@ static int __init vtd_setup(void)
+     P(iommu_hap_pt_share, "Shared EPT tables");
+ #undef P
+ 
+-    ret = init_vtd_hw();
++    ret = init_vtd_hw(false);
+     if ( ret )
+         goto error;
+ 
+@@ -2596,7 +2600,7 @@ static void vtd_resume(void)
+     if ( !iommu_enabled )
+         return;
+ 
+-    if ( init_vtd_hw() != 0  && force_iommu )
++    if ( init_vtd_hw(true) != 0 && force_iommu )
+          panic("IOMMU setup failed, crash Xen for security purpose\n");
+ 
+     for_each_drhd_unit ( drhd )

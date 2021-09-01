@@ -1,0 +1,128 @@
+From 93c9edbef51b31056f93a37a778326c90a83158c Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 15 Jun 2021 16:02:29 +0100
+Subject: tests/xenstore: Rework Makefile
+
+In particular, fill in the install/uninstall rules so this test can be
+packaged to be automated sensibly.
+
+This causes the code to be noticed by CI, which objects as follows:
+
+  test-xenstore.c: In function 'main':
+  test-xenstore.c:486:5: error: ignoring return value of 'asprintf', declared
+  with attribute warn_unused_result [-Werror=unused-result]
+       asprintf(&path, "%s/%u", TEST_PATH, getpid());
+       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Address the CI failure by checking the asprintf() return value and exiting.
+
+Rename xs-test to test-xenstore to be consistent with other tests.  Honour
+APPEND_FLAGS too.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/.gitignore b/.gitignore
+index f4a4c697f677..bd1f07d4e119 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -238,7 +238,6 @@ tools/tests/x86_emulator/test_x86_emulator
+ tools/tests/x86_emulator/x86_emulate
+ tools/tests/x86_emulator/xop*.[ch]
+ tools/tests/xen-access/xen-access
+-tools/tests/xenstore/xs-test
+ tools/tests/regression/installed/*
+ tools/tests/regression/build/*
+ tools/tests/regression/downloads/*
+diff --git a/tools/tests/xenstore/.gitignore b/tools/tests/xenstore/.gitignore
+new file mode 100644
+index 000000000000..4b44f5dd608a
+--- /dev/null
++++ b/tools/tests/xenstore/.gitignore
+@@ -0,0 +1 @@
++test-xenstore
+diff --git a/tools/tests/xenstore/Makefile b/tools/tests/xenstore/Makefile
+index a367d88803ae..b9969dd09005 100644
+--- a/tools/tests/xenstore/Makefile
++++ b/tools/tests/xenstore/Makefile
+@@ -1,11 +1,7 @@
+ XEN_ROOT=$(CURDIR)/../../..
+ include $(XEN_ROOT)/tools/Rules.mk
+ 
+-CFLAGS += -Werror
+-
+-CFLAGS += $(CFLAGS_libxenstore)
+-
+-TARGETS-y := xs-test
++TARGETS-y := test-xenstore
+ TARGETS := $(TARGETS-y)
+ 
+ .PHONY: all
+@@ -16,14 +12,31 @@ build: $(TARGETS)
+ 
+ .PHONY: clean
+ clean:
+-	$(RM) *.o $(TARGETS) *~ $(DEPS_RM)
++	$(RM) -- *.o $(TARGETS) $(DEPS_RM)
+ 
+ .PHONY: distclean
+ distclean: clean
++	$(RM) -- *~
++
++.PHONY: install
++install: all
++	$(INSTALL_DIR) $(DESTDIR)$(LIBEXEC_BIN)
++	$(if $(TARGETS),$(INSTALL_PROG) $(TARGETS) $(DESTDIR)$(LIBEXEC_BIN))
++
++.PHONY: uninstall
++uninstall:
++	$(RM) -- $(addprefix $(DESTDIR)$(LIBEXEC_BIN)/,$(TARGETS))
++
++CFLAGS += -Werror
++CFLAGS += $(CFLAGS_libxenstore)
++CFLAGS += $(APPEND_CFLAGS)
++
++LDFLAGS += $(LDLIBS_libxenstore)
++LDFLAGS += $(APPEND_LDFLAGS)
+ 
+-xs-test: xs-test.o Makefile
+-	$(CC) -o $@ $< $(LDFLAGS) $(LDLIBS_libxenstore)
++%.o: Makefile
+ 
+-install uninstall:
++test-xenstore: test-xenstore.o
++	$(CC) -o $@ $< $(LDFLAGS)
+ 
+ -include $(DEPS_INCLUDE)
+diff --git a/tools/tests/xenstore/xs-test.c b/tools/tests/xenstore/test-xenstore.c
+similarity index 98%
+rename from tools/tests/xenstore/xs-test.c
+rename to tools/tests/xenstore/test-xenstore.c
+index c4c99c06617b..d3574b3fa270 100644
+--- a/tools/tests/xenstore/xs-test.c
++++ b/tools/tests/xenstore/test-xenstore.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #define _GNU_SOURCE
++#include <err.h>
+ #include <getopt.h>
+ #include <inttypes.h>
+ #include <stdbool.h>
+@@ -483,11 +484,14 @@ int main(int argc, char *argv[])
+         return 0;
+     }
+ 
+-    asprintf(&path, "%s/%u", TEST_PATH, getpid());
++    if ( asprintf(&path, "%s/%u", TEST_PATH, getpid()) < 0 )
++        err(2, "asprintf() malloc failure\n");
++
+     for ( t = 0; t < WRITE_BUFFERS_N; t++ )
+     {
+         memset(write_buffers[t], 'a' + t, WRITE_BUFFERS_SIZE);
+-        asprintf(&paths[t], "%s/%c", path, 'a' + t);
++        if ( asprintf(&paths[t], "%s/%c", path, 'a' + t) < 0 )
++            err(2, "asprintf() malloc failure\n");
+     }
+ 
+     xsh = xs_open(0);

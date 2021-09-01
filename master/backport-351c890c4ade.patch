@@ -1,0 +1,63 @@
+From 351c890c4ade59b52dd4822a2d5176fe435d21ed Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 15 Jul 2021 09:43:38 +0200
+Subject: IOMMU/PCI: don't let domain cleanup continue when device
+ de-assignment failed
+
+Failure here could in principle mean the device may still be issuing DMA
+requests, which would continue to be translated by the page tables the
+device entry currently points at. With this we cannot allow the
+subsequent cleanup step of freeing the page tables to occur, to prevent
+use-after-free issues. We would need to accept, for the time being, that
+in such a case the remaining domain resources will all be leaked, and
+the domain will continue to exist as a zombie.
+
+However, with flushes no longer timing out (and with proper timeout
+detection for device I/O TLB flushing yet to be implemented), there's no
+way anymore for failures to occur, except due to bugs elsewhere. Hence
+the change here is merely a "just in case" one.
+
+In order to continue the loop in spite of an error, we can't use
+pci_get_pdev_by_domain() anymore. I have no idea why it was used here in
+the first place, instead of the cheaper list iteration.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Paul Durrant <paul@xen.org>
+master commit: f591755823a7e94fc6b4b8ddce71f0421a94fa09
+master date: 2021-06-25 14:06:55 +0200
+
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index 4385a67..3251035 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -968,7 +968,7 @@ static int deassign_device(struct domain *d, uint16_t seg, uint8_t bus,
+ 
+ int pci_release_devices(struct domain *d)
+ {
+-    struct pci_dev *pdev;
++    struct pci_dev *pdev, *tmp;
+     u8 bus, devfn;
+     int ret;
+ 
+@@ -979,18 +979,15 @@ int pci_release_devices(struct domain *d)
+         pcidevs_unlock();
+         return ret;
+     }
+-    while ( (pdev = pci_get_pdev_by_domain(d, -1, -1, -1)) )
++    list_for_each_entry_safe ( pdev, tmp, &d->pdev_list, domain_list )
+     {
+         bus = pdev->bus;
+         devfn = pdev->devfn;
+-        if ( deassign_device(d, pdev->seg, bus, devfn) )
+-            printk("domain %d: deassign device (%04x:%02x:%02x.%u) failed!\n",
+-                   d->domain_id, pdev->seg, bus,
+-                   PCI_SLOT(devfn), PCI_FUNC(devfn));
++        ret = deassign_device(d, pdev->seg, bus, devfn) ?: ret;
+     }
+     pcidevs_unlock();
+ 
+-    return 0;
++    return ret;
+ }
+ 
+ #define PCI_CLASS_BRIDGE_HOST    0x0600

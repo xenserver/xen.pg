@@ -1,4 +1,4 @@
-From 9fdcf851689cb2a9501d3947cb5d767d9c7797e8 Mon Sep 17 00:00:00 2001
+From 1a3e023805c429473893ac683ff833372160be3f Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 20 May 2021 19:16:11 +0100
 Subject: x86/tsx: Deprecate vpmu=rtm-abort and use tsx=<bool> instead
@@ -15,12 +15,13 @@ centralises all TSX handling.
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Acked-by: Jan Beulich <jbeulich@suse.com>
 Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+(cherry picked from commit 9fdcf851689cb2a9501d3947cb5d767d9c7797e8)
 
 diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
-index 99cacbc..e90e548 100644
+index cf9dea62db..43ee82139f 100644
 --- a/docs/misc/xen-command-line.pandoc
 +++ b/docs/misc/xen-command-line.pandoc
-@@ -2142,14 +2142,21 @@ pages) must also be specified via the tbuf_size parameter.
+@@ -2168,14 +2168,21 @@ pages) must also be specified via the tbuf_size parameter.
  
  Controls for the use of Transactional Synchronization eXtensions.
  
@@ -48,7 +49,7 @@ index 99cacbc..e90e548 100644
  
   * An explicit `tsx=` choice is honoured, even if it is `true` and would
     result in a vulnerable system.
-@@ -2157,10 +2164,14 @@ logic applies:
+@@ -2183,10 +2190,14 @@ logic applies:
   * When no explicit `tsx=` choice is given, parts vulnerable to TAA will be
     mitigated by disabling TSX, as this is the lowest overhead option.
  
@@ -64,7 +65,7 @@ index 99cacbc..e90e548 100644
  ### ucode (x86)
  > `= List of [ <integer> | scan=<bool>, nmi=<bool> ]`
  
-@@ -2290,20 +2301,7 @@ provide access to a wealth of low level processor information.
+@@ -2316,20 +2327,7 @@ provide access to a wealth of low level processor information.
  
  *   The `arch` option allows access to the pre-defined architectural events.
  
@@ -87,21 +88,21 @@ index 99cacbc..e90e548 100644
  *Warning:*
  As the virtualisation is not 100% safe, don't use the vpmu flag on
 diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
-index 5585487..92778b7 100644
+index 856de244ce..d831c10de4 100644
 --- a/xen/arch/x86/cpu/intel.c
 +++ b/xen/arch/x86/cpu/intel.c
-@@ -354,9 +354,6 @@ static void Intel_errata_workarounds(struct cpuinfo_x86 *c)
+@@ -356,9 +356,6 @@ static void Intel_errata_workarounds(struct cpuinfo_x86 *c)
  	    (c->x86_model == 29 || c->x86_model == 46 || c->x86_model == 47))
  		__set_bit(X86_FEATURE_CLFLUSH_MONITOR, c->x86_capability);
  
 -	if (cpu_has_tsx_force_abort && opt_rtm_abort)
 -		wrmsrl(MSR_TSX_FORCE_ABORT, TSX_FORCE_ABORT_RTM);
 -
- 	nehalem_cpu_cstate_workaround(c);
+ 	probe_c3_errata(c);
  }
  
 diff --git a/xen/arch/x86/cpu/vpmu.c b/xen/arch/x86/cpu/vpmu.c
-index 83c2a24..3769fbc 100644
+index 83c2a2497c..3769fbcf4e 100644
 --- a/xen/arch/x86/cpu/vpmu.c
 +++ b/xen/arch/x86/cpu/vpmu.c
 @@ -45,7 +45,6 @@ CHECK_pmu_params;
@@ -123,7 +124,7 @@ index 83c2a24..3769fbc 100644
              rc = -EINVAL;
  
 diff --git a/xen/arch/x86/tsx.c b/xen/arch/x86/tsx.c
-index 083b0a2..d9503c3 100644
+index d4b88c98e5..6aded641bc 100644
 --- a/xen/arch/x86/tsx.c
 +++ b/xen/arch/x86/tsx.c
 @@ -5,7 +5,9 @@
@@ -137,11 +138,10 @@ index 083b0a2..d9503c3 100644
   *  -3 => Implicit tsx=1 (feed-through from spec-ctrl=0)
   *
   * This is arranged such that the bottom bit encodes whether TSX is actually
-@@ -47,8 +49,34 @@ void tsx_init(void)
-             rdmsrl(MSR_ARCH_CAPABILITIES, caps);
+@@ -49,6 +51,26 @@ void tsx_init(void)
  
          cpu_has_tsx_ctrl = !!(caps & ARCH_CAPS_TSX_CTRL);
-+
+ 
 +        if ( cpu_has_tsx_force_abort )
 +        {
 +            /*
@@ -161,6 +161,12 @@ index 083b0a2..d9503c3 100644
 +            if ( opt_tsx < 0 )
 +                opt_tsx = 1;
 +        }
++
+         /*
+          * The TSX features (HLE/RTM) are handled specially.  They both
+          * enumerate features but, on certain parts, have mechanisms to be
+@@ -74,6 +96,12 @@ void tsx_init(void)
+         }
      }
  
 +    /*
@@ -172,7 +178,7 @@ index 083b0a2..d9503c3 100644
      if ( cpu_has_tsx_ctrl )
      {
          uint32_t hi, lo;
-@@ -62,9 +90,26 @@ void tsx_init(void)
+@@ -89,9 +117,28 @@ void tsx_init(void)
  
          wrmsr(MSR_TSX_CTRL, lo, hi);
      }
@@ -186,9 +192,11 @@ index 083b0a2..d9503c3 100644
 +
 +        rdmsr(MSR_TSX_FORCE_ABORT, lo, hi);
 +
-+        lo &= ~TSX_FORCE_ABORT_RTM;
 +        /* Check bottom bit only.  Higher bits are various sentinels. */
-+        if ( !(opt_tsx & 1) )
++        rtm_disabled = !(opt_tsx & 1);
++
++        lo &= ~TSX_FORCE_ABORT_RTM;
++        if ( rtm_disabled )
 +            lo |= TSX_FORCE_ABORT_RTM;
 +
 +        wrmsr(MSR_TSX_FORCE_ABORT, lo, hi);
@@ -201,7 +209,7 @@ index 083b0a2..d9503c3 100644
  
  /*
 diff --git a/xen/include/asm-x86/vpmu.h b/xen/include/asm-x86/vpmu.h
-index 55f85ba..4b0a6ba 100644
+index 55f85ba00f..4b0a6ba3da 100644
 --- a/xen/include/asm-x86/vpmu.h
 +++ b/xen/include/asm-x86/vpmu.h
 @@ -126,7 +126,6 @@ static inline int vpmu_do_rdmsr(unsigned int msr, uint64_t *msr_content)

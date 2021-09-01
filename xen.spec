@@ -1,7 +1,5 @@
 # -*- rpm-spec -*-
 
-%{!?python_sitearch: %define python_sitearch %(%{__python} -c "from distutils.sysconfig import get_python_lib; print get_python_lib(1)")}
-
 %define with_sysv 0
 %define with_systemd 1
 
@@ -9,26 +7,16 @@
 %define default_debug_hypervisor 0
 
 %define COMMON_OPTIONS DESTDIR=%{buildroot} %{?_smp_mflags}
-
-# For 32bit dom0 userspace, we need to cross compile a 64bit Xen
-%ifarch %ix86
-%define HVSOR_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 CROSS_COMPILE=x86_64-linux-gnu-
-%define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_32 debug=n
-%endif
-
-# For 64bit
-%ifarch x86_64
 %define HVSOR_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64
 %define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 debug=n
-%endif
 
 %define base_cset RELEASE-%{version}
 %define base_dir  %{name}-%{version}
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.13.1
-Release: 9.12
+Version: 4.13.3
+Release: 9.15
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
@@ -37,15 +25,23 @@ Source2: xl.conf
 Source3: logrotate-xen-tools
 Source4: https://repo.citrite.net/list/ctx-local-contrib/citrix/branding/Citrix_Logo_Black.png
 
-ExclusiveArch: i686 x86_64
+ExclusiveArch: x86_64
 
-#Cross complier
-%ifarch %ix86
-BuildRequires: gcc-x86_64-linux-gnu binutils-x86_64-linux-gnu
+## Pull in the correct RPM macros for the distributon
+## (Any fedora which is still in support uses python3)
+%if 0%{?centos} > 7 || 0%{?rhel} > 7 || 0%{?fedora} > 0
+BuildRequires: python3-devel
+BuildRequires: python3-rpm-macros
+%global py_sitearch %{python3_sitearch}
+%global __python %{__python3}
+%else
+BuildRequires: python2-devel
+BuildRequires: python2-rpm-macros
+%global py_sitearch %{python2_sitearch}
+%global __python %{__python2}
 %endif
 
 # For HVMLoader and 16/32bit firmware
-BuildRequires: /usr/include/gnu/stubs-32.h
 BuildRequires: dev86 iasl
 
 # For the domain builder (decompression and hashing)
@@ -54,9 +50,6 @@ BuildRequires: openssl-devel
 
 # For libxl
 BuildRequires: yajl-devel libuuid-devel perl
-
-# For python stubs
-BuildRequires: python-devel
 
 # For ocaml stubs
 BuildRequires: ocaml ocaml-findlib
@@ -77,16 +70,13 @@ BuildRequires: lzo-devel
 BuildRequires: json-c-devel libempserver-devel
 
 # For manpages
-BuildRequires: perl pandoc
+BuildRequires: perl-podlators
 
 # Misc
 BuildRequires: libtool
 %if %with_systemd
 BuildRequires: systemd-devel
 %endif
-
-# To placate ./configure
-BuildRequires: gettext-devel glib2-devel curl-devel gnutls-devel
 
 # Need cov-analysis if coverity is enabled
 %{?_cov_buildrequires}
@@ -149,7 +139,6 @@ Requires: ipxe
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
-BuildRequires: systemd
 %endif
 Group: System/Base
 %description dom0-tools
@@ -194,6 +183,12 @@ Group: System Environment/Base
 %description installer-files
 This package contains the minimal subset of libraries and binaries required in
 the XenServer installer environment.
+
+%package dom0-tests
+Summary: Xen Hypervisor tests
+Group: System/Libraries
+%description dom0-tests
+This package contains test cases for the Xen Hypervisor.
 
 %prep
 %autosetup -p1
@@ -284,7 +279,6 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 # Build tools and man pages
 %{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} install-tools
 %{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
-%{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/tests/mce-test/tools install
 
 %{__install} -D -m 644 %{SOURCE1} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
 %{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/xen/xl.conf
@@ -317,9 +311,9 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_bindir}/xenstore-rm
 %{_bindir}/xenstore-watch
 %{_bindir}/xenstore-write
-%{python_sitearch}/%{name}/__init__.py*
-%{python_sitearch}/%{name}/lowlevel/__init__.py*
-%{python_sitearch}/%{name}/lowlevel/xs.so
+%{py_sitearch}/%{name}/__init__.py*
+%{py_sitearch}/%{name}/lowlevel/__init__.py*
+%{py_sitearch}/%{name}/lowlevel/xs.so
 
 %files devel
 %{_includedir}/%{name}/COPYING
@@ -414,6 +408,8 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenstore.so.3.0.3
 %{_libdir}/libxentoolcore.so.1
 %{_libdir}/libxentoolcore.so.1.0
+%{_libdir}/libxentoollog.so.1
+%{_libdir}/libxentoollog.so.1.0
 %{_libdir}/libxenvchan.so.4.13
 %{_libdir}/libxenvchan.so.4.13.0
 
@@ -446,6 +442,11 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxentoolcore.a
 %{_libdir}/libxentoolcore.so
 %{_libdir}/pkgconfig/xentoolcore.pc
+
+%{_includedir}/xentoollog.h
+%{_libdir}/libxentoollog.a
+%{_libdir}/libxentoollog.so
+%{_libdir}/pkgconfig/xentoollog.pc
 
 # Lib Xen Vchan
 %{_includedir}/libxenvchan.h
@@ -505,24 +506,24 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_bindir}/xencons
 %{_bindir}/xencov_split
 %{_bindir}/xentrace_format
-%{python_sitearch}/xenfsimage.so
-%{python_sitearch}/grub/ExtLinuxConf.py*
-%{python_sitearch}/grub/GrubConf.py*
-%{python_sitearch}/grub/LiloConf.py*
-%{python_sitearch}/grub/__init__.py*
-%{python_sitearch}/pygrub-*.egg-info
-%{python_sitearch}/xen-*.egg-info
-#{python_sitearch}/xen/__init__.py*           - Must not duplicate xen-tools
-#{python_sitearch}/xen/lowlevel/__init__.py*  - Must not duplicate xen-tools
-%{python_sitearch}/xen/lowlevel/xc.so
-%{python_sitearch}/xen/migration/__init__.py*
-%{python_sitearch}/xen/migration/legacy.py*
-%{python_sitearch}/xen/migration/libxc.py*
-%{python_sitearch}/xen/migration/libxl.py*
-%{python_sitearch}/xen/migration/public.py*
-%{python_sitearch}/xen/migration/tests.py*
-%{python_sitearch}/xen/migration/verify.py*
-%{python_sitearch}/xen/migration/xl.py*
+%{py_sitearch}/xenfsimage.so
+%{py_sitearch}/grub/ExtLinuxConf.py*
+%{py_sitearch}/grub/GrubConf.py*
+%{py_sitearch}/grub/LiloConf.py*
+%{py_sitearch}/grub/__init__.py*
+%{py_sitearch}/pygrub-*.egg-info
+%{py_sitearch}/xen-*.egg-info
+#{py_sitearch}/xen/__init__.py*           - Must not duplicate xen-tools
+#{py_sitearch}/xen/lowlevel/__init__.py*  - Must not duplicate xen-tools
+%{py_sitearch}/xen/lowlevel/xc.so
+%{py_sitearch}/xen/migration/__init__.py*
+%{py_sitearch}/xen/migration/legacy.py*
+%{py_sitearch}/xen/migration/libxc.py*
+%{py_sitearch}/xen/migration/libxl.py*
+%{py_sitearch}/xen/migration/public.py*
+%{py_sitearch}/xen/migration/tests.py*
+%{py_sitearch}/xen/migration/verify.py*
+%{py_sitearch}/xen/migration/xl.py*
 %{_libexecdir}/%{name}/bin/convert-legacy-stream
 %{_libexecdir}/%{name}/bin/init-xenstore-domain
 %{_libexecdir}/%{name}/bin/libxl-save-helper
@@ -592,7 +593,6 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_mandir}/man7/xen-pci-device-reservations.7.gz
 %{_mandir}/man7/xen-pv-channel.7.gz
 %{_mandir}/man7/xen-tscmode.7.gz
-%{_mandir}/man7/xen-vbd-interface.7.gz
 %{_mandir}/man7/xl-numa-placement.7.gz
 %exclude %{_mandir}/man7/xen-vtpm.7.gz
 %exclude %{_mandir}/man7/xen-vtpmmgr.7.gz
@@ -629,8 +629,6 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenlight.so.4.13.0
 %{_libdir}/libxenstat.so.4.13
 %{_libdir}/libxenstat.so.4.13.0
-%{_libdir}/libxentoollog.so.1
-%{_libdir}/libxentoollog.so.1.0
 %{_libdir}/libxlutil.so.4.13
 %{_libdir}/libxlutil.so.4.13.0
 %{_libdir}/xenfsimage/btrfs/fsimage.so
@@ -673,11 +671,6 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenguest.a
 %{_libdir}/libxenguest.so
 %{_libdir}/pkgconfig/xenguest.pc
-
-%{_includedir}/xentoollog.h
-%{_libdir}/libxentoollog.a
-%{_libdir}/libxentoollog.so
-%{_libdir}/pkgconfig/xentoollog.pc
 
 %{_includedir}/_libxl_list.h
 %{_includedir}/_libxl_types.h
@@ -771,9 +764,14 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenctrl.so.4.13.0
 %{_libdir}/libxenguest.so.4.13
 %{_libdir}/libxenguest.so.4.13.0
-%{python_sitearch}/xen/__init__.py*
-%{python_sitearch}/xen/lowlevel/__init__.py*
-%{python_sitearch}/xen/lowlevel/xc.so
+%{py_sitearch}/xen/__init__.py*
+%{py_sitearch}/xen/lowlevel/__init__.py*
+%{py_sitearch}/xen/lowlevel/xc.so
+
+%files dom0-tests
+%{_libexecdir}/%{name}/bin/depriv-fd-checker
+%{_libexecdir}/%{name}/bin/test-cpu-policy
+%{_libexecdir}/%{name}/bin/test-xenstore
 
 %doc
 

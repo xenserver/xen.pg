@@ -1,0 +1,98 @@
+From f17d848c4caa4fa562f3121c430667b6df838700 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 4 Jun 2021 15:04:56 +0200
+Subject: x86/cpuid: Rework HLE and RTM handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The TAA mitigation offered the option to hide the HLE and RTM CPUID bits,
+which has caused some migration compatibility problems.
+
+These two bits are special.  Annotate them with ! to emphasise this point.
+
+Hardware Lock Elision (HLE) may or may not be visible in CPUID, but is
+disabled in microcode on all CPUs, and has been removed from the architecture.
+Do not advertise it to VMs by default.
+
+Restricted Transactional Memory (RTM) may or may not be visible in CPUID, and
+may or may not be configured in force-abort mode.  Have tsx_init() note
+whether RTM has been configured into force-abort mode, so
+guest_common_feature_adjustments() can conditionally hide it from VMs by
+default.
+
+The host policy values for HLE/RTM may or may not be set, depending on any
+previous running kernel's choice of visibility, and Xen's choice.  TSX is
+available on any CPU which enumerates a TSX-hiding mechanism, so instead of
+doing a two-step to clobber any hiding, scan CPUID, then set the visibility,
+just force visibility of the bits in the first place.
+
+With the HLE/RTM bits now unilaterally visible in the host policy,
+xc_cpuid_apply_policy() can construct a more appropriate policy out of thin
+air for pre-4.13 VMs with no CPUID data in their migration stream, and
+specifically one where HLE/RTM doesn't potentially disappear behind the back
+of a running VM.
+
+Fixes: 8c4330818f6 ("x86/spec-ctrl: Mitigate the TSX Asynchronous Abort sidechannel")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+master commit: 8fe24090d940d760145ccd5e234290be7418b175
+master date: 2021-05-27 19:34:00 +0100
+
+diff --git a/xen/arch/x86/tsx.c b/xen/arch/x86/tsx.c
+index 2d202a0d4e..a5d5944fe8 100644
+--- a/xen/arch/x86/tsx.c
++++ b/xen/arch/x86/tsx.c
+@@ -44,6 +44,30 @@ void tsx_init(void)
+             rdmsrl(MSR_ARCH_CAPABILITIES, caps);
+ 
+         cpu_has_tsx_ctrl = !!(caps & ARCH_CAPS_TSX_CTRL);
++
++        /*
++         * The TSX features (HLE/RTM) are handled specially.  They both
++         * enumerate features but, on certain parts, have mechanisms to be
++         * hidden without disrupting running software.
++         *
++         * At the moment, we're running in an unknown context (WRT hiding -
++         * particularly if another fully fledged kernel ran before us) and
++         * depending on user settings, may elect to continue hiding them from
++         * native CPUID instructions.
++         *
++         * Xen doesn't use TSX itself, but use cpu_has_{hle,rtm} for various
++         * system reasons, mostly errata detection, so the meaning is more
++         * useful as "TSX infrastructure available", as opposed to "features
++         * advertised and working".
++         *
++         * Force the features to be visible in Xen's view if we see any of the
++         * infrastructure capable of hiding them.
++         */
++        if ( cpu_has_tsx_ctrl )
++        {
++            setup_force_cpu_cap(X86_FEATURE_HLE);
++            setup_force_cpu_cap(X86_FEATURE_RTM);
++        }
+     }
+ 
+     if ( cpu_has_tsx_ctrl )
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index 3162ee0378..a1d1619643 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -195,14 +195,14 @@ XEN_CPUFEATURE(FSGSBASE,      5*32+ 0) /*A  {RD,WR}{FS,GS}BASE instructions */
+ XEN_CPUFEATURE(TSC_ADJUST,    5*32+ 1) /*S  TSC_ADJUST MSR available */
+ XEN_CPUFEATURE(SGX,           5*32+ 2) /*   Software Guard extensions */
+ XEN_CPUFEATURE(BMI1,          5*32+ 3) /*A  1st bit manipulation extensions */
+-XEN_CPUFEATURE(HLE,           5*32+ 4) /*A  Hardware Lock Elision */
++XEN_CPUFEATURE(HLE,           5*32+ 4) /*!A Hardware Lock Elision */
+ XEN_CPUFEATURE(AVX2,          5*32+ 5) /*A  AVX2 instructions */
+ XEN_CPUFEATURE(FDP_EXCP_ONLY, 5*32+ 6) /*!  x87 FDP only updated on exception. */
+ XEN_CPUFEATURE(SMEP,          5*32+ 7) /*S  Supervisor Mode Execution Protection */
+ XEN_CPUFEATURE(BMI2,          5*32+ 8) /*A  2nd bit manipulation extensions */
+ XEN_CPUFEATURE(ERMS,          5*32+ 9) /*A  Enhanced REP MOVSB/STOSB */
+ XEN_CPUFEATURE(INVPCID,       5*32+10) /*H  Invalidate Process Context ID */
+-XEN_CPUFEATURE(RTM,           5*32+11) /*A  Restricted Transactional Memory */
++XEN_CPUFEATURE(RTM,           5*32+11) /*!A Restricted Transactional Memory */
+ XEN_CPUFEATURE(PQM,           5*32+12) /*   Platform QoS Monitoring */
+ XEN_CPUFEATURE(NO_FPU_SEL,    5*32+13) /*!  FPU CS/DS stored as zero */
+ XEN_CPUFEATURE(MPX,           5*32+14) /*S  Memory Protection Extensions */
