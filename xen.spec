@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.14
+%global hv_rel 10.15
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -846,6 +846,13 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed Sep 1 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.15
+- Fixes for XSA-378 CVE-2021-28694 CVE-2021-28695 CVE-2021-28696, XSA-379
+  CVE-2021-28697, XSA-380 CVE-2021-28698, XSA-382 CVE-2021-28699.
+- Retain visibility of HLE/RTM CPUID bits in guests when resuming on a client
+  part with TSX disabled.
+- Use production hypervisor by default, rather than the debug hypervisor.
+
 * Mon Aug 23 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.14
 - Disable 32bit PV guests by default.  They're not security supported at all
   and by disabling them, we can recover performance in the common case from
