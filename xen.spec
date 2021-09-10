@@ -1,11 +1,11 @@
 # -*- rpm-spec -*-
 
 # Commitish for Source0, required by tooling.
-%global package_srccommit RELEASE-4.13.3
+%global package_srccommit RELEASE-4.13.4
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.16
+%global hv_rel 1
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -29,7 +29,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.13.3
+Version: 4.13.4
 Release: %{?xsrel}%{?dist}
 License: Portions GPLv2 (See COPYING)
 URL:     http://www.xenproject.org
@@ -846,6 +846,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Sep 10 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-1
+- Update to RELEASE-4.13.4.
+
 * Wed Sep 8 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.16
 - Fix for XSA-384 CVE-2021-28701.
 - Bugfixes to XSA-378 fix.
