@@ -1,8 +1,8 @@
 diff --git a/.gitignore b/.gitignore
-index 3ada0c4f0b..d522fa4638 100644
+index bd1f07d4e119..d8bf6c2b4974 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -251,6 +251,9 @@ tools/xcutils/lsevtchn
+@@ -249,6 +249,9 @@ tools/xcutils/lsevtchn
  tools/xcutils/readnotes
  tools/xenbackendd/_paths.h
  tools/xenbackendd/xenbackendd
@@ -13,7 +13,7 @@ index 3ada0c4f0b..d522fa4638 100644
  tools/xenmon/xenbaked
  tools/xenpaging/xenpaging
 diff --git a/tools/Makefile b/tools/Makefile
-index 7b1f6c4d28..2a477c96ac 100644
+index 7b1f6c4d2868..2a477c96acca 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
 @@ -23,6 +23,7 @@ SUBDIRS-$(CONFIG_Linux) += memshr
@@ -26,7 +26,7 @@ index 7b1f6c4d28..2a477c96ac 100644
  ifneq "$(MAKECMDGOALS)" "distclean"
 diff --git a/tools/xenguest/Makefile b/tools/xenguest/Makefile
 new file mode 100644
-index 0000000000..a3e4ce15a0
+index 000000000000..a3e4ce15a002
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,45 @@
@@ -77,7 +77,7 @@ index 0000000000..a3e4ce15a0
 +-include $(DEPS)
 diff --git a/tools/xenguest/xenguest.c b/tools/xenguest/xenguest.c
 new file mode 100644
-index 0000000000..835d05eb88
+index 000000000000..835d05eb8882
 --- /dev/null
 +++ b/tools/xenguest/xenguest.c
 @@ -0,0 +1,751 @@
@@ -834,10 +834,10 @@ index 0000000000..835d05eb88
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 0000000000..73429232dc
+index 000000000000..1bfff4ec5aaf
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1772 @@
+@@ -0,0 +1,1761 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -1508,6 +1508,8 @@ index 0000000000..73429232dc
 +#define ACPI_INFO_PHYSICAL_ADDRESS 0xfc000000
 +#define LAPIC_BASE_ADDRESS         0xfee00000
 +
++#define ALIGN(p, a) (((p) + ((a) - 1)) & ~((a) - 1))
++
 +struct xenguest_acpi_ctxt {
 +    struct acpi_ctxt c;
 +
@@ -1515,10 +1517,10 @@ index 0000000000..73429232dc
 +    unsigned int page_shift;
 +
 +    /* Memory allocator */
-+    unsigned long alloc_base_paddr;
-+    unsigned long alloc_base_vaddr;
-+    unsigned long alloc_currp;
-+    unsigned long alloc_end;
++    unsigned long guest_start;
++    unsigned long guest_curr;
++    unsigned long guest_end;
++    void *buf;
 +};
 +
 +extern const unsigned char dsdt_pvh[];
@@ -1530,8 +1532,7 @@ index 0000000000..73429232dc
 +    struct xenguest_acpi_ctxt *xenguest_ctxt =
 +        CONTAINER_OF(ctxt, struct xenguest_acpi_ctxt, c);
 +
-+    return (((unsigned long)v - xenguest_ctxt->alloc_base_vaddr) +
-+            xenguest_ctxt->alloc_base_paddr);
++    return xenguest_ctxt->guest_start + (v - xenguest_ctxt->buf);
 +}
 +
 +static void *mem_alloc(struct acpi_ctxt *ctxt,
@@ -1545,20 +1546,16 @@ index 0000000000..73429232dc
 +    if ( align < 16 )
 +        align = 16;
 +
-+    s = (xenguest_ctxt->alloc_currp + align) & ~((unsigned long)align - 1);
++    s = ALIGN(xenguest_ctxt->guest_curr, align);
 +    e = s + size - 1;
 +
 +    /* TODO: Reallocate memory */
-+    if ( (e < s) || (e >= xenguest_ctxt->alloc_end) )
++    if ( (e < s) || (e >= xenguest_ctxt->guest_end) )
 +        return NULL;
 +
-+    while ( xenguest_ctxt->alloc_currp >> xenguest_ctxt->page_shift !=
-+            e >> xenguest_ctxt->page_shift )
-+        xenguest_ctxt->alloc_currp += xenguest_ctxt->page_size;
++    xenguest_ctxt->guest_curr = e;
 +
-+    xenguest_ctxt->alloc_currp = e;
-+
-+    return (void *)s;
++    return xenguest_ctxt->buf + (s - xenguest_ctxt->guest_start);
 +}
 +
 +static void acpi_mem_free(struct acpi_ctxt *ctxt,
@@ -1611,12 +1608,9 @@ index 0000000000..73429232dc
 +    struct acpi_config config = {0};
 +    struct xenguest_acpi_ctxt xenguest_ctxt;
 +    int rc = 0, acpi_pages_num;
-+    void *acpi_pages;
-+    unsigned long page_mask;
 +
 +    xenguest_ctxt.page_size = XC_DOM_PAGE_SIZE(dom);
 +    xenguest_ctxt.page_shift =  XC_DOM_PAGE_SHIFT(dom);
-+    page_mask = (1UL << xenguest_ctxt.page_shift) - 1;
 +
 +    xenguest_ctxt.c.mem_ops.alloc = mem_alloc;
 +    xenguest_ctxt.c.mem_ops.v2p = virt_to_phys;
@@ -1629,25 +1623,22 @@ index 0000000000..73429232dc
 +        goto out;
 +    }
 +
-+    config.rsdp = (unsigned long)xc_dom_malloc(dom, xenguest_ctxt.page_size);
-+    config.infop = (unsigned long)xc_dom_malloc(dom, xenguest_ctxt.page_size);
++    config.rsdp = (unsigned long)malloc(xenguest_ctxt.page_size);
++    config.infop = (unsigned long)malloc(xenguest_ctxt.page_size);
 +    /* Pages to hold ACPI tables */
-+    acpi_pages =  xc_dom_malloc(dom, (NUM_ACPI_PAGES + 1) *
-+                                xenguest_ctxt.page_size);
++    xenguest_ctxt.buf = malloc(NUM_ACPI_PAGES * xenguest_ctxt.page_size);
 +
-+    if ( !config.rsdp || !config.infop || !acpi_pages )
++    if ( !config.rsdp || !config.infop || !xenguest_ctxt.buf )
 +        return -ENOMEM;
 +
 +    /*
 +     * Set up allocator memory.
 +     * Start next to acpi_info page to avoid fracturing e820.
 +     */
-+    xenguest_ctxt.alloc_base_paddr = ACPI_INFO_PHYSICAL_ADDRESS +
-+        xenguest_ctxt.page_size;
-+    xenguest_ctxt.alloc_base_vaddr = xenguest_ctxt.alloc_currp =
-+        (unsigned long)acpi_pages;
-+    xenguest_ctxt.alloc_end = (unsigned long)acpi_pages +
-+        (NUM_ACPI_PAGES * xenguest_ctxt.page_size);
++    xenguest_ctxt.guest_start = xenguest_ctxt.guest_curr = xenguest_ctxt.guest_end =
++        ACPI_INFO_PHYSICAL_ADDRESS + xenguest_ctxt.page_size;
++
++    xenguest_ctxt.guest_end += NUM_ACPI_PAGES * xenguest_ctxt.page_size;
 +
 +    /* Build the tables. */
 +    rc = acpi_build_tables(&xenguest_ctxt.c, &config);
@@ -1658,10 +1649,8 @@ index 0000000000..73429232dc
 +    }
 +
 +    /* Calculate how many pages are needed for the tables. */
-+    acpi_pages_num =
-+        ((xenguest_ctxt.alloc_currp - (unsigned long)acpi_pages)
-+         >> xenguest_ctxt.page_shift) +
-+        ((xenguest_ctxt.alloc_currp & page_mask) ? 1 : 0);
++    acpi_pages_num = (ALIGN(xenguest_ctxt.guest_curr, xenguest_ctxt.page_size) -
++                      xenguest_ctxt.guest_start) >> xenguest_ctxt.page_shift;
 +
 +    dom->acpi_modules[0].data = (void *)config.rsdp;
 +    dom->acpi_modules[0].length = 64;
@@ -1671,7 +1660,7 @@ index 0000000000..73429232dc
 +    dom->acpi_modules[1].length = 4096;
 +    dom->acpi_modules[1].guest_addr_out = ACPI_INFO_PHYSICAL_ADDRESS;
 +
-+    dom->acpi_modules[2].data = acpi_pages;
++    dom->acpi_modules[2].data = xenguest_ctxt.buf;
 +    dom->acpi_modules[2].length = acpi_pages_num  << xenguest_ctxt.page_shift;
 +    dom->acpi_modules[2].guest_addr_out = ACPI_INFO_PHYSICAL_ADDRESS +
 +        xenguest_ctxt.page_size;
@@ -2612,7 +2601,7 @@ index 0000000000..73429232dc
 + */
 diff --git a/tools/xenguest/xg_emu.c b/tools/xenguest/xg_emu.c
 new file mode 100644
-index 0000000000..a85d56da82
+index 000000000000..a85d56da828b
 --- /dev/null
 +++ b/tools/xenguest/xg_emu.c
 @@ -0,0 +1,425 @@
@@ -3043,7 +3032,7 @@ index 0000000000..a85d56da82
 +}
 diff --git a/tools/xenguest/xg_internal.h b/tools/xenguest/xg_internal.h
 new file mode 100644
-index 0000000000..256472986a
+index 000000000000..256472986a9b
 --- /dev/null
 +++ b/tools/xenguest/xg_internal.h
 @@ -0,0 +1,124 @@
