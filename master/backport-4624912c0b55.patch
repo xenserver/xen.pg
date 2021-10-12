@@ -1,0 +1,82 @@
+From 3c906e7b389e0067fe440cb01a8133f952973878 Mon Sep 17 00:00:00 2001
+From: "Daniel P. Smith" <dpsmith@apertussolutions.com>
+Date: Fri, 10 Sep 2021 16:12:57 -0400
+Subject: xsm: remove the ability to disable flask
+
+On Linux when SELinux is put into permissive mode the discretionary access
+controls are still in place. Whereas for Xen when the enforcing state of flask
+is set to permissive, all operations for all domains would succeed, i.e. it
+does not fall back to the default access controls. To provide a means to mimic
+a similar but not equivalent behaviour, a flask op is present to allow a
+one-time switch back to the default access controls, aka the "dummy policy".
+
+While this may be desirable for an OS, Xen is a hypervisor and should not
+allow the switching of which security policy framework is being enforced after
+boot.  This patch removes the flask op to enforce the desired XSM usage model
+requiring a reboot of Xen to change the XSM policy module in use.
+
+Signed-off-by: Daniel P. Smith <dpsmith@apertussolutions.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+(cherry picked from commit 4624912c0b5505387e53a12ef3417d001431a29d)
+
+diff --git a/xen/include/public/xsm/flask_op.h b/xen/include/public/xsm/flask_op.h
+index 970ec07f0b36..b2a066831a17 100644
+--- a/xen/include/public/xsm/flask_op.h
++++ b/xen/include/public/xsm/flask_op.h
+@@ -175,7 +175,7 @@ struct xen_flask_op {
+ #define FLASK_SETBOOL           12
+ #define FLASK_COMMITBOOLS       13
+ #define FLASK_MLS               14
+-#define FLASK_DISABLE           15
++#define FLASK_DISABLE           15 /* No longer implemented */
+ #define FLASK_GETAVC_THRESHOLD  16
+ #define FLASK_SETAVC_THRESHOLD  17
+ #define FLASK_AVC_HASHSTATS     18
+diff --git a/xen/xsm/flask/flask_op.c b/xen/xsm/flask/flask_op.c
+index 1c4decc6cd1c..c560aee43938 100644
+--- a/xen/xsm/flask/flask_op.c
++++ b/xen/xsm/flask/flask_op.c
+@@ -222,32 +222,6 @@ static int flask_security_sid(struct xen_flask_sid_context *arg)
+ 
+ #ifndef COMPAT
+ 
+-static int flask_disable(void)
+-{
+-    static int flask_disabled = 0;
+-
+-    if ( ss_initialized )
+-    {
+-        /* Not permitted after initial policy load. */
+-        return -EINVAL;
+-    }
+-
+-    if ( flask_disabled )
+-    {
+-        /* Only do this once. */
+-        return -EINVAL;
+-    }
+-
+-    printk("Flask:  Disabled at runtime.\n");
+-
+-    flask_disabled = 1;
+-
+-    /* Reset xsm_ops to the original module. */
+-    xsm_ops = &dummy_xsm_ops;
+-
+-    return 0;
+-}
+-
+ static int flask_security_setavc_threshold(struct xen_flask_setavc_threshold *arg)
+ {
+     int rv = 0;
+@@ -697,10 +671,6 @@ ret_t do_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op)
+         rv = flask_mls_enabled;
+         break;    
+ 
+-    case FLASK_DISABLE:
+-        rv = flask_disable();
+-        break;
+-
+     case FLASK_GETAVC_THRESHOLD:
+         rv = avc_cache_threshold;
+         break;

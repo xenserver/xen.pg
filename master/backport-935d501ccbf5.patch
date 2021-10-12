@@ -1,0 +1,202 @@
+From 95d064bdc9fbcaa6ffc9be605ab9fe716c23632a Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Sat, 16 Jan 2021 16:09:10 +0000
+Subject: xen/xsm: Improve alloc/free of evtchn buckets
+
+Currently, flask_alloc_security_evtchn() is called in loops of
+64 (EVTCHNS_PER_BUCKET), which for non-dummy implementations is a function
+pointer call even in the no-op case.  The non no-op case only sets a single
+constant, and doesn't actually fail.
+
+Spectre v2 protections has made function pointer calls far more expensive, and
+64 back-to-back calls is a waste.  Rework the APIs to pass the size of the
+bucket instead, and call them once.
+
+No practical change, but {alloc,free}_evtchn_bucket() should be rather more
+efficient now.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Daniel P. Smith <dpsmith@apertussolutions.com>
+(cherry picked from commit 935d501ccbf5b8c4db1f6d0730a4a4c998e9e76a)
+
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index 45852c07ba6f..4e07333af59c 100644
+--- a/xen/common/event_channel.c
++++ b/xen/common/event_channel.c
+@@ -145,6 +145,14 @@ static bool virq_is_global(unsigned int virq)
+     return true;
+ }
+ 
++static void free_evtchn_bucket(struct domain *d, struct evtchn *bucket)
++{
++    if ( !bucket )
++        return;
++
++    xsm_free_security_evtchns(bucket, EVTCHNS_PER_BUCKET);
++    xfree(bucket);
++}
+ 
+ static struct evtchn *alloc_evtchn_bucket(struct domain *d, unsigned int port)
+ {
+@@ -153,34 +161,22 @@ static struct evtchn *alloc_evtchn_bucket(struct domain *d, unsigned int port)
+ 
+     chn = xzalloc_array(struct evtchn, EVTCHNS_PER_BUCKET);
+     if ( !chn )
+-        return NULL;
++        goto err;
++
++    if ( xsm_alloc_security_evtchns(chn, EVTCHNS_PER_BUCKET) )
++        goto err;
+ 
+     for ( i = 0; i < EVTCHNS_PER_BUCKET; i++ )
+     {
+-        if ( xsm_alloc_security_evtchn(&chn[i]) )
+-        {
+-            while ( i-- )
+-                xsm_free_security_evtchn(&chn[i]);
+-            xfree(chn);
+-            return NULL;
+-        }
+         chn[i].port = port + i;
+         rwlock_init(&chn[i].lock);
+     }
+-    return chn;
+-}
+-
+-static void free_evtchn_bucket(struct domain *d, struct evtchn *bucket)
+-{
+-    unsigned int i;
+ 
+-    if ( !bucket )
+-        return;
+-
+-    for ( i = 0; i < EVTCHNS_PER_BUCKET; i++ )
+-        xsm_free_security_evtchn(bucket + i);
++    return chn;
+ 
+-    xfree(bucket);
++ err:
++    free_evtchn_bucket(d, chn);
++    return NULL;
+ }
+ 
+ int evtchn_allocate_port(struct domain *d, evtchn_port_t port)
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index b8e185e6fa9b..736929b274fb 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -308,12 +308,14 @@ static XSM_INLINE int xsm_evtchn_reset(XSM_DEFAULT_ARG struct domain *d1, struct
+     return xsm_default_action(action, d1, d2);
+ }
+ 
+-static XSM_INLINE int xsm_alloc_security_evtchn(struct evtchn *chn)
++static XSM_INLINE int xsm_alloc_security_evtchns(
++    struct evtchn chn[], unsigned int nr)
+ {
+     return 0;
+ }
+ 
+-static XSM_INLINE void xsm_free_security_evtchn(struct evtchn *chn)
++static XSM_INLINE void xsm_free_security_evtchns(
++    struct evtchn chn[], unsigned int nr)
+ {
+     return;
+ }
+diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
+index e22d6160b5fc..47bd55c1fd3a 100644
+--- a/xen/include/xsm/xsm.h
++++ b/xen/include/xsm/xsm.h
+@@ -72,8 +72,8 @@ struct xsm_operations {
+ 
+     int (*alloc_security_domain) (struct domain *d);
+     void (*free_security_domain) (struct domain *d);
+-    int (*alloc_security_evtchn) (struct evtchn *chn);
+-    void (*free_security_evtchn) (struct evtchn *chn);
++    int (*alloc_security_evtchns) (struct evtchn chn[], unsigned int nr);
++    void (*free_security_evtchns) (struct evtchn chn[], unsigned int nr);
+     char *(*show_security_evtchn) (struct domain *d, const struct evtchn *chn);
+     int (*init_hardware_domain) (struct domain *d);
+ 
+@@ -314,14 +314,16 @@ static inline void xsm_free_security_domain (struct domain *d)
+     xsm_ops->free_security_domain(d);
+ }
+ 
+-static inline int xsm_alloc_security_evtchn (struct evtchn *chn)
++static inline int xsm_alloc_security_evtchns(
++    struct evtchn chn[], unsigned int nr)
+ {
+-    return xsm_ops->alloc_security_evtchn(chn);
++    return xsm_ops->alloc_security_evtchns(chn, nr);
+ }
+ 
+-static inline void xsm_free_security_evtchn (struct evtchn *chn)
++static inline void xsm_free_security_evtchns(
++    struct evtchn chn[], unsigned int nr)
+ {
+-    (void)xsm_ops->free_security_evtchn(chn);
++    xsm_ops->free_security_evtchns(chn, nr);
+ }
+ 
+ static inline char *xsm_show_security_evtchn (struct domain *d, const struct evtchn *chn)
+diff --git a/xen/xsm/dummy.c b/xen/xsm/dummy.c
+index 5705e52791be..742a3d06a42d 100644
+--- a/xen/xsm/dummy.c
++++ b/xen/xsm/dummy.c
+@@ -49,8 +49,8 @@ void __init xsm_fixup_ops (struct xsm_operations *ops)
+ 
+     set_to_dummy_if_null(ops, alloc_security_domain);
+     set_to_dummy_if_null(ops, free_security_domain);
+-    set_to_dummy_if_null(ops, alloc_security_evtchn);
+-    set_to_dummy_if_null(ops, free_security_evtchn);
++    set_to_dummy_if_null(ops, alloc_security_evtchns);
++    set_to_dummy_if_null(ops, free_security_evtchns);
+     set_to_dummy_if_null(ops, show_security_evtchn);
+     set_to_dummy_if_null(ops, init_hardware_domain);
+ 
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index cf7f25cda208..7657cb84852e 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -306,19 +306,25 @@ static int flask_evtchn_reset(struct domain *d1, struct domain *d2)
+     return domain_has_perm(d1, d2, SECCLASS_EVENT, EVENT__RESET);
+ }
+ 
+-static int flask_alloc_security_evtchn(struct evtchn *chn)
++static int flask_alloc_security_evtchns(struct evtchn chn[], unsigned int nr)
+ {
+-    chn->ssid.flask_sid = SECINITSID_UNLABELED;
++    unsigned int i;
++
++    for ( i = 0; i < nr; ++i )
++        chn[i].ssid.flask_sid = SECINITSID_UNLABELED;
+ 
+-    return 0;    
++    return 0;
+ }
+ 
+-static void flask_free_security_evtchn(struct evtchn *chn)
++static void flask_free_security_evtchns(struct evtchn chn[], unsigned int nr)
+ {
++    unsigned int i;
++
+     if ( !chn )
+         return;
+ 
+-    chn->ssid.flask_sid = SECINITSID_UNLABELED;
++    for ( i = 0; i < nr; ++i )
++        chn[i].ssid.flask_sid = SECINITSID_UNLABELED;
+ }
+ 
+ static char *flask_show_security_evtchn(struct domain *d, const struct evtchn *chn)
+@@ -1769,8 +1775,8 @@ static struct xsm_operations flask_ops = {
+ 
+     .alloc_security_domain = flask_domain_alloc_security,
+     .free_security_domain = flask_domain_free_security,
+-    .alloc_security_evtchn = flask_alloc_security_evtchn,
+-    .free_security_evtchn = flask_free_security_evtchn,
++    .alloc_security_evtchns = flask_alloc_security_evtchns,
++    .free_security_evtchns = flask_free_security_evtchns,
+     .show_security_evtchn = flask_show_security_evtchn,
+     .init_hardware_domain = flask_init_hardware_domain,
+ 
