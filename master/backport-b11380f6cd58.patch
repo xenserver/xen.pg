@@ -1,0 +1,88 @@
+From b11380f6cd58ce40422473262b2b4c2b210447a1 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 4 Oct 2021 21:39:03 +0100
+Subject: x86/spec-ctrl: Build with BRANCH_HARDEN lfences by default
+
+Branch Harden is enabled by default at compile and boot time.  Invert the
+logic to compile with lfence by default and nop out in the non-default case.
+
+This has several advantages.  It removes 3829 patch points (in the random
+build of Xen I have to hand) by default on boot, 70% (!) of the
+.altinstr_replacement section.  For builds of Xen with a non-nops capable tool
+chain, the code after `spec-ctrl=no-branch-harden` is better because Xen can
+write long nops.
+
+Most importantly however, it means the disassembly actually matches what runs
+in the common case, with the ability to distinguish the lfences from other
+uses of nops.
+
+Finally, make opt_branch_harden local to spec_ctrl.c and __initdata.  It has
+never been used externally, even at it's introduction in c/s 3860d5534df4
+"spec: add l1tf-barrier".
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index a440fb8c51f1..6639a69557a2 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -52,7 +52,7 @@ bool __read_mostly opt_ibpb = true;
+ bool __read_mostly opt_ssbd = false;
+ int8_t __read_mostly opt_eager_fpu = -1;
+ int8_t __read_mostly opt_l1d_flush = -1;
+-bool __read_mostly opt_branch_harden = true;
++static bool __initdata opt_branch_harden = true;
+ 
+ bool __initdata bsp_delay_spec_ctrl;
+ uint8_t __read_mostly default_xen_spec_ctrl;
+@@ -1096,8 +1096,9 @@ void __init init_speculation_mitigations(void)
+     else if ( opt_l1d_flush == -1 )
+         opt_l1d_flush = cpu_has_bug_l1tf && !(caps & ARCH_CAPS_SKIP_L1DFL);
+ 
+-    if ( opt_branch_harden )
+-        setup_force_cpu_cap(X86_FEATURE_SC_BRANCH_HARDEN);
++    /* We compile lfence's in by default, and nop them out if requested. */
++    if ( !opt_branch_harden )
++        setup_force_cpu_cap(X86_FEATURE_SC_NO_BRANCH_HARDEN);
+ 
+     /*
+      * We do not disable HT by default on affected hardware.
+diff --git a/xen/include/asm-x86/cpufeatures.h b/xen/include/asm-x86/cpufeatures.h
+index b9d3cac97538..bd9034fb4f9b 100644
+--- a/xen/include/asm-x86/cpufeatures.h
++++ b/xen/include/asm-x86/cpufeatures.h
+@@ -27,7 +27,7 @@ XEN_CPUFEATURE(XEN_SMAP,          X86_SYNTH(11)) /* SMAP gets used by Xen itself
+ XEN_CPUFEATURE(LFENCE_DISPATCH,   X86_SYNTH(12)) /* lfence set as Dispatch Serialising */
+ XEN_CPUFEATURE(IND_THUNK_LFENCE,  X86_SYNTH(13)) /* Use IND_THUNK_LFENCE */
+ XEN_CPUFEATURE(IND_THUNK_JMP,     X86_SYNTH(14)) /* Use IND_THUNK_JMP */
+-XEN_CPUFEATURE(SC_BRANCH_HARDEN,  X86_SYNTH(15)) /* Conditional Branch Hardening */
++XEN_CPUFEATURE(SC_NO_BRANCH_HARDEN, X86_SYNTH(15)) /* (Disable) Conditional branch hardening */
+ XEN_CPUFEATURE(SC_MSR_PV,         X86_SYNTH(16)) /* MSR_SPEC_CTRL used by Xen for PV */
+ XEN_CPUFEATURE(SC_MSR_HVM,        X86_SYNTH(17)) /* MSR_SPEC_CTRL used by Xen for HVM */
+ XEN_CPUFEATURE(SC_RSB_PV,         X86_SYNTH(18)) /* RSB overwrite needed for PV */
+diff --git a/xen/include/asm-x86/nospec.h b/xen/include/asm-x86/nospec.h
+index f6eb84eee554..5312ae4c6f31 100644
+--- a/xen/include/asm-x86/nospec.h
++++ b/xen/include/asm-x86/nospec.h
+@@ -10,7 +10,7 @@
+ static always_inline bool barrier_nospec_true(void)
+ {
+ #ifdef CONFIG_SPECULATIVE_HARDEN_BRANCH
+-    alternative("", "lfence", X86_FEATURE_SC_BRANCH_HARDEN);
++    alternative("lfence", "", X86_FEATURE_SC_NO_BRANCH_HARDEN);
+ #endif
+     return true;
+ }
+diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
+index b252bb863111..59bab1a41bb6 100644
+--- a/xen/include/asm-x86/spec_ctrl.h
++++ b/xen/include/asm-x86/spec_ctrl.h
+@@ -37,7 +37,6 @@ extern bool opt_ibpb;
+ extern bool opt_ssbd;
+ extern int8_t opt_eager_fpu;
+ extern int8_t opt_l1d_flush;
+-extern bool opt_branch_harden;
+ 
+ extern bool bsp_delay_spec_ctrl;
+ extern uint8_t default_xen_spec_ctrl;
