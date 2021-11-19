@@ -1,0 +1,245 @@
+From 7867181b2ad63f0d2f1ba97598e577538b83882f Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 19 Jan 2018 11:14:42 +0100
+Subject: x86/PoD: correctly handle non-order-0 decrease-reservation requests
+
+p2m_pod_decrease_reservation() at the moment only returns a boolean
+value: true for "nothing more to do", false for "something more to do".
+If it returns false, decrease_reservation() will loop over the entire
+range, calling guest_remove_page() for each page.
+
+Unfortunately, in the case p2m_pod_decrease_reservation() succeeds
+partially, some of the memory in the range will be not-present; at which
+point guest_remove_page() will return an error, and the entire operation
+will fail.
+
+Fix this by:
+1. Having p2m_pod_decrease_reservation() return exactly the number of
+   gpfn pages it has handled (i.e., replaced with 'not present').
+2. Making guest_remove_page() return -ENOENT in the case that the gpfn
+   in question was already empty (and in no other cases).
+3. When looping over guest_remove_page(), expect the number of -ENOENT
+   failures to be no larger than the number of pages
+   p2m_pod_decrease_reservation() removed.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: George Dunlap <george.dunlap@citrix.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Julien Grall <julien.grall@linaro.org>
+
+diff --git a/xen/arch/arm/p2m.c b/xen/arch/arm/p2m.c
+index 4a16b07..9a84634 100644
+--- a/xen/arch/arm/p2m.c
++++ b/xen/arch/arm/p2m.c
+@@ -253,11 +253,10 @@ int guest_physmap_mark_populate_on_demand(struct domain *d,
+     return -ENOSYS;
+ }
+ 
+-int p2m_pod_decrease_reservation(struct domain *d,
+-                                 xen_pfn_t gpfn,
+-                                 unsigned int order)
++unsigned long p2m_pod_decrease_reservation(struct domain *d, xen_pfn_t gpfn,
++                                           unsigned int order)
+ {
+-    return -ENOSYS;
++    return 0;
+ }
+ 
+ static void p2m_set_permission(lpae_t *e, p2m_type_t t, p2m_access_t a)
+diff --git a/xen/arch/x86/mm/p2m-pod.c b/xen/arch/x86/mm/p2m-pod.c
+index d69a7b2..67f004b 100644
+--- a/xen/arch/x86/mm/p2m-pod.c
++++ b/xen/arch/x86/mm/p2m-pod.c
+@@ -506,13 +506,12 @@ p2m_pod_zero_check_superpage(struct p2m_domain *p2m, unsigned long gfn);
+  * Once both of these functions have been completed, we can return and
+  * allow decrease_reservation() to handle everything else.
+  */
+-int
++unsigned long
+ p2m_pod_decrease_reservation(struct domain *d,
+                              xen_pfn_t gpfn,
+                              unsigned int order)
+ {
+-    int ret=0;
+-    unsigned long i, n;
++    unsigned long ret = 0, i, n;
+     struct p2m_domain *p2m = p2m_get_hostp2m(d);
+     bool_t steal_for_cache;
+     long pod, nonpod, ram;
+@@ -573,9 +572,9 @@ p2m_pod_decrease_reservation(struct domain *d,
+                 domain_crash(d);
+             goto out_unlock;
+         }
+-        p2m->pod.entry_count -= 1UL << order;
++        ret = 1UL << order;
++        p2m->pod.entry_count -= ret;
+         BUG_ON(p2m->pod.entry_count < 0);
+-        ret = 1;
+         goto out_entry_check;
+     }
+ 
+@@ -625,6 +624,7 @@ p2m_pod_decrease_reservation(struct domain *d,
+             p2m->pod.entry_count -= n;
+             BUG_ON(p2m->pod.entry_count < 0);
+             pod -= n;
++            ret += n;
+         }
+         else if ( steal_for_cache && p2m_is_ram(t) )
+         {
+@@ -659,14 +659,10 @@ p2m_pod_decrease_reservation(struct domain *d,
+ 
+             nonpod -= n;
+             ram -= n;
++            ret += n;
+         }
+     }    
+ 
+-    /* If there are no more non-PoD entries, tell decrease_reservation() that
+-     * there's nothing left to do. */
+-    if ( nonpod == 0 )
+-        ret = 1;
+-
+ out_entry_check:
+     /* If we've reduced our "liabilities" beyond our "assets", free some */
+     if ( p2m->pod.entry_count < p2m->pod.count )
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index 20d239e..d1cd305 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -250,13 +250,16 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
+ 
+ #ifdef CONFIG_X86
+     mfn = mfn_x(get_gfn_query(d, gmfn, &p2mt)); 
++    if ( unlikely(p2mt == p2m_invalid) || unlikely(p2mt == p2m_mmio_dm) )
++        return -ENOENT;
++
+     if ( unlikely(p2m_is_paging(p2mt)) )
+     {
+         rc = guest_physmap_remove_page(d, gmfn, mfn, 0);
+-        put_gfn(d, gmfn);
+-
+         if ( rc )
+-            return rc;
++            goto out_put_gfn;
++
++        put_gfn(d, gmfn);
+ 
+         /* If the page hasn't yet been paged out, there is an
+          * actual page that needs to be released. */
+@@ -274,9 +277,7 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
+     if ( p2mt == p2m_mmio_direct )
+     {
+         rc = -EPERM;
+-        put_gfn(d, gmfn);
+-
+-        return rc;
++        goto out_put_gfn;
+     }
+ #else
+     mfn = gmfn_to_mfn(d, gmfn);
+@@ -301,10 +302,8 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
+         rc = mem_sharing_unshare_page(d, gmfn, 0);
+         if ( rc )
+         {
+-            put_gfn(d, gmfn);
+             (void)mem_sharing_notify_enomem(d, gmfn, 0);
+-
+-            return rc;
++            goto out_put_gfn;
+         }
+         /* Maybe the mfn changed */
+         mfn = mfn_x(get_gfn_query_unlocked(d, gmfn, &p2mt));
+@@ -350,9 +349,14 @@ int guest_remove_page(struct domain *d, unsigned long gmfn)
+         put_page(page);
+ 
+     put_page(page);
++ out_put_gfn: __maybe_unused
+     put_gfn(d, gmfn);
+ 
+-    return rc;
++    /*
++     * Filter out -ENOENT return values that aren't a result of an empty p2m
++     * entry.
++     */
++    return rc != -ENOENT ? rc : -EINVAL;
+ }
+ 
+ static void decrease_reservation(struct memop_args *a)
+@@ -367,6 +371,8 @@ static void decrease_reservation(struct memop_args *a)
+ 
+     for ( i = a->nr_done; i < a->nr_extents; i++ )
+     {
++        unsigned long pod_done;
++
+         if ( i != a->nr_done && hypercall_preempt_check() )
+         {
+             a->preempted = 1;
+@@ -391,13 +397,33 @@ static void decrease_reservation(struct memop_args *a)
+         }
+ 
+         /* See if populate-on-demand wants to handle this */
+-        if ( is_hvm_domain(a->domain)
+-             && p2m_pod_decrease_reservation(a->domain, gmfn, a->extent_order) )
+-            continue;
++        pod_done = is_hvm_domain(a->domain) ?
++                   p2m_pod_decrease_reservation(a->domain, gmfn,
++                                                a->extent_order) : 0;
+ 
+-        for ( j = 0; j < (1 << a->extent_order); j++ )
+-            if ( guest_remove_page(a->domain, gmfn + j) )
++        /*
++         * Look for pages not handled by p2m_pod_decrease_reservation().
++         *
++         * guest_remove_page() will return -ENOENT for pages which have already
++         * been removed by p2m_pod_decrease_reservation(); so expect to see
++         * exactly pod_done failures.  Any more means that there were invalid
++         * entries before p2m_pod_decrease_reservation() was called.
++         */
++        for ( j = 0; j + pod_done < (1UL << a->extent_order); j++ )
++        {
++            switch ( guest_remove_page(a->domain, gmfn + j) )
++            {
++            case 0:
++                break;
++            case -ENOENT:
++                if ( !pod_done )
++                    goto out;
++                --pod_done;
++                break;
++            default:
+                 goto out;
++            }
++        }
+     }
+ 
+  out:
+diff --git a/xen/include/asm-arm/p2m.h b/xen/include/asm-arm/p2m.h
+index 0427fa4..fb64f82 100644
+--- a/xen/include/asm-arm/p2m.h
++++ b/xen/include/asm-arm/p2m.h
+@@ -184,8 +184,8 @@ unsigned long gmfn_to_mfn(struct domain *d, unsigned long gpfn);
+  */
+ 
+ /* Call when decreasing memory reservation to handle PoD entries properly.
+- * Will return '1' if all entries were handled and nothing more need be done.*/
+-int
++ * Returns the number of pages that were successfully processed.*/
++unsigned long
+ p2m_pod_decrease_reservation(struct domain *d,
+                              xen_pfn_t gpfn,
+                              unsigned int order);
+diff --git a/xen/include/asm-x86/p2m.h b/xen/include/asm-x86/p2m.h
+index 8b1f7f0..02d6e74 100644
+--- a/xen/include/asm-x86/p2m.h
++++ b/xen/include/asm-x86/p2m.h
+@@ -630,8 +630,8 @@ int p2m_pod_empty_cache(struct domain *d);
+ int p2m_pod_set_mem_target(struct domain *d, unsigned long target);
+ 
+ /* Call when decreasing memory reservation to handle PoD entries properly.
+- * Will return '1' if all entries were handled and nothing more need be done.*/
+-int
++ * Returns the number of pages that were successfully processed.*/
++unsigned long
+ p2m_pod_decrease_reservation(struct domain *d,
+                              xen_pfn_t gpfn,
+                              unsigned int order);
