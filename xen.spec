@@ -27,6 +27,12 @@
 
 %define base_dir  %{name}-%{version}
 
+%define lp_devel_dir %{_usrsrc}/xen-%{version}-%{release}
+
+# Prevent RPM adding Provides/Requires to lp-devel package
+%global __provides_exclude_from ^%{lp_devel_dir}/.*$
+%global __requires_exclude_from ^%{lp_devel_dir}/.*$
+
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.13.4
@@ -201,6 +207,14 @@ Group: System/Libraries
 %description dom0-tests
 This package contains test cases for the Xen Hypervisor.
 
+%package lp-devel_%{version}_%{release}
+License: GPLv2
+Summary: Development package for building livepatches
+Group: Development/System
+%description lp-devel_%{version}_%{release}
+Contains the prepared source files, config, and xen-syms for building live
+patches against base version %{version}-%{release}.
+
 %prep
 %autosetup -p1
 %{?_cov_prepare}
@@ -233,6 +247,10 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 
 mkdir -p %{buildroot}/boot/
 
+# Install source for building live patches
+mkdir -p %{buildroot}%{_usrsrc}
+cp -r $(pwd) %{buildroot}%{lp_devel_dir}
+
 # Regular build of Xen
 %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel} \
     KCONFIG_CONFIG=../buildconfigs/config-release olddefconfig
@@ -245,6 +263,7 @@ cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.gz
 cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.map
 cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{hv_rel}
 cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.config
+install -m 644 xen/xen-syms %{buildroot}%{lp_devel_dir}
 
 # Debug build of Xen
 %{__make} %{HVSOR_OPTIONS} -C xen clean
@@ -783,6 +802,9 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{_libexecdir}/%{name}/bin/depriv-fd-checker
 %{_libexecdir}/%{name}/bin/test-cpu-policy
 %{_libexecdir}/%{name}/bin/test-xenstore
+
+%files lp-devel_%{version}_%{release}
+%{lp_devel_dir}
 
 %doc
 
