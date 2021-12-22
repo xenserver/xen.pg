@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.17
+%global hv_rel 10.18
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -846,6 +846,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed Dec 22 2021 Igor Druzhinin <igor.druzhinin@citrix.com> - 4.13.4-10.18
+- CA-361938: Fix advertisment of HLE/RTM to guests on Broadwell
+- CA-360592: CVE-2021-28705 / XSA-389: issues with partially successful
+  P2M updates on x86
+- CA-360591: CVE-2021-28704 / XSA-388: PoD operations on misaligned GFNs
+
 * Tue Nov 02 2021 Igor Druzhinin <igor.druzhinin@citrix.com> - 4.13.4-10.17
 - CP-38201: Enable static analysis with Coverity
 
