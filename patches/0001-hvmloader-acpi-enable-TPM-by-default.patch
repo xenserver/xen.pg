@@ -4,6 +4,32 @@ Date: Tue, 21 Aug 2018 16:42:48 +0100
 Subject: [PATCH] hvmloader/acpi: enable TPM by default
 
 Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+diff --git a/tools/firmware/hvmloader/config.h b/tools/firmware/hvmloader/config.h
+index fb05f53..4a565f3 100644
+--- a/tools/firmware/hvmloader/config.h
++++ b/tools/firmware/hvmloader/config.h
+@@ -58,7 +58,7 @@ extern uint8_t ioapic_version;
+ /* MMIO hole: Hardcoded defaults, which can be dynamically expanded. */
+ #define PCI_MEM_END         0xfc000000
+ 
+-#define ACPI_TIS_HDR_ADDRESS 0xFED40F00UL
++#define ACPI_CRB_HDR_ADDRESS 0xFED40034UL
+ 
+ extern unsigned long pci_mem_start, pci_mem_end;
+ extern uint64_t pci_hi_mem_start, pci_hi_mem_end;
+diff --git a/tools/firmware/hvmloader/util.c b/tools/firmware/hvmloader/util.c
+index 7da144b..d5bc67e 100644
+--- a/tools/firmware/hvmloader/util.c
++++ b/tools/firmware/hvmloader/util.c
+@@ -1000,7 +1000,7 @@ void hvmloader_acpi_build_tables(struct acpi_config *config,
+                             ACPI_HAS_8042 | ACPI_HAS_CMOS_RTC);
+     config->acpi_revision = 4;
+ 
+-    config->tis_hdr = (uint16_t *)ACPI_TIS_HDR_ADDRESS;
++    config->crb_hdr = (uint16_t *)ACPI_CRB_HDR_ADDRESS;
+ 
+     config->numa.nr_vmemranges = nr_vmemranges;
+     config->numa.nr_vnodes = nr_vnodes;
 diff --git a/tools/libacpi/acpi2_0.h b/tools/libacpi/acpi2_0.h
 index 2619ba3..01d9aea 100644
 --- a/tools/libacpi/acpi2_0.h
@@ -56,12 +82,16 @@ index 2619ba3..01d9aea 100644
  #define ACPI_2_0_WAET_REVISION 0x01
  #define ACPI_1_0_FADT_REVISION 0x01
 diff --git a/tools/libacpi/build.c b/tools/libacpi/build.c
-index d56ed65..952226f 100644
+index 9b9e886..806ebd4 100644
 --- a/tools/libacpi/build.c
 +++ b/tools/libacpi/build.c
-@@ -419,6 +419,11 @@ static int construct_secondary_tables(struct acpi_ctxt *ctxt,
-          (config->tis_hdr[0] != 0 && config->tis_hdr[0] != 0xffff) &&
-          (config->tis_hdr[1] != 0 && config->tis_hdr[1] != 0xffff) )
+@@ -416,9 +416,13 @@ static int construct_secondary_tables(struct acpi_ctxt *ctxt,
+ 
+     /* TPM TCPA and SSDT. */
+     if ( (config->table_flags & ACPI_HAS_TCPA) &&
+-         (config->tis_hdr[0] != 0 && config->tis_hdr[0] != 0xffff) &&
+-         (config->tis_hdr[1] != 0 && config->tis_hdr[1] != 0xffff) )
++         (config->crb_hdr[0] != 0 && config->crb_hdr[0] != 0xffff) )
      {
 +        struct Acpi20TPM2 *tpm2;
 +        void *log;
@@ -71,7 +101,7 @@ index d56ed65..952226f 100644
          ssdt = ctxt->mem_ops.alloc(ctxt, sizeof(ssdt_tpm), 16);
          if (!ssdt) return -1;
          memcpy(ssdt, ssdt_tpm, sizeof(ssdt_tpm));
-@@ -437,7 +442,7 @@ static int construct_secondary_tables(struct acpi_ctxt *ctxt,
+@@ -437,7 +441,7 @@ static int construct_secondary_tables(struct acpi_ctxt *ctxt,
          tcpa->header.oem_revision = ACPI_OEM_REVISION;
          tcpa->header.creator_id   = ACPI_CREATOR_ID;
          tcpa->header.creator_revision = ACPI_CREATOR_REVISION;
@@ -80,7 +110,7 @@ index d56ed65..952226f 100644
          {
              tcpa->lasa = ctxt->mem_ops.v2p(ctxt, lasa);
              tcpa->laml = ACPI_2_0_TCPA_LAML_SIZE;
-@@ -446,6 +451,36 @@ static int construct_secondary_tables(struct acpi_ctxt *ctxt,
+@@ -446,6 +450,36 @@ static int construct_secondary_tables(struct acpi_ctxt *ctxt,
                           offsetof(struct acpi_header, checksum),
                           tcpa->header.length);
          }
@@ -117,6 +147,19 @@ index d56ed65..952226f 100644
      }
  
      /* SRAT and SLIT */
+diff --git a/tools/libacpi/libacpi.h b/tools/libacpi/libacpi.h
+index a2efd23..59d75f7 100644
+--- a/tools/libacpi/libacpi.h
++++ b/tools/libacpi/libacpi.h
+@@ -78,7 +78,7 @@ struct acpi_config {
+     struct acpi_numa numa;
+     const struct hvm_info_table *hvminfo;
+ 
+-    const uint16_t *tis_hdr;
++    const uint16_t *crb_hdr;
+ 
+     /*
+      * Address where acpi_info should be placed.
 diff --git a/tools/libacpi/ssdt_tpm.asl b/tools/libacpi/ssdt_tpm.asl
 index a0fb1fd..f8f4ea7 100644
 --- a/tools/libacpi/ssdt_tpm.asl
