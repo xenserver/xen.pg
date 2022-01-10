@@ -39,10 +39,10 @@ index b025f1839278..d1baf0e076ae 100644
  -include $(DEPS_INCLUDE)
 diff --git a/tools/misc/xen-spec-ctrl.c b/tools/misc/xen-spec-ctrl.c
 new file mode 100644
-index 000000000000..9b958703c98a
+index 000000000000..d46778eca989
 --- /dev/null
 +++ b/tools/misc/xen-spec-ctrl.c
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,60 @@
 +#define _GNU_SOURCE
 +
 +#include <stdio.h>
@@ -91,10 +91,6 @@ index 000000000000..9b958703c98a
 +                  "Did you forget to update the microcode with xen-ucode?";
 +            break;
 +
-+        case EFAULT:
-+            str = "Some error has occured!";
-+            break;
-+
 +        default:
 +            str = strerror(errno);
 +            break;
@@ -107,6 +103,142 @@ index 000000000000..9b958703c98a
 +
 +    return 0;
 +}
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 766627618e3d..becc1b474bf2 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -552,6 +552,131 @@ void identify_cpu(struct cpuinfo_x86 *c)
+ 	}
+ }
+ 
++static void fill_featureset(uint32_t fs[FSCAPINTS])
++{
++    unsigned int i, max_leaf, max_extd, tmp;
++
++    BUILD_BUG_ON(FSCAPINTS != 15);
++
++    max_leaf = cpuid_eax(0);
++    if ( max_leaf >= 1 )
++        cpuid(1, &tmp, &tmp, &fs[FEATURESET_1c],  &fs[FEATURESET_1d]);
++
++    if ( max_leaf >= 7 )
++    {
++        unsigned int max_feat;
++
++        cpuid_count(7, 0, &max_feat, &fs[FEATURESET_7b0],
++                    &fs[FEATURESET_7c0], &fs[FEATURESET_7d0]);
++        if ( max_feat >= 1 )
++            cpuid_count(7, 1, &fs[FEATURESET_7a1], &tmp, &tmp, &tmp);
++    }
++
++    if ( max_leaf >= 0xd )
++        cpuid_count(0xd, 1, &fs[FEATURESET_Da1], &tmp, &tmp, &tmp);
++
++    max_extd = cpuid_eax(0x80000000);
++    if ( (max_extd >> 16) != 0x8000 )
++        max_extd = 0;
++
++    if ( max_extd >= 0x80000001 )
++        cpuid(0x80000001, &tmp, &tmp, &fs[FEATURESET_e1c], &fs[FEATURESET_e1d]);
++    if ( max_extd >= 0x80000007 )
++        cpuid(0x80000007, &tmp, &tmp, &tmp, &fs[FEATURESET_e7d]);
++    if ( max_extd >= 0x80000008 )
++        cpuid(0x80000008, &tmp, &fs[FEATURESET_e8b], &tmp, &tmp);
++
++    for ( i = 0; i < FSCAPINTS; ++i )
++    {
++        fs[i] |= forced_caps[i];
++        fs[i] &= known_features[i] & ~cleared_caps[i];
++    }
++}
++
++static void update_cpuid(void *data)
++{
++    volatile uint32_t *new_fs = data;
++    uint32_t fs[FSCAPINTS] = {};
++    unsigned int i, cpu = smp_processor_id();
++
++    fill_featureset(fs);
++
++    for ( i = 0; i < ARRAY_SIZE(fs); ++i )
++        /*
++         * The common case is no difference from the initiating CPU.  Only
++         * issue the atomic operation if it looks like we have bits to clear.
++         */
++        if ( new_fs[i] & ~fs[i] )
++            asm volatile ( "lock and %[fs], %[new_fs]"
++                           : [new_fs] "+m" (new_fs[i])
++                           : [fs] "r" (fs[i]) );
++
++    /*
++     * Update cpu_data[], but skip CPU0 for now.  boot_cpu_data needs to wait
++     * until all CPUs have merged.
++     */
++    if ( cpu != 0 )
++        memcpy(cpu_data[cpu].x86_capability, fs, sizeof(fs));
++}
++
++int sysctl_update_spec_ctrl_cpuid(void)
++{
++    uint32_t i, new_fs[FSCAPINTS] = {};
++    bool lost = false, updated = false;
++
++    /* Scan for new features on the current CPU. */
++    fill_featureset(new_fs);
++    for ( i = 0; i < ARRAY_SIZE(new_fs); ++i )
++        if ( new_fs[i] & ~boot_cpu_data.x86_capability[i] )
++            break;
++
++    /* If nothing new, don't bother querying other CPUs. */
++    if ( i == ARRAY_SIZE(new_fs) )
++        return -ENOEXEC;
++
++    /* If new features have appeared, check all CPUs. */
++    smp_call_function(update_cpuid, new_fs, 1);
++
++    /* Merge is complete.  First check for lost features. */
++    for ( i = 0; i < ARRAY_SIZE(new_fs); ++i )
++        if ( ~new_fs[i] & boot_cpu_data.x86_capability[i] )
++        {
++            if ( !lost )
++                printk(XENLOG_ERR "CPUID features lost\n");
++
++            printk(XENLOG_ERR "  featureset word %u, lost %08x\n",
++                   i, ~new_fs[i] & boot_cpu_data.x86_capability[i]);
++            lost = true;
++        }
++
++    if ( lost )
++    {
++        printk(XENLOG_ERR "Skipping data update, but system may be unstable\n");
++        return -EXDEV;
++    }
++
++    /* Update boot_cpu_data, printing new features. */
++    for ( i = 0; i < ARRAY_SIZE(new_fs); ++i )
++        if ( new_fs[i] & ~boot_cpu_data.x86_capability[i] )
++        {
++            if ( !updated )
++                printk(XENLOG_INFO "New CPUID features detected\n");
++
++            printk(XENLOG_INFO "  featureset word %u, new %08x\n",
++                   i, new_fs[i] & ~boot_cpu_data.x86_capability[i]);
++
++            ACCESS_ONCE(boot_cpu_data.x86_capability[i]) = new_fs[i];
++            updated = true;
++        }
++
++    if ( !updated )
++        return -ENOEXEC;
++
++    init_guest_cpuid();
++
++    return 0;
++}
++
+ /* leaf 0xb SMT level */
+ #define SMT_LEVEL       0
+ 
 diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
 index 76c916647a80..8c1ad237e68e 100644
 --- a/xen/arch/x86/cpuid.c
@@ -156,247 +288,69 @@ index 76c916647a80..8c1ad237e68e 100644
  {
      cpuid_calculate_raw_policy();
      calculate_host_policy();
-diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index 6639a69557a2..0ea52cb46118 100644
---- a/xen/arch/x86/spec_ctrl.c
-+++ b/xen/arch/x86/spec_ctrl.c
-@@ -16,11 +16,16 @@
-  *
-  * Copyright (c) 2017-2018 Citrix Systems Ltd.
-  */
-+#include <xen/cpu.h>
- #include <xen/errno.h>
- #include <xen/init.h>
- #include <xen/lib.h>
-+#include <xen/stop_machine.h>
- #include <xen/warning.h>
- 
-+#include <public/platform.h>
-+
-+#include <asm/delay.h>
- #include <asm/microcode.h>
- #include <asm/msr.h>
- #include <asm/processor.h>
-@@ -1266,6 +1271,174 @@ void __init init_speculation_mitigations(void)
-         wrmsrl(MSR_MCU_OPT_CTRL, default_xen_mcu_opt_ctrl);
- }
- 
-+#define MICROCODE_CALLIN_TIMEOUT_US 30000
-+#define MICROCODE_UPDATE_TIMEOUT_US 1000000
-+
-+static atomic_t cpu_in, cpu_out;
-+static atomic_t next_cpu;
-+
-+static unsigned int common_caps;
-+
-+#define XENPF_spec_ctrl_success 0 /* New mitigations have been applied.       */
-+                                  /* This is returned in case if some H/W     */
-+                                  /* feature-bits have disappered! (Note that */
-+                                  /* we don't expect this in practice.        */
-+#define XENPF_spec_ctrl_noop    1 /* All mitigations are up to date */
-+#define XENPF_spec_ctrl_error   2 /* Some error has occured */
-+static uint32_t spec_ctrl_status;
-+
-+/* Wait for CPUs to rendezvous with a timeout (us) */
-+static int wait_for_cpus(atomic_t *cnt, unsigned int expect,
-+                         unsigned int timeout)
-+{
-+    while ( atomic_read(cnt) < expect )
-+    {
-+        if ( timeout <= 0 )
-+        {
-+            printk("CPU%d: Timeout when waiting for CPUs calling in\n",
-+                   smp_processor_id());
-+            return -EBUSY;
-+        }
-+        udelay(1);
-+        timeout--;
-+    }
-+
-+    return 0;
-+}
-+
-+static int update_x86_caps(void)
-+{
-+    int cpu = smp_processor_id();
-+    struct cpuinfo_x86 *c = &cpu_data[cpu];
-+    unsigned int edx, tmp;
-+
-+    if ( c->cpuid_level < 0x00000007 )
-+        return -ENOSYS;
-+
-+    /* Intel-defined CPU features, CPUID level 0x00000007:0.edx, word 9 */
-+    cpuid_count(0x00000007, 0, &tmp, &tmp, &tmp, &edx);
-+    c->x86_capability[cpufeat_word(X86_FEATURE_AVX512_4VNNIW)] = edx;
-+
-+    /* Find the new common feature subset */
-+    if ( common_caps == 0 )
-+        common_caps = edx;
-+    else
-+        common_caps &= edx;
-+
-+    return 0;
-+}
-+
-+static int recalc_cpuid_policy(void)
-+{
-+    unsigned int idx = cpufeat_word(X86_FEATURE_AVX512_4VNNIW);
-+
-+    if ( boot_cpu_data.x86_capability[idx] == common_caps )
-+    {
-+        /* No new H/W features have been detected */
-+        spec_ctrl_status = XENPF_spec_ctrl_noop;
-+        return 0;
-+    }
-+
-+    /* Update the global common feature set */
-+    boot_cpu_data.x86_capability[idx] = common_caps;
-+
-+    /* Recalculate CPUID policies */
-+    init_guest_cpuid();
-+
-+    spec_ctrl_status = XENPF_spec_ctrl_success;
-+
-+    return 0;
-+}
-+
-+static int do_x86_caps_update(void *unused)
-+{
-+    int cpu = smp_processor_id();
-+    unsigned int cpu_nr = num_online_cpus();
-+    unsigned int finished;
-+    int ret;
-+    static bool error;
-+
-+    atomic_inc(&cpu_in);
-+    ret = wait_for_cpus(&cpu_in, cpu_nr, MICROCODE_CALLIN_TIMEOUT_US);
-+    if ( ret )
-+        return ret;
-+
-+    while ( cpu != atomic_read(&next_cpu) )
-+    {
-+        finished = atomic_read(&cpu_out);
-+        if ( wait_for_cpus(&next_cpu, cpu, MICROCODE_UPDATE_TIMEOUT_US) )
-+        {
-+            if ( atomic_read(&cpu_out) > finished )
-+                continue;
-+            printk("Timeout during do_x86_caps_update (finished %d/%d)",
-+                   finished, cpu_nr);
-+            return -EBUSY;
-+        }
-+    }
-+
-+    update_x86_caps();
-+
-+    finished = atomic_read(&cpu_out);
-+    if ( finished == cpu_nr - 1 )
-+    {
-+        /* This is the last CPU. Update CPUID policy */
-+        recalc_cpuid_policy();
-+    }
-+
-+    atomic_set(&next_cpu, cpumask_next(cpu, &cpu_online_map));
-+
-+    atomic_inc(&cpu_out);
-+    finished = atomic_read(&cpu_out);
-+    while ( !error && finished != cpu_nr )
-+    {
-+        /*
-+         * During each timeout interval, at least a CPU is expected to
-+         * finish its update. Otherwise, something goes wrong.
-+         */
-+        if ( wait_for_cpus(&cpu_out, finished + 1,
-+                           MICROCODE_UPDATE_TIMEOUT_US) && !error )
-+        {
-+            error = true;
-+            printk("Timeout when finishing do_x86_caps_update (finished %d/%d)",
-+                   finished, cpu_nr);
-+            return -EBUSY;
-+        }
-+
-+        finished = atomic_read(&cpu_out);
-+    }
-+
-+    return 0;
-+}
-+
-+long spec_ctrl_do_update(void *data)
-+{
-+    long ret = 0;
-+
-+    if ( !get_cpu_maps() )
-+        return -EBUSY;
-+
-+    spec_ctrl_status = XENPF_spec_ctrl_error;
-+
-+    atomic_set(&cpu_in, 0);
-+    atomic_set(&cpu_out, 0);
-+    atomic_set(&next_cpu, cpumask_first(&cpu_online_map));
-+
-+    common_caps = 0;
-+
-+    ret = stop_machine_run(do_x86_caps_update, NULL, NR_CPUS);
-+    if ( !ret )
-+    {
-+        if ( spec_ctrl_status == XENPF_spec_ctrl_error )
-+            ret = -EFAULT;
-+        if ( spec_ctrl_status == XENPF_spec_ctrl_noop )
-+            ret = -ENOEXEC;
-+    }
-+
-+    put_cpu_maps();
-+
-+    return ret;
-+}
-+
- static void __init __maybe_unused build_assertions(void)
- {
-     /* The optimised assembly relies on this alias. */
 diff --git a/xen/arch/x86/sysctl.c b/xen/arch/x86/sysctl.c
-index af617464cdad..b44f821c64db 100644
+index af617464cdad..0aba82a8cb95 100644
 --- a/xen/arch/x86/sysctl.c
 +++ b/xen/arch/x86/sysctl.c
-@@ -32,6 +32,7 @@
- #include <xsm/xsm.h>
- #include <asm/psr.h>
- #include <asm/cpuid.h>
-+#include <asm/spec_ctrl.h>
- 
- const struct cpu_policy system_policies[] = {
-     [ XEN_SYSCTL_cpu_policy_raw ] = {
-@@ -452,6 +453,19 @@ long arch_do_sysctl(
+@@ -452,6 +452,33 @@ long arch_do_sysctl(
          break;
      }
  
 +    case XEN_SYSCTL_spec_ctrl:
-+    {
 +        if ( sysctl->u.spec_ctrl.op != XENPF_spec_ctrl_update )
 +        {
 +            ret = -EINVAL;
 +            break;
 +        }
 +
-+        ret = continue_hypercall_on_cpu(smp_processor_id(),
-+                                        spec_ctrl_do_update, NULL);
++        /*
++         * We're (potentially) updating the default CPUID/MSR settings for all
++         * VM types, and need to not race with with other consumers of the
++         * system policies:
++         *   XEN_DOMCTL_createdomain
++         *   XEN_SYSCTL_get_cpu_featureset
++         *   XEN_SYSCTL_get_cpu_policy
++         *
++         * We already hold the sysctl lock.  Take the domctl lock too.
++         */
++        if ( !domctl_lock_acquire() )
++        {
++            ret = -ERESTART;
++            break;
++        }
++
++        ret = sysctl_update_spec_ctrl_cpuid();
++        domctl_lock_release();
 +        break;
-+    }
 +
      default:
          ret = -ENOSYS;
          break;
-diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
-index 59bab1a41bb6..461ee2f2ce7d 100644
---- a/xen/include/asm-x86/spec_ctrl.h
-+++ b/xen/include/asm-x86/spec_ctrl.h
-@@ -136,6 +136,8 @@ static always_inline void spec_ctrl_exit_idle(struct cpu_info *info)
-      */
- }
+diff --git a/xen/arch/x86/xstate.c b/xen/arch/x86/xstate.c
+index 0abf20d2ef21..5aaff3141c0c 100644
+--- a/xen/arch/x86/xstate.c
++++ b/xen/arch/x86/xstate.c
+@@ -622,6 +622,7 @@ void xstate_init(struct cpuinfo_x86 *c)
  
-+long spec_ctrl_do_update(void *data);
+     if ( bsp )
+     {
++        setup_force_cpu_cap(X86_FEATURE_OSXSAVE);
+         xfeature_mask = feature_mask;
+         /*
+          * xsave_cntxt_size is the max size required by enabled features.
+diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
+index e3c189f68675..cc40738d8964 100644
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -617,6 +617,8 @@ extern int8_t opt_tsx, cpu_has_tsx_ctrl;
+ extern bool rtm_disabled;
+ void tsx_init(void);
+ 
++int sysctl_update_spec_ctrl_cpuid(void);
 +
- #endif /* __ASSEMBLY__ */
- #endif /* !__X86_SPEC_CTRL_H__ */
+ #endif /* !__ASSEMBLY__ */
  
+ #endif /* __ASM_X86_PROCESSOR_H */
 diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
 index d5d5976af5bc..18b44cc65805 100644
 --- a/xen/include/public/sysctl.h
