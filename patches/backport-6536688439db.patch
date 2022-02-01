@@ -1,0 +1,143 @@
+From 004c4ec5c2e9703a9f5bb82bc0ff4f943c053dee Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 25 Jan 2022 13:52:30 +0100
+Subject: x86/msr: Split MSR_SPEC_CTRL handling
+
+In order to fix a VT-x bug, and support MSR_SPEC_CTRL on AMD, move
+MSR_SPEC_CTRL handling into the new {pv,hvm}_{get,set}_reg() infrastructure.
+
+Duplicate the msrs->spec_ctrl.raw accesses in the PV and VT-x paths for now.
+The SVM path is currently unreachable because of the CPUID policy.
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: 6536688439dbca1d08fd6db5be29c39e3917fb2f
+master date: 2022-01-20 16:32:11 +0000
+
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 0a173b8cea93..6696ec390e51 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -2241,6 +2241,9 @@ static uint64_t vmx_get_reg(struct vcpu *v, unsigned int reg)
+ 
+     switch ( reg )
+     {
++    case MSR_SPEC_CTRL:
++        return v->arch.msrs->spec_ctrl.raw;
++
+     default:
+         printk(XENLOG_G_ERR "%s(%pv, 0x%08x) Bad register\n",
+                __func__, v, reg);
+@@ -2255,6 +2258,10 @@ static void vmx_set_reg(struct vcpu *v, unsigned int reg, uint64_t val)
+ 
+     switch ( reg )
+     {
++    case MSR_SPEC_CTRL:
++        v->arch.msrs->spec_ctrl.raw = val;
++        break;
++
+     default:
+         printk(XENLOG_G_ERR "%s(%pv, 0x%08x, 0x%016"PRIx64") Bad register\n",
+                __func__, v, reg, val);
+diff --git a/xen/arch/x86/msr.c b/xen/arch/x86/msr.c
+index 71eb86908862..2ed2a2da1cb5 100644
+--- a/xen/arch/x86/msr.c
++++ b/xen/arch/x86/msr.c
+@@ -26,6 +26,7 @@
+ 
+ #include <asm/debugreg.h>
+ #include <asm/msr.h>
++#include <asm/pv/domain.h>
+ #include <asm/setup.h>
+ 
+ DEFINE_PER_CPU(uint32_t, tsc_aux);
+@@ -215,8 +216,7 @@ int guest_rdmsr(struct vcpu *v, uint32_t msr, uint64_t *val)
+     case MSR_SPEC_CTRL:
+         if ( !cp->feat.ibrsb )
+             goto gp_fault;
+-        *val = msrs->spec_ctrl.raw;
+-        break;
++        goto get_reg;
+ 
+     case MSR_INTEL_PLATFORM_INFO:
+         *val = mp->platform_info.raw;
+@@ -327,6 +327,13 @@ int guest_rdmsr(struct vcpu *v, uint32_t msr, uint64_t *val)
+ 
+     return ret;
+ 
++ get_reg: /* Delegate register access to per-vm-type logic. */
++    if ( is_pv_domain(d) )
++        *val = pv_get_reg(v, msr);
++    else
++        *val = hvm_get_reg(v, msr);
++    return X86EMUL_OKAY;
++
+  gp_fault:
+     return X86EMUL_EXCEPTION;
+ }
+@@ -419,9 +426,7 @@ int guest_wrmsr(struct vcpu *v, uint32_t msr, uint64_t val)
+ 
+         if ( val & rsvd )
+             goto gp_fault; /* Rsvd bit set? */
+-
+-        msrs->spec_ctrl.raw = val;
+-        break;
++        goto set_reg;
+ 
+     case MSR_PRED_CMD:
+         if ( !cp->feat.ibrsb && !cp->extd.ibpb )
+@@ -552,6 +557,13 @@ int guest_wrmsr(struct vcpu *v, uint32_t msr, uint64_t val)
+ 
+     return ret;
+ 
++ set_reg: /* Delegate register access to per-vm-type logic. */
++    if ( is_pv_domain(d) )
++        pv_set_reg(v, msr, val);
++    else
++        hvm_set_reg(v, msr, val);
++    return X86EMUL_OKAY;
++
+  gp_fault:
+     return X86EMUL_EXCEPTION;
+ }
+diff --git a/xen/arch/x86/pv/emulate.c b/xen/arch/x86/pv/emulate.c
+index 04eca9e8b3ef..cc4df27ddc78 100644
+--- a/xen/arch/x86/pv/emulate.c
++++ b/xen/arch/x86/pv/emulate.c
+@@ -92,12 +92,16 @@ void pv_emul_instruction_done(struct cpu_user_regs *regs, unsigned long rip)
+ 
+ uint64_t pv_get_reg(struct vcpu *v, unsigned int reg)
+ {
++    const struct vcpu_msrs *msrs = v->arch.msrs;
+     struct domain *d = v->domain;
+ 
+     ASSERT(v == current || !vcpu_runnable(v));
+ 
+     switch ( reg )
+     {
++    case MSR_SPEC_CTRL:
++        return msrs->spec_ctrl.raw;
++
+     default:
+         printk(XENLOG_G_ERR "%s(%pv, 0x%08x) Bad register\n",
+                __func__, v, reg);
+@@ -108,12 +112,17 @@ uint64_t pv_get_reg(struct vcpu *v, unsigned int reg)
+ 
+ void pv_set_reg(struct vcpu *v, unsigned int reg, uint64_t val)
+ {
++    struct vcpu_msrs *msrs = v->arch.msrs;
+     struct domain *d = v->domain;
+ 
+     ASSERT(v == current || !vcpu_runnable(v));
+ 
+     switch ( reg )
+     {
++    case MSR_SPEC_CTRL:
++        msrs->spec_ctrl.raw = val;
++        break;
++
+     default:
+         printk(XENLOG_G_ERR "%s(%pv, 0x%08x, 0x%016"PRIx64") Bad register\n",
+                __func__, v, reg, val);
