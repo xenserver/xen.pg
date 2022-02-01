@@ -1,5 +1,10 @@
+From d94d006ed36084914c2931641b724ae262e3fb80 Mon Sep 17 00:00:00 2001
 From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 23 Nov 2021 13:32:54 +0100
 Subject: x86/PoD: deal with misaligned GFNs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Users of XENMEM_decrease_reservation and XENMEM_populate_physmap aren't
 required to pass in order-aligned GFN values. (While I consider this
@@ -27,15 +32,19 @@ single iteration, i.e. behavior is unchanged for them. (FTAOD pulling
 out just pod_lock() into p2m_pod_decrease_reservation() would result in
 a lock order violation.)
 
-This is part of XSA-388.
+This is CVE-2021-28704 and CVE-2021-28707 / part of XSA-388.
 
 Fixes: 3c352011c0d3 ("x86/PoD: shorten certain operations on higher order ranges")
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
 Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+master commit: 182c737b9ba540ebceb1433f3940fbed6eac4ea9
+master date: 2021-11-22 12:27:30 +0000
 
+diff --git a/xen/arch/x86/mm/p2m-pod.c b/xen/arch/x86/mm/p2m-pod.c
+index 007cdd87d07c..c14801f5ff8e 100644
 --- a/xen/arch/x86/mm/p2m-pod.c
 +++ b/xen/arch/x86/mm/p2m-pod.c
-@@ -495,7 +495,7 @@ p2m_pod_zero_check_superpage(struct p2m_
+@@ -495,7 +495,7 @@ p2m_pod_zero_check_superpage(struct p2m_domain *p2m, gfn_t gfn);
  
  
  /*
@@ -44,7 +53,7 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
   * + To properly handle clearing of PoD entries
   * + To "steal back" memory being freed for the PoD cache, rather than
   *   releasing it.
-@@ -503,8 +503,8 @@ p2m_pod_zero_check_superpage(struct p2m_
+@@ -503,8 +503,8 @@ p2m_pod_zero_check_superpage(struct p2m_domain *p2m, gfn_t gfn);
   * Once both of these functions have been completed, we can return and
   * allow decrease_reservation() to handle everything else.
   */
@@ -55,7 +64,7 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
  {
      unsigned long ret = 0, i, n;
      struct p2m_domain *p2m = p2m_get_hostp2m(d);
-@@ -551,8 +551,10 @@ p2m_pod_decrease_reservation(struct doma
+@@ -557,8 +557,10 @@ p2m_pod_decrease_reservation(struct domain *d, gfn_t gfn, unsigned int order)
           * All PoD: Mark the whole region invalid and tell caller
           * we're done.
           */
@@ -68,7 +77,7 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
          {
              /*
               * If this fails, we can't tell how much of the range was changed.
-@@ -560,7 +562,12 @@ p2m_pod_decrease_reservation(struct doma
+@@ -566,7 +568,12 @@ p2m_pod_decrease_reservation(struct domain *d, gfn_t gfn, unsigned int order)
               * impossible.
               */
              if ( order != 0 )
@@ -81,7 +90,7 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
              goto out_unlock;
          }
          ret = 1UL << order;
-@@ -667,6 +674,22 @@ out_unlock:
+@@ -674,6 +681,22 @@ p2m_pod_decrease_reservation(struct domain *d, gfn_t gfn, unsigned int order)
      return ret;
  }
  
@@ -104,7 +113,7 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
  void p2m_pod_dump_data(struct domain *d)
  {
      struct p2m_domain *p2m = p2m_get_hostp2m(d);
-@@ -1266,19 +1289,15 @@ remap_and_retry:
+@@ -1269,19 +1292,15 @@ p2m_pod_demand_populate(struct p2m_domain *p2m, gfn_t gfn,
      return true;
  }
  
@@ -127,7 +136,7 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
      gfn_lock(p2m, gfn, order);
  
      P2M_DEBUG("mark pod gfn=%#lx\n", gfn_l);
-@@ -1316,12 +1335,44 @@ guest_physmap_mark_populate_on_demand(st
+@@ -1319,6 +1338,17 @@ guest_physmap_mark_populate_on_demand(struct domain *d, unsigned long gfn_l,
          BUG_ON(p2m->pod.entry_count < 0);
          pod_unlock(p2m);
      }
@@ -145,10 +154,10 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
  
  out:
      gfn_unlock(p2m, gfn, order);
- 
+@@ -1326,6 +1356,27 @@ guest_physmap_mark_populate_on_demand(struct domain *d, unsigned long gfn_l,
      return rc;
  }
-+
+ 
 +int
 +guest_physmap_mark_populate_on_demand(struct domain *d, unsigned long gfn,
 +                                      unsigned int order)
@@ -169,7 +178,7 @@ Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
 +
 +    return rc;
 +}
- 
++
  void p2m_pod_init(struct p2m_domain *p2m)
  {
-
+     unsigned int i;
