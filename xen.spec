@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.18
+%global hv_rel 10.19
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -868,6 +868,14 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Tue Feb 8 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.19
+- Fixes for XSA-394 CVE-2022-23034, XSA-395 CVE-2022-23035.
+- Support for AMD MSR_SPEC_CTRL in HVM guests.
+- Logic to match the Intel Feb 2022 microcode.  De-featuring TSX on more
+  client parts, and retrofitting AMD's PSFD interface for guests.
+- Build fix for Ocaml 4.12
+- Fix and simplify runtime new CPUID feature logic.
+
 * Wed Dec 22 2021 Igor Druzhinin <igor.druzhinin@citrix.com> - 4.13.4-10.18
 - CA-361938: Fix advertisment of HLE/RTM to guests on Broadwell
 - CA-360592: CVE-2021-28705 / XSA-389: issues with partially successful
