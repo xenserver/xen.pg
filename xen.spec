@@ -61,6 +61,8 @@ BuildRequires: python2-rpm-macros
 %global __python %{__python2}
 %endif
 
+BuildRequires: devtoolset-11-gcc devtoolset-11-binutils
+
 # For HVMLoader and 16/32bit firmware
 BuildRequires: dev86 iasl
 
@@ -228,6 +230,8 @@ cp %{SOURCE4} .
 
 %build
 
+source /opt/rh/devtoolset-11/enable
+
 %configure --disable-qemu-traditional \
            --disable-seabios \
            --disable-stubdom \
@@ -241,6 +245,8 @@ cp %{SOURCE4} .
            --with-system-ovmf=/usr/share/edk2/OVMF.fd
 
 %install
+
+source /opt/rh/devtoolset-11/enable
 
 # The existence of this directory causes ocamlfind to put things in it
 mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
