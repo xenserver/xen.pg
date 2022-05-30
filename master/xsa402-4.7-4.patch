@@ -1,0 +1,91 @@
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Subject: x86/amd: Work around CLFLUSH ordering on older parts
+
+On pre-CLFLUSHOPT AMD CPUs, CLFLUSH is weakely ordered with everything,
+including reads and writes to the address, and LFENCE/SFENCE instructions.
+
+This creates a multitude of problematic corner cases, laid out in the manual.
+Arrange to use MFENCE on both sides of the CLFLUSH to force proper ordering.
+
+This is part of XSA-402.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index 7562914f4a5a..35a1187f8bb0 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -620,6 +620,14 @@ static void init_amd(struct cpuinfo_x86 *c)
+ 	/* MFENCE stops RDTSC speculation */
+ 	__set_bit(X86_FEATURE_MFENCE_RDTSC, c->x86_capability);
+ 
++	/*
++	 * On pre-CLFLUSHOPT AMD CPUs, CLFLUSH is weakly ordered with
++	 * everything, including reads and writes to address, and
++	 * LFENCE/SFENCE instructions.
++	 */
++	if (!cpu_has_clflushopt)
++		__set_bit(X86_FEATURE_CLFLUSH_MFENCE, c->x86_capability);
++
+ 	switch(c->x86)
+ 	{
+ 	case 0xf ... 0x17:
+diff --git a/xen/arch/x86/flushtlb.c b/xen/arch/x86/flushtlb.c
+index 10ee6b9114b0..983df7bad8b2 100644
+--- a/xen/arch/x86/flushtlb.c
++++ b/xen/arch/x86/flushtlb.c
+@@ -238,6 +238,13 @@ unsigned int flush_area_local(const void *va, unsigned int flags)
+     return flags;
+ }
+ 
++/*
++ * On pre-CLFLUSHOPT AMD CPUs, CLFLUSH is weakly ordered with everything,
++ * including reads and writes to address, and LFENCE/SFENCE instructions.
++ *
++ * This function only works safely after alternatives have run.  Luckily, at
++ * the time of writing, we don't flush the caches that early.
++ */
+ void cache_flush(const void *addr, unsigned int size)
+ {
+     /*
+@@ -247,6 +254,8 @@ void cache_flush(const void *addr, unsigned int size)
+     unsigned int clflush_size = current_cpu_data.x86_clflush_size ?: 16;
+     const void *end = addr + size;
+ 
++    alternative(ASM_NOP3, "mfence", X86_FEATURE_CLFLUSH_MFENCE);
++
+     addr -= (unsigned long)addr & (clflush_size - 1);
+     for ( ; addr < end; addr += clflush_size )
+     {
+@@ -262,7 +271,9 @@ void cache_flush(const void *addr, unsigned int size)
+                        [p] "m" (*(const char *)(addr)));
+     }
+ 
+-    alternative(ASM_NOP3, "sfence", X86_FEATURE_CLFLUSHOPT);
++    alternative_2(ASM_NOP3,
++                  "sfence", X86_FEATURE_CLFLUSHOPT,
++                  "mfence", X86_FEATURE_CLFLUSH_MFENCE);
+ }
+ 
+ void cache_writeback(const void *addr, unsigned int size)
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index 8af3e80e3cd1..472796f06036 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -41,6 +41,7 @@
+ #define X86_FEATURE_SC_VERW_HVM		((FSCAPINTS+0)*32+ 22) /* VERW used by Xen for HVM */
+ #define X86_FEATURE_SC_VERW_IDLE	((FSCAPINTS+0)*32+ 23) /* VERW used by Xen for idle */
+ #define X86_FEATURE_SC_L1TF_VULN	((FSCAPINTS+0)*32+ 24) /* L1TF protection required */
++#define X86_FEATURE_CLFLUSH_MFENCE	((FSCAPINTS+0)*32+ 25) /* MFENCE needed to serialise CLFLUSH */
+ 
+ #define cpufeat_word(idx)	((idx) / 32)
+ #define cpufeat_bit(idx)	((idx) % 32)
+@@ -82,6 +83,7 @@
+ #define cpu_has_invpcid         boot_cpu_has(X86_FEATURE_INVPCID)
+ #define cpu_has_rtm             boot_cpu_has(X86_FEATURE_RTM)
+ #define cpu_has_smap            boot_cpu_has(X86_FEATURE_SMAP)
++#define cpu_has_clflushopt      boot_cpu_has(X86_FEATURE_CLFLUSHOPT)
+ #define cpu_has_fpu_sel         (!boot_cpu_has(X86_FEATURE_NO_FPU_SEL))
+ #define cpu_has_ffxsr           ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) \
+                                  && boot_cpu_has(X86_FEATURE_FFXSR))
