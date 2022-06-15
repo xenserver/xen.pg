@@ -44,6 +44,7 @@ Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
 Source4: https://repo.citrite.net/list/ctx-local-contrib/citrix/branding2020/Citrix_Logo_Black.png
+Source5: gen_test_metadata.py
 
 ExclusiveArch: x86_64
 
@@ -315,6 +316,9 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 # Build tools and man pages
 %{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} install-tools
 %{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
+
+# Build test case metadata
+%{__python} %{SOURCE5} -i %{buildroot}/%{_libexecdir}/%{name} -o %{buildroot}/%{_datadir}/xen-dom0-tests-metadata.json
 
 %{__install} -D -m 644 %{SOURCE1} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
 %{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/xen/xl.conf
@@ -805,9 +809,10 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{py_sitearch}/xen/lowlevel/xc.so
 
 %files dom0-tests
-%{_libexecdir}/%{name}/bin/depriv-fd-checker
+%exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker
 %{_libexecdir}/%{name}/bin/test-cpu-policy
 %{_libexecdir}/%{name}/bin/test-xenstore
+%{_datadir}/xen-dom0-tests-metadata.json
 
 %files lp-devel_%{version}_%{release}
 %{lp_devel_dir}
