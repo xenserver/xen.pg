@@ -89,7 +89,7 @@ index a9f37cba67a2..0c0e70841df2 100644
      tsx_init(); /* Needs microcode.  May change HLE/RTM feature bits. */
  
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index a8cd8ca9721c..656eb5fb1edb 100644
+index 3640ac93bef5..331f8bda23da 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
 @@ -67,7 +67,6 @@ static bool __initdata cpu_has_bug_msbds_only; /* => minimal HT impact. */
@@ -97,10 +97,10 @@ index a8cd8ca9721c..656eb5fb1edb 100644
  
  static int8_t __initdata opt_srb_lock = -1;
 -uint64_t __read_mostly default_xen_mcu_opt_ctrl;
+ static bool __initdata opt_unpriv_mmio;
+ static bool __read_mostly opt_fb_clear_mmio;
  
- static int __init parse_spec_ctrl(const char *s)
- {
-@@ -376,7 +375,7 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+@@ -384,7 +383,7 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
             (default_xen_spec_ctrl & SPEC_CTRL_SSBD)  ? " SSBD+" : " SSBD-",
             !(caps & ARCH_CAPS_TSX_CTRL)              ? "" :
             (opt_tsx & 1)                             ? " TSX+" : " TSX-",
@@ -109,7 +109,7 @@ index a8cd8ca9721c..656eb5fb1edb 100644
             opt_srb_lock                              ? " SRB_LOCK+" : " SRB_LOCK-",
             opt_ibpb                                  ? " IBPB"  : "",
             opt_l1d_flush                             ? " L1D_FLUSH" : "",
-@@ -1237,32 +1236,24 @@ void __init init_speculation_mitigations(void)
+@@ -1268,38 +1267,29 @@ void __init init_speculation_mitigations(void)
          tsx_init();
      }
  
@@ -119,10 +119,15 @@ index a8cd8ca9721c..656eb5fb1edb 100644
 +     * On some SRBDS-affected hardware, it may be safe to relax srb-lock by
 +     * default.
 +     *
-+     * On parts which enumerate MDS_NO and not TAA_NO, TSX is the only known
-+     * way to access the Fill Buffer.  If TSX isn't available (inc. SKU
-+     * reasons on some models), or TSX is explicitly disabled, then there is
-+     * no need for the extra overhead to protect RDRAND/RDSEED.
++     * All parts with SRBDS_CTRL suffer SSDP, the mechanism by which stale RNG
++     * data becomes available to other contexts.  To recover the data, an
++     * attacker needs to use:
++     *  - SBDS (MDS or TAA to sample the cores fill buffer)
++     *  - SBDR (Architecturally retrieve stale transaction buffer contents)
++     *  - DRPW (Architecturally latch stale fill buffer data)
++     *
++     * On MDS_NO parts, and with TAA_NO or TSX unavailable/disabled, and there
++     * is no unprivileged MMIO access, the RNG data doesn't need protecting.
 +     */
 +    if ( cpu_has_srbds_ctrl )
      {
@@ -134,12 +139,18 @@ index a8cd8ca9721c..656eb5fb1edb 100644
 -         * On some SRBDS-affected hardware, it may be safe to relax srb-lock
 -         * by default.
 -         *
--         * On parts which enumerate MDS_NO and not TAA_NO, TSX is the only way
--         * to access the Fill Buffer.  If TSX isn't available (inc. SKU
--         * reasons on some models), or TSX is explicitly disabled, then there
--         * is no need for the extra overhead to protect RDRAND/RDSEED.
+-         * All parts with SRBDS_CTRL suffer SSDP, the mechanism by which stale
+-         * RNG data becomes available to other contexts.  To recover the data,
+-         * an attacker needs to use:
+-         *  - SBDS (MDS or TAA to sample the cores fill buffer)
+-         *  - SBDR (Architecturally retrieve stale transaction buffer contents)
+-         *  - DRPW (Architecturally latch stale fill buffer data)
+-         *
+-         * On MDS_NO parts, and with TAA_NO or TSX unavailable/disabled, and
+-         * there is no unprivileged MMIO access, the RNG data doesn't need
+-         * protecting.
 -         */
-         if ( opt_srb_lock == -1 &&
+         if ( opt_srb_lock == -1 && !opt_unpriv_mmio &&
               (caps & (ARCH_CAPS_MDS_NO|ARCH_CAPS_TAA_NO)) == ARCH_CAPS_MDS_NO &&
               (!cpu_has_hle || ((caps & ARCH_CAPS_TSX_CTRL) && rtm_disabled)) )
              opt_srb_lock = 0;
@@ -154,7 +165,7 @@ index a8cd8ca9721c..656eb5fb1edb 100644
      }
  
      print_details(thunk, caps);
-@@ -1300,9 +1291,6 @@ void __init init_speculation_mitigations(void)
+@@ -1337,9 +1327,6 @@ void __init init_speculation_mitigations(void)
          wrmsrl(MSR_SPEC_CTRL, val);
          info->last_spec_ctrl = val;
      }
@@ -191,10 +202,10 @@ index 07b2b1a981f0..7fe46827b4c2 100644
  
  #endif /* __ASM_X86_PROCESSOR_H */
 diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
-index 59bab1a41bb6..ba03bb42e5b5 100644
+index 6b662e9602a2..fd8d1d6268f5 100644
 --- a/xen/include/asm-x86/spec_ctrl.h
 +++ b/xen/include/asm-x86/spec_ctrl.h
-@@ -53,8 +53,6 @@ extern int8_t opt_pv_l1tf_hwdom, opt_pv_l1tf_domu;
+@@ -55,8 +55,6 @@ extern int8_t opt_pv_l1tf_hwdom, opt_pv_l1tf_domu;
   */
  extern paddr_t l1tf_addr_mask, l1tf_safe_maddr;
  
