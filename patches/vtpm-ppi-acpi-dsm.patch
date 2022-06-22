@@ -7,24 +7,64 @@ found in qemu.git:hw/acpi/tpm.c (tpm_build_ppi_acpi()).
 
 Signed-off-by: Anthony PERARD <anthony.perard@citrix.com>
 diff --git a/tools/libacpi/ssdt_tpm.asl b/tools/libacpi/ssdt_tpm.asl
-index f8f4ea7df2..8a13c44f20 100644
+index f8f4ea7df2..524e95c1bc 100644
 --- a/tools/libacpi/ssdt_tpm.asl
 +++ b/tools/libacpi/ssdt_tpm.asl
-@@ -28,9 +28,142 @@ DefinitionBlock ("SSDT_TPM.aml", "SSDT", 2, "Xen", "HVM", 0)
+@@ -28,9 +28,186 @@ DefinitionBlock ("SSDT_TPM.aml", "SSDT", 2, "Xen", "HVM", 0)
                  0x00001000,         // Address Length
                  )
          })
 +
-+        OperationRegion (TPP2, SystemMemory, 0xFED45000 + 0x100, 0x5A) // TPM_PPI_ADDR_BASE + 0x100
-+        Field (TPP2, AnyAcc, NoLock, Preserve)
++        // IO port address must match the one in varstored
++        OperationRegion (TPP2, SystemIO, 0x0104, 0x8)
++
++        // byte access to TPP2 values
++        // (index access is always 32-bit)
++        Field (TPP2, DwordAcc, NoLock, Preserve)
 +        {
-+            PPIN, 8,
-+            PPIP, 32,
-+            PPRP, 32,
-+            PPRQ, 32,
-+            PPRM, 32,
-+            LPPR, 32,
++            IDXB, 32,
++            AccessAs(ByteAcc),
++            VALB, 8,
 +        }
++
++        // double word (32 bit) access to TPP2 values
++        Field (TPP2, DwordAcc, NoLock, Preserve)
++        {
++            IDXD, 32,
++            VALD, 32,
++        }
++
++        // Read a byte from the PPI region
++        // Arg0 is the offset into the region
++        Method (TPRB, 1, Serialized)
++        {
++            IDXB = Arg0
++            Return (VALB)
++        }
++
++        // Write a double word (32 bits) to the PPI region
++        // Arg0 is the offset into the region
++        // Arg1 is the double word to be written.
++        Method (TPWD, 2, Serialized)
++        {
++            IDXD = Arg0
++            VALD = Arg1
++        }
++
++        // Read a double word (32 bits) from the PPI region
++        // Arg0 is the offset into the region
++        Method (TPRD, 1, Serialized)
++        {
++            IDXD = Arg0
++            Return (VALD)
++        }
++
++        // PPI region offsets from
++        // https://qemu.readthedocs.io/en/latest/specs/tpm.html#acpi-ppi-interface
++        Name (PPRP, 0x105)
++        Name (PPRQ, 0x109)
++        Name (PPRM, 0x10D)
++        Name (LPPR, 0x111)
 +
 +        Method (TPFN, 1, Serialized)
 +        {
@@ -32,12 +72,7 @@ index f8f4ea7df2..8a13c44f20 100644
 +            If (Arg0 >= 0x100) {
 +                Return (0)
 +            }
-+            OperationRegion (TPP1, SystemMemory, 0xFED45000 + Arg0, 0x1)
-+            Field (TPP1, ByteAcc, NoLock, Preserve)
-+            {
-+                TPPF, 8,
-+            }
-+            Return (TPPF)
++            Return (TPRB (Arg0))
 +        }
 +
          Method (_STA, 0, NotSerialized)  // _STA: Status
@@ -76,24 +111,28 @@ index f8f4ea7df2..8a13c44f20 100644
 +                If (Arg2 == 2) {
 +                    Local0 = DerefOf (Arg3 [0]) // opcode
 +                    Local1 = TPFN (Local0) // op flags
-+                    if ((Local1 & 0x07) == 0x0) { // TPM_PPI_FUNC_NOT_IMPLEMENTED
++
++                    // FUNC_NOT_IMPLEMENTED or FUNC_BIOS_ONLY or FUNC_BLOCKED
++                    if ((Local1 >= 0) && (Local1 <= 2)) {
 +                        Return (1)
 +                    }
 +
-+                    PPRQ = Local0
-+                    PPRM = 0
++                    // operation is FUNC_ALLOWED_USR_{,NOT_}REQ
++
++                    TPWD (PPRQ, Local0)
++                    TPWD (PPRM, 0)
 +                    Return (0)
 +                }
 +
 +                // Get Pending TPM Operation Requested By the OS
 +                If (Arg2 == 3) {
 +                    If (Arg1 == 1) {
-+                        TPM2[1] = PPRQ
++                        TPM2[1] = TPRD (PPRQ)
 +                        Return (TPM2)
 +                    }
 +                    If (Arg1 == 2) {
-+                        TPM3[1] = PPRQ
-+                        TPM3[2] = PPRM
++                        TPM3[1] = TPRD (PPRQ)
++                        TPM3[2] = TPRD (PPRM)
 +                        Return (TPM3)
 +                    }
 +                }
@@ -105,8 +144,8 @@ index f8f4ea7df2..8a13c44f20 100644
 +
 +                // Return TPM Operation Response to OS Environment
 +                If (Arg2 == 5) {
-+                    TPM3[1] = LPPR
-+                    TPM3[2] = PPRP
++                    TPM3[1] = TPRD (LPPR)
++                    TPM3[2] = TPRD (PPRP)
 +                    Return (TPM3)
 +                }
 +
@@ -119,23 +158,29 @@ index f8f4ea7df2..8a13c44f20 100644
 +                If (Arg2 == 7) {
 +                    Local0 = DerefOf (Arg3 [0]) // opcode
 +                    Local1 = TPFN (Local0) // op flags
-+                    if ((Local1 & 0x07) == 0x0) { // TPM_PPI_FUNC_NOT_IMPLEMENTED
++
++                    // FUNC_NOT_IMPLEMENTED or FUNC_BIOS_ONLY
++                    if ((Local1 == 0) || (Local1 == 1)) {
 +                        Return (1)
 +                    }
-+                    if ((Local1 & 0x02) == 0x0) { // TPM_PPI_FUNC_BLOCKED
++
++                    // FUNC_BLOCKED
++                    if (Local1 == 2) {
 +                        Return (3)
 +                    }
 +
++                    // operation is FUNC_ALLOWED_USR_{,NOT_}REQ
++
 +                    // Rev ID == 1
 +                    If (Arg1 == 1) {
-+                        PPRQ = Local0
-+                        PPRM = 0
++                        TPWD (PPRQ, Local0)
++                        TPWD (PPRM, 0)
 +                    }
 +
 +                    // Rev ID == 2
 +                    If (Arg1 == 2) {
-+                        PPRQ = Local0
-+                        PPRM = DerefOf (Arg3[1])
++                        TPWD (PPRQ, Local0)
++                        TPWD (PPRM, DerefOf (Arg3[1]))
 +                    }
 +
 +                    Return (0)
@@ -144,8 +189,7 @@ index f8f4ea7df2..8a13c44f20 100644
 +                // Get User Confirmation Status for Operation
 +                If (Arg2 == 8) {
 +                    Local0 = DerefOf (Arg3 [0]) // opcode
-+                    Local1 = TPFN (Local0) // op flags
-+                    Return (Local1 & 0x7)
++                    Return (TPFN (Local0)) // op flags
 +                }
 +
 +            }
