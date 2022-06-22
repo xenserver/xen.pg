@@ -42,6 +42,36 @@ XenServer changes to Xen command line default options.
 
 * Disable 32bit PV guests by default in non-shim configurations.
 
+* Use x2APIC in physical destination mode to prevent APIC vector shortage.
+
+diff --git a/xen/arch/x86/genapic/x2apic.c b/xen/arch/x86/genapic/x2apic.c
+index 1cb16bc10d87..71d8d9bb4269 100644
+--- a/xen/arch/x86/genapic/x2apic.c
++++ b/xen/arch/x86/genapic/x2apic.c
+@@ -220,20 +220,15 @@ static struct notifier_block x2apic_cpu_nfb = {
+    .notifier_call = update_clusterinfo
+ };
+ 
+-static s8 __initdata x2apic_phys = -1; /* By default we use logical cluster mode. */
++static s8 __initdata x2apic_phys = -1; /* By default we use physical mode. */
+ boolean_param("x2apic_phys", x2apic_phys);
+ 
+ const struct genapic *__init apic_x2apic_probe(void)
+ {
+     if ( x2apic_phys < 0 )
+     {
+-        /*
+-         * Force physical mode if there's no interrupt remapping support: The
+-         * ID in clustered mode requires a 32 bit destination field due to
+-         * the usage of the high 16 bits to hold the cluster ID.
+-         */
+-        x2apic_phys = !iommu_intremap ||
+-                      (acpi_gbl_FADT.flags & ACPI_FADT_APIC_PHYSICAL);
++        /* Use physical mode by default unless requested in FADT. */
++        x2apic_phys = !(acpi_gbl_FADT.flags & ACPI_FADT_APIC_CLUSTER);
+     }
+     else if ( !x2apic_phys && !iommu_intremap )
+     {
 diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
 index f3bd7f9bee94..886d6022cffc 100644
 --- a/xen/arch/x86/hvm/vmx/vmcs.c
@@ -78,7 +108,7 @@ index 6e0256f04823..b7e05ad13371 100644
  /* Protected by microcode_mutex */
  static struct microcode_patch *microcode_cache;
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index bd84a68008f5..ef3b82cb1125 100644
+index 3abeaf19ff7e..a37dc767a86f 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
 @@ -187,7 +187,7 @@ static uint32_t base_disallow_mask;
@@ -113,7 +143,7 @@ index 856dc0b0cef8..6434be41ba52 100644
  static int __init parse_watchdog(const char *s)
  {
 diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
-index b07976309b16..7a9f9686facf 100644
+index 6adcb1bb003c..c70deea3cd54 100644
 --- a/xen/arch/x86/setup.c
 +++ b/xen/arch/x86/setup.c
 @@ -1604,6 +1604,9 @@ void __init noreturn __start_xen(unsigned long mbi_p)
@@ -195,7 +225,7 @@ index 9e1071417555..ffc0c4a3bba7 100644
  static int __init parse_efi_param(const char *s)
  {
 diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
-index 855b66f2d1b5..584cd0bb286b 100644
+index 36bd3ae75050..fa76f469af70 100644
 --- a/xen/common/page_alloc.c
 +++ b/xen/common/page_alloc.c
 @@ -213,7 +213,7 @@ static unsigned long __initdata opt_bootscrub_chunk = MB(128);
@@ -232,7 +262,7 @@ index 948a926a6242..3b00dfb6f51b 100644
  static char __initdata _conring[_CONRING_SIZE];
  static char *__read_mostly conring = _conring;
 diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
-index 93d43779788e..7ce27261ee0f 100644
+index 9aef696d90eb..89ed9e55508b 100644
 --- a/xen/drivers/passthrough/iommu.c
 +++ b/xen/drivers/passthrough/iommu.c
 @@ -30,7 +30,7 @@ bool_t __initdata iommu_enable = 1;
