@@ -1,0 +1,83 @@
+From c61de2940ce9f56cfb456cfaf613d344639636e9 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 27 Jun 2022 11:54:27 +0100
+Subject: x86/spec-ctrl: Only adjust MSR_SPEC_CTRL for idle with legacy IBRS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Back at the time of the original Spectre-v2 fixes, it was recommended to clear
+MSR_SPEC_CTRL when going idle.  This is because of the side effects on the
+sibling thread caused by the microcode IBRS and STIBP implementations which
+were retrofitted to existing CPUs.
+
+However, there are no relevant cross-thread impacts for the hardware
+IBRS/STIBP implementations, so this logic should not be used on Intel CPUs
+supporting eIBRS, or any AMD CPUs; doing so only adds unnecessary latency to
+the idle path.
+
+Furthermore, there's no point playing with MSR_SPEC_CTRL in the idle paths if
+SMT is disabled for other reasons.
+
+Fixes: 8d03080d2a33 ("x86/spec-ctrl: Cease using thunk=lfence on AMD")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+(cherry picked from commit ffc7694e0c99eea158c32aa164b7d1e1bb1dc46b)
+
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index 6f060f584129..fcccfdb1c080 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -1047,8 +1047,14 @@ void __init init_speculation_mitigations(void)
+     /* (Re)init BSP state now that default_spec_ctrl_flags has been calculated. */
+     init_shadow_spec_ctrl_state();
+ 
+-    /* If Xen is using any MSR_SPEC_CTRL settings, adjust the idle path. */
+-    if ( default_xen_spec_ctrl )
++    /*
++     * For microcoded IBRS only (i.e. Intel, pre eIBRS), it is recommended to
++     * clear MSR_SPEC_CTRL before going idle, to avoid impacting sibling
++     * threads.  Activate this if SMT is enabled, and Xen is using a non-zero
++     * MSR_SPEC_CTRL setting.
++     */
++    if ( boot_cpu_has(X86_FEATURE_IBRSB) && !(caps & ARCH_CAPABILITIES_IBRS_ALL) &&
++         hw_smt_enabled && default_xen_spec_ctrl )
+         __set_bit(X86_FEATURE_SC_MSR_IDLE, boot_cpu_data.x86_capability);
+ 
+     if ( opt_xpti == -1 )
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index 7211cd2f7b38..616ce4bb03ec 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -35,7 +35,7 @@
+ #define X86_FEATURE_SC_RSB_PV		((FSCAPINTS+0)*32+ 16) /* RSB overwrite needed for PV */
+ #define X86_FEATURE_SC_RSB_HVM		((FSCAPINTS+0)*32+ 17) /* RSB overwrite needed for HVM */
+ #define X86_FEATURE_NO_XPTI		((FSCAPINTS+0)*32+ 18) /* XPTI mitigation not in use */
+-#define X86_FEATURE_SC_MSR_IDLE		((FSCAPINTS+0)*32+ 19) /* (SC_MSR_PV || SC_MSR_HVM) && default_xen_spec_ctrl */
++#define X86_FEATURE_SC_MSR_IDLE		((FSCAPINTS+0)*32+ 19) /* Clear MSR_SPEC_CTRL on idle */
+ #define X86_FEATURE_MFENCE_RDTSC	((FSCAPINTS+0)*32+ 20) /* MFENCE synchronizes RDTSC */
+ /* Bits 21,22 unused. */
+ #define X86_FEATURE_SC_VERW_IDLE	((FSCAPINTS+0)*32+ 23) /* VERW used by Xen for idle */
+diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
+index c729c89da3b4..8d759136369b 100644
+--- a/xen/include/asm-x86/spec_ctrl.h
++++ b/xen/include/asm-x86/spec_ctrl.h
+@@ -76,7 +76,8 @@ static always_inline void spec_ctrl_enter_idle(struct cpu_info *info)
+     uint32_t val = 0;
+ 
+     /*
+-     * Branch Target Injection:
++     * It is recommended in some cases to clear MSR_SPEC_CTRL when going idle,
++     * to avoid impacting sibling threads.
+      *
+      * Latch the new shadow value, then enable shadowing, then update the MSR.
+      * There are no SMP issues here; only local processor ordering concerns.
+@@ -114,7 +115,7 @@ static always_inline void spec_ctrl_exit_idle(struct cpu_info *info)
+     uint32_t val = info->xen_spec_ctrl;
+ 
+     /*
+-     * Branch Target Injection:
++     * Restore MSR_SPEC_CTRL on exit from idle.
+      *
+      * Disable shadowing before updating the MSR.  There are no SMP issues
+      * here; only local processor ordering concerns.
