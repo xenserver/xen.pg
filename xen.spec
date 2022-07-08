@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.26
+%global hv_rel 10.27
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -874,6 +874,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Jul 8 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.27
+- Fixes for XSA-407 CVE-2022-23816 CVE-2022-23825.
+- Switch to x2APIC physical destination mode by default.  Addresses problems
+  with vector exhaustion on large systems.
+- Address an issue where EPT superpages were unnecessarily split.
+
 * Thu Jun 16 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.26
 - Fixes for XSA-404 CVE-2022-21123 CVE-2022-21125 CVE-2022-21166.
 
