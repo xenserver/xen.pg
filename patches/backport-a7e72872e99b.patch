@@ -1,4 +1,4 @@
-From 2b7934bd819704beb4408597c20a8ca12b10eff9 Mon Sep 17 00:00:00 2001
+From a7e72872e99bed2dde6b90f0bd1e65ce3bae2173 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Wed, 16 Mar 2022 13:07:40 +0000
 Subject: x86/spec-ctrl: Knobs for STIBP and PSFD, and follow hardware STIBP
@@ -16,20 +16,19 @@ together, for consistency.
 
 However, AMD have a hardware hint CPUID bit recommending that STIBP be set
 unilaterally.  This is advertised on Zen3, so follow the recommendation.
-Furthermore, in such cases, set STIBP behind the guest's back for now.  This
-has negligible overhead for the guest, but saves a WRMSR on vmentry.  This is
-the only default change.
+Furthermore, in such cases, set STIBP behind the guest's back for now.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
 Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
 (cherry picked from commit fef244b179c06fcdfa581f7d57fa6e578c49ff50)
+[Adjust for absence of INTEL_PSFD]
 
 diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
-index 57e742b09bcf..38da2ea1015a 100644
+index 022cb01da762..a998418585bd 100644
 --- a/docs/misc/xen-command-line.pandoc
 +++ b/docs/misc/xen-command-line.pandoc
-@@ -2054,8 +2054,9 @@ By default SSBD will be mitigated at runtime (i.e `ssbd=runtime`).
+@@ -2034,8 +2034,9 @@ By default SSBD will be mitigated at runtime (i.e `ssbd=runtime`).
  
  ### spec-ctrl (x86)
  > `= List of [ <bool>, xen=<bool>, {pv,hvm,msr-sc,rsb,md-clear}=<bool>,
@@ -41,7 +40,7 @@ index 57e742b09bcf..38da2ea1015a 100644
  
  Controls for speculative execution sidechannel mitigations.  By default, Xen
  will pick the most appropriate mitigations based on compiled in support,
-@@ -2105,9 +2106,10 @@ On hardware supporting IBRS (Indirect Branch Restricted Speculation), the
+@@ -2085,9 +2086,10 @@ On hardware supporting IBRS (Indirect Branch Restricted Speculation), the
  If Xen is not using IBRS itself, functionality is still set up so IBRS can be
  virtualised for guests.
  
@@ -55,7 +54,7 @@ index 57e742b09bcf..38da2ea1015a 100644
  
  On hardware supporting SSBD (Speculative Store Bypass Disable), the `ssbd=`
  option can be used to force or prevent Xen using the feature itself.  On AMD
-@@ -2115,6 +2117,15 @@ hardware, this is a global option applied at boot, and not virtualised for
+@@ -2095,6 +2097,15 @@ hardware, this is a global option applied at boot, and not virtualised for
  guest use.  On Intel hardware, the feature is virtualised for guests,
  independently of Xen's choice of setting.
  
@@ -71,35 +70,8 @@ index 57e742b09bcf..38da2ea1015a 100644
  On all hardware, the `eager-fpu=` option can be used to force or prevent Xen
  from using fully eager FPU context switches.  This is currently implemented as
  a global control.  By default, Xen will choose to use fully eager context
-diff --git a/xen/arch/x86/hvm/svm/vmcb.c b/xen/arch/x86/hvm/svm/vmcb.c
-index 1fef0da22c60..4dc83cfdcb36 100644
---- a/xen/arch/x86/hvm/svm/vmcb.c
-+++ b/xen/arch/x86/hvm/svm/vmcb.c
-@@ -29,6 +29,7 @@
- #include <asm/hvm/support.h>
- #include <asm/hvm/svm/svm.h>
- #include <asm/hvm/svm/svmdebug.h>
-+#include <asm/spec_ctrl.h>
- 
- struct vmcb_struct *alloc_vmcb(void) 
- {
-@@ -214,6 +215,14 @@ static int construct_vmcb(struct vcpu *v)
- 
-     vmcb->cleanbits.bytes = 0;
- 
-+    /*
-+     * When default_xen_spec_ctrl simply SPEC_CTRL_STIBP, default this behind
-+     * the back of the VM too.  Our SMT topology isn't accurate, the overhead
-+     * is neglegable, and doing this saves a WRMSR on the vmentry path.
-+     */
-+    if ( default_xen_spec_ctrl == SPEC_CTRL_STIBP )
-+        v->arch.msrs->spec_ctrl.raw = SPEC_CTRL_STIBP;
-+
-     return 0;
- }
- 
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index 93ea03e44864..cfd05c605dae 100644
+index e037e9b52ea2..a4121e25cc63 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
 @@ -48,9 +48,13 @@ static enum ind_thunk {
@@ -116,8 +88,8 @@ index 93ea03e44864..cfd05c605dae 100644
 -bool __read_mostly opt_ssbd = false;
  int8_t __read_mostly opt_eager_fpu = -1;
  int8_t __read_mostly opt_l1d_flush = -1;
- static bool __initdata opt_branch_harden = true;
-@@ -172,12 +176,20 @@ static int __init parse_spec_ctrl(const char *s)
+ bool __read_mostly opt_branch_harden = true;
+@@ -174,12 +178,20 @@ static int __init parse_spec_ctrl(const char *s)
              else
                  rc = -EINVAL;
          }
@@ -140,26 +112,25 @@ index 93ea03e44864..cfd05c605dae 100644
          else if ( (val = parse_boolean("eager-fpu", s, ss)) >= 0 )
              opt_eager_fpu = val;
          else if ( (val = parse_boolean("l1d-flush", s, ss)) >= 0 )
-@@ -376,7 +388,7 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+@@ -375,7 +387,7 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
                 "\n");
  
      /* Settings for Xen's protection, irrespective of guests. */
--    printk("  Xen settings: BTI-Thunk %s, SPEC_CTRL: %s%s%s, Other:%s%s%s%s%s\n",
-+    printk("  Xen settings: BTI-Thunk %s, SPEC_CTRL: %s%s%s%s, Other:%s%s%s%s%s\n",
+-    printk("  Xen settings: BTI-Thunk %s, SPEC_CTRL: %s%s%s%s, Other:%s%s%s%s%s\n",
++    printk("  Xen settings: BTI-Thunk %s, SPEC_CTRL: %s%s%s%s%s, Other:%s%s%s%s%s\n",
             thunk == THUNK_NONE      ? "N/A" :
             thunk == THUNK_RETPOLINE ? "RETPOLINE" :
             thunk == THUNK_LFENCE    ? "LFENCE" :
-@@ -385,6 +397,9 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
-            (default_xen_spec_ctrl & SPEC_CTRL_IBRS)  ? "IBRS+" :  "IBRS-",
-            !boot_cpu_has(X86_FEATURE_SSBD)           ? "" :
+@@ -389,6 +401,8 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+            (!boot_cpu_has(X86_FEATURE_SSBD) &&
+             !boot_cpu_has(X86_FEATURE_AMD_SSBD))     ? "" :
             (default_xen_spec_ctrl & SPEC_CTRL_SSBD)  ? " SSBD+" : " SSBD-",
-+           (!boot_cpu_has(X86_FEATURE_PSFD) &&
-+            !boot_cpu_has(X86_FEATURE_INTEL_PSFD))   ? "" :
++           !boot_cpu_has(X86_FEATURE_PSFD) &&
 +           (default_xen_spec_ctrl & SPEC_CTRL_PSFD)  ? " PSFD+" : " PSFD-",
             !(caps & ARCH_CAPS_TSX_CTRL)              ? "" :
             (opt_tsx & 1)                             ? " TSX+" : " TSX-",
-            !cpu_has_srbds_ctrl                       ? "" :
-@@ -1059,14 +1074,49 @@ void __init init_speculation_mitigations(void)
+            !boot_cpu_has(X86_FEATURE_SRBDS_CTRL)     ? "" :
+@@ -1034,14 +1048,48 @@ void __init init_speculation_mitigations(void)
              setup_force_cpu_cap(X86_FEATURE_SC_MSR_HVM);
      }
  
@@ -205,9 +176,8 @@ index 93ea03e44864..cfd05c605dae 100644
 +    if ( opt_psfd == -1 )
 +        opt_psfd = 0;
 +
-+    if ( opt_psfd && (boot_cpu_has(X86_FEATURE_PSFD) ||
-+                      boot_cpu_has(X86_FEATURE_INTEL_PSFD)) )
++    if ( opt_psfd && boot_cpu_has(X86_FEATURE_PSFD) )
 +        default_xen_spec_ctrl |= SPEC_CTRL_PSFD;
  
      /*
-      * PV guests can create RSB entries for any linear address they control,
+      * PV guests can poison the RSB to any virtual address from which

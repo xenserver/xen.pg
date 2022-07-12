@@ -1,4 +1,4 @@
-From 04746b915e73345d1d7c35532b1bbd69df367e8a Mon Sep 17 00:00:00 2001
+From ebe3f5d9092466d2648c47c5aa6e9c9319db7bb5 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 24 Feb 2022 13:44:33 +0000
 Subject: x86/spec-ctrl: Support IBPB-on-entry
@@ -37,17 +37,18 @@ This is part of XSA-407.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 53a570b285694947776d5190f591a0d5b9b18de7)
 
 diff --git a/xen/arch/x86/hvm/svm/entry.S b/xen/arch/x86/hvm/svm/entry.S
-index 68c38847a004..62022ad78943 100644
+index 0684d29050a5..d7c85fdfc61b 100644
 --- a/xen/arch/x86/hvm/svm/entry.S
 +++ b/xen/arch/x86/hvm/svm/entry.S
-@@ -101,7 +101,19 @@ __UNLIKELY_END(nsvm_hap)
+@@ -90,10 +90,26 @@ __UNLIKELY_END(nsvm_hap)
  
          GET_CURRENT(bx)
  
--        /* SPEC_CTRL_ENTRY_FROM_SVM    Req: %rsp=regs/cpuinfo         Clob: acd */
-+        /* SPEC_CTRL_ENTRY_FROM_SVM    Req: %rsp=regs/cpuinfo, %rdx=0 Clob: acd */
+-        /* SPEC_CTRL_ENTRY_FROM_SVM    Req: b=curr %rsp=regs/cpuinfo, Clob: ac  */
++        /* SPEC_CTRL_ENTRY_FROM_SVM    Req: %rsp=regs/cpuinfo, %rdx=0 Clob: ac  */
 +
 +        .macro svm_vmexit_cond_ibpb
 +            testb  $SCF_entry_ibpb, CPUINFO_xen_spec_ctrl(%rsp)
@@ -61,10 +62,6 @@ index 68c38847a004..62022ad78943 100644
 +        ALTERNATIVE "", svm_vmexit_cond_ibpb, X86_FEATURE_IBPB_ENTRY_HVM
 +
          ALTERNATIVE "", DO_OVERWRITE_RSB, X86_FEATURE_SC_RSB_HVM
- 
-         .macro svm_vmexit_spec_ctrl
-@@ -118,6 +130,10 @@ __UNLIKELY_END(nsvm_hap)
-         ALTERNATIVE "", svm_vmexit_spec_ctrl, X86_FEATURE_SC_MSR_HVM
          /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
  
 +        /*
@@ -90,7 +87,7 @@ index f3bd7f9bee94..447f583e07c4 100644
      vmx_vmcs_exit(v);
  
 diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
-index 9059c2ef6e43..622ab131d111 100644
+index 9059c2ef6e43..6d2e0426771e 100644
 --- a/xen/arch/x86/x86_64/compat/entry.S
 +++ b/xen/arch/x86/x86_64/compat/entry.S
 @@ -17,7 +17,7 @@ ENTRY(entry_int82)
@@ -98,10 +95,19 @@ index 9059c2ef6e43..622ab131d111 100644
          SAVE_ALL compat=1 /* DPL1 gate, restricted to 32bit PV guests only. */
  
 -        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, Clob: acd */
-+        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, %rdx=0 Clob: acd */
++        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, %rdx=0, Clob: acd */
          /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
  
          CR4_PV32_RESTORE
+@@ -208,7 +208,7 @@ ENTRY(cstar_enter)
+         movl  $TRAP_syscall, 4(%rsp)
+         SAVE_ALL
+ 
+-        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, Clob: acd */
++        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, %rdx=0, Clob: acd */
+         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
+ 
+         GET_STACK_END(bx)
 diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
 index 481110fb9360..9fd4cef30f73 100644
 --- a/xen/arch/x86/x86_64/entry.S
@@ -152,7 +158,7 @@ index 481110fb9360..9fd4cef30f73 100644
  
          mov   STACK_CPUINFO_FIELD(xen_cr3)(%r14), %rcx
 diff --git a/xen/include/asm-x86/cpufeatures.h b/xen/include/asm-x86/cpufeatures.h
-index 0519d95735dc..313765579e72 100644
+index fc54c24a34ef..c6136ca4a031 100644
 --- a/xen/include/asm-x86/cpufeatures.h
 +++ b/xen/include/asm-x86/cpufeatures.h
 @@ -37,6 +37,8 @@ XEN_CPUFEATURE(SC_MSR_IDLE,       X86_SYNTH(21)) /* Clear MSR_SPEC_CTRL on idle
@@ -165,7 +171,7 @@ index 0519d95735dc..313765579e72 100644
  /* Bug words follow the synthetic words. */
  #define X86_NR_BUG 1
 diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
-index dff11c88b613..1afcd442b5bd 100644
+index 495260d6b6fc..8b69a819175a 100644
 --- a/xen/include/asm-x86/spec_ctrl.h
 +++ b/xen/include/asm-x86/spec_ctrl.h
 @@ -34,6 +34,8 @@
@@ -194,10 +200,10 @@ index dff11c88b613..1afcd442b5bd 100644
  #ifndef __ASSEMBLY__
  
 diff --git a/xen/include/asm-x86/spec_ctrl_asm.h b/xen/include/asm-x86/spec_ctrl_asm.h
-index 859f34e1febb..451e5d26f829 100644
+index 3ec680b5870b..5756f3f1a83d 100644
 --- a/xen/include/asm-x86/spec_ctrl_asm.h
 +++ b/xen/include/asm-x86/spec_ctrl_asm.h
-@@ -88,6 +88,35 @@
+@@ -80,6 +80,35 @@
   *  - SPEC_CTRL_EXIT_TO_{SVM,VMX}
   */
  
@@ -233,7 +239,7 @@ index 859f34e1febb..451e5d26f829 100644
  .macro DO_OVERWRITE_RSB tmp=rax
  /*
   * Requires nothing
-@@ -215,12 +244,16 @@
+@@ -232,12 +261,16 @@
  
  /* Use after an entry from PV context (syscall/sysenter/int80/int82/etc). */
  #define SPEC_CTRL_ENTRY_FROM_PV                                         \
@@ -250,7 +256,7 @@ index 859f34e1febb..451e5d26f829 100644
      ALTERNATIVE "", DO_OVERWRITE_RSB, X86_FEATURE_SC_RSB_PV;            \
      ALTERNATIVE "", __stringify(DO_SPEC_CTRL_ENTRY maybexen=1),         \
          X86_FEATURE_SC_MSR_PV
-@@ -244,11 +277,23 @@
+@@ -261,11 +294,23 @@
   * Requires %rsp=regs, %r14=stack_end, %rdx=0
   * Clobbers %rax, %rbx, %rcx, %rdx
   *
