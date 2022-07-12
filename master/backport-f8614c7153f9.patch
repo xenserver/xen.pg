@@ -1,4 +1,4 @@
-From 70daaa23615506131fcc26b3289d52eef32206fc Mon Sep 17 00:00:00 2001
+From f8614c7153f95dcd1a1320156787dbc5325fd946 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Mon, 27 Jun 2022 19:29:40 +0100
 Subject: x86/spec-ctrl: Mitigate Branch Type Confusion when possible
@@ -22,52 +22,53 @@ If all PV guests on the system are trusted, then it is recommended to boot
 with `spec-ctrl=ibpb-entry=no-pv`, as this will provide an additional marginal
 perf improvement.
 
-This is part of XSA-407.
+This is part of XSA-407 / CVE-2022-23825.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit d8cb7e0f069e0f106d24941355b59b45a731eabe)
 
 diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
-index 38da2ea1015a..e852dfa3ea27 100644
+index 359859b51808..956ecd5a3591 100644
 --- a/docs/misc/xen-command-line.pandoc
 +++ b/docs/misc/xen-command-line.pandoc
-@@ -2054,6 +2054,7 @@ By default SSBD will be mitigated at runtime (i.e `ssbd=runtime`).
+@@ -2034,7 +2034,7 @@ By default SSBD will be mitigated at runtime (i.e `ssbd=runtime`).
  
  ### spec-ctrl (x86)
- > `= List of [ <bool>, xen=<bool>, {pv,hvm,msr-sc,rsb,md-clear}=<bool>,
-+>              ibpb-entry=<bool>|{pv,hvm}=<bool>,
+ > `= List of [ <bool>, xen=<bool>, {pv,hvm}=<bool>,
+->              {msr-sc,rsb,md-clear}=<bool>|{pv,hvm}=<bool>,
++>              {msr-sc,rsb,md-clear,ibpb-entry}=<bool>|{pv,hvm}=<bool>,
  >              bti-thunk=retpoline|lfence|jmp, {ibrs,ibpb,ssbd,psfd,
  >              eager-fpu,l1d-flush,branch-harden,srb-lock,
  >              unpriv-mmio}=<bool> ]`
-@@ -2078,9 +2079,10 @@ in place for guests to use.
+@@ -2059,9 +2059,10 @@ in place for guests to use.
  
  Use of a positive boolean value for either of these options is invalid.
  
--The booleans `pv=`, `hvm=`, `msr-sc=`, `rsb=` and `md-clear=` offer fine
+-The `pv=`, `hvm=`, `msr-sc=`, `rsb=` and `md-clear=` options offer fine
 -grained control over the primitives by Xen.  These impact Xen's ability to
--protect itself, and Xen's ability to virtualise support for guests to use.
-+The `pv=`, `hvm=`, `msr-sc=`, `rsb=`, `md-clear=` and `ipbp-entry=` options
-+offer fine grained control over the primitives used by Xen.  These impact
-+Xen's ability to protect itself, and Xen's ability to virtualise support for
+-protect itself, and/or Xen's ability to virtualise support for guests to use.
++The `pv=`, `hvm=`, `msr-sc=`, `rsb=`, `md-clear=` and `ibpb-entry=` options
++offer fine grained control over the primitives by Xen.  These impact Xen's
++ability to protect itself, and/or Xen's ability to virtualise support for
 +guests to use.
  
  * `pv=` and `hvm=` offer control over all suboptions for PV and HVM guests
    respectively.
-@@ -2094,6 +2096,12 @@ protect itself, and Xen's ability to virtualise support for guests to use.
+@@ -2080,6 +2081,11 @@ protect itself, and/or Xen's ability to virtualise support for guests to use.
    compatibility with development versions of this fix, `mds=` is also accepted
    on Xen 4.12 and earlier as an alias.  Consult vendor documentation in
    preference to here.*
 +* `ibpb-entry=` offers control over whether IBPB (Indirect Branch Prediction
-+  Barrier) is used on entry to Xen.  This option can be used as a simple
-+  boolean, or with `pv`, `hvm` sub booleans.  This is used by default on
-+  hardware vulnerable to Branch Type Confusion, but for performance reasons,
-+  dom0 is unprotected by default.  If it necessary to protect dom0 too, boot
-+  with `spec-ctrl=ibpb-entry`.
++  Barrier) is used on entry to Xen.  This is used by default on hardware
++  vulnerable to Branch Type Confusion, but for performance reasons, dom0 is
++  unprotected by default.  If it necessary to protect dom0 too, boot with
++  `spec-ctrl=ibpb-entry`.
  
  If Xen was compiled with INDIRECT_THUNK support, `bti-thunk=` can be used to
  select which of the thunks gets patched into the `__x86_indirect_thunk_%reg`
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index ae6ccc70dfc0..aee7028abe68 100644
+index 4fdc6e93add4..bfa5d27e00f5 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
 @@ -39,6 +39,10 @@ static bool __initdata opt_rsb_hvm = true;
@@ -89,8 +90,8 @@ index ae6ccc70dfc0..aee7028abe68 100644
 +int8_t __read_mostly opt_ibpb_ctxt_switch = -1;
  int8_t __read_mostly opt_eager_fpu = -1;
  int8_t __read_mostly opt_l1d_flush = -1;
- static bool __initdata opt_branch_harden = true;
-@@ -114,6 +118,9 @@ static int __init parse_spec_ctrl(const char *s)
+ bool __read_mostly opt_branch_harden = true;
+@@ -115,6 +119,9 @@ static int __init parse_spec_ctrl(const char *s)
              opt_rsb_hvm = false;
              opt_md_clear_pv = 0;
              opt_md_clear_hvm = 0;
@@ -100,7 +101,7 @@ index ae6ccc70dfc0..aee7028abe68 100644
  
              opt_thunk = THUNK_JMP;
              opt_ibrs = 0;
-@@ -139,12 +146,14 @@ static int __init parse_spec_ctrl(const char *s)
+@@ -141,12 +148,14 @@ static int __init parse_spec_ctrl(const char *s)
              opt_msr_sc_pv = val;
              opt_rsb_pv = val;
              opt_md_clear_pv = val;
@@ -113,11 +114,11 @@ index ae6ccc70dfc0..aee7028abe68 100644
              opt_md_clear_hvm = val;
 +            opt_ibpb_entry_hvm = val;
          }
-         else if ( (val = parse_boolean("msr-sc", s, ss)) >= 0 )
+         else if ( (val = parse_boolean("msr-sc", s, ss)) != -1 )
          {
-@@ -161,6 +170,28 @@ static int __init parse_spec_ctrl(const char *s)
-             opt_md_clear_pv = val;
-             opt_md_clear_hvm = val;
+@@ -211,6 +220,28 @@ static int __init parse_spec_ctrl(const char *s)
+                 break;
+             }
          }
 +        else if ( (val = parse_boolean("ibpb-entry", s, ss)) != -1 )
 +        {
@@ -130,7 +131,7 @@ index ae6ccc70dfc0..aee7028abe68 100644
 +                break;
 +
 +            case -2:
-+                s += 11; /* Skip over "ibpb-entry=" */
++                s += strlen("ibpb-entry=");
 +                if ( (val = parse_boolean("pv", s, ss)) >= 0 )
 +                    opt_ibpb_entry_pv = val;
 +                else if ( (val = parse_boolean("hvm", s, ss)) >= 0 )
@@ -144,7 +145,7 @@ index ae6ccc70dfc0..aee7028abe68 100644
  
          /* Xen's speculative sidechannel mitigation settings. */
          else if ( !strncmp(s, "bti-thunk=", 10) )
-@@ -423,27 +454,31 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
+@@ -474,27 +505,31 @@ static void __init print_details(enum ind_thunk thunk, uint64_t caps)
       * mitigation support for guests.
       */
  #ifdef CONFIG_HVM
@@ -180,7 +181,7 @@ index ae6ccc70dfc0..aee7028abe68 100644
  
      printk("  XPTI (64-bit PV only): Dom0 %s, DomU %s (with%s PCID)\n",
             opt_xpti_hwdom ? "enabled" : "disabled",
-@@ -705,6 +740,55 @@ static bool __init should_use_eager_fpu(void)
+@@ -727,6 +762,55 @@ static bool __init should_use_eager_fpu(void)
      }
  }
  
@@ -236,7 +237,7 @@ index ae6ccc70dfc0..aee7028abe68 100644
  /* Calculate whether this CPU is vulnerable to L1TF. */
  static __init void l1tf_calculations(uint64_t caps)
  {
-@@ -960,8 +1044,12 @@ void spec_ctrl_init_domain(struct domain *d)
+@@ -982,8 +1066,12 @@ void spec_ctrl_init_domain(struct domain *d)
      bool verw = ((pv ? opt_md_clear_pv : opt_md_clear_hvm) ||
                   (opt_fb_clear_mmio && is_iommu_enabled(d)));
  
@@ -249,7 +250,7 @@ index ae6ccc70dfc0..aee7028abe68 100644
          0;
  }
  
-@@ -1089,12 +1177,15 @@ void __init init_speculation_mitigations(void)
+@@ -1111,12 +1199,15 @@ void __init init_speculation_mitigations(void)
      }
  
      /*
@@ -269,7 +270,7 @@ index ae6ccc70dfc0..aee7028abe68 100644
  
      if ( opt_stibp && (boot_cpu_has(X86_FEATURE_STIBP) ||
                         boot_cpu_has(X86_FEATURE_AMD_STIBP)) )
-@@ -1166,9 +1257,7 @@ void __init init_speculation_mitigations(void)
+@@ -1169,9 +1260,7 @@ void __init init_speculation_mitigations(void)
      if ( opt_rsb_hvm )
          setup_force_cpu_cap(X86_FEATURE_SC_RSB_HVM);
  
@@ -281,7 +282,7 @@ index ae6ccc70dfc0..aee7028abe68 100644
      /* Check whether Eager FPU should be enabled by default. */
      if ( opt_eager_fpu == -1 )
 diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
-index 1afcd442b5bd..8399a0389ee7 100644
+index 8b69a819175a..2f15ae981495 100644
 --- a/xen/include/asm-x86/spec_ctrl.h
 +++ b/xen/include/asm-x86/spec_ctrl.h
 @@ -65,7 +65,7 @@
