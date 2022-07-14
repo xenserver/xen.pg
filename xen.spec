@@ -37,13 +37,12 @@ Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.13.4
 Release: %{?xsrel}%{?dist}
-License: Portions GPLv2 (See COPYING)
+License: GPLv2 and LGPLv2 and MIT and Public Domain
 URL:     http://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{package_srccommit}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
-Source4: https://repo.citrite.net/list/ctx-local-contrib/citrix/branding2020/Citrix_Logo_Black.png
 Source5: gen_test_metadata.py
 
 ExclusiveArch: x86_64
@@ -109,38 +108,39 @@ Xen Hypervisor.
 
 %package hypervisor
 Summary: The Xen Hypervisor
-License: Various (See description)
+License: GPLv2
 Requires(post): coreutils grep
 %description hypervisor
 This package contains the Xen Project Hypervisor with selected patches provided by Citrix.
 
-Citrix, the Citrix logo, Xen, XenServer, and certain other marks appearing herein are proprietary trademarks of Citrix Systems, Inc., and are registered in the U.S. and other countries. You may not redistribute this package, nor display or otherwise use any Citrix trademarks or any marks that incorporate Citrix trademarks without the express prior written authorization of Citrix. Nothing herein shall restrict your rights, if any, in the software contained within this package under an applicable open source license.
-
-Portions of this package are © 2018 Citrix Systems, Inc. For other copyright and licensing information see the relevant source RPM.
-
 %package hypervisor-debuginfo
 Summary: The Xen Hypervisor debug information
+License: GPLv2
 %description hypervisor-debuginfo
 This package contains the Xen Hypervisor debug information.
 
 %package tools
 Summary: Xen Hypervisor general tools
+License: GPLv2 and LGPLv2
 Requires: xen-libs = %{version}
 %description tools
 This package contains the Xen Hypervisor general tools for all domains.
 
 %package devel
 Summary: The Xen Hypervisor public headers
+License: MIT and Public Domain
 %description devel
 This package contains the Xen Hypervisor public header files.
 
 %package libs
 Summary: Xen Hypervisor general libraries
+License: LGPLv2
 %description libs
 This package contains the Xen Hypervisor general libraries for all domains.
 
 %package libs-devel
 Summary: Xen Hypervisor general development libraries
+License: LGPLv2
 Requires: xen-libs = %{version}
 Requires: xen-devel = %{version}
 %description libs-devel
@@ -148,6 +148,7 @@ This package contains the Xen Hypervisor general development for all domains.
 
 %package dom0-tools
 Summary: Xen Hypervisor Domain 0 tools
+License: GPLv2 and LGPLv2 and MIT
 Requires: xen-dom0-libs = %{version}
 Requires: xen-tools = %{version}
 Requires: edk2
@@ -162,12 +163,14 @@ This package contains the Xen Hypervisor control domain tools.
 
 %package dom0-libs
 Summary: Xen Hypervisor Domain 0 libraries
+License: GPLv2 and LGPLv2 and MIT
 Requires: xen-hypervisor = %{version}
 %description dom0-libs
 This package contains the Xen Hypervisor control domain libraries.
 
 %package dom0-libs-devel
 Summary: Xen Hypervisor Domain 0 headers
+License: GPLv2 and LGPLv2 and MIT
 Requires: xen-devel = %{version}
 Requires: xen-dom0-libs = %{version}
 %description dom0-libs-devel
@@ -175,12 +178,14 @@ This package contains the Xen Hypervisor control domain headers.
 
 %package ocaml-libs
 Summary: Xen Hypervisor ocaml libraries
+License: LGPLv2
 Requires: xen-dom0-libs = %{version}
 %description ocaml-libs
 This package contains the Xen Hypervisor ocaml libraries.
 
 %package ocaml-devel
 Summary: Xen Hypervisor ocaml headers
+License: LGPLv2
 Requires: xen-ocaml-libs = %{version}
 Requires: xen-dom0-libs-devel = %{version}
 %description ocaml-devel
@@ -188,12 +193,14 @@ This package contains the Xen Hypervisor ocaml headers.
 
 %package installer-files
 Summary: Xen files for the XenServer installer
+License: LGPLv2
 %description installer-files
 This package contains the minimal subset of libraries and binaries required in
 the XenServer installer environment.
 
 %package dom0-tests
 Summary: Xen Hypervisor tests
+License: GPLv2
 %description dom0-tests
 This package contains test cases for the Xen Hypervisor.
 
@@ -213,7 +220,6 @@ patches against base version %{version}-%{release}.
 base_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info)
 pq_cset="%{package_speccommit}"
 echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
-cp %{SOURCE4} .
 
 %build
 
@@ -319,7 +325,7 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 /boot/%{name}-%{version}-%{hv_rel}-d.map
 /boot/%{name}-%{version}-%{hv_rel}-d.config
 %config %{_sysconfdir}/sysconfig/kernel-xen
-%doc Citrix_Logo_Black.png
+%license COPYING
 %ghost %attr(0644,root,root) %{_sysconfdir}/sysconfig/kernel-xen-args
 
 %files hypervisor-debuginfo
