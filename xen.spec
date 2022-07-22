@@ -110,7 +110,6 @@ Xen Hypervisor.
 %package hypervisor
 Summary: The Xen Hypervisor
 License: Various (See description)
-Group: System/Hypervisor
 Requires(post): coreutils grep
 %description hypervisor
 This package contains the Xen Project Hypervisor with selected patches provided by Citrix.
@@ -121,26 +120,22 @@ Portions of this package are © 2018 Citrix Systems, Inc. For other copyright an
 
 %package hypervisor-debuginfo
 Summary: The Xen Hypervisor debug information
-Group: Development/Debug
 %description hypervisor-debuginfo
 This package contains the Xen Hypervisor debug information.
 
 %package tools
 Summary: Xen Hypervisor general tools
 Requires: xen-libs = %{version}
-Group: System/Base
 %description tools
 This package contains the Xen Hypervisor general tools for all domains.
 
 %package devel
 Summary: The Xen Hypervisor public headers
-Group: Development/Libraries
 %description devel
 This package contains the Xen Hypervisor public header files.
 
 %package libs
 Summary: Xen Hypervisor general libraries
-Group: System/Libraries
 %description libs
 This package contains the Xen Hypervisor general libraries for all domains.
 
@@ -148,7 +143,6 @@ This package contains the Xen Hypervisor general libraries for all domains.
 Summary: Xen Hypervisor general development libraries
 Requires: xen-libs = %{version}
 Requires: xen-devel = %{version}
-Group: Development/Libraries
 %description libs-devel
 This package contains the Xen Hypervisor general development for all domains.
 
@@ -163,14 +157,12 @@ Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
 %endif
-Group: System/Base
 %description dom0-tools
 This package contains the Xen Hypervisor control domain tools.
 
 %package dom0-libs
 Summary: Xen Hypervisor Domain 0 libraries
 Requires: xen-hypervisor = %{version}
-Group: System/Libraries
 %description dom0-libs
 This package contains the Xen Hypervisor control domain libraries.
 
@@ -178,14 +170,12 @@ This package contains the Xen Hypervisor control domain libraries.
 Summary: Xen Hypervisor Domain 0 headers
 Requires: xen-devel = %{version}
 Requires: xen-dom0-libs = %{version}
-Group: Development/Libraries
 %description dom0-libs-devel
 This package contains the Xen Hypervisor control domain headers.
 
 %package ocaml-libs
 Summary: Xen Hypervisor ocaml libraries
 Requires: xen-dom0-libs = %{version}
-Group: System/Libraries
 %description ocaml-libs
 This package contains the Xen Hypervisor ocaml libraries.
 
@@ -193,27 +183,23 @@ This package contains the Xen Hypervisor ocaml libraries.
 Summary: Xen Hypervisor ocaml headers
 Requires: xen-ocaml-libs = %{version}
 Requires: xen-dom0-libs-devel = %{version}
-Group: Development/Libraries
 %description ocaml-devel
 This package contains the Xen Hypervisor ocaml headers.
 
 %package installer-files
 Summary: Xen files for the XenServer installer
-Group: System Environment/Base
 %description installer-files
 This package contains the minimal subset of libraries and binaries required in
 the XenServer installer environment.
 
 %package dom0-tests
 Summary: Xen Hypervisor tests
-Group: System/Libraries
 %description dom0-tests
 This package contains test cases for the Xen Hypervisor.
 
 %package lp-devel_%{version}_%{release}
 License: GPLv2
 Summary: Development package for building livepatches
-Group: Development/System
 %description lp-devel_%{version}_%{release}
 Contains the prepared source files, config, and xen-syms for building live
 patches against base version %{version}-%{release}.
