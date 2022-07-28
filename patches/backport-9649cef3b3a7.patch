@@ -1,0 +1,63 @@
+From 9649cef3b3a7eaca1347154ea7f274586d48bc29 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 28 Feb 2020 16:25:43 +0100
+Subject: AMD/IOMMU: correct handling when XT's prereq features are unavailable
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We should neither cause IOMMU initialization as a whole to fail in this
+case (we should still be able to bring up the system in non-x2APIC or
+x2APIC physical mode), nor should the remainder of the function be
+skipped (as the main part of it won't get entered a 2nd time) in such an
+event. It is merely necessary for the function to indicate to the caller
+(iov_supports_xt()) that setup failed as far as x2APIC is concerned.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/drivers/passthrough/amd/iommu_init.c b/xen/drivers/passthrough/amd/iommu_init.c
+index 7a41010d09e1..43c4eadcd71e 100644
+--- a/xen/drivers/passthrough/amd/iommu_init.c
++++ b/xen/drivers/passthrough/amd/iommu_init.c
+@@ -1419,6 +1419,7 @@ static int __init amd_iommu_prepare_one(struct amd_iommu *iommu)
+ int __init amd_iommu_prepare(bool xt)
+ {
+     struct amd_iommu *iommu;
++    bool has_xt = true;
+     int rc = -ENODEV;
+ 
+     BUG_ON( !iommu_found() );
+@@ -1455,17 +1456,16 @@ int __init amd_iommu_prepare(bool xt)
+         if ( rc )
+             goto error_out;
+ 
+-        rc = -ENODEV;
+-        if ( xt && (!iommu->features.flds.ga_sup || !iommu->features.flds.xt_sup) )
+-            goto error_out;
++        if ( !iommu->features.flds.ga_sup || !iommu->features.flds.xt_sup )
++            has_xt = false;
+     }
+ 
+     for_each_amd_iommu ( iommu )
+     {
+         /* NB: There's no need to actually write these out right here. */
+-        iommu->ctrl.ga_en |= xt;
+-        iommu->ctrl.xt_en = xt;
+-        iommu->ctrl.int_cap_xt_en = xt;
++        iommu->ctrl.ga_en |= xt && has_xt;
++        iommu->ctrl.xt_en = xt && has_xt;
++        iommu->ctrl.int_cap_xt_en = xt && has_xt;
+     }
+ 
+     rc = amd_iommu_update_ivrs_mapping_acpi();
+@@ -1477,7 +1477,7 @@ int __init amd_iommu_prepare(bool xt)
+         ivhd_type = 0;
+     }
+ 
+-    return rc;
++    return rc ?: xt && !has_xt ? -ENODEV : 0;
+ }
+ 
+ int __init amd_iommu_init(bool xt)
