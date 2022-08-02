@@ -1,0 +1,98 @@
+From 6ba701064227c6a4baa64d377e1ad869452f7fb6 Mon Sep 17 00:00:00 2001
+Message-Id: <6ba701064227c6a4baa64d377e1ad869452f7fb6.1659423146.git.lin.liu@citrix.com>
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 18 Feb 2022 14:45:14 +0100
+Subject: video/vesa: drop "vesa-mtrr" command line option
+
+Now that we use ioremap_wc() for mapping the frame buffer, there's no
+need for this option anymore. As noted in the change introducing the
+use of ioremap_wc(), mtrr_add() didn't work in certain cases anyway.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
+index 833c8677527a..aef7ca493af2 100644
+--- a/docs/misc/xen-command-line.pandoc
++++ b/docs/misc/xen-command-line.pandoc
+@@ -2318,9 +2318,6 @@ cache-warming. 1ms (1000) has been measured as a good value.
+ ### vesa-map
+ > `= <integer>`
+ 
+-### vesa-mtrr
+-> `= <integer>`
+-
+ ### vesa-ram
+ > `= <integer>`
+ 
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 1927d49762b6..f0ba7f59d777 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -1654,8 +1654,6 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+ 
+     local_irq_enable();
+ 
+-    vesa_mtrr_init();
+-
+     early_msi_init();
+ 
+     iommu_setup();    /* setup iommu if available */
+diff --git a/xen/drivers/video/vesa.c b/xen/drivers/video/vesa.c
+index b922156ec530..d142750567af 100644
+--- a/xen/drivers/video/vesa.c
++++ b/xen/drivers/video/vesa.c
+@@ -144,38 +144,6 @@ void __init vesa_init(void)
+     video_puts = lfb_redraw_puts;
+ }
+ 
+-#include <asm/mtrr.h>
+-
+-static unsigned int vesa_mtrr;
+-integer_param("vesa-mtrr", vesa_mtrr);
+-
+-void __init vesa_mtrr_init(void)
+-{
+-    static const int mtrr_types[] = {
+-        0, MTRR_TYPE_UNCACHABLE, MTRR_TYPE_WRBACK,
+-        MTRR_TYPE_WRCOMB, MTRR_TYPE_WRTHROUGH };
+-    unsigned int size_total;
+-    int rc, type;
+-
+-    if ( !lfb || (vesa_mtrr == 0) || (vesa_mtrr >= ARRAY_SIZE(mtrr_types)) )
+-        return;
+-
+-    type = mtrr_types[vesa_mtrr];
+-    if ( !type )
+-        return;
+-
+-    /* Find the largest power-of-two */
+-    size_total = vram_total;
+-    while ( size_total & (size_total - 1) )
+-        size_total &= size_total - 1;
+-
+-    /* Try and find a power of two to add */
+-    do {
+-        rc = mtrr_add(lfb_base(), size_total, type, 1);
+-        size_total >>= 1;
+-    } while ( (size_total >= PAGE_SIZE) && (rc == -EINVAL) );
+-}
+-
+ static void lfb_flush(void)
+ {
+     __asm__ __volatile__ ("sfence" : : : "memory");
+diff --git a/xen/include/asm-x86/setup.h b/xen/include/asm-x86/setup.h
+index 138a41ac1a14..0c61894410d5 100644
+--- a/xen/include/asm-x86/setup.h
++++ b/xen/include/asm-x86/setup.h
+@@ -28,10 +28,8 @@ void init_IRQ(void);
+ 
+ #ifdef CONFIG_VIDEO
+ void vesa_init(void);
+-void vesa_mtrr_init(void);
+ #else
+ static inline void vesa_init(void) {};
+-static inline void vesa_mtrr_init(void) {};
+ #endif
+ 
+ int construct_dom0(
