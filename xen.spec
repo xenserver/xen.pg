@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.28
+%global hv_rel 10.29
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -871,6 +871,11 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Aug 5 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.29
+- Improve boot speed by using WC mappings for the VGA framebuffer.
+- Fix crash on boot on AMD Zen2/3 systems when x2apic is disabled by firmware.
+- Correct the RPM license fields.
+
 * Tue Jul 26 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.28
 - Fix for XSA-408 CVE-2022-33745.
 
