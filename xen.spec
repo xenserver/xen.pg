@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.29
+%global hv_rel 10.30
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -74,7 +74,8 @@ BuildRequires: openssl-devel
 BuildRequires: yajl-devel libuuid-devel perl
 
 # For ocaml stubs
-BuildRequires: ocaml ocaml-findlib
+BuildRequires: ocaml >= 4.13.1-3
+BuildRequires: ocaml-findlib
 
 BuildRequires: libblkid-devel
 
@@ -871,6 +872,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Tue Aug 9 2022 Pau Ruiz Safont <pau.safont@citrix.com> - 4.13.4-10.30
+- Bump release and rebuild with OCaml 4.13.1-3 compiler.
+
 * Fri Aug 5 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.29
 - Improve boot speed by using WC mappings for the VGA framebuffer.
 - Fix crash on boot on AMD Zen2/3 systems when x2apic is disabled by firmware.
