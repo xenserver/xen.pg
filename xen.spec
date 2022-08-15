@@ -243,6 +243,40 @@ cp -a . ../livepatch-src/
 %{?_cov_wrap} %{make_build} build-tools
 %{make_build} -C docs man-pages
 
+# The hypervisor build system can't cope with RPM's {C,LD}FLAGS
+unset CFLAGS
+unset LDFLAGS
+
+build_xen () { # $1=vendorversion $2=buildconfig $3=outdir $4=cov
+    local mk ver cov
+
+    [ -n "$1" ] && ver="XEN_VENDORVERSION=$1"
+    [ -n "$4" ] && cov="%{?_cov_wrap}"
+
+    mk="$cov %{make_build} -C xen $ver"
+
+    cp -a buildconfigs/$2 xen/.config
+    $mk olddefconfig
+    $mk build
+    $mk MAP
+
+    mkdir -p xen/$3
+    cp -a xen/xen xen/xen.gz xen/System.map xen/xen-syms xen/.config xen/$3
+}
+
+# Builds of Xen
+build_xen -%{hv_rel}   config-release         build-xen-release
+
+%{make_build} -C xen clean
+build_xen -%{hv_rel}-d config-debug           build-xen-debug      cov
+
+%{make_build} -C xen clean
+build_xen ""           config-pvshim-release  build-shim-release
+
+%{make_build} -C xen clean
+build_xen ""           config-pvshim-debug    build-shim-debug
+
+
 %install
 
 source /opt/rh/devtoolset-11/enable
@@ -255,59 +289,27 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 %{make_build} DESTDIR=%{buildroot} install-tools
 %{make_build} DESTDIR=%{buildroot} -C docs install-man-pages
 
-mkdir -p %{buildroot}/boot/
-
 # Install artefacts for livepatches
-mkdir -p %{buildroot}%{_usrsrc}
+%{__install} -p -D -m 644 xen/build-xen-release/xen-syms %{buildroot}%{lp_devel_dir}/xen-syms
 cp -a ../livepatch-src/. %{buildroot}%{lp_devel_dir}
 
-# Regular build of Xen
-%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel} \
-    KCONFIG_CONFIG=../buildconfigs/config-release olddefconfig
-%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel} \
-    KCONFIG_CONFIG=../buildconfigs/config-release build
-%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel} \
-    KCONFIG_CONFIG=../buildconfigs/config-release MAP
+# Install release & debug Xen
+install_xen () { # $1=vendorversion $2=outdir
+    %{__install} -p -D -m 644 xen/$2/xen.gz     %{buildroot}/boot/xen-%{version}$1.gz
+    %{__install} -p -D -m 644 xen/$2/System.map %{buildroot}/boot/xen-%{version}$1.map
+    %{__install} -p -D -m 644 xen/$2/.config    %{buildroot}/boot/xen-%{version}$1.config
+    %{__install} -p -D -m 644 xen/$2/xen-syms   %{buildroot}/boot/xen-syms-%{version}$1
+}
+install_xen -%{hv_rel}   build-xen-release
+install_xen -%{hv_rel}-d build-xen-debug
 
-cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.gz
-cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.map
-cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{hv_rel}
-cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.config
-install -m 644 xen/xen-syms %{buildroot}%{lp_devel_dir}
-
-# Debug build of Xen
-%{make_build} -C xen clean
-%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
-    KCONFIG_CONFIG=../buildconfigs/config-debug olddefconfig
-%{?_cov_wrap} %{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
-    KCONFIG_CONFIG=../buildconfigs/config-debug build
-%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
-    KCONFIG_CONFIG=../buildconfigs/config-debug MAP
-
-cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{hv_rel}-d.gz
-cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{hv_rel}-d.map
-cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{hv_rel}-d
-cp buildconfigs/config-debug %{buildroot}/boot/%{name}-%{version}-%{hv_rel}-d.config
-
-# do not strip the hypervisor-debuginfo targerts
-chmod -x %{buildroot}/boot/xen-syms-*
-
-# Regular build of PV shim
-cp buildconfigs/config-pvshim-release xen/arch/x86/configs/pvshim_defconfig
-%{make_build} -C tools/firmware/xen-dir xen-shim
-%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim \
-    %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim-release
-%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim-syms \
-    %{buildroot}/usr/lib/debug/%{_libexecdir}/%{name}/boot/xen-shim-syms-release
-
-# Debug build of PV shim
-%{make_build} -C tools/firmware/xen-dir clean
-cp buildconfigs/config-pvshim-debug xen/arch/x86/configs/pvshim_defconfig
-%{?_cov_wrap} %{make_build} -C tools/firmware/xen-dir xen-shim
-%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim \
-    %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim-debug
-%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim-syms \
-    %{buildroot}/usr/lib/debug/%{_libexecdir}/%{name}/boot/xen-shim-syms-debug
+# Install release & debug shims
+install_shim () { # $1=outdir $2=suffix
+    %{__install} -p -D -m 644 xen/$1/xen      %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim-$2
+    %{__install} -p -D -m 644 xen/$1/xen-syms %{buildroot}/usr/lib/debug%{_libexecdir}/%{name}/boot/xen-shim-syms-$2
+}
+install_shim build-shim-release release
+install_shim build-shim-debug   debug
 
 # choose between debug and release PV shim build
 %if %{default_debug_hypervisor}
