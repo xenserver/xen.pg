@@ -21,10 +21,6 @@
 # Use the production hypervisor by default
 %define default_debug_hypervisor 0
 
-%define COMMON_OPTIONS DESTDIR=%{buildroot} %{?_smp_mflags}
-%define HVSOR_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64
-%define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 debug=n
-
 %define base_dir  %{name}-%{version}
 
 %define lp_devel_dir %{_usrsrc}/xen-%{version}-%{release}
@@ -225,6 +221,7 @@ echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
 %build
 
 source /opt/rh/devtoolset-11/enable
+export XEN_TARGET_ARCH=%{_arch}
 
 %configure --disable-qemu-traditional \
            --disable-seabios \
@@ -241,6 +238,7 @@ source /opt/rh/devtoolset-11/enable
 %install
 
 source /opt/rh/devtoolset-11/enable
+export XEN_TARGET_ARCH=%{_arch}
 
 # The existence of this directory causes ocamlfind to put things in it
 mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
@@ -252,11 +250,11 @@ mkdir -p %{buildroot}%{_usrsrc}
 cp -r $(pwd) %{buildroot}%{lp_devel_dir}
 
 # Regular build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel} \
+%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel} \
     KCONFIG_CONFIG=../buildconfigs/config-release olddefconfig
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel} \
+%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel} \
     KCONFIG_CONFIG=../buildconfigs/config-release build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel} \
+%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel} \
     KCONFIG_CONFIG=../buildconfigs/config-release MAP
 
 cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.gz
@@ -266,12 +264,12 @@ cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{hv_rel}.co
 install -m 644 xen/xen-syms %{buildroot}%{lp_devel_dir}
 
 # Debug build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen clean
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
+%{make_build} -C xen clean
+%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug olddefconfig
-%{?_cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
+%{?_cov_wrap} %{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
+%{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel}-d \
     KCONFIG_CONFIG=../buildconfigs/config-debug MAP
 
 cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{hv_rel}-d.gz
@@ -284,16 +282,16 @@ chmod -x %{buildroot}/boot/xen-syms-*
 
 # Regular build of PV shim
 cp buildconfigs/config-pvshim-release xen/arch/x86/configs/pvshim_defconfig
-%{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir xen-shim
+%{make_build} -C tools/firmware/xen-dir xen-shim
 %{__install} -D -m 644 tools/firmware/xen-dir/xen-shim \
     %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim-release
 %{__install} -D -m 644 tools/firmware/xen-dir/xen-shim-syms \
     %{buildroot}/usr/lib/debug/%{_libexecdir}/%{name}/boot/xen-shim-syms-release
 
 # Debug build of PV shim
-%{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir clean
+%{make_build} -C tools/firmware/xen-dir clean
 cp buildconfigs/config-pvshim-debug xen/arch/x86/configs/pvshim_defconfig
-%{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir xen-shim
+%{?_cov_wrap} %{make_build} -C tools/firmware/xen-dir xen-shim
 %{__install} -D -m 644 tools/firmware/xen-dir/xen-shim \
     %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim-debug
 %{__install} -D -m 644 tools/firmware/xen-dir/xen-shim-syms \
@@ -307,8 +305,8 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %endif
 
 # Build tools and man pages
-%{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} install-tools
-%{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
+%{?_cov_wrap} %{make_build} DESTDIR=%{buildroot} install-tools
+%{make_build} DESTDIR=%{buildroot} -C docs install-man-pages
 
 # Build test case metadata
 %{__python} %{SOURCE5} -i %{buildroot}/%{_libexecdir}/%{name} -o %{buildroot}/%{_datadir}/xen-dom0-tests-metadata.json
