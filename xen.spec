@@ -313,13 +313,13 @@ install_shim build-shim-debug   debug
 
 # choose between debug and release PV shim build
 %if %{default_debug_hypervisor}
-ln -sf xen-shim-debug %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
+ln -sf xen-shim-debug %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %else
-ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
+ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %endif
 
 # Build test case metadata
-%{__python} %{SOURCE5} -i %{buildroot}/%{_libexecdir}/%{name} -o %{buildroot}/%{_datadir}/xen-dom0-tests-metadata.json
+%{__python} %{SOURCE5} -i %{buildroot}%{_libexecdir}/%{name} -o %{buildroot}%{_datadir}/xen-dom0-tests-metadata.json
 
 %{__install} -D -m 644 %{SOURCE1} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
 %{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/xen/xl.conf
