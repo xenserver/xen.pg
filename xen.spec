@@ -239,6 +239,10 @@ export XEN_TARGET_ARCH=%{_arch}
 mkdir ../livepatch-src
 cp -a . ../livepatch-src/
 
+# Build tools and man pages
+%{?_cov_wrap} %{make_build} build-tools
+%{make_build} -C docs man-pages
+
 %install
 
 source /opt/rh/devtoolset-11/enable
@@ -246,6 +250,10 @@ export XEN_TARGET_ARCH=%{_arch}
 
 # The existence of this directory causes ocamlfind to put things in it
 mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
+
+# Install tools and man pages
+%{make_build} DESTDIR=%{buildroot} install-tools
+%{make_build} DESTDIR=%{buildroot} -C docs install-man-pages
 
 mkdir -p %{buildroot}/boot/
 
@@ -307,10 +315,6 @@ ln -sf xen-shim-debug %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %else
 ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %endif
-
-# Build tools and man pages
-%{?_cov_wrap} %{make_build} DESTDIR=%{buildroot} install-tools
-%{make_build} DESTDIR=%{buildroot} -C docs install-man-pages
 
 # Build test case metadata
 %{__python} %{SOURCE5} -i %{buildroot}/%{_libexecdir}/%{name} -o %{buildroot}/%{_datadir}/xen-dom0-tests-metadata.json
