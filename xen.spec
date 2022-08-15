@@ -235,6 +235,10 @@ export XEN_TARGET_ARCH=%{_arch}
            --with-system-ipxe=/usr/share/ipxe/ipxe.bin \
            --with-system-ovmf=/usr/share/edk2/OVMF.fd
 
+# Take a snapshot of the configured source tree for livepatches
+mkdir ../livepatch-src
+cp -a . ../livepatch-src/
+
 %install
 
 source /opt/rh/devtoolset-11/enable
@@ -245,9 +249,9 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 
 mkdir -p %{buildroot}/boot/
 
-# Install source for building live patches
+# Install artefacts for livepatches
 mkdir -p %{buildroot}%{_usrsrc}
-cp -r $(pwd) %{buildroot}%{lp_devel_dir}
+cp -a ../livepatch-src/. %{buildroot}%{lp_devel_dir}
 
 # Regular build of Xen
 %{make_build} -C xen XEN_VENDORVERSION=-%{hv_rel} \
