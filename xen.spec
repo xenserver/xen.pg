@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.30
+%global hv_rel 10.31
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -880,6 +880,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed Aug 17 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.31
+- Fix CPU hotplug on AMD.
+- Improve diagnostics in nmi_show_execution_state().
+- Rework specfile so tools get the default RPM CFLAGS/LDFLAGS, including
+  various hardening settings.
+
 * Tue Aug 9 2022 Pau Ruiz Safont <pau.safont@citrix.com> - 4.13.4-10.30
 - Bump release and rebuild with OCaml 4.13.1-3 compiler.
 
