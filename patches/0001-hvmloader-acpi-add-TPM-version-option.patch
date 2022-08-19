@@ -1,0 +1,161 @@
+acpi: Make TPM version configurable.
+
+This patch makes the TPM version, for which the ACPI libary probes,
+configurable.  If acpi_config.tpm_verison is set to 1, it indicates that 1.2
+(TCPA) should be probed.
+I have also added to hvmloader an option to allow setting this new config,
+which can be triggered by setting the platform/tpm_verion xenstore key.
+
+Signed-off-by: Jennifer Herbert <jennifer.herbert@citrix.com>
+diff --git a/docs/misc/xenstore-paths.pandoc b/docs/misc/xenstore-paths.pandoc
+index 7e85c35805..112c3b22ef 100644
+--- a/docs/misc/xenstore-paths.pandoc
++++ b/docs/misc/xenstore-paths.pandoc
+@@ -262,6 +262,14 @@ at the guest physical address in HVM_PARAM_VM_GENERATION_ID_ADDR.
+ See Microsoft's "Virtual Machine Generation ID" specification for the
+ circumstances where the generation ID needs to be changed.
+ 
++
++#### ~/platform/tpm_version = INTEGER [HVM,INTERNAL]
++
++The TPM version to be probed for.
++
++A value of 1 indicates to probe for TPM 1.2. If unset, or an
++invalid version, then no TPM is probed.
++
+ ### Frontend device paths
+ 
+ Paravirtual device frontends are generally specified by their own
+diff --git a/tools/firmware/hvmloader/util.c b/tools/firmware/hvmloader/util.c
+index 7da144b0bb..2d9f40cb02 100644
+--- a/tools/firmware/hvmloader/util.c
++++ b/tools/firmware/hvmloader/util.c
+@@ -994,13 +994,22 @@ void hvmloader_acpi_build_tables(struct acpi_config *config,
+     if ( !strncmp(xenstore_read("platform/acpi_laptop_slate", "0"), "1", 1)  )
+         config->table_flags |= ACPI_HAS_SSDT_LAPTOP_SLATE;
+ 
+-    config->table_flags |= (ACPI_HAS_TCPA | ACPI_HAS_IOAPIC |
++    config->table_flags |= (ACPI_HAS_TPM | ACPI_HAS_IOAPIC |
+                             ACPI_HAS_WAET | ACPI_HAS_PMTIMER |
+                             ACPI_HAS_BUTTONS | ACPI_HAS_VGA |
+                             ACPI_HAS_8042 | ACPI_HAS_CMOS_RTC);
+     config->acpi_revision = 4;
+ 
+-    config->tis_hdr = (uint16_t *)ACPI_TIS_HDR_ADDRESS;
++    s = xenstore_read("platform/tpm_version", "0");
++    config->tpm_version = strtoll(s, NULL, 0);
++
++    switch( config->tpm_version )
++    {
++    case 1:
++        config->table_flags |= ACPI_HAS_TPM;
++        config->tis_hdr = (uint16_t *)ACPI_TIS_HDR_ADDRESS;
++        break;
++    }
+ 
+     config->numa.nr_vmemranges = nr_vmemranges;
+     config->numa.nr_vnodes = nr_vnodes;
+diff --git a/tools/libacpi/build.c b/tools/libacpi/build.c
+index 9b9e886f9c..4581762e59 100644
+--- a/tools/libacpi/build.c
++++ b/tools/libacpi/build.c
+@@ -413,38 +413,46 @@ static int construct_secondary_tables(struct acpi_ctxt *ctxt,
+         memcpy(ssdt, ssdt_laptop_slate, sizeof(ssdt_laptop_slate));
+         table_ptrs[nr_tables++] = ctxt->mem_ops.v2p(ctxt, ssdt);
+     }
+-
+-    /* TPM TCPA and SSDT. */
+-    if ( (config->table_flags & ACPI_HAS_TCPA) &&
+-         (config->tis_hdr[0] != 0 && config->tis_hdr[0] != 0xffff) &&
+-         (config->tis_hdr[1] != 0 && config->tis_hdr[1] != 0xffff) )
++    /* TPM and SSDT. */
++    if (config->table_flags & ACPI_HAS_TPM)
+     {
+-        ssdt = ctxt->mem_ops.alloc(ctxt, sizeof(ssdt_tpm), 16);
+-        if (!ssdt) return -1;
+-        memcpy(ssdt, ssdt_tpm, sizeof(ssdt_tpm));
+-        table_ptrs[nr_tables++] = ctxt->mem_ops.v2p(ctxt, ssdt);
+-
+-        tcpa = ctxt->mem_ops.alloc(ctxt, sizeof(struct acpi_20_tcpa), 16);
+-        if (!tcpa) return -1;
+-        memset(tcpa, 0, sizeof(*tcpa));
+-        table_ptrs[nr_tables++] = ctxt->mem_ops.v2p(ctxt, tcpa);
+-
+-        tcpa->header.signature = ACPI_2_0_TCPA_SIGNATURE;
+-        tcpa->header.length    = sizeof(*tcpa);
+-        tcpa->header.revision  = ACPI_2_0_TCPA_REVISION;
+-        fixed_strcpy(tcpa->header.oem_id, ACPI_OEM_ID);
+-        fixed_strcpy(tcpa->header.oem_table_id, ACPI_OEM_TABLE_ID);
+-        tcpa->header.oem_revision = ACPI_OEM_REVISION;
+-        tcpa->header.creator_id   = ACPI_CREATOR_ID;
+-        tcpa->header.creator_revision = ACPI_CREATOR_REVISION;
+-        if ( (lasa = ctxt->mem_ops.alloc(ctxt, ACPI_2_0_TCPA_LAML_SIZE, 16)) != NULL )
++        switch (config->tpm_version)
+         {
+-            tcpa->lasa = ctxt->mem_ops.v2p(ctxt, lasa);
+-            tcpa->laml = ACPI_2_0_TCPA_LAML_SIZE;
+-            memset(lasa, 0, tcpa->laml);
+-            set_checksum(tcpa,
+-                         offsetof(struct acpi_header, checksum),
+-                         tcpa->header.length);
++        case 1:
++            if (!config->tis_hdr ||
++                config->tis_hdr[0] == 0 || config->tis_hdr[0] == 0xffff ||
++                config->tis_hdr[1] == 0 || config->tis_hdr[1] == 0xffff)
++                break;
++
++            ssdt = ctxt->mem_ops.alloc(ctxt, sizeof(ssdt_tpm), 16);
++            if (!ssdt) return -1;
++            memcpy(ssdt, ssdt_tpm, sizeof(ssdt_tpm));
++            table_ptrs[nr_tables++] = ctxt->mem_ops.v2p(ctxt, ssdt);
++
++            tcpa = ctxt->mem_ops.alloc(ctxt, sizeof(struct acpi_20_tcpa), 16);
++            if (!tcpa) return -1;
++            memset(tcpa, 0, sizeof(*tcpa));
++            table_ptrs[nr_tables++] = ctxt->mem_ops.v2p(ctxt, tcpa);
++
++            tcpa->header.signature = ACPI_2_0_TCPA_SIGNATURE;
++            tcpa->header.length    = sizeof(*tcpa);
++            tcpa->header.revision  = ACPI_2_0_TCPA_REVISION;
++            fixed_strcpy(tcpa->header.oem_id, ACPI_OEM_ID);
++            fixed_strcpy(tcpa->header.oem_table_id, ACPI_OEM_TABLE_ID);
++            tcpa->header.oem_revision = ACPI_OEM_REVISION;
++            tcpa->header.creator_id   = ACPI_CREATOR_ID;
++            tcpa->header.creator_revision = ACPI_CREATOR_REVISION;
++
++            if ( (lasa = ctxt->mem_ops.alloc(ctxt, ACPI_2_0_TCPA_LAML_SIZE, 16)) != NULL )
++            {
++                tcpa->lasa = ctxt->mem_ops.v2p(ctxt, lasa);
++                tcpa->laml = ACPI_2_0_TCPA_LAML_SIZE;
++                memset(lasa, 0, tcpa->laml);
++                set_checksum(tcpa,
++                             offsetof(struct acpi_header, checksum),
++                             tcpa->header.length);
++            }
++            break;
+         }
+     }
+ 
+diff --git a/tools/libacpi/libacpi.h b/tools/libacpi/libacpi.h
+index a2efd23b0b..9143616130 100644
+--- a/tools/libacpi/libacpi.h
++++ b/tools/libacpi/libacpi.h
+@@ -27,7 +27,7 @@
+ #define ACPI_HAS_SSDT_PM           (1<<4)
+ #define ACPI_HAS_SSDT_S3           (1<<5)
+ #define ACPI_HAS_SSDT_S4           (1<<6)
+-#define ACPI_HAS_TCPA              (1<<7)
++#define ACPI_HAS_TPM               (1<<7)
+ #define ACPI_HAS_IOAPIC            (1<<8)
+ #define ACPI_HAS_WAET              (1<<9)
+ #define ACPI_HAS_PMTIMER           (1<<10)
+@@ -78,8 +78,8 @@ struct acpi_config {
+     struct acpi_numa numa;
+     const struct hvm_info_table *hvminfo;
+ 
++    uint8_t tpm_version;
+     const uint16_t *tis_hdr;
+-
+     /*
+      * Address where acpi_info should be placed.
+      * This must match the OperationRegion(BIOS, SystemMemory, ....)
