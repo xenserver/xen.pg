@@ -1,0 +1,86 @@
+From: Roger Pau Monné <roger.pau@citrix.com>
+Subject: x86/p2m: refuse new allocations for dying domains
+
+This will in particular prevent any attempts to add entries to the p2m,
+once - in a subsequent change - non-root entries have been removed.
+
+This is part of CVE-2022-33746 / XSA-410.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Tim Deegan <tim@xen.org>
+
+diff --git a/xen/arch/x86/mm/hap/hap.c b/xen/arch/x86/mm/hap/hap.c
+index 3c927e0d4255..9a081e18b2ed 100644
+--- a/xen/arch/x86/mm/hap/hap.c
++++ b/xen/arch/x86/mm/hap/hap.c
+@@ -244,6 +244,9 @@ static struct page_info *hap_alloc(struct domain *d)
+ 
+     ASSERT(paging_locked_by_me(d));
+ 
++    if ( unlikely(d->is_dying) )
++        return NULL;
++
+     pg = page_list_remove_head(&d->arch.paging.hap.freelist);
+     if ( unlikely(!pg) )
+         return NULL;
+@@ -280,7 +283,7 @@ static struct page_info *hap_alloc_p2m_page(struct domain *d)
+         d->arch.paging.hap.p2m_pages++;
+         ASSERT(!page_get_owner(pg) && !(pg->count_info & PGC_count_mask));
+     }
+-    else if ( !d->arch.paging.p2m_alloc_failed )
++    else if ( !d->arch.paging.p2m_alloc_failed && !d->is_dying )
+     {
+         d->arch.paging.p2m_alloc_failed = 1;
+         dprintk(XENLOG_ERR, "d%i failed to allocate from HAP pool\n",
+diff --git a/xen/arch/x86/mm/shadow/common.c b/xen/arch/x86/mm/shadow/common.c
+index 4f1b77d6c6ec..f9b49333bb29 100644
+--- a/xen/arch/x86/mm/shadow/common.c
++++ b/xen/arch/x86/mm/shadow/common.c
+@@ -907,6 +907,10 @@ static bool __must_check _shadow_prealloc(struct domain *d, unsigned int pages)
+     if ( d->arch.paging.shadow.free_pages >= pages )
+         return true;
+ 
++    if ( unlikely(d->is_dying) )
++        /* No reclaim when the domain is dying, teardown will take care of it. */
++        return false;
++
+     /* Shouldn't have enabled shadows if we've no vcpus. */
+     ASSERT(d->vcpu && d->vcpu[0]);
+ 
+@@ -957,7 +961,7 @@ static bool __must_check _shadow_prealloc(struct domain *d, unsigned int pages)
+            d->arch.paging.shadow.free_pages,
+            d->arch.paging.shadow.p2m_pages);
+ 
+-    ASSERT(d->is_dying);
++    ASSERT_UNREACHABLE();
+ 
+     flush_tlb_mask(d->dirty_cpumask);
+ 
+@@ -971,10 +975,13 @@ static bool __must_check _shadow_prealloc(struct domain *d, unsigned int pages)
+  * to avoid freeing shadows that the caller is currently working on. */
+ bool shadow_prealloc(struct domain *d, unsigned int type, unsigned int count)
+ {
+-    bool ret = _shadow_prealloc(d, shadow_size(type) * count);
++    bool ret;
+ 
+-    if ( !ret && !d->is_dying &&
+-         (!d->is_shutting_down || d->shutdown_code != SHUTDOWN_crash) )
++    if ( unlikely(d->is_dying) )
++       return false;
++
++    ret = _shadow_prealloc(d, shadow_size(type) * count);
++    if ( !ret && (!d->is_shutting_down || d->shutdown_code != SHUTDOWN_crash) )
+         /*
+          * Failing to allocate memory required for shadow usage can only result in
+          * a domain crash, do it here rather that relying on every caller to do it.
+@@ -1206,6 +1213,9 @@ shadow_alloc_p2m_page(struct domain *d)
+ {
+     struct page_info *pg = NULL;
+ 
++    if ( unlikely(d->is_dying) )
++       return NULL;
++
+     /* This is called both from the p2m code (which never holds the
+      * paging lock) and the log-dirty code (which always does). */
+     paging_lock_recursive(d);
