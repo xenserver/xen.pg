@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.32
+%global hv_rel 10.33
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -880,6 +880,16 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Thu Oct 6 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.33
+- Fixes for XSA-410 CVE-2022-33746, XSA-411 CVE-2022-33748.
+- Activate DOITM (Data Operand Invariant Timing Mode) unilaterally on capable
+  hardware (Intel IceLake/Gracemont and later) to keep properly-written crypto
+  code safe from timing attacks.
+- Fix compressed XSAVE size reporting.  Fixes an issue with Linux 5.19+ on
+  Intel Skylake or AMD Zen1 or later hardware.
+- Fix a performance issue when when using CUDA workloads (e.g. Tensorflow) on
+  a passed-through GPU.
+
 * Fri Sep 16 2022 Ross Lagerwall <ross.lagerwall@citrix.com> - 4.13.4-10.32
 - Add TPM 2.0 supporting patches
 
