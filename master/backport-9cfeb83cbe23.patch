@@ -1,0 +1,90 @@
+From 9cfeb83cbe23a873de512211d7ecd989348b9df0 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 12 Oct 2021 15:41:48 +0200
+Subject: tools/xenstore: set open file descriptor limit for xenstored
+
+Add a configuration item for the maximum number of open file
+descriptors xenstored should be allowed to have.
+
+The default should be "unlimited" in order not to restrict xenstored
+in the number of domains it can support, but unfortunately the kernel
+is normally limiting the maximum value via /proc/sys/fs/nr_open [1],
+[2]. So check that file to exist and if it does, limit the maximum
+value to the one specified by /proc/sys/fs/nr_open.
+
+As an aid for the admin configuring the value add a comment specifying
+the common needs of xenstored for the different domain types.
+
+[1]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=60fd760fb9ff7034360bab7137c917c0330628c2
+[2]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=0c2d64fb6cae9aae480f6a46cfe79f8d7d48b59f
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Ian Jackson <iwj@xenproject.org>
+Release-Acked-by: Ian Jackson <iwj@xenproject.org>
+
+diff --git a/tools/hotplug/Linux/init.d/sysconfig.xencommons.in b/tools/hotplug/Linux/init.d/sysconfig.xencommons.in
+index 192aa09fd12f..94376a4fe132 100644
+--- a/tools/hotplug/Linux/init.d/sysconfig.xencommons.in
++++ b/tools/hotplug/Linux/init.d/sysconfig.xencommons.in
+@@ -33,6 +33,19 @@
+ #XENSTORED=@XENSTORED@
+ 
+ ## Type: string
++## Default: unlimited
++#
++# Select maximum number of file descriptors xenstored is allowed to have
++# opened at one time.
++# For each HVM domain xenstored might need up to 5 open file descriptors,
++# PVH and PV domains will require up to 3 open file descriptors. Additionally
++# 20-30 file descriptors will be opened for internal uses.
++# The specified value (including "unlimited") will be capped by the contents
++# of /proc/sys/fs/nr_open if existing.
++# Only evaluated if XENSTORETYPE is "daemon".
++#XENSTORED_MAX_OPEN_FDS=unlimited
++
++## Type: string
+ ## Default: ""
+ #
+ # Additional commandline arguments to start xenstored,
+diff --git a/tools/hotplug/Linux/launch-xenstore.in b/tools/hotplug/Linux/launch-xenstore.in
+index 31fe1701816b..0b9fa9824213 100644
+--- a/tools/hotplug/Linux/launch-xenstore.in
++++ b/tools/hotplug/Linux/launch-xenstore.in
+@@ -55,6 +55,7 @@ test -f @CONFIG_DIR@/@CONFIG_LEAF_DIR@/xencommons && . @CONFIG_DIR@/@CONFIG_LEAF
+ [ "$XENSTORETYPE" = "daemon" ] && {
+ 	[ -z "$XENSTORED_ROOTDIR" ] && XENSTORED_ROOTDIR="@XEN_LIB_STORED@"
+ 	[ -z "$XENSTORED_TRACE" ] || XENSTORED_ARGS="$XENSTORED_ARGS -T @XEN_LOG_DIR@/xenstored-trace.log"
++	[ -z "$XENSTORED_MAX_OPEN_FDS" ] && XENSTORED_MAX_OPEN_FDS=unlimited
+ 	[ -z "$XENSTORED" ] && XENSTORED=@XENSTORED@
+ 	[ -x "$XENSTORED" ] || {
+ 		echo "No xenstored found"
+@@ -63,10 +64,28 @@ test -f @CONFIG_DIR@/@CONFIG_LEAF_DIR@/xencommons && . @CONFIG_DIR@/@CONFIG_LEAF
+ 	[ -z "$XENSTORED_OOM_MEM_THRESHOLD" ] || XENSTORED_OOM_MEM_THRESHOLD=50
+ 	XS_OOM_SCORE=-$(($XENSTORED_OOM_MEM_THRESHOLD * 10))
+ 
++	[ "$XENSTORED_MAX_OPEN_FDS" = "unlimited" ] || {
++		[ -z "${XENSTORED_MAX_OPEN_FDS//[0-9]}" ] &&
++		[ -n "$XENSTORED_MAX_OPEN_FDS" ] || {
++			echo "XENSTORED_MAX_OPEN_FDS=$XENSTORED_MAX_OPEN_FDS invalid"
++			echo "Setting to default \"unlimited\"."
++			XENSTORED_MAX_OPEN_FDS=unlimited
++		}
++	}
++	[ -r /proc/sys/fs/nr_open ] && {
++		MAX_FDS=`cat /proc/sys/fs/nr_open`
++		[ "$XENSTORED_MAX_OPEN_FDS" = "unlimited" ] && XENSTORED_MAX_OPEN_FDS=$MAX_FDS
++		[ $XENSTORED_MAX_OPEN_FDS -gt $MAX_FDS ] && {
++			echo "XENSTORED_MAX_OPEN_FDS exceeds system limit."
++			echo "Setting to \"$MAX_FDS\"."
++			XENSTORED_MAX_OPEN_FDS=$MAX_FDS
++		}
++	}
++
+ 	rm -f @XEN_RUN_DIR@/xenstored.pid
+ 
+ 	echo -n Starting $XENSTORED...
+-	$XENSTORED --pid-file @XEN_RUN_DIR@/xenstored.pid $XENSTORED_ARGS
++	prlimit --nofile=$XENSTORED_MAX_OPEN_FDS $XENSTORED --pid-file @XEN_RUN_DIR@/xenstored.pid $XENSTORED_ARGS
+ 
+ 	systemd-notify --booted 2>/dev/null || timeout_xenstore $XENSTORED || exit 1
+ 	XS_PID=`cat @XEN_RUN_DIR@/xenstored.pid`
