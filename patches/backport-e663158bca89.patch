@@ -1,36 +1,38 @@
-From d430b0439e98598d1370de126f3ad323468bf51f Mon Sep 17 00:00:00 2001
+From e663158bca89aa81ea567befc7c0f742568a6194 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
-Date: Mon, 7 Dec 2020 23:34:23 +0000
-Subject: [PATCH 1/5] tools/ocaml/xenstored: only quit on SIGTERM when a reload
- is possible
+Date: Fri, 8 Jan 2021 11:57:37 +0000
+Subject: tools/oxenstored: Only quit on SIGTERM when a reload is possible
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-Currently when oxenstored receives SIGTERM it dumps its state and quits.
-It is possible to then restart it if --restart is given, however that is
-not always safe:
+Currently when oxenstored receives SIGTERM it dumps its state and quits.  It
+is possible to then restart it if --restart is given, however that is not
+always safe:
 
-* domains could have active transactions, and after a restart they would
-either reuse transaction IDs of already open transactions, or get an
-error back that the transaction doesn't exist
+* Domains could have active transactions, and after a restart they would
+  either reuse transaction IDs of already open transactions, or get an error
+  back that the transaction doesn't exist
 
-* there could be pending data to send to a VM still in oxenstored's
+* There could be pending data to send to a VM still in oxenstored's
   queue which would be lost
 
-* there could be pending input to be processed from a VM in oxenstored's
+* There could be pending input to be processed from a VM in oxenstored's
   queue which would be lost
 
-Prevent shutting down oxenstored via SIGTERM in the above situations.
-Also ignore domains marked as bad because oxenstored would never talk
-to them again.
+Prevent shutting down oxenstored via SIGTERM in the above situations.  Also
+ignore domains marked as bad because oxenstored would never talk to them
+again.
 
 Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+Reviewed-by: Pau Ruiz Safont <pau.safont@citrix.com>
+Reviewed-by: Christian Lindig <christian.lindig@citrix.com>
+
 diff --git a/tools/ocaml/xenstored/connection.ml b/tools/ocaml/xenstored/connection.ml
-index fa0d3c4d92..bd02060cd0 100644
+index daf8d804f7ef..b8d9857019bb 100644
 --- a/tools/ocaml/xenstored/connection.ml
 +++ b/tools/ocaml/xenstored/connection.ml
-@@ -290,6 +290,41 @@ let has_new_output con = Xenbus.Xb.has_new_output con.xb
+@@ -289,6 +289,41 @@ let has_new_output con = Xenbus.Xb.has_new_output con.xb
  let peek_output con = Xenbus.Xb.peek_output con.xb
  let do_output con = Xenbus.Xb.output con.xb
  
@@ -73,10 +75,10 @@ index fa0d3c4d92..bd02060cd0 100644
  	has_more_input con || not (has_old_output con) && has_new_output con
  
 diff --git a/tools/ocaml/xenstored/connections.ml b/tools/ocaml/xenstored/connections.ml
-index 1a70d412d5..2749091bc1 100644
+index d293ca0f0410..c80b63a10104 100644
 --- a/tools/ocaml/xenstored/connections.ml
 +++ b/tools/ocaml/xenstored/connections.ml
-@@ -194,3 +194,11 @@ let debug cons =
+@@ -196,3 +196,11 @@ let debug cons =
  	let anonymous = Hashtbl.fold (fun _ con accu -> Connection.debug con :: accu) cons.anonymous [] in
  	let domains = Hashtbl.fold (fun _ con accu -> Connection.debug con :: accu) cons.domains [] in
  	String.concat "" (domains @ anonymous)
@@ -89,7 +91,7 @@ index 1a70d412d5..2749091bc1 100644
 +
 +let prevents_quit cons = filter ~f:Connection.prevents_live_update cons
 diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
-index 62fbd9db15..91d9386314 100644
+index 39d6d767e4cf..53d86618f2b8 100644
 --- a/tools/ocaml/xenstored/xenstored.ml
 +++ b/tools/ocaml/xenstored/xenstored.ml
 @@ -20,6 +20,7 @@ open Parse_arg
@@ -100,31 +102,31 @@ index 62fbd9db15..91d9386314 100644
  let debug fmt = Logging.debug "xenstored" fmt
  let info fmt = Logging.info "xenstored" fmt
  
-@@ -317,7 +318,9 @@ let _ =
- 	Select.use_poll (not cf.use_select);
+@@ -312,7 +313,9 @@ let _ =
+ 	);
  
  	Sys.set_signal Sys.sighup (Sys.Signal_handle sighup_handler);
 -	Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun _ -> quit := true));
 +	Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun _ ->
-+		 info "Received SIGTERM";
-+		 quit := true));
++		info "Received SIGTERM";
++		quit := true));
  	Sys.set_signal Sys.sigusr1 (Sys.Signal_handle (fun _ -> sigusr1_handler store));
  	Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
  
-@@ -431,6 +434,12 @@ let _ =
+@@ -424,6 +427,12 @@ let _ =
  		);
  		let elapsed = Unix.gettimeofday () -. now in
  		debug "periodic_ops took %F seconds." elapsed;
-+		if !quit then
-+		(match Connections.prevents_quit cons with
-+		| [] -> ()
-+		| domains ->
-+		    List.iter (fun con -> warn "%s prevents live update" (Connection.get_domstr con)) domains
++		if !quit then (
++			match Connections.prevents_quit cons with
++			| [] -> ()
++			| domains -> List.iter (fun con -> warn "%s prevents live update"
++								(Connection.get_domstr con)) domains
 +		);
  		delay_next_frequent_ops_by elapsed
  	in
  
-@@ -482,7 +491,7 @@ let _ =
+@@ -475,7 +484,7 @@ let _ =
  		in
  
  	Systemd.sd_notify_ready ();
