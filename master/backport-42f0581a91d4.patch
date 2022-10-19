@@ -1,8 +1,20 @@
+From 42f0581a91d4340ae66768a29fd779f83415bdfe Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Fri, 8 Jan 2021 11:57:37 +0000
+Subject: tools/oxenstored: Implement live update for socket connections
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+Reviewed-by: Pau Ruiz Safont <pau.safont@citrix.com>
+Reviewed-by: Christian Lindig <christian.lindig@citrix.com>
+
 diff --git a/tools/ocaml/xenstored/connection.ml b/tools/ocaml/xenstored/connection.ml
-index bd02060cd0..eb23c3af7a 100644
+index b8d9857019bb..59be4e2f659a 100644
 --- a/tools/ocaml/xenstored/connection.ml
 +++ b/tools/ocaml/xenstored/connection.ml
-@@ -281,6 +281,9 @@ let get_transaction con tid =
+@@ -280,6 +280,9 @@ let get_transaction con tid =
  
  let do_input con = Xenbus.Xb.input con.xb
  let has_input con = Xenbus.Xb.has_in_packet con.xb
@@ -12,7 +24,7 @@ index bd02060cd0..eb23c3af7a 100644
  let pop_in con = Xenbus.Xb.get_in_packet con.xb
  let has_more_input con = Xenbus.Xb.has_more_input con.xb
  
-@@ -309,12 +312,13 @@ let is_bad con = match con.dom with None -> false | Some dom -> Domain.is_bad_do
+@@ -308,12 +311,13 @@ let is_bad con = match con.dom with None -> false | Some dom -> Domain.is_bad_do
     Restrictions below can be relaxed once xenstored learns to dump more
     of its live state in a safe way *)
  let has_extra_connection_data con =
@@ -24,11 +36,11 @@ index bd02060cd0..eb23c3af7a 100644
  	has_in || has_out
 -	|| has_socket (* dom0 sockets not dumped yet *)
 +	(* TODO: what about SIGTERM, should use systemd to store FDS
-+	 || has_socket (* dom0 sockets not * dumped yet *) *)
++	|| has_socket (* dom0 sockets not * dumped yet *) *)
  	|| has_nondefault_perms (* set_target not dumped yet *)
  
  let has_transaction_data con =
-@@ -337,16 +341,21 @@ let stats con =
+@@ -336,16 +340,21 @@ let stats con =
  	Hashtbl.length con.watches, con.stat_nb_ops
  
  let dump con chan =
@@ -57,7 +69,7 @@ index bd02060cd0..eb23c3af7a 100644
  let debug con =
  	let domid = get_domstr con in
 diff --git a/tools/ocaml/xenstored/parse_arg.ml b/tools/ocaml/xenstored/parse_arg.ml
-index 1803c3eda0..ff63f70953 100644
+index 2c4b5a852853..7c0478e76a0c 100644
 --- a/tools/ocaml/xenstored/parse_arg.ml
 +++ b/tools/ocaml/xenstored/parse_arg.ml
 @@ -24,6 +24,7 @@ type config =
@@ -66,52 +78,50 @@ index 1803c3eda0..ff63f70953 100644
  	restart: bool;
 +	live_reload: bool;
  	disable_socket: bool;
- 	use_select: bool;
  }
-@@ -36,6 +37,7 @@ let do_argv =
+ 
+@@ -35,6 +36,7 @@ let do_argv =
  	and reraise_top_level = ref false
  	and config_file = ref ""
  	and restart = ref false
 +	and live_reload = ref false
  	and disable_socket = ref false
- 	and use_select = ref false in
+ 	in
  
-@@ -53,6 +55,7 @@ let do_argv =
+@@ -52,6 +54,7 @@ let do_argv =
  		  ("--pid-file", Arg.Set_string pidfile, ""); (* for compatibility *)
  		  ("-T", Arg.Set_string tracefile, ""); (* for compatibility *)
  		  ("--restart", Arg.Set restart, "Read database on starting");
 +		  ("--live", Arg.Set live_reload, "Read live dump on startup");
  		  ("--disable-socket", Arg.Unit (fun () -> disable_socket := true), "Disable socket");
- 		  ("--use-select", Arg.Unit (fun () -> use_select := true), "Use select instead of poll"); (* for backward compatibility and testing *)
  		] in
-@@ -67,6 +70,7 @@ let do_argv =
+ 	let usage_msg = "usage : xenstored [--config-file <filename>] [--no-domain-init] [--help] [--no-fork] [--reraise-top-level] [--restart] [--disable-socket]" in
+@@ -65,5 +68,6 @@ let do_argv =
  		pidfile = if !pidfile <> "" then Some !pidfile else None;
  		tracefile = if !tracefile <> "" then Some !tracefile else None;
  		restart = !restart;
 +		live_reload = !live_reload;
  		disable_socket = !disable_socket;
- 		use_select = !use_select;
  	}
 diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
-index 3174d8ede5..dd50456ad5 100644
+index acb0dd7adec4..27790d4a5c41 100644
 --- a/tools/ocaml/xenstored/process.ml
 +++ b/tools/ocaml/xenstored/process.ml
-@@ -91,19 +91,24 @@ type t =
- 		; cmdline: string list
- 		; deadline: float
+@@ -91,18 +91,23 @@ type t =
+ 	; cmdline: string list
+ 	; deadline: float
  	; force: bool
 +	; result: string list
  	; pending: bool }
  
- let state =
- 	ref
- 		{ binary= Sys.executable_name
--		; cmdline= []
-+		; cmdline= (Sys.argv |> Array.to_list |> List.tl)
- 		; deadline= 0.
- 		; force= false
-+		; result = []
- 		; pending= false }
+ let state = ref
+ 	{ binary= Sys.executable_name
+-	; cmdline= []
++	; cmdline= (Sys.argv |> Array.to_list |> List.tl)
+ 	; deadline= 0.
+ 	; force= false
++	; result = []
+ 	; pending= false }
  
  let debug = Printf.eprintf
  
@@ -123,7 +133,7 @@ index 3174d8ede5..dd50456ad5 100644
  
  let string_of_t t =
  	let executable, rest = args_of_t t in
-@@ -117,12 +122,12 @@ let launch_exn t =
+@@ -116,11 +121,11 @@ let launch_exn t =
  
  let validate_exn t =
  	(* --help must be last to check validity of earlier arguments *)
@@ -133,13 +143,12 @@ index 3174d8ede5..dd50456ad5 100644
 +	let cmd = string_of_t t' in
  	debug "Executing %s" cmd ;
  	match Unix.fork () with
- 	| 0 ->
--		 ( try launch_exn t with _ -> exit 2 )
-+		 ( try launch_exn t' with _ -> exit 2 )
+-	| 0 ->   ( try launch_exn t with _ -> exit 2 )
++	| 0 ->   ( try launch_exn t' with _ -> exit 2 )
  	| pid -> (
- 	match Unix.waitpid [] pid with
- 		| _, Unix.WEXITED 0 ->
-@@ -146,10 +151,14 @@ let parse_live_update args =
+ 		match Unix.waitpid [] pid with
+ 			| _, Unix.WEXITED 0 ->
+@@ -142,10 +147,14 @@ let parse_live_update args =
  			validate_exn {!state with binary= file}
  		| ["-a"] ->
  			debug "Live update aborted" ;
@@ -156,7 +165,7 @@ index 3174d8ede5..dd50456ad5 100644
  			let timeout = ref 60 in
  			let force = ref false in
  			Arg.parse_argv ~current:(ref 0) (Array.of_list args)
-@@ -165,10 +174,16 @@ let parse_live_update args =
+@@ -162,10 +171,16 @@ let parse_live_update args =
  			"live-update -s" ;
  			debug "Live update process queued" ;
  				{!state with deadline = Unix.gettimeofday () +. float !timeout
@@ -168,37 +177,37 @@ index 3174d8ede5..dd50456ad5 100644
 +		match !state.pending, !state.result with
 +		| true, _ -> Some "BUSY"
 +		| false, (_ :: _ as result) ->
-+				(* xenstore-control has read the result, clear it *)
-+				state := { !state with result = [] };
-+				Some (String.concat "\n" result)
++			(* xenstore-control has read the result, clear it *)
++			state := { !state with result = [] };
++			Some (String.concat "\n" result)
 +		| false, [] -> None
  	with
  	| Arg.Bad s | Arg.Help s | Invalid_argument s ->
  		Some s
-@@ -182,17 +197,27 @@ let parse_live_update args =
+@@ -179,17 +194,27 @@ let parse_live_update args =
  			| [] -> true
  			| _ when Unix.gettimeofday () < t.deadline -> false
  			| l ->
--				 info "Live update timeout reached: %d active connections" (List.length l);
--				 List.iter (fun con -> warn "%s prevents live update" (Connection.get_domstr con)) l;
-+				 warn "timeout reached: have to wait, migrate or shutdown %d domains:" (List.length l);
-+				 let msgs = List.rev_map (fun con -> Printf.sprintf "%s: %d tx, in: %b, out: %b, perm: %s"
-+					 (Connection.get_domstr con)
-+					 (Connection.number_of_transactions con)
-+					 (Connection.has_input con)
-+					 (Connection.has_output con)
-+					 (Connection.get_perm con |> Perms.Connection.to_string)
+-				info "Live update timeout reached: %d active connections" (List.length l);
+-				List.iter (fun con -> warn "%s prevents live update" (Connection.get_domstr con)) l;
++				warn "timeout reached: have to wait, migrate or shutdown %d domains:" (List.length l);
++				let msgs = List.rev_map (fun con -> Printf.sprintf "%s: %d tx, in: %b, out: %b, perm: %s"
++					(Connection.get_domstr con)
++					(Connection.number_of_transactions con)
++					(Connection.has_input con)
++					(Connection.has_output con)
++					(Connection.get_perm con |> Perms.Connection.to_string)
 +					) l in
-+				 List.iter (warn "Live-update: %s") msgs;
- 				 if t.force then begin
- 					 warn "Live update forced, some domain connections may break!";
- 					 true
- 				 end else begin
--					 warn "Live update aborted, try migrating or shutting down the domains/toolstack";
--					 state := { t with pending = false };
-+					 warn "Live update aborted (see above for domains preventing it)";
-+					 state := { t with pending = false; result = msgs};
- 					 false
++				List.iter (warn "Live-update: %s") msgs;
+ 				if t.force then begin
+ 					warn "Live update forced, some domain connections may break!";
+ 					true
+ 				end else begin
+-					warn "Live update aborted, try migrating or shutting down the domains/toolstack";
+-					state := { t with pending = false };
++					warn "Live update aborted (see above for domains preventing it)";
++					state := { t with pending = false; result = msgs};
+ 					false
  				end
  		end else false
 +
@@ -208,7 +217,7 @@ index 3174d8ede5..dd50456ad5 100644
  
  (* packets *)
 diff --git a/tools/ocaml/xenstored/store.ml b/tools/ocaml/xenstored/store.ml
-index e20767372f..a3be2e6bbe 100644
+index 328d3a51984f..ebf6cbd9c7a0 100644
 --- a/tools/ocaml/xenstored/store.ml
 +++ b/tools/ocaml/xenstored/store.ml
 @@ -366,7 +366,7 @@ let traversal root_node f =
@@ -221,7 +230,7 @@ index e20767372f..a3be2e6bbe 100644
  	_traversal [] root_node
  
 diff --git a/tools/ocaml/xenstored/utils.ml b/tools/ocaml/xenstored/utils.ml
-index eb79bf0146..6c1603c276 100644
+index eb79bf0146e5..dd03b2b5bc3c 100644
 --- a/tools/ocaml/xenstored/utils.ml
 +++ b/tools/ocaml/xenstored/utils.ml
 @@ -115,3 +115,15 @@ let path_validate path connection_path =
@@ -230,18 +239,18 @@ index eb79bf0146..6c1603c276 100644
  	abs_path
 +
 +module FD : sig
-+     type t = Unix.file_descr
-+     val of_int: int -> t
-+     val to_int : t -> int
++	type t = Unix.file_descr
++	val of_int: int -> t
++	val to_int : t -> int
 +end = struct
-+    type t = Unix.file_descr
-+    (* This is like Obj.magic but just for these types,
-+       and relies on Unix.file_descr = int *)
-+    external to_int : t -> int = "%identity"
-+    external of_int : int -> t = "%identity"
++	type t = Unix.file_descr
++	(* This is like Obj.magic but just for these types,
++	   and relies on Unix.file_descr = int *)
++	external to_int : t -> int = "%identity"
++	external of_int : int -> t = "%identity"
 +end
 diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
-index b6646fbbf9..84f7d1f736 100644
+index b7b3b43f79ea..30edf4de6a5a 100644
 --- a/tools/ocaml/xenstored/xenstored.ml
 +++ b/tools/ocaml/xenstored/xenstored.ml
 @@ -141,9 +141,12 @@ exception Bad_format of string
@@ -259,18 +268,20 @@ index b6646fbbf9..84f7d1f736 100644
  	let header = input_line chan in
  	if header <> dump_format_header then
  		raise (Bad_format "header");
-@@ -155,6 +158,10 @@ let from_channel_f chan domain_f watch_f store_f =
+@@ -155,6 +158,12 @@ let from_channel_f chan domain_f watch_f store_f =
  			let l = String.split ',' line in
  			try
  				match l with
-+				| "global" :: rw :: ro :: [] ->
-+					global_f ~rw ~ro
++				| "global" :: rw :: _ ->
++					(* there might be more parameters here,
++					   e.g. a RO socket from a previous version: ignore it *)
++					global_f ~rw
 +				| "socket" :: fd :: [] ->
 +					socket_f ~fd:(int_of_string fd)
  				| "dom" :: domid :: mfn :: port :: []->
  					domain_f (int_of_string domid)
  					         (Nativeint.of_string mfn)
-@@ -175,12 +182,28 @@ let from_channel_f chan domain_f watch_f store_f =
+@@ -175,12 +184,28 @@ let from_channel_f chan domain_f watch_f store_f =
  		with End_of_file ->
  			quit := true
  	done;
@@ -281,27 +292,27 @@ index b6646fbbf9..84f7d1f736 100644
  	(* don't let the permission get on our way, full perm ! *)
  	let op = Store.get_ops store Perms.Connection.full_rights in
 -
-+	let rwro = ref (None, None) in
-+	let global_f ~rw ~ro =
++	let rwro = ref (None) in
++	let global_f ~rw =
 +		let get_listen_sock sockfd =
 +			let fd = sockfd |> int_of_string |> Utils.FD.of_int in
 +			Unix.listen fd 1;
 +			Some fd
 +		in
-+		rwro := get_listen_sock rw, get_listen_sock ro
++		rwro := get_listen_sock rw
 +	in
 +	let socket_f ~fd =
 +		let ufd = Utils.FD.of_int fd in
 +		let is_valid = try (Unix.fstat ufd).Unix.st_kind = Unix.S_SOCK with _ -> false in
 +		if is_valid then
-+			Connections.add_anonymous cons ufd true
++			Connections.add_anonymous cons ufd
 +		else
 +			warn "Ignoring invalid socket FD %d" fd
 +	in
  	let domain_f domid mfn port =
  		let ndom =
  			if domid > 0 then
-@@ -190,28 +213,38 @@ let from_channel store cons doms chan =
+@@ -190,28 +215,38 @@ let from_channel store cons doms chan =
  			in
  		Connections.add_domain cons ndom;
  		in
@@ -330,7 +341,7 @@ index b6646fbbf9..84f7d1f736 100644
  	        (fun () -> close_in channel)
  
 -let to_channel store cons chan =
-+let to_channel store cons (rw, ro) chan =
++let to_channel store cons rw chan =
  	let hexify s = Utils.hexify s in
  
  	fprintf chan "%s\n" dump_format_header;
@@ -338,7 +349,7 @@ index b6646fbbf9..84f7d1f736 100644
 +		(* systemd and utils.ml sets it close on exec *)
 +		Unix.clear_close_on_exec fd;
 +		Utils.FD.to_int fd in
-+	fprintf chan "global,%d,%d\n" (fdopt rw) (fdopt ro);
++	fprintf chan "global,%d\n" (fdopt rw);
  
 -	(* dump connections related to domains; domid, mfn, eventchn port, watches *)
 -	Connections.iter_domains cons (fun con -> Connection.dump con chan);
@@ -347,7 +358,7 @@ index b6646fbbf9..84f7d1f736 100644
  
  	(* dump the store *)
  	Store.dump_fct store (fun path node ->
-@@ -224,9 +257,9 @@ let to_channel store cons chan =
+@@ -224,9 +259,9 @@ let to_channel store cons chan =
  	()
  
  
@@ -359,16 +370,15 @@ index b6646fbbf9..84f7d1f736 100644
  	        (fun () -> close_out channel)
  end
  
-@@ -248,14 +281,14 @@ let _ =
+@@ -246,13 +281,13 @@ let _ =
  	);
  
- 	let rw_sock, ro_sock =
+ 	let rw_sock =
 -		if cf.disable_socket then
 +		if cf.disable_socket || cf.live_reload then
- 			None, None
+ 			None
  		else
- 			Some (Unix.handle_unix_error Utils.create_unix_socket Define.xs_daemon_socket),
- 			Some (Unix.handle_unix_error Utils.create_unix_socket Define.xs_daemon_socket_ro)
+ 			Some (Unix.handle_unix_error Utils.create_unix_socket Define.xs_daemon_socket)
  		in
  
 -	if cf.daemonize then
@@ -376,51 +386,44 @@ index b6646fbbf9..84f7d1f736 100644
  		Unixext.daemonize ()
  	else
  		printf "Xen Storage Daemon, version %d.%d\n%!"
-@@ -295,10 +328,15 @@ let _ =
+@@ -292,10 +327,15 @@ let _ =
  	List.iter (fun path ->
  		Store.write store Perms.Connection.full_rights path "") Store.Path.specials;
  
-+	let rw_sock, ro_sock =
++	let rw_sock =
  	if cf.restart && Sys.file_exists Disk.xs_daemon_database then (
 -		DB.from_file store domains cons Disk.xs_daemon_database;
 -		Event.bind_dom_exc_virq eventchn
--	) else (
 +		let rwro = DB.from_file store domains cons Disk.xs_daemon_database in
 +		info "Live reload: database loaded";
 +		Event.bind_dom_exc_virq eventchn;
 +		Process.LiveUpdate.completed ();
 +		rwro
-+ 	) else (
+ 	) else (
 +		info "No live reload: regular startup";
  		if !Disk.enable then (
  			info "reading store from disk";
  			Disk.read store
-@@ -312,10 +350,13 @@ let _ =
+@@ -309,7 +349,8 @@ let _ =
  			Connections.add_domain cons (Domains.create0 domains);
  			Event.bind_dom_exc_virq eventchn
  		);
 -	);
-+		rw_sock, ro_sock
++		rw_sock
 +	) in
  
- 	(* required for xenstore-control to detect availability of live-update *)
--	Store.mkdir store Perms.Connection.full_rights (Store.Path.of_string "/tool");
-+	let toolpath = Store.Path.of_string "/tool" in
-+	if not (Store.path_exists store toolpath) then
-+		Store.mkdir store Perms.Connection.full_rights toolpath;
- 	Store.write store Perms.Connection.full_rights
- 		(Store.Path.of_string "/tool/xenstored") Sys.executable_name;
- 
-@@ -329,7 +370,7 @@ let _ =
+ 	Sys.set_signal Sys.sighup (Sys.Signal_handle sighup_handler);
+ 	Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun _ ->
+@@ -319,7 +360,7 @@ let _ =
  	Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
  
  	if cf.activate_access_log then begin
 -		let post_rotate () = DB.to_file store cons Disk.xs_daemon_database in
-+		let post_rotate () = DB.to_file store cons (None, None) Disk.xs_daemon_database in
++		let post_rotate () = DB.to_file store cons (None) Disk.xs_daemon_database in
  		Logging.init_access_log post_rotate
  	end;
  
-@@ -374,6 +415,7 @@ let _ =
+@@ -362,6 +403,7 @@ let _ =
  	let ring_scan_checker dom =
  		(* no need to scan domains already marked as for processing *)
  		if not (Domain.get_io_credit dom > 0) then
@@ -428,12 +431,12 @@ index b6646fbbf9..84f7d1f736 100644
  			let con = Connections.find_domain cons (Domain.get_id dom) in
  			if not (Connection.has_more_work con) then (
  				Process.do_output store cons domains con;
-@@ -503,7 +545,7 @@ let _ =
+@@ -491,7 +533,7 @@ let _ =
  			live_update := Process.LiveUpdate.should_run cons;
  			if !live_update || !quit then begin
  				(* don't initiate live update if saving state fails *)
 -				DB.to_file store cons Disk.xs_daemon_database;
-+				DB.to_file store cons (rw_sock, ro_sock) Disk.xs_daemon_database;
++				DB.to_file store cons (rw_sock) Disk.xs_daemon_database;
  				quit := true;
  			end
  		with exc ->
