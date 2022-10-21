@@ -1,0 +1,289 @@
+From 104afb886f1d9243f99e0fd998d7c898bc834831 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 13 Sep 2022 07:35:12 +0200
+Subject: tools/xenstore: remove nodes owned by destroyed domain
+
+In case a domain is removed from Xenstore, remove all nodes owned by
+it per default.
+
+This tackles the problem that nodes might be created by a domain
+outside its home path in Xenstore, leading to Xenstore hogging more
+and more memory. Domain quota don't work in this case if the guest is
+rebooting in between.
+
+Since XSA-322 ownership of such stale nodes is transferred to dom0,
+which is helping against unintended access, but not against OOM of
+Xenstore.
+
+As a fallback for weird cases add a Xenstore start parameter for
+keeping today's way to handle stale nodes, adding the risk of Xenstore
+hitting an OOM situation.
+
+This is part of XSA-419 / CVE-2022-42322.
+
+Fixes: 496306324d8d ("tools/xenstore: revoke access rights for removed domains")
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+
+diff --git a/tools/xenstore/xenstored_core.c b/tools/xenstore/xenstored_core.c
+index 9655af4c01fa..7eb698e1fc22 100644
+--- a/tools/xenstore/xenstored_core.c
++++ b/tools/xenstore/xenstored_core.c
+@@ -76,6 +76,7 @@ static bool verbose = false;
+ LIST_HEAD(connections);
+ int tracefd = -1;
+ static bool recovery = true;
++bool keep_orphans = false;
+ static int reopen_log_pipe[2];
+ static int reopen_log_pipe0_pollfd_idx = -1;
+ char *tracefile = NULL;
+@@ -662,7 +663,7 @@ struct node *read_node(struct connection *conn, const void *ctx,
+ 	node->perms.p = hdr->perms;
+ 	node->acc.domid = node->perms.p[0].id;
+ 	node->acc.memory = data.dsize;
+-	if (domain_adjust_node_perms(conn, node))
++	if (domain_adjust_node_perms(node))
+ 		goto error;
+ 
+ 	/* If owner is gone reset currently accounted memory size. */
+@@ -705,7 +706,7 @@ int write_node_raw(struct connection *conn, TDB_DATA *key, struct node *node,
+ 	void *p;
+ 	struct xs_tdb_record_hdr *hdr;
+ 
+-	if (domain_adjust_node_perms(conn, node))
++	if (domain_adjust_node_perms(node))
+ 		return errno;
+ 
+ 	data.dsize = sizeof(*hdr)
+@@ -1546,7 +1547,7 @@ static int delnode_sub(const void *ctx, struct connection *conn,
+ 	return WALK_TREE_RM_CHILDENTRY;
+ }
+ 
+-static int _rm(struct connection *conn, const void *ctx, const char *name)
++int rm_node(struct connection *conn, const void *ctx, const char *name)
+ {
+ 	struct node *parent;
+ 	char *parentname = get_parent(ctx, name);
+@@ -1608,7 +1609,7 @@ static int do_rm(const void *ctx, struct connection *conn,
+ 	if (streq(name, "/"))
+ 		return EINVAL;
+ 
+-	ret = _rm(conn, ctx, name);
++	ret = rm_node(conn, ctx, name);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2461,6 +2462,8 @@ static void usage(void)
+ "  -R, --no-recovery       to request that no recovery should be attempted when\n"
+ "                          the store is corrupted (debug only),\n"
+ "  -I, --internal-db       store database in memory, not on disk\n"
++"  -K, --keep-orphans      don't delete nodes owned by a domain when the\n"
++"                          domain is deleted (this is a security risk!)\n"
+ "  -V, --verbose           to request verbose execution.\n");
+ }
+ 
+@@ -2484,6 +2487,7 @@ static struct option options[] = {
+ 	{ "timeout", 1, NULL, 'w' },
+ 	{ "no-recovery", 0, NULL, 'R' },
+ 	{ "internal-db", 0, NULL, 'I' },
++	{ "keep-orphans", 0, NULL, 'K' },
+ 	{ "verbose", 0, NULL, 'V' },
+ 	{ "watch-nb", 1, NULL, 'W' },
+ 	{ NULL, 0, NULL, 0 } };
+@@ -2558,7 +2562,7 @@ int main(int argc, char *argv[])
+ 	int timeout;
+ 
+ 
+-	while ((opt = getopt_long(argc, argv, "DE:F:HNPS:t:A:Q:q:T:RVW:w:", options,
++	while ((opt = getopt_long(argc, argv, "DE:F:HKNPS:t:A:Q:q:T:RVW:w:", options,
+ 				  NULL)) != -1) {
+ 		switch (opt) {
+ 		case 'D':
+@@ -2594,6 +2598,9 @@ int main(int argc, char *argv[])
+ 		case 'I':
+ 			tdb_flags = TDB_INTERNAL|TDB_NOLOCK;
+ 			break;
++		case 'K':
++			keep_orphans = true;
++			break;
+ 		case 'V':
+ 			verbose = true;
+ 			break;
+diff --git a/tools/xenstore/xenstored_core.h b/tools/xenstore/xenstored_core.h
+index fc9882ac37d5..ec24c27ac240 100644
+--- a/tools/xenstore/xenstored_core.h
++++ b/tools/xenstore/xenstored_core.h
+@@ -204,6 +204,9 @@ int write_node_raw(struct connection *conn, TDB_DATA *key, struct node *node,
+ struct node *read_node(struct connection *conn, const void *ctx,
+ 		       const char *name);
+ 
++/* Remove a node and its children. */
++int rm_node(struct connection *conn, const void *ctx, const char *name);
++
+ void setup_structure(void);
+ struct connection *new_connection(connwritefn_t *write, connreadfn_t *read);
+ void check_store(void);
+@@ -242,6 +245,7 @@ extern int quota_req_outstanding;
+ extern int quota_trans_nodes;
+ extern int quota_memory_per_domain_soft;
+ extern int quota_memory_per_domain_hard;
++extern bool keep_orphans;
+ 
+ extern unsigned int timeout_watch_event_msec;
+ 
+diff --git a/tools/xenstore/xenstored_domain.c b/tools/xenstore/xenstored_domain.c
+index 4a0e6a05b8cb..ca639cf433cf 100644
+--- a/tools/xenstore/xenstored_domain.c
++++ b/tools/xenstore/xenstored_domain.c
+@@ -204,10 +204,65 @@ static void unmap_interface(void *interface)
+ 	xengnttab_unmap(*xgt_handle, interface, 1);
+ }
+ 
++static int domain_tree_remove_sub(const void *ctx, struct connection *conn,
++				  struct node *node, void *arg)
++{
++	struct domain *domain = arg;
++	TDB_DATA key;
++	int ret = WALK_TREE_OK;
++
++	if (node->perms.p[0].id != domain->domid)
++		return WALK_TREE_OK;
++
++	if (keep_orphans) {
++		key.dptr = (char *)node->name;
++		key.dsize = strlen(node->name);
++		domain->nbentry--;
++		node->perms.p[0].id = priv_domid;
++		node->acc.memory = 0;
++		domain_entry_inc(NULL, node);
++		if (write_node_raw(NULL, &key, node, true)) {
++			/* That's unfortunate. We only can try to continue. */
++			syslog(LOG_ERR,
++			       "error when moving orphaned node %s to dom0\n",
++			       node->name);
++		} else
++			trace("orphaned node %s moved to dom0\n", node->name);
++	} else {
++		if (rm_node(NULL, ctx, node->name)) {
++			/* That's unfortunate. We only can try to continue. */
++			syslog(LOG_ERR,
++			       "error when deleting orphaned node %s\n",
++			       node->name);
++		} else
++			trace("orphaned node %s deleted\n", node->name);
++
++		/* Skip children in all cases in order to avoid more errors. */
++		ret = WALK_TREE_SKIP_CHILDREN;
++	}
++
++	return domain->nbentry > 0 ? ret : WALK_TREE_SUCCESS_STOP;
++}
++
++static void domain_tree_remove(struct domain *domain)
++{
++	int ret;
++	struct walk_funcs walkfuncs = { .enter = domain_tree_remove_sub };
++
++	if (domain->nbentry > 0) {
++		ret = walk_node_tree(domain, NULL, "/", &walkfuncs, domain);
++		if (ret == WALK_TREE_ERROR_STOP)
++			syslog(LOG_ERR,
++			       "error when looking for orphaned nodes\n");
++	}
++}
++
+ static int destroy_domain(void *_domain)
+ {
+ 	struct domain *domain = _domain;
+ 
++	domain_tree_remove(domain);
++
+ 	list_del(&domain->list);
+ 
+ 	if (!domain->introduced)
+@@ -845,15 +900,15 @@ int domain_entry_inc(struct connection *conn, struct node *node)
+ 	struct domain *d;
+ 	unsigned int domid;
+ 
+-	if (!conn)
++	if (!node->perms.p)
+ 		return 0;
+ 
+-	domid = node->perms.p ? node->perms.p[0].id : conn->id;
++	domid = node->perms.p[0].id;
+ 
+-	if (conn->transaction) {
++	if (conn && conn->transaction) {
+ 		transaction_entry_inc(conn->transaction, domid);
+ 	} else {
+-		d = (domid == conn->id && conn->domain) ? conn->domain
++		d = (conn && domid == conn->id && conn->domain) ? conn->domain
+ 		    : find_or_alloc_existing_domain(domid);
+ 		if (d)
+ 			d->nbentry++;
+@@ -914,23 +969,11 @@ int domain_alloc_permrefs(struct node_perms *perms)
+  * Remove permissions for no longer existing domains in order to avoid a new
+  * domain with the same domid inheriting the permissions.
+  */
+-int domain_adjust_node_perms(struct connection *conn, struct node *node)
++int domain_adjust_node_perms(struct node *node)
+ {
+ 	unsigned int i;
+ 	int ret;
+ 
+-	ret = chk_domain_generation(node->perms.p[0].id, node->generation);
+-
+-	/* If the owner doesn't exist any longer give it to priv domain. */
+-	if (!ret) {
+-		/*
+-		 * In theory we'd need to update the number of dom0 nodes here,
+-		 * but we could be called for a read of the node. So better
+-		 * avoid the risk to overflow the node count of dom0.
+-		 */
+-		node->perms.p[0].id = priv_domid;
+-	}
+-
+ 	for (i = 1; i < node->perms.num; i++) {
+ 		if (node->perms.p[i].perms & XS_PERM_IGNORE)
+ 			continue;
+@@ -948,15 +991,15 @@ void domain_entry_dec(struct connection *conn, struct node *node)
+ 	struct domain *d;
+ 	unsigned int domid;
+ 
+-	if (!conn)
++	if (!node->perms.p)
+ 		return;
+ 
+ 	domid = node->perms.p ? node->perms.p[0].id : conn->id;
+ 
+-	if (conn->transaction) {
++	if (conn && conn->transaction) {
+ 		transaction_entry_dec(conn->transaction, domid);
+ 	} else {
+-		d = (domid == conn->id && conn->domain) ? conn->domain
++		d = (conn && domid == conn->id && conn->domain) ? conn->domain
+ 		    : find_domain_struct(domid);
+ 		if (d) {
+ 			d->nbentry--;
+@@ -1075,7 +1118,7 @@ int domain_memory_add(unsigned int domid, int mem, bool no_quota_check)
+ 		 * exist, as accounting is done either for a domain related to
+ 		 * the current connection, or for the domain owning a node
+ 		 * (which is always existing, as the owner of the node is
+-		 * tested to exist and replaced by domid 0 if not).
++		 * tested to exist and deleted or replaced by domid 0 if not).
+ 		 * So not finding the related domain MUST be an error in the
+ 		 * data base.
+ 		 */
+diff --git a/tools/xenstore/xenstored_domain.h b/tools/xenstore/xenstored_domain.h
+index bab405209e2a..5bd253395d77 100644
+--- a/tools/xenstore/xenstored_domain.h
++++ b/tools/xenstore/xenstored_domain.h
+@@ -64,7 +64,7 @@ bool domain_can_write(struct connection *conn);
+ bool domain_is_unprivileged(struct connection *conn);
+ 
+ /* Remove node permissions for no longer existing domains. */
+-int domain_adjust_node_perms(struct connection *conn, struct node *node);
++int domain_adjust_node_perms(struct node *node);
+ int domain_alloc_permrefs(struct node_perms *perms);
+ 
+ /* Quota manipulation */
