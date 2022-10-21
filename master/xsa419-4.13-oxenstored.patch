@@ -1,0 +1,84 @@
+From a21dcd5dedc7af0e73395e8bd6af3dcdef1dc9e5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Wed, 12 Oct 2022 19:13:06 +0100
+Subject: tools/ocaml/xenstored: Fix quota bypass on domain shutdown
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+XSA-322 fixed a domid reuse vulnerability by assigning Dom0 as the owner of
+any nodes left after a domain is shutdown (e.g. outside its /local/domain/N
+tree).
+
+However Dom0 has no quota on purpose, so this opened up another potential
+attack vector. Avoid it by deleting these nodes instead of assigning them to
+Dom0.
+
+This is part of XSA-419 / CVE-2022-42323.
+
+Fixes: c46eff921209 ("tools/ocaml/xenstored: clean up permissions for dead domains")
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/xenstored/perms.ml b/tools/ocaml/xenstored/perms.ml
+index e8a16221f8fa..84f2503e8e29 100644
+--- a/tools/ocaml/xenstored/perms.ml
++++ b/tools/ocaml/xenstored/perms.ml
+@@ -64,8 +64,7 @@ let get_owner perm = perm.owner
+ * *)
+ let remove_domid ~domid perm =
+ 	let acl = List.filter (fun (acl_domid, _) -> acl_domid <> domid) perm.acl in
+-	let owner = if perm.owner = domid then 0 else perm.owner in
+-	{ perm with acl; owner }
++	if perm.owner = domid then None else Some { perm with acl; owner = perm.owner }
+ 
+ let default0 = create 0 NONE []
+ 
+diff --git a/tools/ocaml/xenstored/store.ml b/tools/ocaml/xenstored/store.ml
+index 20e67b142746..70f0c83de404 100644
+--- a/tools/ocaml/xenstored/store.ml
++++ b/tools/ocaml/xenstored/store.ml
+@@ -87,10 +87,21 @@ let check_owner node connection =
+ 
+ let rec recurse fct node = fct node; SymbolMap.iter (fun _ -> recurse fct) node.children
+ 
+-(** [recurse_map f tree] applies [f] on each node in the tree recursively *)
+-let recurse_map f =
++(** [recurse_filter_map f tree] applies [f] on each node in the tree recursively,
++    possibly removing some nodes.
++    Note that the nodes removed this way won't generate watch events.
++*)
++let recurse_filter_map f =
++	let invalid = -1 in
++	let is_valid _ node = node.perms.owner <> invalid in
+ 	let rec walk node =
+-		f { node with children = SymbolMap.map walk node.children }
++		(* Map.filter_map is Ocaml 4.11+ only *)
++		let node =
++		{ node with children =
++			SymbolMap.map walk node.children |> SymbolMap.filter is_valid } in
++		match f node with
++		| Some keep -> keep
++		| None -> { node with perms = {node.perms with owner = invalid } }
+ 	in
+ 	walk
+ 
+@@ -444,11 +455,13 @@ let setperms store perm path nperms =
+ 
+ let reset_permissions store domid =
+ 	Logging.info "store|node" "Cleaning up xenstore ACLs for domid %d" domid;
+-	store.root <- Node.recurse_map (fun node ->
+-		let perms = Perms.Node.remove_domid ~domid node.perms in
+-		if perms <> node.perms then
+-			Logging.debug "store|node" "Changed permissions for node %s" (Node.get_name node);
+-		{ node with perms }
++	store.root <- Node.recurse_filter_map (fun node ->
++		match Perms.Node.remove_domid ~domid node.perms with
++		| None -> None
++		| Some perms ->
++			if perms <> node.perms then
++				Logging.debug "store|node" "Changed permissions for node %s" (Node.get_name node);
++			Some { node with perms }
+ 	) store.root
+ 
+ type ops = {
