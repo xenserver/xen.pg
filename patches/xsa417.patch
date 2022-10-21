@@ -1,0 +1,134 @@
+From 67d5ecd609b8f12346eadb40e547cd7e01d825dc Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 13 Sep 2022 07:35:10 +0200
+Subject: tools/xenstore: fix checking node permissions
+
+Today chk_domain_generation() is being used to check whether a node
+permission entry is still valid or whether it is referring to a domain
+no longer existing. This is done by comparing the node's and the
+domain's generation count.
+
+In case no struct domain is existing for a checked domain, but the
+domain itself is valid, chk_domain_generation() assumes it is being
+called due to the first node created for a new domain and it will
+return success.
+
+This might be wrong in case the checked permission is related to an
+old domain, which has just been replaced with a new domain using the
+same domid.
+
+Fix that by letting chk_domain_generation() fail in case a struct
+domain isn't found. In order to cover the case of the first node for
+a new domain try to allocate the needed struct domain explicitly when
+processing the related SET_PERMS command. In case a referenced domain
+isn't existing, flag the related permission to be ignored right away.
+
+This is XSA-417 / CVE-2022-42320.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+
+diff --git a/tools/xenstore/xenstored_core.c b/tools/xenstore/xenstored_core.c
+index d6bbb532fb18..25064427be40 100644
+--- a/tools/xenstore/xenstored_core.c
++++ b/tools/xenstore/xenstored_core.c
+@@ -1640,6 +1640,11 @@ static int do_set_perms(const void *ctx, struct connection *conn,
+ 	if (!xs_strings_to_perms(perms.p, perms.num, permstr))
+ 		return errno;
+ 
++	if (domain_alloc_permrefs(&perms) < 0)
++		return ENOMEM;
++	if (perms.p[0].perms & XS_PERM_IGNORE)
++		return ENOENT;
++
+ 	/* First arg is node name. */
+ 	if (strstarts(in->buffer, "@")) {
+ 		if (set_perms_special(conn, in->buffer, &perms))
+diff --git a/tools/xenstore/xenstored_domain.c b/tools/xenstore/xenstored_domain.c
+index 04bdf5179227..4a0e6a05b8cb 100644
+--- a/tools/xenstore/xenstored_domain.c
++++ b/tools/xenstore/xenstored_domain.c
+@@ -869,7 +869,6 @@ int domain_entry_inc(struct connection *conn, struct node *node)
+  * count (used for testing whether a node permission is older than a domain).
+  *
+  * Return values:
+- * -1: error
+  *  0: domain has higher generation count (it is younger than a node with the
+  *     given count), or domain isn't existing any longer
+  *  1: domain is older than the node
+@@ -877,20 +876,38 @@ int domain_entry_inc(struct connection *conn, struct node *node)
+ static int chk_domain_generation(unsigned int domid, uint64_t gen)
+ {
+ 	struct domain *d;
+-	xc_dominfo_t dominfo;
+ 
+ 	if (!xc_handle && domid == 0)
+ 		return 1;
+ 
+ 	d = find_domain_struct(domid);
+-	if (d)
+-		return (d->generation <= gen) ? 1 : 0;
+ 
+-	if (!get_domain_info(domid, &dominfo))
+-		return 0;
++	return (d && d->generation <= gen) ? 1 : 0;
++}
+ 
+-	d = alloc_domain(NULL, domid);
+-	return d ? 1 : -1;
++/*
++ * Allocate all missing struct domain referenced by a permission set.
++ * Any permission entries for not existing domains will be marked to be
++ * ignored.
++ */
++int domain_alloc_permrefs(struct node_perms *perms)
++{
++	unsigned int i, domid;
++	struct domain *d;
++	xc_dominfo_t dominfo;
++
++	for (i = 0; i < perms->num; i++) {
++		domid = perms->p[i].id;
++		d = find_domain_struct(domid);
++		if (!d) {
++			if (!get_domain_info(domid, &dominfo))
++				perms->p[i].perms |= XS_PERM_IGNORE;
++			else if (!alloc_domain(NULL, domid))
++				return ENOMEM;
++		}
++	}
++
++	return 0;
+ }
+ 
+ /*
+@@ -903,8 +920,6 @@ int domain_adjust_node_perms(struct connection *conn, struct node *node)
+ 	int ret;
+ 
+ 	ret = chk_domain_generation(node->perms.p[0].id, node->generation);
+-	if (ret < 0)
+-		return errno;
+ 
+ 	/* If the owner doesn't exist any longer give it to priv domain. */
+ 	if (!ret) {
+@@ -921,8 +936,6 @@ int domain_adjust_node_perms(struct connection *conn, struct node *node)
+ 			continue;
+ 		ret = chk_domain_generation(node->perms.p[i].id,
+ 					    node->generation);
+-		if (ret < 0)
+-			return errno;
+ 		if (!ret)
+ 			node->perms.p[i].perms |= XS_PERM_IGNORE;
+ 	}
+diff --git a/tools/xenstore/xenstored_domain.h b/tools/xenstore/xenstored_domain.h
+index 732eb8fa75e1..bab405209e2a 100644
+--- a/tools/xenstore/xenstored_domain.h
++++ b/tools/xenstore/xenstored_domain.h
+@@ -65,6 +65,7 @@ bool domain_is_unprivileged(struct connection *conn);
+ 
+ /* Remove node permissions for no longer existing domains. */
+ int domain_adjust_node_perms(struct connection *conn, struct node *node);
++int domain_alloc_permrefs(struct node_perms *perms);
+ 
+ /* Quota manipulation */
+ int domain_entry_inc(struct connection *conn, struct node *);
