@@ -1,0 +1,279 @@
+From ac36354c8fabf58b12781358dec39aecc3a6376b Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 13 Sep 2022 07:35:09 +0200
+Subject: tools/xenstore: add infrastructure to keep track of per domain memory
+ usage
+
+The amount of memory a domain can consume in Xenstore is limited by
+various quota today, but even with sane quota a domain can still
+consume rather large memory quantities.
+
+Add the infrastructure for keeping track of the amount of memory a
+domain is consuming in Xenstore. Note that this is only the memory a
+domain has direct control over, so any internal administration data
+needed by Xenstore only is not being accounted for.
+
+There are two quotas defined: a soft quota which will result in a
+warning issued via syslog() when it is exceeded, and a hard quota
+resulting in a stop of accepting further requests or watch events as
+long as the hard quota would be violated by accepting those.
+
+Setting any of those quotas to 0 will disable it.
+
+As default values use 2MB per domain for the soft limit (this basically
+covers the allowed case to create 1000 nodes needing 2kB each), and
+2.5MB for the hard limit.
+
+This is part of XSA-326.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+
+diff --git a/tools/xenstore/xenstored_core.c b/tools/xenstore/xenstored_core.c
+index 1335051a53f3..217096d91a9d 100644
+--- a/tools/xenstore/xenstored_core.c
++++ b/tools/xenstore/xenstored_core.c
+@@ -104,6 +104,8 @@ int quota_max_transaction = 10;
+ int quota_nb_perms_per_node = 5;
+ int quota_trans_nodes = 1024;
+ int quota_req_outstanding = 20;
++int quota_memory_per_domain_soft = 2 * 1024 * 1024; /* 2 MB */
++int quota_memory_per_domain_hard = 2 * 1024 * 1024 + 512 * 1024; /* 2.5 MB */
+ 
+ unsigned int timeout_watch_event_msec = 20000;
+ 
+@@ -2214,7 +2216,14 @@ static void usage(void)
+ "                          quotas are:\n"
+ "                          transaction-nodes: number of accessed node per\n"
+ "                                             transaction\n"
++"                          memory: total used memory per domain for nodes,\n"
++"                                  transactions, watches and requests, above\n"
++"                                  which Xenstore will stop talking to domain\n"
+ "                          outstanding: number of outstanding requests\n"
++"  -q, --quota-soft <what>=<nb> set a soft quota <what> to the value <nb>,\n"
++"                          causing a warning to be issued via syslog() if the\n"
++"                          limit is violated, allowed quotas are:\n"
++"                          memory: see above\n"
+ "  -w, --timeout <what>=<seconds>   set the timeout in seconds for <what>,\n"
+ "                          allowed timeout candidates are:\n"
+ "                          watch-event: time a watch-event is kept pending\n"
+@@ -2240,6 +2249,7 @@ static struct option options[] = {
+ 	{ "transaction", 1, NULL, 't' },
+ 	{ "perm-nb", 1, NULL, 'A' },
+ 	{ "quota", 1, NULL, 'Q' },
++	{ "quota-soft", 1, NULL, 'q' },
+ 	{ "timeout", 1, NULL, 'w' },
+ 	{ "no-recovery", 0, NULL, 'R' },
+ 	{ "internal-db", 0, NULL, 'I' },
+@@ -2285,7 +2295,7 @@ static void set_timeout(const char *arg)
+ 		barf("unknown timeout \"%s\"\n", arg);
+ }
+ 
+-static void set_quota(const char *arg)
++static void set_quota(const char *arg, bool soft)
+ {
+ 	const char *eq = strchr(arg, '=');
+ 	int val;
+@@ -2293,11 +2303,16 @@ static void set_quota(const char *arg)
+ 	if (!eq)
+ 		barf("quotas must be specified via <what>=<nb>\n");
+ 	val = get_optval_int(eq + 1);
+-	if (what_matches(arg, "outstanding"))
++	if (what_matches(arg, "outstanding") && !soft)
+ 		quota_req_outstanding = val;
+-	else if (what_matches(arg, "transaction-nodes"))
++	else if (what_matches(arg, "transaction-nodes") && !soft)
+ 		quota_trans_nodes = val;
+-	else
++	else if (what_matches(arg, "memory")) {
++		if (soft)
++			quota_memory_per_domain_soft = val;
++		else
++			quota_memory_per_domain_hard = val;
++	} else
+ 		barf("unknown quota \"%s\"\n", arg);
+ }
+ 
+@@ -2312,7 +2327,7 @@ int main(int argc, char *argv[])
+ 	int timeout;
+ 
+ 
+-	while ((opt = getopt_long(argc, argv, "DE:F:HNPS:t:A:Q:T:RVW:w:", options,
++	while ((opt = getopt_long(argc, argv, "DE:F:HNPS:t:A:Q:q:T:RVW:w:", options,
+ 				  NULL)) != -1) {
+ 		switch (opt) {
+ 		case 'D':
+@@ -2358,7 +2373,10 @@ int main(int argc, char *argv[])
+ 			quota_nb_perms_per_node = strtol(optarg, NULL, 10);
+ 			break;
+ 		case 'Q':
+-			set_quota(optarg);
++			set_quota(optarg, false);
++			break;
++		case 'q':
++			set_quota(optarg, true);
+ 			break;
+ 		case 'w':
+ 			set_timeout(optarg);
+diff --git a/tools/xenstore/xenstored_core.h b/tools/xenstore/xenstored_core.h
+index d95e4262a91e..4e53072e637c 100644
+--- a/tools/xenstore/xenstored_core.h
++++ b/tools/xenstore/xenstored_core.h
+@@ -226,6 +226,8 @@ extern int priv_domid;
+ extern int quota_nb_entry_per_domain;
+ extern int quota_req_outstanding;
+ extern int quota_trans_nodes;
++extern int quota_memory_per_domain_soft;
++extern int quota_memory_per_domain_hard;
+ 
+ extern unsigned int timeout_watch_event_msec;
+ 
+diff --git a/tools/xenstore/xenstored_domain.c b/tools/xenstore/xenstored_domain.c
+index e411c79d58a7..112fb457581e 100644
+--- a/tools/xenstore/xenstored_domain.c
++++ b/tools/xenstore/xenstored_domain.c
+@@ -84,6 +84,13 @@ struct domain
+ 	/* number of entry from this domain in the store */
+ 	int nbentry;
+ 
++	/* Amount of memory allocated for this domain. */
++	int memory;
++	bool soft_quota_reported;
++	bool hard_quota_reported;
++	time_t mem_last_msg;
++#define MEM_WARN_MINTIME_SEC 10
++
+ 	/* number of watch for this domain */
+ 	int nbwatch;
+ 
+@@ -297,6 +304,9 @@ bool domain_can_read(struct connection *conn)
+ 			return false;
+ 		if (conn->domain->nboutstanding >= quota_req_outstanding)
+ 			return false;
++		if (conn->domain->memory >= quota_memory_per_domain_hard &&
++		    quota_memory_per_domain_hard)
++			return false;
+ 	}
+ 
+ 	if (conn->is_ignored)
+@@ -944,6 +954,89 @@ int domain_entry(struct connection *conn)
+ 		: 0;
+ }
+ 
++static bool domain_chk_quota(struct domain *domain, int mem)
++{
++	time_t now;
++
++	if (!domain || !domid_is_unprivileged(domain->domid) ||
++	    (domain->conn && domain->conn->is_ignored))
++		return false;
++
++	now = time(NULL);
++
++	if (mem >= quota_memory_per_domain_hard &&
++	    quota_memory_per_domain_hard) {
++		if (domain->hard_quota_reported)
++			return true;
++		syslog(LOG_ERR, "Domain %u exceeds hard memory quota, Xenstore interface to domain stalled\n",
++		       domain->domid);
++		domain->mem_last_msg = now;
++		domain->hard_quota_reported = true;
++		return true;
++	}
++
++	if (now - domain->mem_last_msg >= MEM_WARN_MINTIME_SEC) {
++		if (domain->hard_quota_reported) {
++			domain->mem_last_msg = now;
++			domain->hard_quota_reported = false;
++			syslog(LOG_INFO, "Domain %u below hard memory quota again\n",
++			       domain->domid);
++		}
++		if (mem >= quota_memory_per_domain_soft &&
++		    quota_memory_per_domain_soft &&
++		    !domain->soft_quota_reported) {
++			domain->mem_last_msg = now;
++			domain->soft_quota_reported = true;
++			syslog(LOG_WARNING, "Domain %u exceeds soft memory quota\n",
++			       domain->domid);
++		}
++		if (mem < quota_memory_per_domain_soft &&
++		    domain->soft_quota_reported) {
++			domain->mem_last_msg = now;
++			domain->soft_quota_reported = false;
++			syslog(LOG_INFO, "Domain %u below soft memory quota again\n",
++			       domain->domid);
++		}
++
++	}
++
++	return false;
++}
++
++int domain_memory_add(unsigned int domid, int mem, bool no_quota_check)
++{
++	struct domain *domain;
++
++	domain = find_domain_struct(domid);
++	if (domain) {
++		/*
++		 * domain_chk_quota() will print warning and also store whether
++		 * the soft/hard quota has been hit. So check no_quota_check
++		 * *after*.
++		 */
++		if (domain_chk_quota(domain, domain->memory + mem) &&
++		    !no_quota_check)
++			return ENOMEM;
++		domain->memory += mem;
++	} else {
++		/*
++		 * The domain the memory is to be accounted for should always
++		 * exist, as accounting is done either for a domain related to
++		 * the current connection, or for the domain owning a node
++		 * (which is always existing, as the owner of the node is
++		 * tested to exist and replaced by domid 0 if not).
++		 * So not finding the related domain MUST be an error in the
++		 * data base.
++		 */
++		errno = ENOENT;
++		corrupt(NULL, "Accounting called for non-existing domain %u\n",
++			domid);
++		return ENOENT;
++	}
++
++	return 0;
++}
++
+ void domain_watch_inc(struct connection *conn)
+ {
+ 	if (!conn || !conn->domain)
+diff --git a/tools/xenstore/xenstored_domain.h b/tools/xenstore/xenstored_domain.h
+index 4edf1dba9425..3a8c6bab48ba 100644
+--- a/tools/xenstore/xenstored_domain.h
++++ b/tools/xenstore/xenstored_domain.h
+@@ -64,6 +64,26 @@ int domain_entry_inc(struct connection *conn, struct node *);
+ void domain_entry_dec(struct connection *conn, struct node *);
+ int domain_entry_fix(unsigned int domid, int num, bool update);
+ int domain_entry(struct connection *conn);
++int domain_memory_add(unsigned int domid, int mem, bool no_quota_check);
++
++/*
++ * domain_memory_add_chk(): to be used when memory quota should be checked.
++ * Not to be used when specifying a negative mem value, as lowering the used
++ * memory should always be allowed.
++ */
++static inline int domain_memory_add_chk(unsigned int domid, int mem)
++{
++	return domain_memory_add(domid, mem, false);
++}
++/*
++ * domain_memory_add_nochk(): to be used when memory quota should not be
++ * checked, e.g. when lowering memory usage, or in an error case for undoing
++ * a previous memory adjustment.
++ */
++static inline void domain_memory_add_nochk(unsigned int domid, int mem)
++{
++	domain_memory_add(domid, mem, true);
++}
+ void domain_watch_inc(struct connection *conn);
+ void domain_watch_dec(struct connection *conn);
+ int domain_watch(struct connection *conn);
