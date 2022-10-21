@@ -1,0 +1,191 @@
+From f0081da9dd7218f486841dc6cacbe71d2fc761e8 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 13 Sep 2022 07:35:07 +0200
+Subject: tools/xenstore: reduce number of watch events
+
+When removing a watched node outside of a transaction, two watch events
+are being produced instead of just a single one.
+
+When finalizing a transaction watch events can be generated for each
+node which is being modified, even if outside a transaction such
+modifications might not have resulted in a watch event.
+
+This happens e.g.:
+
+- for nodes which are only modified due to added/removed child entries
+- for nodes being removed or created implicitly (e.g. creation of a/b/c
+  is implicitly creating a/b, resulting in watch events for a, a/b and
+  a/b/c instead of a/b/c only)
+
+Avoid these additional watch events, in order to reduce the needed
+memory inside Xenstore for queueing them.
+
+This is being achieved by adding event flags to struct accessed_node
+specifying whether an event should be triggered, and whether it should
+be an exact match of the modified path. Both flags can be set from
+fire_watches() instead of implying them only.
+
+This is part of XSA-326.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+
+diff --git a/tools/xenstore/xenstored_core.c b/tools/xenstore/xenstored_core.c
+index 11b8d986340f..8f8d10cee95e 100644
+--- a/tools/xenstore/xenstored_core.c
++++ b/tools/xenstore/xenstored_core.c
+@@ -1180,7 +1180,7 @@ static void delete_child(struct connection *conn,
+ }
+ 
+ static int delete_node(struct connection *conn, const void *ctx,
+-		       struct node *parent, struct node *node)
++		       struct node *parent, struct node *node, bool watch_exact)
+ {
+ 	char *name;
+ 
+@@ -1192,7 +1192,7 @@ static int delete_node(struct connection *conn, const void *ctx,
+ 				       node->children);
+ 		child = name ? read_node(conn, node, name) : NULL;
+ 		if (child) {
+-			if (delete_node(conn, ctx, node, child))
++			if (delete_node(conn, ctx, node, child, true))
+ 				return errno;
+ 		} else {
+ 			trace("delete_node: Error deleting child '%s/%s'!\n",
+@@ -1204,7 +1204,12 @@ static int delete_node(struct connection *conn, const void *ctx,
+ 		talloc_free(name);
+ 	}
+ 
+-	fire_watches(conn, ctx, node->name, node, true, NULL);
++	/*
++	 * Fire the watches now, when we can still see the node permissions.
++	 * This fine as we are single threaded and the next possible read will
++	 * be handled only after the node has been really removed.
++	 */
++	fire_watches(conn, ctx, node->name, node, watch_exact, NULL);
+ 	delete_node_single(conn, node);
+ 	delete_child(conn, parent, basename(node->name));
+ 	talloc_free(node);
+@@ -1230,13 +1235,7 @@ static int _rm(struct connection *conn, const void *ctx, struct node *node,
+ 		return (errno == ENOMEM) ? ENOMEM : EINVAL;
+ 	node->parent = parent;
+ 
+-	/*
+-	 * Fire the watches now, when we can still see the node permissions.
+-	 * This fine as we are single threaded and the next possible read will
+-	 * be handled only after the node has been really removed.
+-	 */
+-	fire_watches(conn, ctx, name, node, false, NULL);
+-	return delete_node(conn, ctx, parent, node);
++	return delete_node(conn, ctx, parent, node, false);
+ }
+ 
+ 
+diff --git a/tools/xenstore/xenstored_transaction.c b/tools/xenstore/xenstored_transaction.c
+index 4ffa18311120..6fbdb29dcdd7 100644
+--- a/tools/xenstore/xenstored_transaction.c
++++ b/tools/xenstore/xenstored_transaction.c
+@@ -130,6 +130,10 @@ struct accessed_node
+ 
+ 	/* Transaction node in data base? */
+ 	bool ta_node;
++
++	/* Watch event flags. */
++	bool fire_watch;
++	bool watch_exact;
+ };
+ 
+ struct changed_domain
+@@ -330,6 +334,29 @@ int access_node(struct connection *conn, struct node *node,
+ }
+ 
+ /*
++ * A watch event should be fired for a node modified inside a transaction.
++ * Set the corresponding information. A non-exact event is replacing an exact
++ * one, but not the other way round.
++ */
++void queue_watches(struct connection *conn, const char *name, bool watch_exact)
++{
++	struct accessed_node *i;
++
++	i = find_accessed_node(conn->transaction, name);
++	if (!i) {
++		conn->transaction->fail = true;
++		return;
++	}
++
++	if (!i->fire_watch) {
++		i->fire_watch = true;
++		i->watch_exact = watch_exact;
++	} else if (!watch_exact) {
++		i->watch_exact = false;
++	}
++}
++
++/*
+  * Finalize transaction:
+  * Walk through accessed nodes and check generation against global data.
+  * If all entries match, read the transaction entries and write them without
+@@ -383,15 +410,15 @@ static int finalize_transaction(struct connection *conn,
+ 				ret = tdb_store(tdb_ctx, key, data,
+ 						TDB_REPLACE);
+ 				talloc_free(data.dptr);
+-				if (ret)
+-					goto err;
+-				fire_watches(conn, trans, i->node, NULL, false,
+-					     i->perms.p ? &i->perms : NULL);
+ 			} else {
+-				fire_watches(conn, trans, i->node, NULL, false,
++				ret = tdb_delete(tdb_ctx, key);
++			}
++			if (ret)
++				goto err;
++			if (i->fire_watch) {
++				fire_watches(conn, trans, i->node, NULL,
++					     i->watch_exact,
+ 					     i->perms.p ? &i->perms : NULL);
+-				if (tdb_delete(tdb_ctx, key))
+-					goto err;
+ 			}
+ 		}
+ 
+diff --git a/tools/xenstore/xenstored_transaction.h b/tools/xenstore/xenstored_transaction.h
+index 14062730e3c9..0093cac807e3 100644
+--- a/tools/xenstore/xenstored_transaction.h
++++ b/tools/xenstore/xenstored_transaction.h
+@@ -42,6 +42,9 @@ void transaction_entry_dec(struct transaction *trans, unsigned int domid);
+ int access_node(struct connection *conn, struct node *node,
+                 enum node_access_type type, TDB_DATA *key);
+ 
++/* Queue watches for a modified node. */
++void queue_watches(struct connection *conn, const char *name, bool watch_exact);
++
+ /* Prepend the transaction to name if appropriate. */
+ int transaction_prepend(struct connection *conn, const char *name,
+                         TDB_DATA *key);
+diff --git a/tools/xenstore/xenstored_watch.c b/tools/xenstore/xenstored_watch.c
+index 6d8097376e47..2f9367767e44 100644
+--- a/tools/xenstore/xenstored_watch.c
++++ b/tools/xenstore/xenstored_watch.c
+@@ -29,6 +29,7 @@
+ #include "xenstore_lib.h"
+ #include "utils.h"
+ #include "xenstored_domain.h"
++#include "xenstored_transaction.h"
+ 
+ extern int quota_nb_watch_per_domain;
+ 
+@@ -143,9 +144,11 @@ void fire_watches(struct connection *conn, const void *ctx, const char *name,
+ 	struct connection *i;
+ 	struct watch *watch;
+ 
+-	/* During transactions, don't fire watches. */
+-	if (conn && conn->transaction)
++	/* During transactions, don't fire watches, but queue them. */
++	if (conn && conn->transaction) {
++		queue_watches(conn, name, exact);
+ 		return;
++	}
+ 
+ 	/* Create an event for each watch. */
+ 	list_for_each_entry(i, &connections, list) {
