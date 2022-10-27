@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.33
+%global hv_rel 10.34
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -880,6 +880,19 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Thu Oct 27 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.34
+- Fixes for
+  - XSA-326 CVE-2022-42311 CVE-2022-42312 CVE-2022-42313 CVE-2022-42314
+            CVE-2022-42315 CVE-2022-42316 CVE-2022-42317 CVE-2022-42318
+  - XSA-414 CVE-2022-42309
+  - XSA-415 CVE-2022-42310
+  - XSA-416 CVE-2022-42319
+  - XSA-417 CVE-2022-42320
+  - XSA-418 CVE-2022-42321
+  - XSA-419 CVE-2022-42322 CVE-2022-42323
+  - XSA-420 CVE-2022-42324
+  - XSA-421 CVE-2022-42325 CVE-2022-42326
+
 * Thu Oct 6 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.33
 - Fixes for XSA-410 CVE-2022-33746, XSA-411 CVE-2022-33748.
 - Activate DOITM (Data Operand Invariant Timing Mode) unilaterally on capable
