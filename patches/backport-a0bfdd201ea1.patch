@@ -1,0 +1,50 @@
+From a0bfdd201ea12aa5679bb8944d63a4e0d3c23160 Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Fri, 28 Oct 2022 15:48:50 +0200
+Subject: x86/pv-shim: correct ballooning up for compat guests
+
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+
+The compat layer for multi-extent memory ops may need to split incoming
+requests. Since the guest handles in the interface structures may not be
+altered, it does so by leveraging do_memory_op()'s continuation
+handling: It hands on non-initial requests with a non-zero start extent,
+with the (native) handle suitably adjusted down. As a result
+do_memory_op() sees only the first of potentially several requests with
+start extent being zero. It's only that case when the function would
+issue a call to pv_shim_online_memory(), yet the range then covers only
+the first sub-range that results from the split.
+
+Address that breakage by making a complementary call to
+pv_shim_online_memory() in compat layer.
+
+Fixes: b2245acc60c3 ("xen/pvshim: memory hotplug")
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-acked-by: Henry Wang <Henry.Wang@arm.com>
+
+diff --git a/xen/common/compat/memory.c b/xen/common/compat/memory.c
+index ed92e05b0833..e46f1cbe10ff 100644
+--- a/xen/common/compat/memory.c
++++ b/xen/common/compat/memory.c
+@@ -7,6 +7,7 @@ EMIT_FILE;
+ #include <xen/event.h>
+ #include <xen/mem_access.h>
+ #include <asm/current.h>
++#include <asm/guest.h>
+ #include <compat/memory.h>
+ 
+ #define xen_domid_t domid_t
+@@ -144,7 +145,10 @@ int compat_memory_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) compat)
+                 nat.rsrv->nr_extents = end_extent;
+                 ++split;
+             }
+-
++           /* Avoid calling pv_shim_online_memory() when in a continuation. */
++           if ( pv_shim && op != XENMEM_decrease_reservation && !start_extent )
++               pv_shim_online_memory(cmp.rsrv.nr_extents - nat.rsrv->nr_extents,
++                                     cmp.rsrv.extent_order);
+             break;
+ 
+         case XENMEM_exchange:

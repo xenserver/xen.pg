@@ -1,0 +1,67 @@
+From 1d7fbc535d1d37bdc2cc53ede360b0f6651f7de1 Mon Sep 17 00:00:00 2001
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+Date: Fri, 28 Oct 2022 15:49:33 +0200
+Subject: x86/pv-shim: correct ballooning down for compat guests
+
+From: Igor Druzhinin <igor.druzhinin@citrix.com>
+
+The compat layer for multi-extent memory ops may need to split incoming
+requests. Since the guest handles in the interface structures may not be
+altered, it does so by leveraging do_memory_op()'s continuation
+handling: It hands on non-initial requests with a non-zero start extent,
+with the (native) handle suitably adjusted down. As a result
+do_memory_op() sees only the first of potentially several requests with
+start extent being zero. In order to be usable as overall result, the
+function accumulates args.nr_done, i.e. it initialized the field with
+the start extent. Therefore non-initial requests resulting from the
+split would pass too large a number into pv_shim_offline_memory().
+
+Address that breakage by always calling pv_shim_offline_memory()
+regardless of current hypercall preemption status, with a suitably
+adjusted first argument. Note that this is correct also for the native
+guest case: We now simply "commit" what was completed right away, rather
+than at the end of a series of preemption/re-start cycles. In fact this
+improves overall preemption behavior: There's no longer a potentially
+big chunk of work done non-preemptively at the end of the last
+"iteration".
+
+Fixes: b2245acc60c3 ("xen/pvshim: memory hotplug")
+Signed-off-by: Igor Druzhinin <igor.druzhinin@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-acked-by: Henry Wang <Henry.Wang@arm.com>
+
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index 7c394b36403c..97805e8ebe47 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -1253,22 +1253,17 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+ 
+         rc = args.nr_done;
+ 
+-        if ( args.preempted )
+-            return hypercall_create_continuation(
+-                __HYPERVISOR_memory_op, "lh",
+-                op | (rc << MEMOP_EXTENT_SHIFT), arg);
+-
+ #ifdef CONFIG_X86
+         if ( pv_shim && op == XENMEM_decrease_reservation )
+-            /*
+-             * Only call pv_shim_offline_memory when the hypercall has
+-             * finished. Note that nr_done is used to cope in case the
+-             * hypercall has failed and only part of the extents where
+-             * processed.
+-             */
+-            pv_shim_offline_memory(args.nr_done, args.extent_order);
++            pv_shim_offline_memory(args.nr_done - start_extent,
++                                   args.extent_order);
+ #endif
+ 
++        if ( args.preempted )
++           return hypercall_create_continuation(
++                __HYPERVISOR_memory_op, "lh",
++                op | (rc << MEMOP_EXTENT_SHIFT), arg);
++
+         break;
+ 
+     case XENMEM_exchange:
