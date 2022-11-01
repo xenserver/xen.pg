@@ -1,0 +1,108 @@
+From 6f311278e9f8082378e236ab246ae160d76db008 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 13 Sep 2022 07:35:07 +0200
+Subject: tools/xenstore: add helpers to free struct buffered_data
+
+Add two helpers for freeing struct buffered_data: free_buffered_data()
+for freeing one instance and conn_free_buffered_data() for freeing all
+instances for a connection.
+
+This is avoiding duplicated code and will help later when more actions
+are needed when freeing a struct buffered_data.
+
+This is part of XSA-326.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+(cherry picked from commit ead062a68a9c201a95488e84750a70a107f7b317)
+
+diff --git a/tools/xenstore/xenstored_core.c b/tools/xenstore/xenstored_core.c
+index 97ff35cd2b11..11b8d986340f 100644
+--- a/tools/xenstore/xenstored_core.c
++++ b/tools/xenstore/xenstored_core.c
+@@ -205,6 +205,21 @@ void reopen_log(void)
+ 	}
+ }
+ 
++static void free_buffered_data(struct buffered_data *out,
++			       struct connection *conn)
++{
++	list_del(&out->list);
++	talloc_free(out);
++}
++
++void conn_free_buffered_data(struct connection *conn)
++{
++	struct buffered_data *out;
++
++	while ((out = list_top(&conn->out_list, struct buffered_data, list)))
++		free_buffered_data(out, conn);
++}
++
+ static bool write_messages(struct connection *conn)
+ {
+ 	int ret;
+@@ -248,8 +263,7 @@ static bool write_messages(struct connection *conn)
+ 
+ 	trace_io(conn, out, 1);
+ 
+-	list_del(&out->list);
+-	talloc_free(out);
++	free_buffered_data(out, conn);
+ 
+ 	return true;
+ }
+@@ -1389,18 +1403,12 @@ static struct {
+  */
+ static void ignore_connection(struct connection *conn)
+ {
+-	struct buffered_data *out, *tmp;
+-
+ 	trace("CONN %p ignored\n", conn);
+ 
+ 	conn->is_ignored = true;
+ 	conn_delete_all_watches(conn);
+ 	conn_delete_all_transactions(conn);
+-
+-	list_for_each_entry_safe(out, tmp, &conn->out_list, list) {
+-		list_del(&out->list);
+-		talloc_free(out);
+-	}
++	conn_free_buffered_data(conn);
+ 
+ 	talloc_free(conn->in);
+ 	conn->in = NULL;
+diff --git a/tools/xenstore/xenstored_core.h b/tools/xenstore/xenstored_core.h
+index 2b0f796d9bb1..83d49693fc19 100644
+--- a/tools/xenstore/xenstored_core.h
++++ b/tools/xenstore/xenstored_core.h
+@@ -226,6 +226,8 @@ extern xengnttab_handle **xgt_handle;
+ 
+ int remember_string(struct hashtable *hash, const char *str);
+ 
++void conn_free_buffered_data(struct connection *conn);
++
+ #endif /* _XENSTORED_CORE_H */
+ 
+ /*
+diff --git a/tools/xenstore/xenstored_domain.c b/tools/xenstore/xenstored_domain.c
+index cbd8e6b747bd..416b92cad4b2 100644
+--- a/tools/xenstore/xenstored_domain.c
++++ b/tools/xenstore/xenstored_domain.c
+@@ -406,15 +406,10 @@ static struct domain *find_domain_by_domid(unsigned int domid)
+ static void domain_conn_reset(struct domain *domain)
+ {
+ 	struct connection *conn = domain->conn;
+-	struct buffered_data *out;
+ 
+ 	conn_delete_all_watches(conn);
+ 	conn_delete_all_transactions(conn);
+-
+-	while ((out = list_top(&conn->out_list, struct buffered_data, list))) {
+-		list_del(&out->list);
+-		talloc_free(out);
+-	}
++	conn_free_buffered_data(conn);
+ 
+ 	talloc_free(conn->in);
+ 

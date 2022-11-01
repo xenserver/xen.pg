@@ -1,0 +1,252 @@
+From f859218309f09ec6d425e02b583e4494924304ad Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 13 Sep 2022 07:35:09 +0200
+Subject: tools/xenstore: limit max number of nodes accessed in a transaction
+
+Today a guest is free to access as many nodes in a single transaction
+as it wants. This can lead to unbounded memory consumption in Xenstore
+as there is the need to keep track of all nodes having been accessed
+during a transaction.
+
+In oxenstored the number of requests in a transaction is being limited
+via a quota maxrequests (default is 1024). As multiple accesses of a
+node are not problematic in C Xenstore, limit the number of accessed
+nodes.
+
+In order to let read_node() detect a quota error in case too many nodes
+are being accessed, check the return value of access_node() and return
+NULL in case an error has been seen. Introduce __must_check and add it
+to the access_node() prototype.
+
+This is part of XSA-326 / CVE-2022-42314.
+
+Suggested-by: Julien Grall <julien@xen.org>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+(cherry picked from commit 268369d8e322d227a74a899009c5748d7b0ea142)
+
+diff --git a/tools/include/xen-tools/libs.h b/tools/include/xen-tools/libs.h
+index cc7dfc8c6453..34db3b784732 100644
+--- a/tools/include/xen-tools/libs.h
++++ b/tools/include/xen-tools/libs.h
+@@ -59,4 +59,8 @@
+     })
+ #endif
+ 
++#ifndef __must_check
++#define __must_check __attribute__((__warn_unused_result__))
++#endif
++
+ #endif	/* __XEN_TOOLS_LIBS__ */
+diff --git a/tools/xenstore/xenstored_core.c b/tools/xenstore/xenstored_core.c
+index 98d242e06241..57c999129215 100644
+--- a/tools/xenstore/xenstored_core.c
++++ b/tools/xenstore/xenstored_core.c
+@@ -102,6 +102,7 @@ int quota_nb_watch_per_domain = 128;
+ int quota_max_entry_size = 2048; /* 2K */
+ int quota_max_transaction = 10;
+ int quota_nb_perms_per_node = 5;
++int quota_trans_nodes = 1024;
+ int quota_req_outstanding = 20;
+ 
+ unsigned int timeout_watch_event_msec = 20000;
+@@ -500,6 +501,7 @@ struct node *read_node(struct connection *conn, const void *ctx,
+ 	TDB_DATA key, data;
+ 	struct xs_tdb_record_hdr *hdr;
+ 	struct node *node;
++	int err;
+ 
+ 	node = talloc(ctx, struct node);
+ 	if (!node) {
+@@ -521,14 +523,13 @@ struct node *read_node(struct connection *conn, const void *ctx,
+ 	if (data.dptr == NULL) {
+ 		if (tdb_error(tdb_ctx) == TDB_ERR_NOEXIST) {
+ 			node->generation = NO_GENERATION;
+-			access_node(conn, node, NODE_ACCESS_READ, NULL);
+-			errno = ENOENT;
++			err = access_node(conn, node, NODE_ACCESS_READ, NULL);
++			errno = err ? : ENOENT;
+ 		} else {
+ 			log("TDB error on read: %s", tdb_errorstr(tdb_ctx));
+ 			errno = EIO;
+ 		}
+-		talloc_free(node);
+-		return NULL;
++		goto error;
+ 	}
+ 
+ 	node->parent = NULL;
+@@ -543,19 +544,36 @@ struct node *read_node(struct connection *conn, const void *ctx,
+ 
+ 	/* Permissions are struct xs_permissions. */
+ 	node->perms.p = hdr->perms;
+-	if (domain_adjust_node_perms(conn, node)) {
+-		talloc_free(node);
+-		return NULL;
+-	}
++	if (domain_adjust_node_perms(conn, node))
++		goto error;
+ 
+ 	/* Data is binary blob (usually ascii, no nul). */
+ 	node->data = node->perms.p + hdr->num_perms;
+ 	/* Children is strings, nul separated. */
+ 	node->children = node->data + node->datalen;
+ 
+-	access_node(conn, node, NODE_ACCESS_READ, NULL);
++	if (access_node(conn, node, NODE_ACCESS_READ, NULL))
++		goto error;
+ 
+ 	return node;
++
++ error:
++	err = errno;
++	talloc_free(node);
++	errno = err;
++	return NULL;
++}
++
++static bool read_node_can_propagate_errno(void)
++{
++	/*
++	 * 2 error cases for read_node() can always be propagated up:
++	 * ENOMEM, because this has nothing to do with the node being in the
++	 * data base or not, but is caused by a general lack of memory.
++	 * ENOSPC, because this is related to hitting quota limits which need
++	 * to be respected.
++	 */
++	return errno == ENOMEM || errno == ENOSPC;
+ }
+ 
+ int write_node_raw(struct connection *conn, TDB_DATA *key, struct node *node,
+@@ -670,7 +688,7 @@ static int ask_parents(struct connection *conn, const void *ctx,
+ 		node = read_node(conn, ctx, name);
+ 		if (node)
+ 			break;
+-		if (errno == ENOMEM)
++		if (read_node_can_propagate_errno())
+ 			return errno;
+ 	} while (!streq(name, "/"));
+ 
+@@ -733,7 +751,7 @@ static struct node *get_node(struct connection *conn,
+ 		}
+ 	}
+ 	/* Clean up errno if they weren't supposed to know. */
+-	if (!node && errno != ENOMEM)
++	if (!node && !read_node_can_propagate_errno())
+ 		errno = errno_from_parents(conn, ctx, name, errno, perm);
+ 	return node;
+ }
+@@ -1115,7 +1133,7 @@ static struct node *construct_node(struct connection *conn, const void *ctx,
+ 
+ 	/* If parent doesn't exist, create it. */
+ 	parent = read_node(conn, parentname, parentname);
+-	if (!parent)
++	if (!parent && errno == ENOENT)
+ 		parent = construct_node(conn, ctx, parentname);
+ 	if (!parent)
+ 		return NULL;
+@@ -1394,7 +1412,7 @@ static int _rm(struct connection *conn, const void *ctx, struct node *node,
+ 
+ 	parent = read_node(conn, ctx, parentname);
+ 	if (!parent)
+-		return (errno == ENOMEM) ? ENOMEM : EINVAL;
++		return read_node_can_propagate_errno() ? errno : EINVAL;
+ 	node->parent = parent;
+ 
+ 	return delete_node(conn, ctx, parent, node, false);
+@@ -1422,7 +1440,7 @@ static int do_rm(struct connection *conn, struct buffered_data *in)
+ 				return 0;
+ 			}
+ 			/* Restore errno, just in case. */
+-			if (errno != ENOMEM)
++			if (!read_node_can_propagate_errno())
+ 				errno = ENOENT;
+ 		}
+ 		return errno;
+@@ -2192,6 +2210,8 @@ static void usage(void)
+ "  -A, --perm-nb <nb>      limit the number of permissions per node,\n"
+ "  -Q, --quota <what>=<nb> set the quota <what> to the value <nb>, allowed\n"
+ "                          quotas are:\n"
++"                          transaction-nodes: number of accessed node per\n"
++"                                             transaction\n"
+ "                          outstanding: number of outstanding requests\n"
+ "  -w, --timeout <what>=<seconds>   set the timeout in seconds for <what>,\n"
+ "                          allowed timeout candidates are:\n"
+@@ -2273,6 +2293,8 @@ static void set_quota(const char *arg)
+ 	val = get_optval_int(eq + 1);
+ 	if (what_matches(arg, "outstanding"))
+ 		quota_req_outstanding = val;
++	else if (what_matches(arg, "transaction-nodes"))
++		quota_trans_nodes = val;
+ 	else
+ 		barf("unknown quota \"%s\"\n", arg);
+ }
+diff --git a/tools/xenstore/xenstored_core.h b/tools/xenstore/xenstored_core.h
+index 98db4afcaabf..7e371253d2d1 100644
+--- a/tools/xenstore/xenstored_core.h
++++ b/tools/xenstore/xenstored_core.h
+@@ -34,6 +34,7 @@
+ #include "list.h"
+ #include "tdb.h"
+ #include "hashtable.h"
++#include "utils.h"
+ 
+ /* DEFAULT_BUFFER_SIZE should be large enough for each errno string. */
+ #define DEFAULT_BUFFER_SIZE 16
+@@ -223,6 +224,7 @@ extern int dom0_event;
+ extern int priv_domid;
+ extern int quota_nb_entry_per_domain;
+ extern int quota_req_outstanding;
++extern int quota_trans_nodes;
+ 
+ extern unsigned int timeout_watch_event_msec;
+ 
+diff --git a/tools/xenstore/xenstored_transaction.c b/tools/xenstore/xenstored_transaction.c
+index bf2fda8234b3..778b7e439cb3 100644
+--- a/tools/xenstore/xenstored_transaction.c
++++ b/tools/xenstore/xenstored_transaction.c
+@@ -156,6 +156,9 @@ struct transaction
+ 	/* Connection-local identifier for this transaction. */
+ 	uint32_t id;
+ 
++	/* Node counter. */
++	unsigned int nodes;
++
+ 	/* Generation when transaction started. */
+ 	uint64_t generation;
+ 
+@@ -266,6 +269,11 @@ int access_node(struct connection *conn, struct node *node,
+ 
+ 	i = find_accessed_node(trans, node->name);
+ 	if (!i) {
++		if (trans->nodes >= quota_trans_nodes &&
++		    domain_is_unprivileged(conn)) {
++			ret = ENOSPC;
++			goto err;
++		}
+ 		i = talloc_zero(trans, struct accessed_node);
+ 		if (!i)
+ 			goto nomem;
+@@ -303,6 +311,7 @@ int access_node(struct connection *conn, struct node *node,
+ 				i->ta_node = true;
+ 			}
+ 		}
++		trans->nodes++;
+ 		list_add_tail(&i->list, &trans->accessed);
+ 	}
+ 
+diff --git a/tools/xenstore/xenstored_transaction.h b/tools/xenstore/xenstored_transaction.h
+index 0093cac807e3..e3cbd6b23095 100644
+--- a/tools/xenstore/xenstored_transaction.h
++++ b/tools/xenstore/xenstored_transaction.h
+@@ -39,8 +39,8 @@ void transaction_entry_inc(struct transaction *trans, unsigned int domid);
+ void transaction_entry_dec(struct transaction *trans, unsigned int domid);
+ 
+ /* This node was accessed. */
+-int access_node(struct connection *conn, struct node *node,
+-                enum node_access_type type, TDB_DATA *key);
++int __must_check access_node(struct connection *conn, struct node *node,
++                             enum node_access_type type, TDB_DATA *key);
+ 
+ /* Queue watches for a modified node. */
+ void queue_watches(struct connection *conn, const char *name, bool watch_exact);

@@ -1,0 +1,73 @@
+From 0135300160627cd502d9179ab79da1c631dca6f0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Fri, 29 Jul 2022 18:53:29 +0100
+Subject: tools/ocaml/libs/xb: hide type of Xb.t
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hiding the type will make it easier to change the implementation
+in the future without breaking code that relies on it.
+
+No functional change.
+
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+(cherry picked from commit 7ade30a1451734d041363c750a65d322e25b47ba)
+
+diff --git a/tools/ocaml/libs/xb/xb.ml b/tools/ocaml/libs/xb/xb.ml
+index 104d319d7747..8404ddd8a682 100644
+--- a/tools/ocaml/libs/xb/xb.ml
++++ b/tools/ocaml/libs/xb/xb.ml
+@@ -196,6 +196,9 @@ let peek_output con = Queue.peek con.pkt_out
+ let input_len con = Queue.length con.pkt_in
+ let has_in_packet con = Queue.length con.pkt_in > 0
+ let get_in_packet con = Queue.pop con.pkt_in
++let has_partial_input con = match con.partial_in with
++	| HaveHdr _ -> true
++	| NoHdr (n, _) -> n < Partial.header_size ()
+ let has_more_input con =
+ 	match con.backend with
+ 	| Fd _         -> false
+diff --git a/tools/ocaml/libs/xb/xb.mli b/tools/ocaml/libs/xb/xb.mli
+index 3a00da6cddc1..794e35bb343e 100644
+--- a/tools/ocaml/libs/xb/xb.mli
++++ b/tools/ocaml/libs/xb/xb.mli
+@@ -66,13 +66,7 @@ type backend_mmap = {
+ type backend_fd = { fd : Unix.file_descr; }
+ type backend = Fd of backend_fd | Xenmmap of backend_mmap
+ type partial_buf = HaveHdr of Partial.pkt | NoHdr of int * bytes
+-type t = {
+-  backend : backend;
+-  pkt_in : Packet.t Queue.t;
+-  pkt_out : Packet.t Queue.t;
+-  mutable partial_in : partial_buf;
+-  mutable partial_out : string;
+-}
++type t
+ val init_partial_in : unit -> partial_buf
+ val reconnect : t -> unit
+ val queue : t -> Packet.t -> unit
+@@ -97,6 +91,7 @@ val has_output : t -> bool
+ val peek_output : t -> Packet.t
+ val input_len : t -> int
+ val has_in_packet : t -> bool
++val has_partial_input : t -> bool
+ val get_in_packet : t -> Packet.t
+ val has_more_input : t -> bool
+ val is_selectable : t -> bool
+diff --git a/tools/ocaml/xenstored/connection.ml b/tools/ocaml/xenstored/connection.ml
+index daf8d804f7ef..70c43485528c 100644
+--- a/tools/ocaml/xenstored/connection.ml
++++ b/tools/ocaml/xenstored/connection.ml
+@@ -125,9 +125,7 @@ let get_perm con =
+ let set_target con target_domid =
+ 	con.perm <- Perms.Connection.set_target (get_perm con) ~perms:[Perms.READ; Perms.WRITE] target_domid
+ 
+-let is_backend_mmap con = match con.xb.Xenbus.Xb.backend with
+-	| Xenbus.Xb.Xenmmap _ -> true
+-	| _ -> false
++let is_backend_mmap con = Xenbus.Xb.is_mmap con.xb
+ 
+ let send_reply con tid rid ty data =
+ 	if (String.length data) > xenstore_payload_max && (is_backend_mmap con) then
