@@ -1,0 +1,85 @@
+From 2963ee5d065ecd2fb8c7a5dcd9f1cff66f6497f2 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 13 Sep 2022 07:35:08 +0200
+Subject: tools/xenstore: don't buffer multiple identical watch events
+
+A guest not reading its Xenstore response buffer fast enough might
+pile up lots of Xenstore watch events buffered. Reduce the generated
+load by dropping new events which already have an identical copy
+pending.
+
+The special events "@..." are excluded from that handling as there are
+known use cases where the handler is relying on each event to be sent
+individually.
+
+This is part of XSA-326.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+(cherry picked from commit b5c0bdb96d33e18c324c13d8e33c08732d77eaa2)
+
+diff --git a/tools/xenstore/xenstored_core.c b/tools/xenstore/xenstored_core.c
+index 5f1733112a4f..0621023bca16 100644
+--- a/tools/xenstore/xenstored_core.c
++++ b/tools/xenstore/xenstored_core.c
+@@ -821,6 +821,7 @@ void send_reply(struct connection *conn, enum xsd_sockmsg_type type,
+ 	bdata->inhdr = true;
+ 	bdata->used = 0;
+ 	bdata->timeout_msec = 0;
++	bdata->watch_event = false;
+ 
+ 	if (len <= DEFAULT_BUFFER_SIZE)
+ 		bdata->buffer = bdata->default_buffer;
+@@ -853,7 +854,7 @@ void send_reply(struct connection *conn, enum xsd_sockmsg_type type,
+ void send_event(struct buffered_data *req, struct connection *conn,
+ 		const char *path, const char *token)
+ {
+-	struct buffered_data *bdata;
++	struct buffered_data *bdata, *bd;
+ 	unsigned int len;
+ 
+ 	len = strlen(path) + 1 + strlen(token) + 1;
+@@ -875,12 +876,29 @@ void send_event(struct buffered_data *req, struct connection *conn,
+ 	bdata->hdr.msg.type = XS_WATCH_EVENT;
+ 	bdata->hdr.msg.len = len;
+ 
++	/*
++	 * Check whether an identical event is pending already.
++	 * Special events are excluded from that check.
++	 */
++	if (path[0] != '@') {
++		list_for_each_entry(bd, &conn->out_list, list) {
++			if (bd->watch_event && bd->hdr.msg.len == len &&
++			    !memcmp(bdata->buffer, bd->buffer, len)) {
++				trace("dropping duplicate watch %s %s for domain %u\n",
++				      path, token, conn->id);
++				talloc_free(bdata);
++				return;
++			}
++		}
++	}
++
+ 	if (timeout_watch_event_msec && domain_is_unprivileged(conn)) {
+ 		bdata->timeout_msec = get_now_msec() + timeout_watch_event_msec;
+ 		if (!conn->timeout_msec)
+ 			conn->timeout_msec = bdata->timeout_msec;
+ 	}
+ 
++	bdata->watch_event = true;
+ 	bdata->pend.req = req;
+ 	if (req)
+ 		req->pend.ref.event_cnt++;
+diff --git a/tools/xenstore/xenstored_core.h b/tools/xenstore/xenstored_core.h
+index edeaa96dd10b..1eb6131fc88d 100644
+--- a/tools/xenstore/xenstored_core.h
++++ b/tools/xenstore/xenstored_core.h
+@@ -51,6 +51,9 @@ struct buffered_data
+ 	/* Are we still doing the header? */
+ 	bool inhdr;
+ 
++	/* Is this a watch event? */
++	bool watch_event;
++
+ 	/* How far are we? */
+ 	unsigned int used;
+ 

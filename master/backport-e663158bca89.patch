@@ -29,10 +29,18 @@ Reviewed-by: Pau Ruiz Safont <pau.safont@citrix.com>
 Reviewed-by: Christian Lindig <christian.lindig@citrix.com>
 
 diff --git a/tools/ocaml/xenstored/connection.ml b/tools/ocaml/xenstored/connection.ml
-index daf8d804f7ef..b8d9857019bb 100644
+index 9aad451a2dbd..acc64d7c3387 100644
 --- a/tools/ocaml/xenstored/connection.ml
 +++ b/tools/ocaml/xenstored/connection.ml
-@@ -289,6 +289,41 @@ let has_new_output con = Xenbus.Xb.has_new_output con.xb
+@@ -405,6 +405,7 @@ let get_transaction con tid =
+ 	Hashtbl.find con.transactions tid
+ 
+ let do_input con = Xenbus.Xb.input con.xb
++let has_partial_input con = Xenbus.Xb.has_partial_input con.xb
+ let has_more_input con = Xenbus.Xb.has_more_input con.xb
+ 
+ let can_input con = Xenbus.Xb.can_input con.xb && BoundedPipe.is_empty con.pending_source_watchevents
+@@ -414,6 +415,41 @@ let has_new_output con = Xenbus.Xb.has_new_output con.xb
  let peek_output con = Xenbus.Xb.peek_output con.xb
  let do_output con = Xenbus.Xb.output con.xb
  
@@ -55,7 +63,7 @@ index daf8d804f7ef..b8d9857019bb 100644
 +   Restrictions below can be relaxed once xenstored learns to dump more
 +   of its live state in a safe way *)
 +let has_extra_connection_data con =
-+	let has_in = has_input con in
++	let has_in = has_partial_input con in
 +	let has_out = has_output con in
 +	let has_socket = con.dom = None in
 +	let has_nondefault_perms = make_perm con.dom <> con.perm in
@@ -72,16 +80,16 @@ index daf8d804f7ef..b8d9857019bb 100644
 +	&& (has_extra_connection_data con || has_transaction_data con)
 +
  let has_more_work con =
- 	has_more_input con || not (has_old_output con) && has_new_output con
+ 	(has_more_input con && can_input con) || not (has_old_output con) && has_new_output con
  
 diff --git a/tools/ocaml/xenstored/connections.ml b/tools/ocaml/xenstored/connections.ml
-index d293ca0f0410..c80b63a10104 100644
+index 29463a4b4e3b..eb301ded268c 100644
 --- a/tools/ocaml/xenstored/connections.ml
 +++ b/tools/ocaml/xenstored/connections.ml
-@@ -196,3 +196,11 @@ let debug cons =
- 	let anonymous = Hashtbl.fold (fun _ con accu -> Connection.debug con :: accu) cons.anonymous [] in
- 	let domains = Hashtbl.fold (fun _ con accu -> Connection.debug con :: accu) cons.domains [] in
- 	String.concat "" (domains @ anonymous)
+@@ -225,3 +225,11 @@ let debug_watchevents cons con =
+ 	let pending = s |> Connection.Watch.Set.elements
+ 		|> List.map (fun w -> Connection.Watch.pending_watchevents w) |> List.fold_left (+) 0 in
+ 	Printf.sprintf "Watches with pending events: %d, pending events total: %d" (Connection.Watch.Set.cardinal s) pending
 +
 +let filter ~f cons =
 +	let fold _ v acc = if f v then v :: acc else acc in
@@ -91,7 +99,7 @@ index d293ca0f0410..c80b63a10104 100644
 +
 +let prevents_quit cons = filter ~f:Connection.prevents_live_update cons
 diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
-index 39d6d767e4cf..53d86618f2b8 100644
+index 86af7a110af7..43fc21fb4c09 100644
 --- a/tools/ocaml/xenstored/xenstored.ml
 +++ b/tools/ocaml/xenstored/xenstored.ml
 @@ -20,6 +20,7 @@ open Parse_arg
@@ -102,7 +110,7 @@ index 39d6d767e4cf..53d86618f2b8 100644
  let debug fmt = Logging.debug "xenstored" fmt
  let info fmt = Logging.info "xenstored" fmt
  
-@@ -312,7 +313,9 @@ let _ =
+@@ -378,7 +379,9 @@ let _ =
  	);
  
  	Sys.set_signal Sys.sighup (Sys.Signal_handle sighup_handler);
@@ -113,7 +121,7 @@ index 39d6d767e4cf..53d86618f2b8 100644
  	Sys.set_signal Sys.sigusr1 (Sys.Signal_handle (fun _ -> sigusr1_handler store));
  	Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
  
-@@ -424,6 +427,12 @@ let _ =
+@@ -490,6 +493,12 @@ let _ =
  		);
  		let elapsed = Unix.gettimeofday () -. now in
  		debug "periodic_ops took %F seconds." elapsed;
@@ -126,7 +134,7 @@ index 39d6d767e4cf..53d86618f2b8 100644
  		delay_next_frequent_ops_by elapsed
  	in
  
-@@ -475,7 +484,7 @@ let _ =
+@@ -541,7 +550,7 @@ let _ =
  		in
  
  	Systemd.sd_notify_ready ();

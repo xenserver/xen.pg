@@ -1,0 +1,94 @@
+From c084ee8e5834a33fba8e03fe9bcd1e1ebe03b09d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Thu, 28 Jul 2022 17:08:15 +0100
+Subject: tools/ocaml/xenstored: Check for maxrequests before performing
+ operations
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Previously we'd perform the operation, record the updated tree in the
+transaction record, then try to insert a watchop path and the reply packet.
+
+If we exceeded max requests we would've returned EQUOTA, but still:
+* have performed the operation on the transaction's tree
+* have recorded the watchop, making this queue effectively unbounded
+
+It is better if we check whether we'd have room to store the operation before
+performing the transaction, and raise EQUOTA there.  Then the transaction
+record won't grow.
+
+This is part of XSA-326 / CVE-2022-42317.
+
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+(cherry picked from commit 329f4d1a6535c6c5a34025ca0d03fc5c7228fcff)
+
+diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
+index 3ab09c6ce926..3279b19b1bff 100644
+--- a/tools/ocaml/xenstored/process.ml
++++ b/tools/ocaml/xenstored/process.ml
+@@ -253,6 +253,7 @@ let input_handle_error ~cons ~doms ~fct ~con ~t ~req =
+ 	let reply_error e =
+ 		Packet.Error e in
+ 	try
++		Transaction.check_quota_exn ~perm:(Connection.get_perm con) t;
+ 		fct con t doms cons req.Packet.data
+ 	with
+ 	| Define.Invalid_path          -> reply_error "EINVAL"
+@@ -545,9 +546,10 @@ let process_packet ~store ~cons ~doms ~con ~req =
+ 		in
+ 
+ 		let response = try
++			Transaction.check_quota_exn ~perm:(Connection.get_perm con) t;
+ 			if tid <> Transaction.none then
+ 				(* Remember the request and response for this operation in case we need to replay the transaction *)
+-				Transaction.add_operation ~perm:(Connection.get_perm con) t req response;
++				Transaction.add_operation t req response;
+ 			response
+ 		with Quota.Limit_reached ->
+ 			Packet.Error "EQUOTA"
+diff --git a/tools/ocaml/xenstored/transaction.ml b/tools/ocaml/xenstored/transaction.ml
+index 17b1bdf2eaf9..294143e2335b 100644
+--- a/tools/ocaml/xenstored/transaction.ml
++++ b/tools/ocaml/xenstored/transaction.ml
+@@ -85,6 +85,7 @@ type t = {
+ 	oldroot: Store.Node.t;
+ 	mutable paths: (Xenbus.Xb.Op.operation * Store.Path.t) list;
+ 	mutable operations: (Packet.request * Packet.response) list;
++	mutable quota_reached: bool;
+ 	mutable read_lowpath: Store.Path.t option;
+ 	mutable write_lowpath: Store.Path.t option;
+ }
+@@ -127,6 +128,7 @@ let make ?(internal=false) id store =
+ 		oldroot = Store.get_root store;
+ 		paths = [];
+ 		operations = [];
++		quota_reached = false;
+ 		read_lowpath = None;
+ 		write_lowpath = None;
+ 	} in
+@@ -143,13 +145,19 @@ let get_root t = Store.get_root t.store
+ 
+ let is_read_only t = t.paths = []
+ let add_wop t ty path = t.paths <- (ty, path) :: t.paths
+-let add_operation ~perm t request response =
++let get_operations t = List.rev t.operations
++
++let check_quota_exn ~perm t =
+ 	if !Define.maxrequests >= 0
+ 		&& not (Perms.Connection.is_dom0 perm)
+-		&& List.length t.operations >= !Define.maxrequests
+-		then raise Quota.Limit_reached;
++		&& (t.quota_reached || List.length t.operations >= !Define.maxrequests)
++		then begin
++			t.quota_reached <- true;
++			raise Quota.Limit_reached;
++		end
++
++let add_operation t request response =
+ 	t.operations <- (request, response) :: t.operations
+-let get_operations t = List.rev t.operations
+ let set_read_lowpath t path = t.read_lowpath <- get_lowest path t.read_lowpath
+ let set_write_lowpath t path = t.write_lowpath <- get_lowest path t.write_lowpath
+ 

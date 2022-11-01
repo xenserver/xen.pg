@@ -11,26 +11,10 @@ Reviewed-by: Pau Ruiz Safont <pau.safont@citrix.com>
 Reviewed-by: Christian Lindig <christian.lindig@citrix.com>
 
 diff --git a/tools/ocaml/xenstored/connection.ml b/tools/ocaml/xenstored/connection.ml
-index b8d9857019bb..59be4e2f659a 100644
+index acc64d7c3387..dde950ab5604 100644
 --- a/tools/ocaml/xenstored/connection.ml
 +++ b/tools/ocaml/xenstored/connection.ml
-@@ -280,6 +280,9 @@ let get_transaction con tid =
- 
- let do_input con = Xenbus.Xb.input con.xb
- let has_input con = Xenbus.Xb.has_in_packet con.xb
-+let has_partial_input con = match con.xb.Xenbus.Xb.partial_in with
-+	| HaveHdr _ -> true
-+	| NoHdr (n, _) -> n < Xenbus.Partial.header_size ()
- let pop_in con = Xenbus.Xb.get_in_packet con.xb
- let has_more_input con = Xenbus.Xb.has_more_input con.xb
- 
-@@ -308,12 +311,13 @@ let is_bad con = match con.dom with None -> false | Some dom -> Domain.is_bad_do
-    Restrictions below can be relaxed once xenstored learns to dump more
-    of its live state in a safe way *)
- let has_extra_connection_data con =
--	let has_in = has_input con in
-+	let has_in = has_input con || has_partial_input con in
- 	let has_out = has_output con in
+@@ -439,7 +439,8 @@ let has_extra_connection_data con =
  	let has_socket = con.dom = None in
  	let has_nondefault_perms = make_perm con.dom <> con.perm in
  	has_in || has_out
@@ -40,7 +24,7 @@ index b8d9857019bb..59be4e2f659a 100644
  	|| has_nondefault_perms (* set_target not dumped yet *)
  
  let has_transaction_data con =
-@@ -336,16 +340,21 @@ let stats con =
+@@ -462,16 +463,21 @@ let stats con =
  	Hashtbl.length con.watches, con.stat_nb_ops
  
  let dump con chan =
@@ -104,10 +88,10 @@ index 2c4b5a852853..7c0478e76a0c 100644
  		disable_socket = !disable_socket;
  	}
 diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
-index acb0dd7adec4..27790d4a5c41 100644
+index 5cd6fe00382a..6cb990ee7fb2 100644
 --- a/tools/ocaml/xenstored/process.ml
 +++ b/tools/ocaml/xenstored/process.ml
-@@ -91,18 +91,23 @@ type t =
+@@ -92,18 +92,23 @@ type t =
  	; cmdline: string list
  	; deadline: float
  	; force: bool
@@ -133,7 +117,7 @@ index acb0dd7adec4..27790d4a5c41 100644
  
  let string_of_t t =
  	let executable, rest = args_of_t t in
-@@ -116,11 +121,11 @@ let launch_exn t =
+@@ -117,11 +122,11 @@ let launch_exn t =
  
  let validate_exn t =
  	(* --help must be last to check validity of earlier arguments *)
@@ -148,7 +132,7 @@ index acb0dd7adec4..27790d4a5c41 100644
  	| pid -> (
  		match Unix.waitpid [] pid with
  			| _, Unix.WEXITED 0 ->
-@@ -142,10 +147,14 @@ let parse_live_update args =
+@@ -143,10 +148,14 @@ let parse_live_update args =
  			validate_exn {!state with binary= file}
  		| ["-a"] ->
  			debug "Live update aborted" ;
@@ -165,7 +149,7 @@ index acb0dd7adec4..27790d4a5c41 100644
  			let timeout = ref 60 in
  			let force = ref false in
  			Arg.parse_argv ~current:(ref 0) (Array.of_list args)
-@@ -162,10 +171,16 @@ let parse_live_update args =
+@@ -163,10 +172,16 @@ let parse_live_update args =
  			"live-update -s" ;
  			debug "Live update process queued" ;
  				{!state with deadline = Unix.gettimeofday () +. float !timeout
@@ -184,17 +168,16 @@ index acb0dd7adec4..27790d4a5c41 100644
  	with
  	| Arg.Bad s | Arg.Help s | Invalid_argument s ->
  		Some s
-@@ -179,17 +194,27 @@ let parse_live_update args =
+@@ -180,17 +195,26 @@ let parse_live_update args =
  			| [] -> true
  			| _ when Unix.gettimeofday () < t.deadline -> false
  			| l ->
 -				info "Live update timeout reached: %d active connections" (List.length l);
 -				List.iter (fun con -> warn "%s prevents live update" (Connection.get_domstr con)) l;
 +				warn "timeout reached: have to wait, migrate or shutdown %d domains:" (List.length l);
-+				let msgs = List.rev_map (fun con -> Printf.sprintf "%s: %d tx, in: %b, out: %b, perm: %s"
++				let msgs = List.rev_map (fun con -> Printf.sprintf "%s: %d tx, out: %b, perm: %s"
 +					(Connection.get_domstr con)
 +					(Connection.number_of_transactions con)
-+					(Connection.has_input con)
 +					(Connection.has_output con)
 +					(Connection.get_perm con |> Perms.Connection.to_string)
 +					) l in
@@ -217,10 +200,10 @@ index acb0dd7adec4..27790d4a5c41 100644
  
  (* packets *)
 diff --git a/tools/ocaml/xenstored/store.ml b/tools/ocaml/xenstored/store.ml
-index 328d3a51984f..ebf6cbd9c7a0 100644
+index d82764f60fb4..bc9db06c81f4 100644
 --- a/tools/ocaml/xenstored/store.ml
 +++ b/tools/ocaml/xenstored/store.ml
-@@ -366,7 +366,7 @@ let traversal root_node f =
+@@ -377,7 +377,7 @@ let traversal root_node f =
  	let rec _traversal path node =
  		f path node;
  		let node_path = Path.of_path_and_name path (Symbol.to_string node.Node.name) in
@@ -250,10 +233,10 @@ index eb79bf0146e5..dd03b2b5bc3c 100644
 +	external of_int : int -> t = "%identity"
 +end
 diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
-index b7b3b43f79ea..30edf4de6a5a 100644
+index 326bb0e02f54..fd0a102627e3 100644
 --- a/tools/ocaml/xenstored/xenstored.ml
 +++ b/tools/ocaml/xenstored/xenstored.ml
-@@ -141,9 +141,12 @@ exception Bad_format of string
+@@ -144,9 +144,12 @@ exception Bad_format of string
  
  let dump_format_header = "$xenstored-dump-format"
  
@@ -268,7 +251,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  	let header = input_line chan in
  	if header <> dump_format_header then
  		raise (Bad_format "header");
-@@ -155,6 +158,12 @@ let from_channel_f chan domain_f watch_f store_f =
+@@ -158,6 +161,12 @@ let from_channel_f chan domain_f watch_f store_f =
  			let l = String.split ',' line in
  			try
  				match l with
@@ -281,7 +264,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  				| "dom" :: domid :: mfn :: port :: []->
  					domain_f (int_of_string domid)
  					         (Nativeint.of_string mfn)
-@@ -175,12 +184,28 @@ let from_channel_f chan domain_f watch_f store_f =
+@@ -178,12 +187,28 @@ let from_channel_f chan domain_f watch_f store_f =
  		with End_of_file ->
  			quit := true
  	done;
@@ -312,7 +295,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  	let domain_f domid mfn port =
  		let ndom =
  			if domid > 0 then
-@@ -190,28 +215,38 @@ let from_channel store cons doms chan =
+@@ -193,28 +218,38 @@ let from_channel store cons doms chan =
  			in
  		Connections.add_domain cons ndom;
  		in
@@ -358,7 +341,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  
  	(* dump the store *)
  	Store.dump_fct store (fun path node ->
-@@ -224,9 +259,9 @@ let to_channel store cons chan =
+@@ -227,9 +262,9 @@ let to_channel store cons chan =
  	()
  
  
@@ -370,7 +353,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  	        (fun () -> close_out channel)
  end
  
-@@ -246,13 +281,13 @@ let _ =
+@@ -312,13 +347,13 @@ let _ =
  	);
  
  	let rw_sock =
@@ -386,7 +369,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  		Unixext.daemonize ()
  	else
  		printf "Xen Storage Daemon, version %d.%d\n%!"
-@@ -292,10 +327,15 @@ let _ =
+@@ -358,10 +393,15 @@ let _ =
  	List.iter (fun path ->
  		Store.write store Perms.Connection.full_rights path "") Store.Path.specials;
  
@@ -404,7 +387,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  		if !Disk.enable then (
  			info "reading store from disk";
  			Disk.read store
-@@ -309,7 +349,8 @@ let _ =
+@@ -375,7 +415,8 @@ let _ =
  			Connections.add_domain cons (Domains.create0 domains);
  			Event.bind_dom_exc_virq eventchn
  		);
@@ -414,7 +397,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  
  	Sys.set_signal Sys.sighup (Sys.Signal_handle sighup_handler);
  	Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun _ ->
-@@ -319,7 +360,7 @@ let _ =
+@@ -385,7 +426,7 @@ let _ =
  	Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
  
  	if cf.activate_access_log then begin
@@ -423,7 +406,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  		Logging.init_access_log post_rotate
  	end;
  
-@@ -362,6 +403,7 @@ let _ =
+@@ -428,6 +469,7 @@ let _ =
  	let ring_scan_checker dom =
  		(* no need to scan domains already marked as for processing *)
  		if not (Domain.get_io_credit dom > 0) then
@@ -431,7 +414,7 @@ index b7b3b43f79ea..30edf4de6a5a 100644
  			let con = Connections.find_domain cons (Domain.get_id dom) in
  			if not (Connection.has_more_work con) then (
  				Process.do_output store cons domains con;
-@@ -491,7 +533,7 @@ let _ =
+@@ -557,7 +599,7 @@ let _ =
  			live_update := Process.LiveUpdate.should_run cons;
  			if !live_update || !quit then begin
  				(* don't initiate live update if saving state fails *)
