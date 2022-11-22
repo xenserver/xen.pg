@@ -63,7 +63,6 @@ def build_metadata(test_cases):
     """
     return {
         "tests": test_cases,
-        "TESTS": ",".join(test_cases)
     }
 
 
