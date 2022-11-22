@@ -1,0 +1,65 @@
+From 4d753ccf9ddf12332435f50d88e8cf0161e7a5b3 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Wed, 2 Nov 2022 12:13:48 +0100
+Subject: x86/shadow: drop (replace) bogus assertions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The addition of a call to shadow_blow_tables() from shadow_teardown()
+has resulted in the "no vcpus" related assertion becoming triggerable:
+If domain_create() fails with at least one page successfully allocated
+in the course of shadow_enable(), or if domain_create() succeeds and
+the domain is then killed without ever invoking XEN_DOMCTL_max_vcpus.
+Note that in-tree tests (test-resource and test-tsx) do exactly the
+latter of these two.
+
+The assertion's comment was bogus anyway: Shadow mode has been getting
+enabled before allocation of vCPU-s for quite some time. Convert the
+assertion to a conditional: As long as there are no vCPU-s, there's
+nothing to blow away.
+
+Fixes: e7aa55c0aab3 ("x86/p2m: free the paging memory pool preemptively")
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+A similar assertion/comment pair exists in _shadow_prealloc(); the
+comment is similarly bogus, and the assertion could in principle trigger
+e.g. when shadow_alloc_p2m_page() is called early enough. Replace those
+at the same time by a similar early return, here indicating failure to
+the caller (which will generally lead to the domain being crashed in
+shadow_prealloc()).
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: a92dc2bb30ba65ae25d2f417677eb7ef9a6a0fef
+master date: 2022-10-24 15:46:11 +0200
+
+diff --git a/xen/arch/x86/mm/shadow/common.c b/xen/arch/x86/mm/shadow/common.c
+index e6af359579b7..cf1743488af5 100644
+--- a/xen/arch/x86/mm/shadow/common.c
++++ b/xen/arch/x86/mm/shadow/common.c
+@@ -911,8 +911,9 @@ static bool __must_check _shadow_prealloc(struct domain *d, unsigned int pages)
+         /* No reclaim when the domain is dying, teardown will take care of it. */
+         return false;
+ 
+-    /* Shouldn't have enabled shadows if we've no vcpus. */
+-    ASSERT(d->vcpu && d->vcpu[0]);
++    /* Nothing to reclaim when there are no vcpus yet. */
++    if ( !d->vcpu[0] )
++        return false;
+ 
+     /* Stage one: walk the list of pinned pages, unpinning them */
+     perfc_incr(shadow_prealloc_1);
+@@ -1000,8 +1001,9 @@ static void shadow_blow_tables(struct domain *d)
+     mfn_t smfn;
+     int i;
+ 
+-    /* Shouldn't have enabled shadows if we've no vcpus. */
+-    ASSERT(d->vcpu && d->vcpu[0]);
++    /* Nothing to do when there are no vcpus yet. */
++    if ( !d->vcpu[0] )
++        return;
+ 
+     /* Pass one: unpin all pinned pages */
+     foreach_pinned_shadow(d, sp, t)
