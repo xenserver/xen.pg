@@ -1,0 +1,80 @@
+From 9bafe4a53306e7aa2ce6ffc96f7477c6f329f7a7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Thu, 3 Nov 2022 14:50:38 +0000
+Subject: tools/ocaml/evtchn: Extend the init() binding with a cloexec flag
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For live update, oxenstored wants to clear CLOEXEC on the evtchn handle, so it
+survives the execve() into the new oxenstored.
+
+Have the new interface match how cloexec works in other Ocaml standard
+libraries.
+
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/libs/eventchn/xeneventchn.ml b/tools/ocaml/libs/eventchn/xeneventchn.ml
+index be4de82f46b9..c16fdd4674f7 100644
+--- a/tools/ocaml/libs/eventchn/xeneventchn.ml
++++ b/tools/ocaml/libs/eventchn/xeneventchn.ml
+@@ -16,7 +16,10 @@
+ 
+ type handle
+ 
+-external init: unit -> handle = "stub_eventchn_init"
++external _init: bool -> handle = "stub_eventchn_init"
++
++let init ?(cloexec=true) () = _init cloexec
++
+ external fdopen: Unix.file_descr -> handle = "stub_eventchn_fdopen"
+ external fd: handle -> Unix.file_descr = "stub_eventchn_fd"
+ 
+diff --git a/tools/ocaml/libs/eventchn/xeneventchn.mli b/tools/ocaml/libs/eventchn/xeneventchn.mli
+index 98b3c86f3702..870429b6b53a 100644
+--- a/tools/ocaml/libs/eventchn/xeneventchn.mli
++++ b/tools/ocaml/libs/eventchn/xeneventchn.mli
+@@ -43,9 +43,12 @@ val to_int: t -> int
+ 
+ val of_int: int -> t
+ 
+-val init: unit -> handle
+-(** Return an initialised event channel interface. On error it
+-    will throw a Failure exception. *)
++val init: ?cloexec:bool -> unit -> handle
++(** [init ?cloexec ()]
++    Return an initialised event channel interface.
++    The default is to close the underlying file descriptor
++    on [execve], which can be overriden with [~cloexec:false].
++    On error it will throw a Failure exception. *)
+ 
+ val fdopen: Unix.file_descr -> handle
+ (** Return an initialised event channel interface, from an already open evtchn
+diff --git a/tools/ocaml/libs/eventchn/xeneventchn_stubs.c b/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
+index 9d803d320327..75746749b7d9 100644
+--- a/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
++++ b/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
+@@ -51,14 +51,18 @@ static struct custom_operations xenevtchn_ops = {
+ 	.compare_ext = custom_compare_ext_default, /* Can't compare     */
+ };
+ 
+-CAMLprim value stub_eventchn_init(void)
++CAMLprim value stub_eventchn_init(value cloexec)
+ {
+-	CAMLparam0();
++	CAMLparam1(cloexec);
+ 	CAMLlocal1(result);
+ 	xenevtchn_handle *xce;
++	unsigned int flags = 0;
++
++	if ( !Bool_val(cloexec) )
++		flags |= XENEVTCHN_NO_CLOEXEC;
+ 
+ 	caml_enter_blocking_section();
+-	xce = xenevtchn_open(NULL, 0);
++	xce = xenevtchn_open(NULL, flags);
+ 	caml_leave_blocking_section();
+ 
+ 	if (xce == NULL)

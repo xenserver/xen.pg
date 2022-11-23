@@ -1,0 +1,134 @@
+From 31fbee749a75621039ca601eaee7222050a7dd83 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 30 Nov 2022 03:17:28 +0000
+Subject: tools/oxenstored: Rename some 'port' variables to 'remote_port'
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This will make the logic clearer when we plumb local_port through these
+functions.
+
+While doing this, rearrange the construct in Domains.create0 to separate the
+remote port handling from the interface handling.  (The interface logic is
+dubious in several ways, but not altered by this cleanup.)
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Edwin Török <edvin.torok@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/xenstored/domains.ml b/tools/ocaml/xenstored/domains.ml
+index 17fe2fa25772..26018ac0dd3d 100644
+--- a/tools/ocaml/xenstored/domains.ml
++++ b/tools/ocaml/xenstored/domains.ml
+@@ -122,9 +122,9 @@ let cleanup doms =
+ let resume _doms _domid =
+ 	()
+ 
+-let create doms domid mfn port =
++let create doms domid mfn remote_port =
+ 	let interface = Xenctrl.map_foreign_range xc domid (Xenmmap.getpagesize()) mfn in
+-	let dom = Domain.make domid mfn port interface doms.eventchn in
++	let dom = Domain.make domid mfn remote_port interface doms.eventchn in
+ 	Hashtbl.add doms.table domid dom;
+ 	Domain.bind_interdomain dom;
+ 	dom
+@@ -133,18 +133,16 @@ let xenstored_kva = ref ""
+ let xenstored_port = ref ""
+ 
+ let create0 doms =
+-	let port, interface =
+-		(
+-			let port = Utils.read_file_single_integer !xenstored_port
+-			and fd = Unix.openfile !xenstored_kva
+-					       [ Unix.O_RDWR ] 0o600 in
+-			let interface = Xenmmap.mmap fd Xenmmap.RDWR Xenmmap.SHARED
+-						  (Xenmmap.getpagesize()) 0 in
+-			Unix.close fd;
+-			port, interface
+-		)
+-		in
+-	let dom = Domain.make 0 Nativeint.zero port interface doms.eventchn in
++	let remote_port = Utils.read_file_single_integer !xenstored_port in
++
++	let interface =
++		let fd = Unix.openfile !xenstored_kva [ Unix.O_RDWR ] 0o600 in
++		let interface = Xenmmap.mmap fd Xenmmap.RDWR Xenmmap.SHARED (Xenmmap.getpagesize()) 0 in
++		Unix.close fd;
++		interface
++	in
++
++	let dom = Domain.make 0 Nativeint.zero remote_port interface doms.eventchn in
+ 	Hashtbl.add doms.table 0 dom;
+ 	Domain.bind_interdomain dom;
+ 	Domain.notify dom;
+diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
+index 72a79e9328dd..b2973aca2a82 100644
+--- a/tools/ocaml/xenstored/process.ml
++++ b/tools/ocaml/xenstored/process.ml
+@@ -558,10 +558,10 @@ let do_transaction_end con t domains cons data =
+ let do_introduce con t domains cons data =
+ 	if not (Connection.is_dom0 con)
+ 	then raise Define.Permission_denied;
+-	let (domid, mfn, port) =
++	let (domid, mfn, remote_port) =
+ 		match (split None '\000' data) with
+-		| domid :: mfn :: port :: _ ->
+-			int_of_string domid, Nativeint.of_string mfn, int_of_string port
++		| domid :: mfn :: remote_port :: _ ->
++			int_of_string domid, Nativeint.of_string mfn, int_of_string remote_port
+ 		| _                         -> raise Invalid_Cmd_Args;
+ 		in
+ 	let dom =
+@@ -569,18 +569,18 @@ let do_introduce con t domains cons data =
+ 			let edom = Domains.find domains domid in
+ 			if (Domain.get_mfn edom) = mfn && (Connections.find_domain cons domid) != con then begin
+ 				(* Use XS_INTRODUCE for recreating the xenbus event-channel. *)
+-				edom.remote_port <- port;
++				edom.remote_port <- remote_port;
+ 				Domain.bind_interdomain edom;
+ 			end;
+ 			edom
+ 		else try
+-			let ndom = Domains.create domains domid mfn port in
++			let ndom = Domains.create domains domid mfn remote_port in
+ 			Connections.add_domain cons ndom;
+ 			Connections.fire_spec_watches (Transaction.get_root t) cons Store.Path.introduce_domain;
+ 			ndom
+ 		with _ -> raise Invalid_Cmd_Args
+ 	in
+-	if (Domain.get_remote_port dom) <> port || (Domain.get_mfn dom) <> mfn then
++	if (Domain.get_remote_port dom) <> remote_port || (Domain.get_mfn dom) <> mfn then
+ 		raise Domain_not_match
+ 
+ let do_release con t domains cons data =
+diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
+index 55071b49eccb..1f11f576b515 100644
+--- a/tools/ocaml/xenstored/xenstored.ml
++++ b/tools/ocaml/xenstored/xenstored.ml
+@@ -167,10 +167,10 @@ let from_channel_f chan global_f socket_f domain_f watch_f store_f =
+ 					global_f ~rw
+ 				| "socket" :: fd :: [] ->
+ 					socket_f ~fd:(int_of_string fd)
+-				| "dom" :: domid :: mfn :: port :: []->
++				| "dom" :: domid :: mfn :: remote_port :: []->
+ 					domain_f (int_of_string domid)
+ 					         (Nativeint.of_string mfn)
+-					         (int_of_string port)
++					         (int_of_string remote_port)
+ 				| "watch" :: domid :: path :: token :: [] ->
+ 					watch_f (int_of_string domid)
+ 					        (unhexify path) (unhexify token)
+@@ -209,10 +209,10 @@ let from_channel store cons doms chan =
+ 		else
+ 			warn "Ignoring invalid socket FD %d" fd
+ 	in
+-	let domain_f domid mfn port =
++	let domain_f domid mfn remote_port =
+ 		let ndom =
+ 			if domid > 0 then
+-				Domains.create doms domid mfn port
++				Domains.create doms domid mfn remote_port
+ 			else
+ 				Domains.create0 doms
+ 			in
