@@ -442,7 +442,7 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 
 %files libs
 %{_libdir}/libxenevtchn.so.1
-%{_libdir}/libxenevtchn.so.1.1
+%{_libdir}/libxenevtchn.so.1.2
 %{_libdir}/libxengnttab.so.1
 %{_libdir}/libxengnttab.so.1.2
 %{_libdir}/libxenstore.so.3.0
