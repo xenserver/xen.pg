@@ -1,0 +1,63 @@
+From c3b6be714c64aa62b56d0bce96f4b6a10b5c2078 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Tue, 1 Nov 2022 17:59:16 +0000
+Subject: tools/ocaml/xenctrl: Make domain_getinfolist tail recursive
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+domain_getinfolist() is quadratic with the number of domains, because of the
+behaviour of the underlying hypercall.  xenopsd was further observed to be
+wasting excessive quantites of time manipulating the list of already-obtained
+domains.
+
+Implement a tail recursive `rev_concat` equivalent to `concat |> rev`, and use
+it instead of calling `@` multiple times.
+
+An incidental benefit is that the list of domains will now be in domid order,
+instead of having pairs of 2 domains changing direction every time.
+
+In a scalability testing scenario with ~1000 VMs, a combination of this and
+the subsequent change takes xenopsd's wallclock time in domain_getinfolist()
+down from 88% to 0.02%
+
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+Tested-by: Pau Ruiz Safont <pau.safont@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index 497ded7ce26b..3ffa69a96c9b 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -198,14 +198,25 @@ external domain_shutdown: handle -> domid -> shutdown_reason -> unit
+ external _domain_getinfolist: handle -> domid -> int -> domaininfo list
+        = "stub_xc_domain_getinfolist"
+ 
++let rev_append_fold acc e = List.rev_append e acc
++
++(**
++ * [rev_concat lst] is equivalent to [lst |> List.concat |> List.rev]
++ * except it is tail recursive, whereas [List.concat] isn't.
++ * Example:
++ * rev_concat [[10;9;8];[7;6];[5]]] = [5; 6; 7; 8; 9; 10]
++ *)
++let rev_concat lst = List.fold_left rev_append_fold [] lst
++
+ let domain_getinfolist handle first_domain =
+ 	let nb = 2 in
+-	let last_domid l = (List.hd l).domid + 1 in
+-	let rec __getlist from =
+-		let l = _domain_getinfolist handle from nb in
+-		(if List.length l = nb then __getlist (last_domid l) else []) @ l
+-		in
+-	List.rev (__getlist first_domain)
++	let rec __getlist lst from =
++		(* _domain_getinfolist returns domains in reverse order, largest first *)
++		match _domain_getinfolist handle from nb with
++		| [] -> rev_concat lst
++		| (hd :: _) as l -> __getlist (l :: lst) (hd.domid + 1)
++	in
++	__getlist [] first_domain
+ 
+ external domain_getinfo: handle -> domid -> domaininfo= "stub_xc_domain_getinfo"
+ 

@@ -1,0 +1,60 @@
+From 22d5affdf0cecfa6faae46fbaec68b8018835220 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Tue, 18 Jan 2022 15:04:48 +0000
+Subject: tools/ocaml/evtchn: OCaml 5 support, fix potential resource leak
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There is no binding for xenevtchn_close().  In principle, this is a resource
+leak, but the typical usage is as a singleton that lives for the lifetime of
+the program.
+
+Ocaml 5 no longer permits storing a naked C pointer in an Ocaml value.
+
+Therefore, use a Custom block.  This allows us to use the finaliser callback
+to call xenevtchn_close(), if the Ocaml object goes out of scope.
+
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/libs/eventchn/xeneventchn_stubs.c b/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
+index ba40078d097d..4bf59913f2a3 100644
+--- a/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
++++ b/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
+@@ -34,7 +34,22 @@
+ #include <caml/fail.h>
+ #include <caml/signals.h>
+ 
+-#define _H(__h) ((xenevtchn_handle *)(__h))
++#define _H(__h) (*((xenevtchn_handle **)Data_custom_val(__h)))
++
++static void stub_evtchn_finalize(value v)
++{
++	xenevtchn_close(_H(v));
++}
++
++static struct custom_operations xenevtchn_ops = {
++	.identifier  = "xenevtchn",
++	.finalize    = stub_evtchn_finalize,
++	.compare     = custom_compare_default,     /* Can't compare     */
++	.hash        = custom_hash_default,        /* Can't hash        */
++	.serialize   = custom_serialize_default,   /* Can't serialize   */
++	.deserialize = custom_deserialize_default, /* Can't deserialize */
++	.compare_ext = custom_compare_ext_default, /* Can't compare     */
++};
+ 
+ CAMLprim value stub_eventchn_init(void)
+ {
+@@ -49,7 +64,9 @@ CAMLprim value stub_eventchn_init(void)
+ 	if (xce == NULL)
+ 		caml_failwith("open failed");
+ 
+-	result = (value)xce;
++	result = caml_alloc_custom(&xenevtchn_ops, sizeof(xce), 0, 1);
++	_H(result) = xce;
++
+ 	CAMLreturn(result);
+ }
+ 

@@ -1,0 +1,74 @@
+From d2162d884cba0ff7b2ac0d832f4e044444bda2e1 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 1 Dec 2022 21:06:25 +0000
+Subject: tools/oxenstored: Render backtraces more nicely in Syslog
+
+fallback_exception_handler feeds a string with embedded newlines directly into
+syslog().  While this is an improvement on getting nothing, syslogd escapes
+all control characters it gets, and emits one (long) log line.
+
+Fix the problem generally in the syslog stub.  As we already have a local copy
+of the string, split it in place and emit one syslog() call per line.
+
+Also tweak Logging.msg_of to avoid putting an extra newline on a string which
+already ends with one.
+
+Fixes: ee7815f49faf ("tools/oxenstored: Set uncaught exception handler")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/xenstored/logging.ml b/tools/ocaml/xenstored/logging.ml
+index 255051437d60..f233bc9a3956 100644
+--- a/tools/ocaml/xenstored/logging.ml
++++ b/tools/ocaml/xenstored/logging.ml
+@@ -344,7 +344,7 @@ let watch_not_fired ~con perms path =
+ 	access_logging ~tid:0 ~con ~data Watch_not_fired ~level:Info
+ 
+ let msg_of exn bt =
+-	Printf.sprintf "Fatal exception: %s\n%s\n" (Printexc.to_string exn)
++	Printf.sprintf "Fatal exception: %s\n%s" (Printexc.to_string exn)
+ 		(Printexc.raw_backtrace_to_string bt)
+ 
+ let fallback_exception_handler exn bt =
+diff --git a/tools/ocaml/xenstored/syslog_stubs.c b/tools/ocaml/xenstored/syslog_stubs.c
+index e16c3a9491d0..760e78ff73dc 100644
+--- a/tools/ocaml/xenstored/syslog_stubs.c
++++ b/tools/ocaml/xenstored/syslog_stubs.c
+@@ -37,14 +37,34 @@ value stub_syslog(value facility, value level, value msg)
+ {
+ 	CAMLparam3(facility, level, msg);
+ 	char *c_msg = strdup(String_val(msg));
++	char *s = c_msg, *ss;
+ 	int c_facility = __syslog_facility_table[Int_val(facility)]
+ 	               | __syslog_level_table[Int_val(level)];
+ 
+ 	if ( !c_msg )
+ 		caml_raise_out_of_memory();
+-	caml_enter_blocking_section();
+-	syslog(c_facility, "%s", c_msg);
+-	caml_leave_blocking_section();
++
++	/*
++	 * syslog() doesn't like embedded newlines, and c_msg generally
++	 * contains them.
++	 *
++	 * Split the message in place by converting \n to \0, and issue one
++	 * syslog() call per line, skipping the final iteration if c_msg ends
++	 * with a newline anyway.
++	 */
++	do {
++		ss = strchr(s, '\n');
++		if ( ss )
++			*ss = '\0';
++		else if ( *s == '\0' )
++			break;
++
++		caml_enter_blocking_section();
++		syslog(c_facility, "%s", s);
++		caml_leave_blocking_section();
++
++		s = ss + 1;
++	} while ( ss );
+ 
+ 	free(c_msg);
+ 	CAMLreturn(Val_unit);

@@ -1,0 +1,72 @@
+From 7ba68a6c558e1fd811c95cb7215a5cd07a3cc2ea Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edvin.torok@citrix.com>
+Date: Mon, 14 Nov 2022 13:36:19 +0000
+Subject: tools/ocaml/evtchn: Add binding for xenevtchn_fdopen()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For live update, the new oxenstored needs to reconstruct an evtchn object
+around an existing file descriptor.
+
+Signed-off-by: Edwin Török <edvin.torok@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/libs/eventchn/xeneventchn.ml b/tools/ocaml/libs/eventchn/xeneventchn.ml
+index dd00a1f0ead5..be4de82f46b9 100644
+--- a/tools/ocaml/libs/eventchn/xeneventchn.ml
++++ b/tools/ocaml/libs/eventchn/xeneventchn.ml
+@@ -17,6 +17,7 @@
+ type handle
+ 
+ external init: unit -> handle = "stub_eventchn_init"
++external fdopen: Unix.file_descr -> handle = "stub_eventchn_fdopen"
+ external fd: handle -> Unix.file_descr = "stub_eventchn_fd"
+ 
+ type t = int
+diff --git a/tools/ocaml/libs/eventchn/xeneventchn.mli b/tools/ocaml/libs/eventchn/xeneventchn.mli
+index 08c73376438e..98b3c86f3702 100644
+--- a/tools/ocaml/libs/eventchn/xeneventchn.mli
++++ b/tools/ocaml/libs/eventchn/xeneventchn.mli
+@@ -47,6 +47,10 @@ val init: unit -> handle
+ (** Return an initialised event channel interface. On error it
+     will throw a Failure exception. *)
+ 
++val fdopen: Unix.file_descr -> handle
++(** Return an initialised event channel interface, from an already open evtchn
++    file descriptor.  On error it will throw a Failure exception. *)
++
+ val fd: handle -> Unix.file_descr
+ (** Return a file descriptor suitable for Unix.select. When
+     the descriptor becomes readable, it is safe to call 'pending'.
+diff --git a/tools/ocaml/libs/eventchn/xeneventchn_stubs.c b/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
+index 4bf59913f2a3..9d803d320327 100644
+--- a/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
++++ b/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
+@@ -70,6 +70,25 @@ CAMLprim value stub_eventchn_init(void)
+ 	CAMLreturn(result);
+ }
+ 
++CAMLprim value stub_eventchn_fdopen(value fdval)
++{
++	CAMLparam1(fdval);
++	CAMLlocal1(result);
++	xenevtchn_handle *xce;
++
++	caml_enter_blocking_section();
++	xce = xenevtchn_fdopen(NULL, Int_val(fdval), 0);
++	caml_leave_blocking_section();
++
++	if (xce == NULL)
++		caml_failwith("evtchn fdopen failed");
++
++	result = caml_alloc_custom(&xenevtchn_ops, sizeof(xce), 0, 1);
++	_H(result) = xce;
++
++	CAMLreturn(result);
++}
++
+ CAMLprim value stub_eventchn_fd(value xce)
+ {
+ 	CAMLparam1(xce);
