@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.35
+%global hv_rel 10.36
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -880,6 +880,10 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Dec 2 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.36
+- Activate AVX-512 by default on AMD platforms.
+- Fixes for oxenstored live update.
+
 * Fri Nov 4 2022  Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.35
 - Fix for XSA-422 CVE-2022-23824
 
