@@ -1,7 +1,7 @@
 # -*- rpm-spec -*-
 
 # Commitish for Source0, required by tooling.
-%global package_srccommit RELEASE-4.13.4
+%global package_srccommit RELEASE-4.13.5
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
@@ -31,7 +31,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.13.4
+Version: 4.13.5
 Release: %{?xsrel}%{?dist}
 License: GPLv2 and LGPLv2 and MIT and Public Domain
 URL:     http://www.xenproject.org
@@ -874,3 +874,6 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 
 %{?_cov_results_package}
 
+%changelog
+* Mon Feb 6 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.29
+- Update to Xen 4.13.5
