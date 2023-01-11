@@ -1,0 +1,61 @@
+From f5d0279839b58cb622f0995dbf9cff056f03082e Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 6 Dec 2022 13:51:49 +0100
+Subject: x86/HVM: don't mark evtchn upcall vector as pending when vLAPIC is
+ disabled
+
+Linux'es relatively new use of HVMOP_set_evtchn_upcall_vector has
+exposed a problem with the marking of the respective vector as
+pending: For quite some time Linux has been checking whether any stale
+ISR or IRR bits would still be set while preparing the LAPIC for use.
+This check is now triggering on the upcall vector, as the registration,
+at least for APs, happens before the LAPIC is actually enabled.
+
+In software-disabled state an LAPIC would not accept any interrupt
+requests and hence no IRR bit would newly become set while in this
+state. As a result it is also wrong for us to mark the upcall vector as
+having a pending request when the vLAPIC is in this state.
+
+To compensate for the "enabled" check added to the assertion logic, add
+logic to (conditionally) mark the upcall vector as having a request
+pending at the time the LAPIC is being software-enabled by the guest.
+Note however that, like for the pt_may_unmask_irq() we already have
+there, long term we may need to find a different solution. This will be
+especially relevant in case yet better LAPIC acceleration would
+eliminate notifications of guest writes to this and other registers.
+
+Fixes: 7b5b8ca7dffd ("x86/upcall: inject a spurious event after setting upcall vector")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/xen/arch/x86/hvm/irq.c b/xen/arch/x86/hvm/irq.c
+index 2ba0a5618f5a..19194458ac85 100644
+--- a/xen/arch/x86/hvm/irq.c
++++ b/xen/arch/x86/hvm/irq.c
+@@ -320,9 +320,10 @@ void hvm_assert_evtchn_irq(struct vcpu *v)
+ 
+     if ( v->arch.hvm.evtchn_upcall_vector != 0 )
+     {
+-        uint8_t vector = v->arch.hvm.evtchn_upcall_vector;
++        struct vlapic *vlapic = vcpu_vlapic(v);
+ 
+-        vlapic_set_irq(vcpu_vlapic(v), vector, 0);
++        if ( vlapic_enabled(vlapic) )
++           vlapic_set_irq(vlapic, v->arch.hvm.evtchn_upcall_vector, 0);
+     }
+     else if ( is_hvm_pv_evtchn_vcpu(v) )
+         vcpu_kick(v);
+diff --git a/xen/arch/x86/hvm/vlapic.c b/xen/arch/x86/hvm/vlapic.c
+index 4cddd9d2c5e6..f46a48672be9 100644
+--- a/xen/arch/x86/hvm/vlapic.c
++++ b/xen/arch/x86/hvm/vlapic.c
+@@ -829,6 +829,9 @@ void vlapic_reg_write(struct vcpu *v, unsigned int reg, uint32_t val)
+         {
+             vlapic->hw.disabled &= ~VLAPIC_SW_DISABLED;
+             pt_may_unmask_irq(vlapic_domain(vlapic), &vlapic->pt);
++            if ( v->arch.hvm.evtchn_upcall_vector &&
++                 vcpu_info(v, evtchn_upcall_pending) )
++                vlapic_set_irq(vlapic, v->arch.hvm.evtchn_upcall_vector, 0);
+         }
+         break;
+ 

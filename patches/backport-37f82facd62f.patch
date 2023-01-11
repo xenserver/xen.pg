@@ -1,0 +1,234 @@
+From 625efe28ab5309ab83f7826ed1de4966ede2f191 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Wed, 9 Nov 2022 11:02:19 +0100
+Subject: xen/sched: migrate timers to correct cpus after suspend
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Today all timers are migrated to cpu 0 when the system is being
+suspended. They are not migrated back after resuming the system again.
+
+This results (at least) to visible problems with the credit scheduler,
+as the timer isn't handled on the cpu it was expected to occur, which
+will result in an ASSERT() triggering. Other more subtle problems, like
+uninterrupted elongated time slices, are probable. The least effect
+will be worse performance on cpu 0 resulting from most scheduling
+related timer interrupts happening there after suspend/resume.
+
+Add migrating the scheduling related timers of a specific cpu from cpu
+0 back to its original cpu when that cpu has gone up when resuming the
+system.
+
+Fixes: 0763cd268789 ("xen/sched: don't disable scheduler on cpus during suspend")
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Tested-by: Marek Marczykowski-Górecki <marmarek@invisiblethingslab.com>
+Acked-by: Dario Faggioli <dfaggioli@suse.com>
+
+diff --git a/xen/common/cpupool.c b/xen/common/cpupool.c
+index ab138e27d6b9..9ee4b8bc3dee 100644
+--- a/xen/common/cpupool.c
++++ b/xen/common/cpupool.c
+@@ -957,6 +957,8 @@ static int cpu_callback(
+     case CPU_ONLINE:
+         if ( system_state <= SYS_STATE_active )
+             rc = cpupool_cpu_add(cpu);
++        else
++            sched_migrate_timers(cpu);
+         break;
+     case CPU_DOWN_PREPARE:
+         /* Suspend/Resume don't change assignments of cpus to cpupools. */
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index e60b96da875e..70fa80a5928e 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -624,6 +624,18 @@ csched_init_pdata(const struct scheduler *ops, void *pdata, int cpu)
+     spin_unlock_irqrestore(&prv->lock, flags);
+ }
+ 
++static void
++csched_move_timers(const struct scheduler *ops, struct sched_resource *sr)
++{
++    struct csched_private *prv = CSCHED_PRIV(ops);
++    struct csched_pcpu *spc = sr->sched_priv;
++
++    if ( sr->master_cpu == prv->master )
++        migrate_timer(&prv->master_ticker, prv->master);
++
++    migrate_timer(&spc->ticker, sr->master_cpu);
++}
++
+ /* Change the scheduler of cpu to us (Credit). */
+ static spinlock_t *
+ csched_switch_sched(struct scheduler *new_ops, unsigned int cpu,
+@@ -2279,6 +2291,7 @@ static const struct scheduler sched_credit_def = {
+     .switch_sched   = csched_switch_sched,
+     .alloc_domdata  = csched_alloc_domdata,
+     .free_domdata   = csched_free_domdata,
++    .move_timers    = csched_move_timers,
+ };
+ 
+ REGISTER_SCHEDULER(sched_credit_def);
+diff --git a/xen/common/sched_rt.c b/xen/common/sched_rt.c
+index b2b29481f364..152cd46e9599 100644
+--- a/xen/common/sched_rt.c
++++ b/xen/common/sched_rt.c
+@@ -764,6 +764,27 @@ rt_switch_sched(struct scheduler *new_ops, unsigned int cpu,
+     return &prv->lock;
+ }
+ 
++static void move_repl_timer(struct rt_private *prv, unsigned int old_cpu)
++{
++    cpumask_t *online = get_sched_res(old_cpu)->cpupool->res_valid;
++    unsigned int new_cpu = cpumask_cycle(old_cpu, online);
++
++    /*
++     * Make sure the timer run on one of the cpus that are still available
++     * to this scheduler. If there aren't any left, it means it's the time
++     * to just kill it.
++     */
++    if ( new_cpu >= nr_cpu_ids )
++    {
++        kill_timer(&prv->repl_timer);
++        dprintk(XENLOG_DEBUG, "RTDS: timer killed on cpu %d\n", old_cpu);
++    }
++    else
++    {
++        migrate_timer(&prv->repl_timer, new_cpu);
++    }
++}
++
+ static void
+ rt_deinit_pdata(const struct scheduler *ops, void *pcpu, int cpu)
+ {
+@@ -773,25 +794,25 @@ rt_deinit_pdata(const struct scheduler *ops, void *pcpu, int cpu)
+     spin_lock_irqsave(&prv->lock, flags);
+ 
+     if ( prv->repl_timer.cpu == cpu )
+-    {
+-        cpumask_t *online = get_sched_res(cpu)->cpupool->res_valid;
+-        unsigned int new_cpu = cpumask_cycle(cpu, online);
++        move_repl_timer(prv, cpu);
+ 
+-        /*
+-         * Make sure the timer run on one of the cpus that are still available
+-         * to this scheduler. If there aren't any left, it means it's the time
+-         * to just kill it.
+-         */
+-        if ( new_cpu >= nr_cpu_ids )
+-        {
+-            kill_timer(&prv->repl_timer);
+-            dprintk(XENLOG_DEBUG, "RTDS: timer killed on cpu %d\n", cpu);
+-        }
+-        else
+-        {
+-            migrate_timer(&prv->repl_timer, new_cpu);
+-        }
+-    }
++    spin_unlock_irqrestore(&prv->lock, flags);
++}
++
++static void
++rt_move_timers(const struct scheduler *ops, struct sched_resource *sr)
++{
++    unsigned long flags;
++    struct rt_private *prv = rt_priv(ops);
++    unsigned int old_cpu;
++
++    spin_lock_irqsave(&prv->lock, flags);
++
++    old_cpu = prv->repl_timer.cpu;
++    if ( prv->repl_timer.status != TIMER_STATUS_invalid &&
++         prv->repl_timer.status != TIMER_STATUS_killed &&
++         !cpumask_test_cpu(old_cpu, sr->cpupool->res_valid) )
++        move_repl_timer(prv, old_cpu);
+ 
+     spin_unlock_irqrestore(&prv->lock, flags);
+ }
+@@ -1566,6 +1587,7 @@ static const struct scheduler sched_rtds_def = {
+     .sleep          = rt_unit_sleep,
+     .wake           = rt_unit_wake,
+     .context_saved  = rt_context_saved,
++    .move_timers    = rt_move_timers,
+ };
+ 
+ REGISTER_SCHEDULER(sched_rtds_def);
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 8ccdb2c4d89c..062b81117e84 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -1275,6 +1275,35 @@ static int cpu_disable_scheduler_check(unsigned int cpu)
+ }
+ 
+ /*
++ * Called after a cpu has come up again in a suspend/resume cycle.
++ * Migrate all timers for this cpu (they have been migrated to cpu 0 when the
++ * cpu was going down).
++ * Note that only timers related to a physical cpu are migrated, not the ones
++ * related to a vcpu or domain.
++ */
++void sched_migrate_timers(unsigned int cpu)
++{
++    struct sched_resource *sr;
++
++    rcu_read_lock(&sched_res_rculock);
++
++    sr = get_sched_res(cpu);
++
++    /*
++     * Note that on a system with parked cpus (e.g. smt=0 on Intel cpus) this
++     * will be called for the parked cpus, too, so the case for no scheduling
++     * resource being available must be considered.
++     */
++    if ( sr && sr->master_cpu == cpu )
++    {
++        migrate_timer(&sr->s_timer, cpu);
++        sched_move_timers(sr->scheduler, sr);
++    }
++
++    rcu_read_unlock(&sched_res_rculock);
++}
++
++/*
+  * In general, this must be called with the scheduler lock held, because the
+  * adjust_affinity hook may want to modify the vCPU state. However, when the
+  * vCPU is being initialized (either for dom0 or domU) there is no risk of
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index b366f1774f75..4712bb3a7546 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -333,6 +333,8 @@ struct scheduler {
+                                     struct xen_sysctl_scheduler_op *);
+     void         (*dump_settings)  (const struct scheduler *);
+     void         (*dump_cpu_state) (const struct scheduler *, int);
++    void         (*move_timers)    (const struct scheduler *,
++                                    struct sched_resource *);
+ };
+ 
+ static inline int sched_init(struct scheduler *s)
+@@ -494,6 +496,13 @@ static inline int sched_adjust_cpupool(const struct scheduler *s,
+     return s->adjust_global ? s->adjust_global(s, op) : 0;
+ }
+ 
++static inline void sched_move_timers(const struct scheduler *s,
++                                     struct sched_resource *sr)
++{
++    if ( s->move_timers )
++        s->move_timers(s, sr);
++}
++
+ static inline void sched_unit_pause_nosync(const struct sched_unit *unit)
+ {
+     struct vcpu *v;
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index f71e37fdc32b..e4681b09ce05 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -698,6 +698,7 @@ void sched_destroy_vcpu(struct vcpu *v);
+ int  sched_init_domain(struct domain *d, int poolid);
+ void sched_destroy_domain(struct domain *d);
+ int sched_move_domain(struct domain *d, struct cpupool *c);
++void sched_migrate_timers(unsigned int cpu);
+ long sched_adjust(struct domain *, struct xen_domctl_scheduler_op *);
+ long sched_adjust_global(struct xen_sysctl_scheduler_op *);
+ int  sched_id(void);
