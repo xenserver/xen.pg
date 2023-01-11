@@ -1,0 +1,56 @@
+From 57f07cca82521088cca0c1fc36d6ffd06cb7de80 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Mon, 21 Nov 2022 12:21:51 +0100
+Subject: efifb: ignore frame buffer with invalid configuration
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On one of my boxes when the HDMI cable is not plugged in the
+FrameBufferBase of the EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE structure is
+set to 0 by the firmware (while some of the other fields looking
+plausible).
+
+Such (bogus address) ends up mapped in vesa_init(), and since it
+overlaps with a RAM region the whole system goes down pretty badly,
+see:
+
+(XEN) vesafb: framebuffer at 0x0000000000000000, mapped to 0xffff82c000201000, using 35209k, total 35209k
+(XEN) vesafb: mode is 0x37557x32, linelength=960, font 8x16
+(XEN) vesafb: Truecolor: size=8:8:8:8, shift=24:0:8:16
+(XEN) (XEN) (XEN) (XEN) (XEN) (XEN) (XEN) (XEN) �ERROR: Class:0; Subclass:0; Operation: 0
+ERROR: No ConOut
+ERROR: No ConIn
+
+Do like Linux and prevent using the EFI Frame Buffer if the base
+address is 0.  This is inline with the logic in Linuxes
+fb_base_is_valid() function at drivers/video/fbdev/efifb.c v6.0.9.
+
+See also Linux commit 133bb070e94ab41d750c6f2160c8843e46f11b78 for
+further reference.
+
+Also prevent using Frame Buffers that have a 0 height or width, as
+those are also invalid.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Release-acked-by: Henry Wang <Henry.Wang@arm.com>
+
+diff --git a/xen/arch/x86/efi/efi-boot.h b/xen/arch/x86/efi/efi-boot.h
+index 6ca1f76877fb..04e2dad55fee 100644
+--- a/xen/arch/x86/efi/efi-boot.h
++++ b/xen/arch/x86/efi/efi-boot.h
+@@ -495,6 +495,13 @@ static void __init efi_arch_video_init(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop,
+ #ifdef CONFIG_VIDEO
+     int bpp = 0;
+ 
++    if ( !gop->Mode->FrameBufferBase || !mode_info->HorizontalResolution ||
++         !mode_info->VerticalResolution )
++    {
++        PrintErr(L"Invalid Frame Buffer configuration found\r\n");
++        return;
++    }
++
+     switch ( mode_info->PixelFormat )
+     {
+     case PixelRedGreenBlueReserved8BitPerColor:

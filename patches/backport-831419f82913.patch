@@ -1,0 +1,57 @@
+From 831419f82913417dee4e5b0f80769c5db590540b Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 2 Dec 2022 10:35:32 +0100
+Subject: x86/Viridian: don't mark IRQ vectors as pending when vLAPIC is
+ disabled
+
+In software-disabled state an LAPIC does not accept any interrupt
+requests and hence no IRR bit would newly become set while in this
+state. As a result it is also wrong for us to mark Viridian IPI or timer
+vectors as having a pending request when the vLAPIC is in this state.
+Such interrupts are simply lost.
+
+Introduce a local variable in send_ipi() to help readability.
+
+Fixes: fda96b7382ea ("viridian: add implementation of the HvSendSyntheticClusterIpi hypercall")
+Fixes: 26fba3c85571 ("viridian: add implementation of synthetic timers")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Paul Durrant <paul@xen.org>
+
+diff --git a/xen/arch/x86/hvm/viridian/synic.c b/xen/arch/x86/hvm/viridian/synic.c
+index 2791021bccb5..f9a602ab0fbd 100644
+--- a/xen/arch/x86/hvm/viridian/synic.c
++++ b/xen/arch/x86/hvm/viridian/synic.c
+@@ -396,7 +396,7 @@ bool viridian_synic_deliver_timer_msg(struct vcpu *v, unsigned int sintx,
+     BUILD_BUG_ON(sizeof(payload) > sizeof(msg->Payload));
+     memcpy(msg->Payload, &payload, sizeof(payload));
+ 
+-    if ( !vs->mask )
++    if ( !vs->mask && vlapic_enabled(vcpu_vlapic(v)) )
+         vlapic_set_irq(vcpu_vlapic(v), vs->vector, 0);
+ 
+     return true;
+diff --git a/xen/arch/x86/hvm/viridian/viridian.c b/xen/arch/x86/hvm/viridian/viridian.c
+index 6eb8dcbb34d2..ca20c48b5dd0 100644
+--- a/xen/arch/x86/hvm/viridian/viridian.c
++++ b/xen/arch/x86/hvm/viridian/viridian.c
+@@ -681,13 +681,18 @@ int viridian_hypercall(struct cpu_user_regs *regs)
+ 
+         for_each_vcpu ( currd, v )
+         {
++            struct vlapic *vlapic;
++
+             if ( v->vcpu_id >= (sizeof(vcpu_mask) * 8) )
+                 break;
+ 
+             if ( !(vcpu_mask & (1ul << v->vcpu_id)) )
+                 continue;
+ 
+-            vlapic_set_irq(vcpu_vlapic(v), vector, 0);
++            vlapic = vcpu_vlapic(v);
++
++            if ( vlapic_enabled(vlapic) )
++                vlapic_set_irq(vlapic, vector, 0);
+         }
+ 
+         status = HV_STATUS_SUCCESS;

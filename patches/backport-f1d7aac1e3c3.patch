@@ -1,0 +1,61 @@
+From f1d7aac1e3c3cd164e17d41791a575a5c3e87121 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Fri, 2 Dec 2022 10:35:01 +0100
+Subject: x86/HVM: don't mark external IRQs as pending when vLAPIC is disabled
+
+In software-disabled state an LAPIC does not accept any interrupt
+requests and hence no IRR bit would newly become set while in this
+state. As a result it is also wrong for us to mark IO-APIC or MSI
+originating vectors as having a pending request when the vLAPIC is in
+this state. Such interrupts are simply lost.
+
+Introduce (IO-APIC) or re-use (MSI) a local variable to help
+readability.
+
+Fixes: 4fe21ad3712e ("This patch add virtual IOAPIC support for VMX guest")
+Fixes: 85715f4bc7c9 ("MSI 5/6: add MSI support to passthrough HVM domain")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/hvm/vioapic.c b/xen/arch/x86/hvm/vioapic.c
+index 553eeb0244ab..9962b89d17c1 100644
+--- a/xen/arch/x86/hvm/vioapic.c
++++ b/xen/arch/x86/hvm/vioapic.c
+@@ -441,9 +441,14 @@ static void vioapic_deliver(struct hvm_vioapic *vioapic, unsigned int pin)
+ 
+     case dest_Fixed:
+         for_each_vcpu ( d, v )
+-            if ( vlapic_match_dest(vcpu_vlapic(v), NULL, 0, dest, dest_mode) )
+-                ioapic_inj_irq(vioapic, vcpu_vlapic(v), vector, trig_mode,
++        {
++            struct vlapic *vlapic = vcpu_vlapic(v);
++
++            if ( vlapic_enabled(vlapic) &&
++                 vlapic_match_dest(vlapic, NULL, 0, dest, dest_mode) )
++                ioapic_inj_irq(vioapic, vlapic, vector, trig_mode,
+                                delivery_mode);
++        }
+         break;
+ 
+     case dest_NMI:
+diff --git a/xen/arch/x86/hvm/vmsi.c b/xen/arch/x86/hvm/vmsi.c
+index f872fe45af28..47db54c9f26b 100644
+--- a/xen/arch/x86/hvm/vmsi.c
++++ b/xen/arch/x86/hvm/vmsi.c
+@@ -86,10 +86,12 @@ int vmsi_deliver(
+ 
+     case dest_Fixed:
+         for_each_vcpu ( d, v )
+-            if ( vlapic_match_dest(vcpu_vlapic(v), NULL,
+-                                   0, dest, dest_mode) )
+-                vmsi_inj_irq(vcpu_vlapic(v), vector,
+-                             trig_mode, delivery_mode);
++        {
++            target = vcpu_vlapic(v);
++            if ( vlapic_enabled(target) &&
++                 vlapic_match_dest(target, NULL, 0, dest, dest_mode) )
++                vmsi_inj_irq(target, vector, trig_mode, delivery_mode);
++        }
+         break;
+ 
+     default:
