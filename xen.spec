@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.36
+%global hv_rel 10.37
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -880,6 +880,19 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Jan 13 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.37
+- Initial support for Intel Sapphire Rapids.
+- Don't mark IRQ vectors as pending when the vLAPIC is disabled.  This fixes
+  an issue with Linux 5.19 and later.
+- Remove an incorrect but benign warning which occurs for a UEFI VM that
+  modifies the vRTC time.
+- Fix overflow with high frequency TSCs.
+- Fix crash on boot with invalid UEFI framebuffer configurations.
+- Fix race condition releasing an IRQ which is in the process of moving
+  between CPUs.
+- Fix timer affinity after S3.
+- Drop Introspection Extensions.
+
 * Fri Dec 2 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.36
 - Activate AVX-512 by default on AMD platforms.
 - Fixes for oxenstored live update.
