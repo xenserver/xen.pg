@@ -1,0 +1,206 @@
+From 7b1b181eb9035d27621b7039a5a9a19c11d21454 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edwin.torok@cloud.com>
+Date: Thu, 12 Jan 2023 17:48:29 +0000
+Subject: tools/ocaml/evtchn: Don't reference Custom objects with the GC lock
+ released
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The modification to the _H() macro for Ocaml 5 support introduced a subtle
+bug.  From the manual:
+
+  https://ocaml.org/manual/intfc.html#ss:parallel-execution-long-running-c-code
+
+"After caml_release_runtime_system() was called and until
+caml_acquire_runtime_system() is called, the C code must not access any OCaml
+data, nor call any function of the run-time system, nor call back into OCaml
+code."
+
+Previously, the value was a naked C pointer, so dereferencing it wasn't
+"accessing any Ocaml data", but the fix to avoid naked C pointers added a
+layer of indirection through an Ocaml Custom object, meaning that the common
+pattern of using _H() in a blocking section is unsafe.
+
+In order to fix:
+
+ * Drop the _H() macro and replace it with a static inline xce_of_val().
+ * Opencode the assignment into Data_custom_val() in the two constructors.
+ * Rename "value xce" parameters to "value xce_val" so we can consistently
+   have "xenevtchn_handle *xce" on the stack, and obtain the pointer with the
+   GC lock still held.
+
+Fixes: 22d5affdf0ce ("tools/ocaml/evtchn: OCaml 5 support, fix potential resource leak")
+Signed-off-by: Edwin Török <edwin.torok@cloud.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/libs/eventchn/xeneventchn_stubs.c b/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
+index 75746749b7d9..21b281c60d1f 100644
+--- a/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
++++ b/tools/ocaml/libs/eventchn/xeneventchn_stubs.c
+@@ -34,11 +34,14 @@
+ #include <caml/fail.h>
+ #include <caml/signals.h>
+ 
+-#define _H(__h) (*((xenevtchn_handle **)Data_custom_val(__h)))
++static inline xenevtchn_handle *xce_of_val(value v)
++{
++	return *(xenevtchn_handle **)Data_custom_val(v);
++}
+ 
+ static void stub_evtchn_finalize(value v)
+ {
+-	xenevtchn_close(_H(v));
++	xenevtchn_close(xce_of_val(v));
+ }
+ 
+ static struct custom_operations xenevtchn_ops = {
+@@ -69,7 +72,7 @@ CAMLprim value stub_eventchn_init(value cloexec)
+ 		caml_failwith("open failed");
+ 
+ 	result = caml_alloc_custom(&xenevtchn_ops, sizeof(xce), 0, 1);
+-	_H(result) = xce;
++	*(xenevtchn_handle **)Data_custom_val(result) = xce;
+ 
+ 	CAMLreturn(result);
+ }
+@@ -88,18 +91,19 @@ CAMLprim value stub_eventchn_fdopen(value fdval)
+ 		caml_failwith("evtchn fdopen failed");
+ 
+ 	result = caml_alloc_custom(&xenevtchn_ops, sizeof(xce), 0, 1);
+-	_H(result) = xce;
++	*(xenevtchn_handle **)Data_custom_val(result) = xce;
+ 
+ 	CAMLreturn(result);
+ }
+ 
+-CAMLprim value stub_eventchn_fd(value xce)
++CAMLprim value stub_eventchn_fd(value xce_val)
+ {
+-	CAMLparam1(xce);
++	CAMLparam1(xce_val);
+ 	CAMLlocal1(result);
++	xenevtchn_handle *xce = xce_of_val(xce_val);
+ 	int fd;
+ 
+-	fd = xenevtchn_fd(_H(xce));
++	fd = xenevtchn_fd(xce);
+ 	if (fd == -1)
+ 		caml_failwith("evtchn fd failed");
+ 
+@@ -108,13 +112,14 @@ CAMLprim value stub_eventchn_fd(value xce)
+ 	CAMLreturn(result);
+ }
+ 
+-CAMLprim value stub_eventchn_notify(value xce, value port)
++CAMLprim value stub_eventchn_notify(value xce_val, value port)
+ {
+-	CAMLparam2(xce, port);
++	CAMLparam2(xce_val, port);
++	xenevtchn_handle *xce = xce_of_val(xce_val);
+ 	int rc;
+ 
+ 	caml_enter_blocking_section();
+-	rc = xenevtchn_notify(_H(xce), Int_val(port));
++	rc = xenevtchn_notify(xce, Int_val(port));
+ 	caml_leave_blocking_section();
+ 
+ 	if (rc == -1)
+@@ -123,15 +128,16 @@ CAMLprim value stub_eventchn_notify(value xce, value port)
+ 	CAMLreturn(Val_unit);
+ }
+ 
+-CAMLprim value stub_eventchn_bind_interdomain(value xce, value domid,
++CAMLprim value stub_eventchn_bind_interdomain(value xce_val, value domid,
+                                               value remote_port)
+ {
+-	CAMLparam3(xce, domid, remote_port);
++	CAMLparam3(xce_val, domid, remote_port);
+ 	CAMLlocal1(port);
++	xenevtchn_handle *xce = xce_of_val(xce_val);
+ 	xenevtchn_port_or_error_t rc;
+ 
+ 	caml_enter_blocking_section();
+-	rc = xenevtchn_bind_interdomain(_H(xce), Int_val(domid), Int_val(remote_port));
++	rc = xenevtchn_bind_interdomain(xce, Int_val(domid), Int_val(remote_port));
+ 	caml_leave_blocking_section();
+ 
+ 	if (rc == -1)
+@@ -141,14 +147,15 @@ CAMLprim value stub_eventchn_bind_interdomain(value xce, value domid,
+ 	CAMLreturn(port);
+ }
+ 
+-CAMLprim value stub_eventchn_bind_virq(value xce, value virq_type)
++CAMLprim value stub_eventchn_bind_virq(value xce_val, value virq_type)
+ {
+-	CAMLparam2(xce, virq_type);
++	CAMLparam2(xce_val, virq_type);
+ 	CAMLlocal1(port);
++	xenevtchn_handle *xce = xce_of_val(xce_val);
+ 	xenevtchn_port_or_error_t rc;
+ 
+ 	caml_enter_blocking_section();
+-	rc = xenevtchn_bind_virq(_H(xce), Int_val(virq_type));
++	rc = xenevtchn_bind_virq(xce, Int_val(virq_type));
+ 	caml_leave_blocking_section();
+ 
+ 	if (rc == -1)
+@@ -158,13 +165,14 @@ CAMLprim value stub_eventchn_bind_virq(value xce, value virq_type)
+ 	CAMLreturn(port);
+ }
+ 
+-CAMLprim value stub_eventchn_unbind(value xce, value port)
++CAMLprim value stub_eventchn_unbind(value xce_val, value port)
+ {
+-	CAMLparam2(xce, port);
++	CAMLparam2(xce_val, port);
++	xenevtchn_handle *xce = xce_of_val(xce_val);
+ 	int rc;
+ 
+ 	caml_enter_blocking_section();
+-	rc = xenevtchn_unbind(_H(xce), Int_val(port));
++	rc = xenevtchn_unbind(xce, Int_val(port));
+ 	caml_leave_blocking_section();
+ 
+ 	if (rc == -1)
+@@ -173,14 +181,15 @@ CAMLprim value stub_eventchn_unbind(value xce, value port)
+ 	CAMLreturn(Val_unit);
+ }
+ 
+-CAMLprim value stub_eventchn_pending(value xce)
++CAMLprim value stub_eventchn_pending(value xce_val)
+ {
+-	CAMLparam1(xce);
++	CAMLparam1(xce_val);
+ 	CAMLlocal1(result);
++	xenevtchn_handle *xce = xce_of_val(xce_val);
+ 	xenevtchn_port_or_error_t port;
+ 
+ 	caml_enter_blocking_section();
+-	port = xenevtchn_pending(_H(xce));
++	port = xenevtchn_pending(xce);
+ 	caml_leave_blocking_section();
+ 
+ 	if (port == -1)
+@@ -190,16 +199,17 @@ CAMLprim value stub_eventchn_pending(value xce)
+ 	CAMLreturn(result);
+ }
+ 
+-CAMLprim value stub_eventchn_unmask(value xce, value _port)
++CAMLprim value stub_eventchn_unmask(value xce_val, value _port)
+ {
+-	CAMLparam2(xce, _port);
++	CAMLparam2(xce_val, _port);
++	xenevtchn_handle *xce = xce_of_val(xce_val);
+ 	evtchn_port_t port;
+ 	int rc;
+ 
+ 	port = Int_val(_port);
+ 
+ 	caml_enter_blocking_section();
+-	rc = xenevtchn_unmask(_H(xce), port);
++	rc = xenevtchn_unmask(xce, port);
+ 	caml_leave_blocking_section();
+ 
+ 	if (rc)

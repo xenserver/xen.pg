@@ -1,0 +1,62 @@
+From f8155243040ea800711ebb178d0c0c9bf6f22c75 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edwin.torok@cloud.com>
+Date: Thu, 12 Jan 2023 11:38:38 +0000
+Subject: tools/ocaml/xc: Fix binding for xc_domain_assign_device()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The patch adding this binding was plain broken, and unreviewed.  It modified
+the C stub to add a 4th parameter without an equivalent adjustment in the
+Ocaml side of the bindings.
+
+In 64bit builds, this causes us to dereference whatever dead value is in %rcx
+when trying to interpret the rflags parameter.
+
+This has gone unnoticed because Xapi doesn't use this binding (it has its
+own), but unbreak the binding by passing RDM_RELAXED unconditionally for
+now (matching the libxl default behaviour).
+
+Fixes: 9b34056cb4 ("tools: extend xc_assign_device() to support rdm reservation policy")
+Signed-off-by: Edwin Török <edwin.torok@cloud.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@citrix.com>
+
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index f45bfd7f6919..7806be889390 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -1204,17 +1204,12 @@ CAMLprim value stub_xc_domain_test_assign_device(value xch, value domid, value d
+ 	CAMLreturn(Val_bool(ret == 0));
+ }
+ 
+-static int domain_assign_device_rdm_flag_table[] = {
+-    XEN_DOMCTL_DEV_RDM_RELAXED,
+-};
+-
+-CAMLprim value stub_xc_domain_assign_device(value xch, value domid, value desc,
+-                                            value rflag)
++CAMLprim value stub_xc_domain_assign_device(value xch, value domid, value desc)
+ {
+-	CAMLparam4(xch, domid, desc, rflag);
++	CAMLparam3(xch, domid, desc);
+ 	int ret;
+ 	int domain, bus, dev, func;
+-	uint32_t sbdf, flag;
++	uint32_t sbdf;
+ 
+ 	domain = Int_val(Field(desc, 0));
+ 	bus = Int_val(Field(desc, 1));
+@@ -1222,10 +1217,8 @@ CAMLprim value stub_xc_domain_assign_device(value xch, value domid, value desc,
+ 	func = Int_val(Field(desc, 3));
+ 	sbdf = encode_sbdf(domain, bus, dev, func);
+ 
+-	ret = Int_val(Field(rflag, 0));
+-	flag = domain_assign_device_rdm_flag_table[ret];
+-
+-	ret = xc_assign_device(_H(xch), _D(domid), sbdf, flag);
++	ret = xc_assign_device(_H(xch), _D(domid), sbdf,
++			       XEN_DOMCTL_DEV_RDM_RELAXED);
+ 
+ 	if (ret < 0)
+ 		failwith_xc(_H(xch));
