@@ -43,19 +43,14 @@ Source5: gen_test_metadata.py
 
 ExclusiveArch: x86_64
 
-## Pull in the correct RPM macros for the distributon
-## (Any fedora which is still in support uses python3)
-%if 0%{?centos} > 7 || 0%{?rhel} > 7 || 0%{?fedora} > 0
 BuildRequires: python3-devel
 BuildRequires: python3-rpm-macros
 %global py_sitearch %{python3_sitearch}
 %global __python %{__python3}
-%else
+
+# Interim, build Python2 bindings too
 BuildRequires: python2-devel
 BuildRequires: python2-rpm-macros
-%global py_sitearch %{python2_sitearch}
-%global __python %{__python2}
-%endif
 
 BuildRequires: devtoolset-11-gcc devtoolset-11-binutils
 
@@ -222,6 +217,7 @@ echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
 
 source /opt/rh/devtoolset-11/enable
 export XEN_TARGET_ARCH=%{_arch}
+export PYTHON="%{__python}"
 
 %configure --disable-qemu-traditional \
            --disable-seabios \
@@ -242,6 +238,9 @@ cp -a . ../livepatch-src/
 # Build tools and man pages
 %{?_cov_wrap} %{make_build} build-tools
 %{make_build} -C docs man-pages
+
+# Interim python2 bindings too
+%{make_build} DESTDIR=%{buildroot} PYTHON=python2 -C tools/python
 
 # The hypervisor build system can't cope with RPM's {C,LD}FLAGS
 unset CFLAGS
@@ -281,6 +280,7 @@ build_xen ""           config-pvshim-debug    build-shim-debug
 
 source /opt/rh/devtoolset-11/enable
 export XEN_TARGET_ARCH=%{_arch}
+export PYTHON="%{__python}"
 
 # The existence of this directory causes ocamlfind to put things in it
 mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
@@ -288,6 +288,9 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 # Install tools and man pages
 %{make_build} DESTDIR=%{buildroot} install-tools
 %{make_build} DESTDIR=%{buildroot} -C docs install-man-pages
+
+# Interim python2 bindings too
+%{make_build} DESTDIR=%{buildroot} PYTHON=python2 install -C tools/python
 
 # Install artefacts for livepatches
 %{__install} -p -D -m 644 xen/build-xen-release/xen-syms %{buildroot}%{lp_devel_dir}/xen-syms
@@ -353,8 +356,13 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{_bindir}/xenstore-watch
 %{_bindir}/xenstore-write
 %{py_sitearch}/%{name}/__init__.py*
+%{py_sitearch}/%{name}/__pycache__/
 %{py_sitearch}/%{name}/lowlevel/__init__.py*
-%{py_sitearch}/%{name}/lowlevel/xs.so
+%{py_sitearch}/%{name}/lowlevel/__pycache__/
+%{py_sitearch}/%{name}/lowlevel/xs*.so
+%{python2_sitearch}/%{name}/__init__.py*
+%{python2_sitearch}/%{name}/lowlevel/__init__.py*
+%{python2_sitearch}/%{name}/lowlevel/xs.so
 
 %files devel
 %{_includedir}/%{name}/COPYING
@@ -547,17 +555,19 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{_bindir}/xencons
 %{_bindir}/xencov_split
 %{_bindir}/xentrace_format
-%{py_sitearch}/xenfsimage.so
+%{py_sitearch}/xenfsimage*.so
 %{py_sitearch}/grub/ExtLinuxConf.py*
 %{py_sitearch}/grub/GrubConf.py*
 %{py_sitearch}/grub/LiloConf.py*
 %{py_sitearch}/grub/__init__.py*
+%{py_sitearch}/grub/__pycache__/
 %{py_sitearch}/pygrub-*.egg-info
 %{py_sitearch}/xen-*.egg-info
 #{py_sitearch}/xen/__init__.py*           - Must not duplicate xen-tools
 #{py_sitearch}/xen/lowlevel/__init__.py*  - Must not duplicate xen-tools
-%{py_sitearch}/xen/lowlevel/xc.so
+%{py_sitearch}/xen/lowlevel/xc*.so
 %{py_sitearch}/xen/migration/__init__.py*
+%{py_sitearch}/xen/migration/__pycache__/
 %{py_sitearch}/xen/migration/legacy.py*
 %{py_sitearch}/xen/migration/libxc.py*
 %{py_sitearch}/xen/migration/libxl.py*
@@ -565,6 +575,10 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{py_sitearch}/xen/migration/tests.py*
 %{py_sitearch}/xen/migration/verify.py*
 %{py_sitearch}/xen/migration/xl.py*
+%{python2_sitearch}/xen-*.egg-info
+%{python2_sitearch}/xen/lowlevel/xc*.so
+%{python2_sitearch}/xen/migration/*.py*
+
 %{_libexecdir}/%{name}/bin/convert-legacy-stream
 %{_libexecdir}/%{name}/bin/init-xenstore-domain
 %{_libexecdir}/%{name}/bin/libxl-save-helper
@@ -806,8 +820,13 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/libxenguest.so.4.13
 %{_libdir}/libxenguest.so.4.13.0
 %{py_sitearch}/xen/__init__.py*
+%{py_sitearch}/xen/__pycache__/
 %{py_sitearch}/xen/lowlevel/__init__.py*
-%{py_sitearch}/xen/lowlevel/xc.so
+%{py_sitearch}/xen/lowlevel/__pycache__/
+%{py_sitearch}/xen/lowlevel/xc*.so
+%{python2_sitearch}/xen/__init__*.py*
+%{python2_sitearch}/xen/lowlevel/__init__*.py*
+%{python2_sitearch}/xen/lowlevel/xc.so
 
 %files dom0-tests
 %exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker
