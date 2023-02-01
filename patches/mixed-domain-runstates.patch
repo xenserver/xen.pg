@@ -2,7 +2,7 @@ Collect domain runstate information in the hypervisor, and export
 through a domctl operation.
 
 diff --git a/tools/flask/policy/modules/dom0.te b/tools/flask/policy/modules/dom0.te
-index 272f6a4f75..dde741c5ef 100644
+index 272f6a4f75db..dde741c5ef6c 100644
 --- a/tools/flask/policy/modules/dom0.te
 +++ b/tools/flask/policy/modules/dom0.te
 @@ -40,6 +40,7 @@ allow dom0_t dom0_t:domain {
@@ -14,7 +14,7 @@ index 272f6a4f75..dde741c5ef 100644
  allow dom0_t dom0_t:resource { add remove };
  
 diff --git a/tools/flask/policy/modules/xen.if b/tools/flask/policy/modules/xen.if
-index 8eb2293a52..8c915b8381 100644
+index 8eb2293a529d..8c915b838168 100644
 --- a/tools/flask/policy/modules/xen.if
 +++ b/tools/flask/policy/modules/xen.if
 @@ -53,6 +53,7 @@ define(`create_domain_common', `
@@ -26,7 +26,7 @@ index 8eb2293a52..8c915b8381 100644
  	allow $1 $2:security check_context;
  	allow $1 $2:shadow enable;
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index 283cbba281..e4da7b4f67 100644
+index 30f142d25c04..97c915b111fd 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
 @@ -469,6 +469,7 @@ typedef struct xc_dominfo {
@@ -50,7 +50,7 @@ index 283cbba281..e4da7b4f67 100644
                                  uint32_t domid,
                                  uint32_t first_port,
 diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
-index 7e72235d62..811b650110 100644
+index 8baf6ee669e6..24340f40a9fc 100644
 --- a/tools/libxc/xc_domain.c
 +++ b/tools/libxc/xc_domain.c
 @@ -1343,6 +1343,24 @@ int xc_vcpu_getinfo(xc_interface *xch,
@@ -79,7 +79,7 @@ index 7e72235d62..811b650110 100644
                                  uint32_t domid,
                                  uint32_t first_port,
 diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
-index 4175e9f070..6cac7a3137 100644
+index a1ff175bc403..4ac920404c8e 100644
 --- a/tools/ocaml/libs/xc/xenctrl.ml
 +++ b/tools/ocaml/libs/xc/xenctrl.ml
 @@ -81,6 +81,18 @@ type domctl_create_config =
@@ -101,7 +101,7 @@ index 4175e9f070..6cac7a3137 100644
  type domaininfo =
  {
  	domid             : domid;
-@@ -211,6 +223,8 @@ external domain_getinfo: handle -> domid -> domaininfo= "stub_xc_domain_getinfo"
+@@ -222,6 +234,8 @@ external domain_getinfo: handle -> domid -> domaininfo= "stub_xc_domain_getinfo"
  
  external domain_get_vcpuinfo: handle -> int -> int -> vcpuinfo
         = "stub_xc_vcpu_getinfo"
@@ -111,7 +111,7 @@ index 4175e9f070..6cac7a3137 100644
  external domain_ioport_permission: handle -> domid -> int -> int -> bool -> unit
         = "stub_xc_domain_ioport_permission"
 diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
-index f4e050e204..fb7d496939 100644
+index 7bf08bfe603f..81f51f16a103 100644
 --- a/tools/ocaml/libs/xc/xenctrl.mli
 +++ b/tools/ocaml/libs/xc/xenctrl.mli
 @@ -73,6 +73,18 @@ type domctl_create_config = {
@@ -143,52 +143,49 @@ index f4e050e204..fb7d496939 100644
         = "stub_xc_domain_ioport_permission"
  external domain_iomem_permission: handle -> domid -> nativeint -> nativeint -> bool -> unit
 diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
-index 53f20313fe..5a28df4bb1 100644
+index c8c49d4cb7f7..642f3610cd15 100644
 --- a/tools/ocaml/libs/xc/xenctrl_stubs.c
 +++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
-@@ -488,6 +488,37 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch, value domid, value vcpu)
+@@ -490,6 +490,34 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch, value domid, value vcpu)
  	CAMLreturn(result);
  }
  
 +CAMLprim value stub_xc_get_runstate_info(value xch, value domid)
 +{
-+        CAMLparam2(xch, domid);
-+        CAMLlocal1(result);
-+        xc_runstate_info_t info;
-+        int retval;
++	CAMLparam2(xch, domid);
++	CAMLlocal1(result);
++	xc_runstate_info_t info;
++	int retval;
 +
-+        retval = xc_get_runstate_info(_H(xch), _D(domid), &info);
-+        if (retval < 0)
-+                failwith_xc(_H(xch));
++	caml_enter_blocking_section();
++	retval = xc_get_runstate_info(_H(xch), _D(domid), &info);
++	caml_leave_blocking_section();
 +
-+        /* Store
-+           0 : state (int32)
-+           1 : missed_changes (int32)
-+           2 : state_entry_time (int64)
-+           3-8 : times (int64s)
-+        */
-+        result = caml_alloc_tuple(9);
-+        Store_field(result, 0, caml_copy_int32(info.state));
-+        Store_field(result, 1, caml_copy_int32(info.missed_changes));
-+        Store_field(result, 2, caml_copy_int64(info.state_entry_time));
-+        Store_field(result, 3, caml_copy_int64(info.time[0]));
-+        Store_field(result, 4, caml_copy_int64(info.time[1]));
-+        Store_field(result, 5, caml_copy_int64(info.time[2]));
-+        Store_field(result, 6, caml_copy_int64(info.time[3]));
-+        Store_field(result, 7, caml_copy_int64(info.time[4]));
-+        Store_field(result, 8, caml_copy_int64(info.time[5]));
++	if (retval < 0)
++		failwith_xc(_H(xch));
 +
-+        CAMLreturn(result);
++	result = caml_alloc_tuple(9);
++	Store_field(result, 0, caml_copy_int32(info.state));
++	Store_field(result, 1, caml_copy_int32(info.missed_changes));
++	Store_field(result, 2, caml_copy_int64(info.state_entry_time));
++	Store_field(result, 3, caml_copy_int64(info.time[0]));
++	Store_field(result, 4, caml_copy_int64(info.time[1]));
++	Store_field(result, 5, caml_copy_int64(info.time[2]));
++	Store_field(result, 6, caml_copy_int64(info.time[3]));
++	Store_field(result, 7, caml_copy_int64(info.time[4]));
++	Store_field(result, 8, caml_copy_int64(info.time[5]));
++
++	CAMLreturn(result);
 +}
 +
  CAMLprim value stub_xc_vcpu_context_get(value xch, value domid,
                                          value cpu)
  {
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index 70502ddd96..0231c5a300 100644
+index 40253575b22c..593eb4081f5a 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -389,6 +389,7 @@ struct domain *domain_create(domid_t domid,
+@@ -396,6 +396,7 @@ struct domain *domain_create(domid_t domid,
      spin_lock_init_prof(d, domain_lock);
      spin_lock_init_prof(d, page_alloc_lock);
      spin_lock_init(&d->hypercall_deadlock_mutex);
@@ -197,10 +194,10 @@ index 70502ddd96..0231c5a300 100644
      INIT_PAGE_LIST_HEAD(&d->xenpage_list);
  
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index 03d0226039..bbcc74de8d 100644
+index 6c903f23b963..1c7e071037b2 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -1066,6 +1066,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+@@ -1072,6 +1072,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
              copyback = 1;
          break;
  
@@ -213,7 +210,7 @@ index 03d0226039..bbcc74de8d 100644
          ret = arch_do_domctl(op, d, u_domctl);
          break;
 diff --git a/xen/common/schedule.c b/xen/common/schedule.c
-index 54a07ff9e8..6e3a0e32bb 100644
+index 062b81117e84..dcd5f1d08906 100644
 --- a/xen/common/schedule.c
 +++ b/xen/common/schedule.c
 @@ -257,9 +257,30 @@ static inline void vcpu_urgent_count_update(struct vcpu *v)
@@ -293,7 +290,7 @@ index 54a07ff9e8..6e3a0e32bb 100644
  }
  
  void sched_guest_idle(void (*idle) (void), unsigned int cpu)
-@@ -320,6 +380,20 @@ void vcpu_runstate_get(struct vcpu *v, struct vcpu_runstate_info *runstate)
+@@ -329,6 +389,20 @@ void vcpu_runstate_get(struct vcpu *v, struct vcpu_runstate_info *runstate)
      rcu_read_unlock(&sched_res_rculock);
  }
  
@@ -315,10 +312,10 @@ index 54a07ff9e8..6e3a0e32bb 100644
  {
      struct vcpu_runstate_info state = { 0 };
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index e313da499f..691f03e0a2 100644
+index 83bf89997278..3ef28ad77305 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1128,6 +1128,46 @@ struct xen_domctl_vuart_op {
+@@ -1129,6 +1129,46 @@ struct xen_domctl_vuart_op {
                                   */
  };
  
@@ -365,7 +362,7 @@ index e313da499f..691f03e0a2 100644
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1209,6 +1249,7 @@ struct xen_domctl {
+@@ -1213,6 +1253,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_vuart_op                      81
  #define XEN_DOMCTL_get_cpu_policy                82
  #define XEN_DOMCTL_set_cpu_policy                83
@@ -373,7 +370,7 @@ index e313da499f..691f03e0a2 100644
  #define XEN_DOMCTL_gdbsx_guestmemio            1000
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
-@@ -1259,6 +1300,7 @@ struct xen_domctl {
+@@ -1263,6 +1304,7 @@ struct xen_domctl {
          struct xen_domctl_set_access_required access_required;
          struct xen_domctl_audit_p2m         audit_p2m;
          struct xen_domctl_set_virq_handler  set_virq_handler;
@@ -382,10 +379,10 @@ index e313da499f..691f03e0a2 100644
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index c0cfe53b6e..993192591b 100644
+index 3013a959ccb7..566054ef8d4b 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -347,6 +347,8 @@ struct vm_event_domain
+@@ -349,6 +349,8 @@ struct vm_event_domain
  
  struct evtchn_port_ops;
  
@@ -394,7 +391,7 @@ index c0cfe53b6e..993192591b 100644
  struct domain
  {
      domid_t          domain_id;
-@@ -531,6 +533,11 @@ struct domain
+@@ -549,6 +551,11 @@ struct domain
      /* Argo interdomain communication support */
      struct argo_domain *argo;
  #endif
@@ -406,7 +403,7 @@ index c0cfe53b6e..993192591b 100644
  };
  
  /* Protect updates/reads (resp.) of domain_list and domain_hash. */
-@@ -940,6 +947,8 @@ int vcpu_set_soft_affinity(struct vcpu *v, const cpumask_t *affinity);
+@@ -959,6 +966,8 @@ int vcpu_set_soft_affinity(struct vcpu *v, const cpumask_t *affinity);
  void restore_vcpu_affinity(struct domain *d);
  
  void vcpu_runstate_get(struct vcpu *v, struct vcpu_runstate_info *runstate);
@@ -416,10 +413,10 @@ index c0cfe53b6e..993192591b 100644
  void sched_guest_idle(void (*idle) (void), unsigned int cpu);
  void scheduler_enable(void);
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
-index cf7f25cda2..66c35fba0f 100644
+index 3403389abc3c..a3db19740ac6 100644
 --- a/xen/xsm/flask/hooks.c
 +++ b/xen/xsm/flask/hooks.c
-@@ -744,6 +744,9 @@ static int flask_domctl(struct domain *d, int cmd)
+@@ -750,6 +750,9 @@ static int flask_domctl(struct domain *d, int cmd)
      case XEN_DOMCTL_get_cpu_policy:
          return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__GET_CPU_POLICY);
  
@@ -430,7 +427,7 @@ index cf7f25cda2..66c35fba0f 100644
          return avc_unknown_permission("domctl", cmd);
      }
 diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
-index c055c14c26..50cc5bfa08 100644
+index c055c14c2654..50cc5bfa080f 100644
 --- a/xen/xsm/flask/policy/access_vectors
 +++ b/xen/xsm/flask/policy/access_vectors
 @@ -243,6 +243,8 @@ class domain2
