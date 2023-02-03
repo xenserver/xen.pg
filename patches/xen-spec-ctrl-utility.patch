@@ -1,0 +1,390 @@
+From 65b3f145b0383b55444dc3a95cd4d18ea5655fff Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Tue, 26 Mar 2019 09:53:25 +0000
+Subject: x86: add XEN_SYSCTL_spec_ctrl and xen-spec-ctrl utility
+
+stop_machine infrastructure is copied from live ucode update.
+CPUID level 0x00000007:0.edx is updated on each cpu.
+CPUID policies are recalculated if there are any CPUID changes.
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+
+diff --git a/tools/misc/.gitignore b/tools/misc/.gitignore
+index 1202c0a72384..2403a2129de1 100644
+--- a/tools/misc/.gitignore
++++ b/tools/misc/.gitignore
+@@ -1,2 +1,3 @@
+ xen-mceinj
++xen-spec-ctrl
+ xen-ucode
+diff --git a/tools/misc/Makefile b/tools/misc/Makefile
+index b025f1839278..d1baf0e076ae 100644
+--- a/tools/misc/Makefile
++++ b/tools/misc/Makefile
+@@ -24,6 +24,7 @@ INSTALL_SBIN-$(CONFIG_X86)     += xen-lowmemd
+ INSTALL_SBIN-$(CONFIG_X86)     += xen-mceinj
+ INSTALL_SBIN-$(CONFIG_X86)     += xen-mfndump
+ INSTALL_SBIN-$(CONFIG_X86)     += xen-ucode
++INSTALL_SBIN-$(CONFIG_X86)     += xen-spec-ctrl
+ INSTALL_SBIN                   += xencov
+ INSTALL_SBIN                   += xenlockprof
+ INSTALL_SBIN                   += xenperf
+@@ -121,4 +122,7 @@ xencov: xencov.o
+ xen-ucode: xen-ucode.o
+ 	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS_libxenctrl) $(APPEND_LDFLAGS)
+ 
++xen-spec-ctrl: xen-spec-ctrl.o
++	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS_libxenctrl) $(APPEND_LDFLAGS)
++
+ -include $(DEPS_INCLUDE)
+diff --git a/tools/misc/xen-spec-ctrl.c b/tools/misc/xen-spec-ctrl.c
+new file mode 100644
+index 000000000000..d46778eca989
+--- /dev/null
++++ b/tools/misc/xen-spec-ctrl.c
+@@ -0,0 +1,60 @@
++#define _GNU_SOURCE
++
++#include <stdio.h>
++#include <err.h>
++#include <errno.h>
++#include <string.h>
++
++#include <xenctrl.h>
++
++void show_help(void)
++{
++    fprintf(stderr,
++            "xen-spec-ctrl: Xen speculation control tool\n"
++            "Usage: xen-spec-ctrl update\n");
++}
++
++int main(int argc, char *argv[])
++{
++    int ret;
++    struct xen_sysctl sysctl = {0};
++    xc_interface *xch;
++    char *str = "Mitigations have been updated! "
++                "Check xen-cpuid output for the details.";
++
++    if ( argc < 2 || strcmp(argv[1], "update") != 0 )
++    {
++        show_help();
++        return 1;
++    }
++
++    xch = xc_interface_open(NULL, NULL, 0);
++    if ( xch == NULL )
++        err(1, "xc_interface_open");
++
++    sysctl.interface_version = XEN_SYSCTL_INTERFACE_VERSION;
++    sysctl.cmd = XEN_SYSCTL_spec_ctrl;
++    sysctl.u.spec_ctrl.op = XENPF_spec_ctrl_update;
++
++    ret = xc_sysctl(xch, &sysctl);
++    if ( ret != 0 )
++    {
++        switch ( errno )
++        {
++        case ENOEXEC:
++            str = "No new H/W features have been found. "
++                  "Did you forget to update the microcode with xen-ucode?";
++            break;
++
++        default:
++            str = strerror(errno);
++            break;
++        }
++    }
++
++    fprintf(stderr, "Status: %s\n", str);
++
++    xc_interface_close(xch);
++
++    return 0;
++}
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index daba23556426..b3171cf7b856 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -587,6 +587,136 @@ void identify_cpu(struct cpuinfo_x86 *c)
+ 	}
+ }
+ 
++static void fill_featureset(uint32_t fs[FSCAPINTS])
++{
++    unsigned int i, max_leaf, max_extd, tmp;
++
++    BUILD_BUG_ON(FSCAPINTS != 18);
++
++    max_leaf = cpuid_eax(0);
++    if ( max_leaf >= 1 )
++        cpuid(1, &tmp, &tmp, &fs[FEATURESET_1c],  &fs[FEATURESET_1d]);
++
++    if ( max_leaf >= 7 )
++    {
++        unsigned int max_feat;
++
++        cpuid_count(7, 0, &max_feat, &fs[FEATURESET_7b0],
++                    &fs[FEATURESET_7c0], &fs[FEATURESET_7d0]);
++        if ( max_feat >= 1 )
++            cpuid_count(7, 1, &fs[FEATURESET_7a1], &fs[FEATURESET_7b1],
++                        &tmp, &tmp);
++        if ( max_feat >= 2 )
++            cpuid_count(7, 2, &tmp, &tmp, &tmp, &fs[FEATURESET_7d2]);
++    }
++
++    if ( max_leaf >= 0xd )
++        cpuid_count(0xd, 1, &fs[FEATURESET_Da1], &tmp, &tmp, &tmp);
++
++    max_extd = cpuid_eax(0x80000000);
++    if ( (max_extd >> 16) != 0x8000 )
++        max_extd = 0;
++
++    if ( max_extd >= 0x80000001 )
++        cpuid(0x80000001, &tmp, &tmp, &fs[FEATURESET_e1c], &fs[FEATURESET_e1d]);
++    if ( max_extd >= 0x80000007 )
++        cpuid(0x80000007, &tmp, &tmp, &tmp, &fs[FEATURESET_e7d]);
++    if ( max_extd >= 0x80000008 )
++        cpuid(0x80000008, &tmp, &fs[FEATURESET_e8b], &tmp, &tmp);
++    if ( 0 && max_extd >= 0x80000021 )
++        cpuid(0x80000021, &fs[FEATURESET_e21a], &tmp, &tmp, &tmp);
++
++    for ( i = 0; i < FSCAPINTS; ++i )
++    {
++        fs[i] |= forced_caps[i];
++        fs[i] &= known_features[i] & ~cleared_caps[i];
++    }
++}
++
++static void update_cpuid(void *data)
++{
++    volatile uint32_t *new_fs = data;
++    uint32_t fs[FSCAPINTS] = {};
++    unsigned int i, cpu = smp_processor_id();
++
++    fill_featureset(fs);
++
++    for ( i = 0; i < ARRAY_SIZE(fs); ++i )
++        /*
++         * The common case is no difference from the initiating CPU.  Only
++         * issue the atomic operation if it looks like we have bits to clear.
++         */
++        if ( new_fs[i] & ~fs[i] )
++            asm volatile ( "lock and %[fs], %[new_fs]"
++                           : [new_fs] "+m" (new_fs[i])
++                           : [fs] "r" (fs[i]) );
++
++    /*
++     * Update cpu_data[], but skip CPU0 for now.  boot_cpu_data needs to wait
++     * until all CPUs have merged.
++     */
++    if ( cpu != 0 )
++        memcpy(cpu_data[cpu].x86_capability, fs, sizeof(fs));
++}
++
++int sysctl_update_spec_ctrl_cpuid(void)
++{
++    uint32_t i, new_fs[FSCAPINTS] = {};
++    bool lost = false, updated = false;
++
++    /* Scan for new features on the current CPU. */
++    fill_featureset(new_fs);
++    for ( i = 0; i < ARRAY_SIZE(new_fs); ++i )
++        if ( new_fs[i] & ~boot_cpu_data.x86_capability[i] )
++            break;
++
++    /* If nothing new, don't bother querying other CPUs. */
++    if ( i == ARRAY_SIZE(new_fs) )
++        return -ENOEXEC;
++
++    /* If new features have appeared, check all CPUs. */
++    smp_call_function(update_cpuid, new_fs, 1);
++
++    /* Merge is complete.  First check for lost features. */
++    for ( i = 0; i < ARRAY_SIZE(new_fs); ++i )
++        if ( ~new_fs[i] & boot_cpu_data.x86_capability[i] )
++        {
++            if ( !lost )
++                printk(XENLOG_ERR "CPUID features lost\n");
++
++            printk(XENLOG_ERR "  featureset word %u, lost %08x\n",
++                   i, ~new_fs[i] & boot_cpu_data.x86_capability[i]);
++            lost = true;
++        }
++
++    if ( lost )
++    {
++        printk(XENLOG_ERR "Skipping data update, but system may be unstable\n");
++        return -EXDEV;
++    }
++
++    /* Update boot_cpu_data, printing new features. */
++    for ( i = 0; i < ARRAY_SIZE(new_fs); ++i )
++        if ( new_fs[i] & ~boot_cpu_data.x86_capability[i] )
++        {
++            if ( !updated )
++                printk(XENLOG_INFO "New CPUID features detected\n");
++
++            printk(XENLOG_INFO "  featureset word %u, new %08x\n",
++                   i, new_fs[i] & ~boot_cpu_data.x86_capability[i]);
++
++            ACCESS_ONCE(boot_cpu_data.x86_capability[i]) = new_fs[i];
++            updated = true;
++        }
++
++    if ( !updated )
++        return -ENOEXEC;
++
++    init_guest_cpuid();
++
++    return 0;
++}
++
+ /* leaf 0xb SMT level */
+ #define SMT_LEVEL       0
+ 
+diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
+index db22f99dd6d4..7d50dee22f41 100644
+--- a/xen/arch/x86/cpuid.c
++++ b/xen/arch/x86/cpuid.c
+@@ -303,7 +303,7 @@ void cpuid_calculate_raw_policy(void)
+     ASSERT(p->x86_vendor == boot_cpu_data.x86_vendor);
+ }
+ 
+-static void __init calculate_host_policy(void)
++static void calculate_host_policy(void)
+ {
+     struct cpuid_policy *p = &host_cpuid_policy;
+ 
+@@ -338,7 +338,7 @@ static void __init calculate_host_policy(void)
+     }
+ }
+ 
+-static void __init guest_common_feature_adjustments(uint32_t *fs)
++static void guest_common_feature_adjustments(uint32_t *fs)
+ {
+     /* Unconditionally claim to be able to set the hypervisor bit. */
+     __set_bit(X86_FEATURE_HYPERVISOR, fs);
+@@ -372,7 +372,7 @@ static void __init guest_common_feature_adjustments(uint32_t *fs)
+         __clear_bit(X86_FEATURE_RTM, fs);
+ }
+ 
+-static void __init calculate_pv_max_policy(void)
++static void calculate_pv_max_policy(void)
+ {
+     struct cpuid_policy *p = &pv_max_cpuid_policy;
+     uint32_t pv_featureset[FSCAPINTS];
+@@ -403,7 +403,7 @@ static void __init calculate_pv_max_policy(void)
+     p->extd.raw[0xa] = EMPTY_LEAF; /* No SVM for PV guests. */
+ }
+ 
+-static void __init calculate_hvm_max_policy(void)
++static void calculate_hvm_max_policy(void)
+ {
+     struct cpuid_policy *p = &hvm_max_cpuid_policy;
+     uint32_t hvm_featureset[FSCAPINTS];
+@@ -467,7 +467,7 @@ static void __init calculate_hvm_max_policy(void)
+     recalculate_xstate(p);
+ }
+ 
+-void __init init_guest_cpuid(void)
++void init_guest_cpuid(void)
+ {
+     cpuid_calculate_raw_policy();
+     calculate_host_policy();
+diff --git a/xen/arch/x86/sysctl.c b/xen/arch/x86/sysctl.c
+index af617464cdad..0aba82a8cb95 100644
+--- a/xen/arch/x86/sysctl.c
++++ b/xen/arch/x86/sysctl.c
+@@ -452,6 +452,33 @@ long arch_do_sysctl(
+         break;
+     }
+ 
++    case XEN_SYSCTL_spec_ctrl:
++        if ( sysctl->u.spec_ctrl.op != XENPF_spec_ctrl_update )
++        {
++            ret = -EINVAL;
++            break;
++        }
++
++        /*
++         * We're (potentially) updating the default CPUID/MSR settings for all
++         * VM types, and need to not race with with other consumers of the
++         * system policies:
++         *   XEN_DOMCTL_createdomain
++         *   XEN_SYSCTL_get_cpu_featureset
++         *   XEN_SYSCTL_get_cpu_policy
++         *
++         * We already hold the sysctl lock.  Take the domctl lock too.
++         */
++        if ( !domctl_lock_acquire() )
++        {
++            ret = -ERESTART;
++            break;
++        }
++
++        ret = sysctl_update_spec_ctrl_cpuid();
++        domctl_lock_release();
++        break;
++
+     default:
+         ret = -ENOSYS;
+         break;
+diff --git a/xen/arch/x86/xstate.c b/xen/arch/x86/xstate.c
+index 0abf20d2ef21..5aaff3141c0c 100644
+--- a/xen/arch/x86/xstate.c
++++ b/xen/arch/x86/xstate.c
+@@ -622,6 +622,7 @@ void xstate_init(struct cpuinfo_x86 *c)
+ 
+     if ( bsp )
+     {
++        setup_force_cpu_cap(X86_FEATURE_OSXSAVE);
+         xfeature_mask = feature_mask;
+         /*
+          * xsave_cntxt_size is the max size required by enabled features.
+diff --git a/xen/include/asm-x86/processor.h b/xen/include/asm-x86/processor.h
+index 8186436f4026..ba165a84f74f 100644
+--- a/xen/include/asm-x86/processor.h
++++ b/xen/include/asm-x86/processor.h
+@@ -622,6 +622,8 @@ void set_in_mcu_opt_ctrl(uint32_t mask, uint32_t val);
+ 
+ extern bool opt_doitm;
+ 
++int sysctl_update_spec_ctrl_cpuid(void);
++
+ #endif /* !__ASSEMBLY__ */
+ 
+ #endif /* __ASM_X86_PROCESSOR_H */
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index d5d5976af5bc..18b44cc65805 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -1035,6 +1035,11 @@ typedef struct xen_sysctl_cpu_policy xen_sysctl_cpu_policy_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_sysctl_cpu_policy_t);
+ #endif
+ 
++struct xen_sysctl_spec_ctrl {
++#define XENPF_spec_ctrl_update  0 /* Try to use new mitigations */
++    uint32_t op;      /* IN */
++};
++
+ struct xen_sysctl {
+     uint32_t cmd;
+ #define XEN_SYSCTL_readconsole                    1
+@@ -1065,6 +1070,7 @@ struct xen_sysctl {
+ #define XEN_SYSCTL_livepatch_op                  27
+ #define XEN_SYSCTL_set_parameter                 28
+ #define XEN_SYSCTL_get_cpu_policy                29
++#define XEN_SYSCTL_spec_ctrl                    188
+     uint32_t interface_version; /* XEN_SYSCTL_INTERFACE_VERSION */
+     union {
+         struct xen_sysctl_readconsole       readconsole;
+@@ -1096,6 +1102,7 @@ struct xen_sysctl {
+ #if defined(__i386__) || defined(__x86_64__)
+         struct xen_sysctl_cpu_policy        cpu_policy;
+ #endif
++        struct xen_sysctl_spec_ctrl         spec_ctrl;
+         uint8_t                             pad[128];
+     } u;
+ };

@@ -1,0 +1,97 @@
+From c5643efcab17c001adf3c667b99d0090363b43d1 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 26 Nov 2019 14:37:27 +0000
+Subject: AMD/IOMMU: Render IO_PAGE_FAULT errors in a more useful manner
+
+Print the PCI coordinates in its common format and use d%u notation for the
+domain.  As well as printing flags, decode them.  IO_PAGE_FAULT is used for
+interrupt remapping errors as well as DMA remapping errors.
+
+Before:
+  (XEN) AMD-Vi: IO_PAGE_FAULT: domain = 0, device id = 0xa1, fault address = 0xbf695000, flags = 0x10
+  (XEN) AMD-Vi: IO_PAGE_FAULT: domain = 0, device id = 0xa1, fault address = 0xbf695040, flags = 0x10
+  (XEN) AMD-Vi: IO_PAGE_FAULT: domain = 0, device id = 0xa1, fault address = 0xfffffff0, flags = 0x30
+  (XEN) AMD-Vi: IO_PAGE_FAULT: domain = 0, device id = 0xa1, fault address = 0x100000000, flags = 0x30
+  (XEN) AMD-Vi: IO_PAGE_FAULT: domain = 0, device id = 0xa1, fault address = 0x100000040, flags = 0x30
+
+After:
+  (XEN) AMD-Vi: IO_PAGE_FAULT: 0000:00:14.1 d0 addr 00000000bf5fc000 flags 0x10 PR
+  (XEN) AMD-Vi: IO_PAGE_FAULT: 0000:00:14.1 d0 addr 00000000bf5fc040 flags 0x10 PR
+  (XEN) AMD-Vi: IO_PAGE_FAULT: 0000:00:14.1 d0 addr 00000000fffffff0 flags 0x30 RW PR
+  (XEN) AMD-Vi: IO_PAGE_FAULT: 0000:00:14.1 d0 addr 0000000100000000 flags 0x30 RW PR
+  (XEN) AMD-Vi: IO_PAGE_FAULT: 0000:00:14.1 d0 addr 0000000100000040 flags 0x30 RW PR
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 680d18763aef6a0b9cb90dcff8e59a6a91fbfb77)
+
+diff --git a/xen/drivers/passthrough/amd/iommu_init.c b/xen/drivers/passthrough/amd/iommu_init.c
+index 2209eba06666..7a41010d09e1 100644
+--- a/xen/drivers/passthrough/amd/iommu_init.c
++++ b/xen/drivers/passthrough/amd/iommu_init.c
+@@ -513,10 +513,7 @@ static hw_irq_controller iommu_x2apic_type = {
+ 
+ static void parse_event_log_entry(struct amd_iommu *iommu, u32 entry[])
+ {
+-    u16 domain_id, device_id, flags;
+-    unsigned int bdf;
+     u32 code;
+-    u64 *addr;
+     int count = 0;
+     static const char *const event_str[] = {
+ #define EVENT_STR(name) [IOMMU_EVENT_##name - 1] = #name
+@@ -555,18 +552,26 @@ static void parse_event_log_entry(struct amd_iommu *iommu, u32 entry[])
+ 
+     if ( code == IOMMU_EVENT_IO_PAGE_FAULT )
+     {
+-        device_id = iommu_get_devid_from_event(entry[0]);
+-        domain_id = get_field_from_reg_u32(entry[1],
+-                                           IOMMU_EVENT_DOMAIN_ID_MASK,
+-                                           IOMMU_EVENT_DOMAIN_ID_SHIFT);
+-        flags = get_field_from_reg_u32(entry[1],
+-                                       IOMMU_EVENT_FLAGS_MASK,
+-                                       IOMMU_EVENT_FLAGS_SHIFT);
+-        addr= (u64*) (entry + 2);
+-        printk(XENLOG_ERR "AMD-Vi: "
+-               "%s: domain = %d, device id = %#x, "
+-               "fault address = %#"PRIx64", flags = %#x\n",
+-               event_str[code-1], domain_id, device_id, *addr, flags);
++        unsigned int bdf;
++        unsigned int device_id = MASK_EXTR(entry[0], IOMMU_EVENT_DEVICE_ID_MASK);
++        unsigned int domain_id = MASK_EXTR(entry[1], IOMMU_EVENT_DOMAIN_ID_MASK);
++        unsigned int flags = MASK_EXTR(entry[1], IOMMU_EVENT_FLAGS_MASK);
++        uint64_t addr = *(uint64_t *)(entry + 2);
++
++        printk(XENLOG_ERR "AMD-Vi: %s: %04x:%02x:%02x.%u d%d addr %016"PRIx64
++               " flags %#x%s%s%s%s%s%s%s%s%s%s\n",
++               event_str[code - 1], iommu->seg, PCI_BUS(device_id),
++               PCI_SLOT(device_id), PCI_FUNC(device_id), domain_id, addr, flags,
++               (flags & 0xe00) ? " ??" : "",
++               (flags & 0x100) ? " TR" : "",
++               (flags & 0x080) ? " RZ" : "",
++               (flags & 0x040) ? " PE" : "",
++               (flags & 0x020) ? " RW" : "",
++               (flags & 0x010) ? " PR" : "",
++               (flags & 0x008) ? " I" : "",
++               (flags & 0x004) ? " US" : "",
++               (flags & 0x002) ? " NX" : "",
++               (flags & 0x001) ? " GN" : "");
+ 
+         for ( bdf = 0; bdf < ivrs_bdf_entries; bdf++ )
+             if ( get_dma_requestor_id(iommu->seg, bdf) == device_id )
+diff --git a/xen/include/asm-x86/hvm/svm/amd-iommu-proto.h b/xen/include/asm-x86/hvm/svm/amd-iommu-proto.h
+index 39832935408b..22bd6a9c277e 100644
+--- a/xen/include/asm-x86/hvm/svm/amd-iommu-proto.h
++++ b/xen/include/asm-x86/hvm/svm/amd-iommu-proto.h
+@@ -287,9 +287,6 @@ static inline uint32_t iommu_get_addr_hi_from_cmd(uint32_t cmd)
+                                   IOMMU_CMD_ADDR_HIGH_SHIFT);
+ }
+ 
+-/* access address field from event log entry */
+-#define iommu_get_devid_from_event          iommu_get_devid_from_cmd
+-
+ /* access iommu base addresses field from mmio regs */
+ static inline void iommu_set_addr_lo_to_reg(uint32_t *reg, uint32_t addr)
+ {
