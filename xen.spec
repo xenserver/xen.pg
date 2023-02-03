@@ -1,28 +1,45 @@
 # -*- rpm-spec -*-
 
+# Commitish for Source0, required by tooling.
+%global package_srccommit RELEASE-4.13.4
+
+# Hypervisor release.  Should match the tag in the repository and would be in
+# the Release field if it weren't for the %%{xsrel} automagic.
+%global hv_rel 9.29
+
+# Full hash from the HEAD commit of this repo during processing, usually
+# provided by the environment.  Default to ??? if not set.
+%{!?package_speccommit: %global package_speccommit ???}
+
+# Normally derived from the tag and provided by the environment.  May be a
+# `git describe` when not building an from a tagged changeset.
+%{!?xsrel: %global xsrel %{hv_rel}}
+
 %define with_sysv 0
 %define with_systemd 1
 
 # Use the production hypervisor by default
 %define default_debug_hypervisor 0
 
-%define COMMON_OPTIONS DESTDIR=%{buildroot} %{?_smp_mflags}
-%define HVSOR_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64
-%define TOOLS_OPTIONS %{COMMON_OPTIONS} XEN_TARGET_ARCH=x86_64 debug=n
-
-%define base_cset RELEASE-%{version}
 %define base_dir  %{name}-%{version}
+
+%define lp_devel_dir %{_usrsrc}/xen-%{version}-%{release}
+
+# Prevent RPM adding Provides/Requires to lp-devel package
+%global __provides_exclude_from ^%{lp_devel_dir}/.*$
+%global __requires_exclude_from ^%{lp_devel_dir}/.*$
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.13.4
-Release: 9.29
+Release: %{?xsrel}%{?dist}
 License: GPLv2 and LGPLv2 and MIT and Public Domain
 URL:     http://www.xenproject.org
-Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{base_cset}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
+Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{package_srccommit}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
+Source5: gen_test_metadata.py
 
 ExclusiveArch: x86_64
 
@@ -86,7 +103,6 @@ Xen Hypervisor.
 %package hypervisor
 Summary: The Xen Hypervisor
 License: GPLv2
-Group: System/Hypervisor
 Requires(post): coreutils grep
 %description hypervisor
 This package contains the Xen Project Hypervisor with selected patches provided by Citrix.
@@ -94,7 +110,6 @@ This package contains the Xen Project Hypervisor with selected patches provided 
 %package hypervisor-debuginfo
 Summary: The Xen Hypervisor debug information
 License: GPLv2
-Group: Development/Debug
 %description hypervisor-debuginfo
 This package contains the Xen Hypervisor debug information.
 
@@ -102,21 +117,18 @@ This package contains the Xen Hypervisor debug information.
 Summary: Xen Hypervisor general tools
 License: GPLv2 and LGPLv2
 Requires: xen-libs = %{version}
-Group: System/Base
 %description tools
 This package contains the Xen Hypervisor general tools for all domains.
 
 %package devel
 Summary: The Xen Hypervisor public headers
 License: MIT and Public Domain
-Group: Development/Libraries
 %description devel
 This package contains the Xen Hypervisor public header files.
 
 %package libs
 Summary: Xen Hypervisor general libraries
 License: LGPLv2
-Group: System/Libraries
 %description libs
 This package contains the Xen Hypervisor general libraries for all domains.
 
@@ -125,7 +137,6 @@ Summary: Xen Hypervisor general development libraries
 License: LGPLv2
 Requires: xen-libs = %{version}
 Requires: xen-devel = %{version}
-Group: Development/Libraries
 %description libs-devel
 This package contains the Xen Hypervisor general development for all domains.
 
@@ -141,7 +152,6 @@ Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
 %endif
-Group: System/Base
 %description dom0-tools
 This package contains the Xen Hypervisor control domain tools.
 
@@ -149,7 +159,6 @@ This package contains the Xen Hypervisor control domain tools.
 Summary: Xen Hypervisor Domain 0 libraries
 License: GPLv2 and LGPLv2 and MIT
 Requires: xen-hypervisor = %{version}
-Group: System/Libraries
 %description dom0-libs
 This package contains the Xen Hypervisor control domain libraries.
 
@@ -158,10 +167,6 @@ Summary: Xen Hypervisor Domain 0 headers
 License: GPLv2 and LGPLv2 and MIT
 Requires: xen-devel = %{version}
 Requires: xen-dom0-libs = %{version}
-
-# Temp until the build dependencies are properly propagated
-Provides: xen-dom0-devel = %{version}
-Group: Development/Libraries
 %description dom0-libs-devel
 This package contains the Xen Hypervisor control domain headers.
 
@@ -169,7 +174,6 @@ This package contains the Xen Hypervisor control domain headers.
 Summary: Xen Hypervisor ocaml libraries
 License: LGPLv2
 Requires: xen-dom0-libs = %{version}
-Group: System/Libraries
 %description ocaml-libs
 This package contains the Xen Hypervisor ocaml libraries.
 
@@ -178,14 +182,12 @@ Summary: Xen Hypervisor ocaml headers
 License: LGPLv2
 Requires: xen-ocaml-libs = %{version}
 Requires: xen-dom0-libs-devel = %{version}
-Group: Development/Libraries
 %description ocaml-devel
 This package contains the Xen Hypervisor ocaml headers.
 
 %package installer-files
 Summary: Xen files for the XenServer installer
 License: LGPLv2
-Group: System Environment/Base
 %description installer-files
 This package contains the minimal subset of libraries and binaries required in
 the XenServer installer environment.
@@ -193,9 +195,15 @@ the XenServer installer environment.
 %package dom0-tests
 Summary: Xen Hypervisor tests
 License: GPLv2
-Group: System/Libraries
 %description dom0-tests
 This package contains test cases for the Xen Hypervisor.
+
+%package lp-devel_%{version}_%{xsrel}
+License: GPLv2
+Summary: Development package for building livepatches
+%description lp-devel_%{version}_%{xsrel}
+Contains the prepared source files, config, and xen-syms for building live
+patches against base version %{version}-%{xsrel}.
 
 %prep
 %autosetup -p1
@@ -204,10 +212,12 @@ This package contains test cases for the Xen Hypervisor.
 %{?_cov_make_model:%{_cov_make_model misc/coverity/model.c}}
 
 base_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info)
-pq_cset=$(sed -ne 's/Changeset: \(.*\)/\1/p' < .gitarchive-info-pq)
+pq_cset="%{package_speccommit}"
 echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
 
 %build
+
+export XEN_TARGET_ARCH=%{_arch}
 
 %configure --disable-qemu-traditional \
            --disable-seabios \
@@ -221,70 +231,90 @@ echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
            --with-system-ipxe=/usr/share/ipxe/ipxe.bin \
            --with-system-ovmf=/usr/share/edk2/OVMF.fd
 
+# Take a snapshot of the configured source tree for livepatches
+mkdir ../livepatch-src
+cp -a . ../livepatch-src/
+
+# Build tools and man pages
+%{?_cov_wrap} %{make_build} build-tools
+%{make_build} -C docs man-pages
+
+# The hypervisor build system can't cope with RPM's {C,LD}FLAGS
+unset CFLAGS
+unset LDFLAGS
+
+build_xen () { # $1=vendorversion $2=buildconfig $3=outdir $4=cov
+    local mk ver cov
+
+    [ -n "$1" ] && ver="XEN_VENDORVERSION=$1"
+    [ -n "$4" ] && cov="%{?_cov_wrap}"
+
+    mk="$cov %{make_build} -C xen $ver"
+
+    cp -a buildconfigs/$2 xen/.config
+    $mk olddefconfig
+    $mk build
+    $mk MAP
+
+    mkdir -p xen/$3
+    cp -a xen/xen xen/xen.gz xen/System.map xen/xen-syms xen/.config xen/$3
+}
+
+# Builds of Xen
+build_xen -%{hv_rel}   config-release         build-xen-release
+
+%{make_build} -C xen clean
+build_xen -%{hv_rel}-d config-debug           build-xen-debug      cov
+
+%{make_build} -C xen clean
+build_xen ""           config-pvshim-release  build-shim-release
+
+%{make_build} -C xen clean
+build_xen ""           config-pvshim-debug    build-shim-debug
+
+
 %install
+
+export XEN_TARGET_ARCH=%{_arch}
 
 # The existence of this directory causes ocamlfind to put things in it
 mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 
-mkdir -p %{buildroot}/boot/
+# Install tools and man pages
+%{make_build} DESTDIR=%{buildroot} install-tools
+%{make_build} DESTDIR=%{buildroot} -C docs install-man-pages
 
-# Regular build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
-    KCONFIG_CONFIG=../buildconfigs/config-release olddefconfig
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
-    KCONFIG_CONFIG=../buildconfigs/config-release build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release} \
-    KCONFIG_CONFIG=../buildconfigs/config-release MAP
+# Install artefacts for livepatches
+%{__install} -p -D -m 644 xen/build-xen-release/xen-syms %{buildroot}%{lp_devel_dir}/xen-syms
+cp -a ../livepatch-src/. %{buildroot}%{lp_devel_dir}
 
-cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}.gz
-cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{release}.map
-cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{release}
-cp buildconfigs/config-release %{buildroot}/boot/%{name}-%{version}-%{release}.config
+# Install release & debug Xen
+install_xen () { # $1=vendorversion $2=outdir
+    %{__install} -p -D -m 644 xen/$2/xen.gz     %{buildroot}/boot/xen-%{version}$1.gz
+    %{__install} -p -D -m 644 xen/$2/System.map %{buildroot}/boot/xen-%{version}$1.map
+    %{__install} -p -D -m 644 xen/$2/.config    %{buildroot}/boot/xen-%{version}$1.config
+    %{__install} -p -D -m 644 xen/$2/xen-syms   %{buildroot}/boot/xen-syms-%{version}$1
+}
+install_xen -%{hv_rel}   build-xen-release
+install_xen -%{hv_rel}-d build-xen-debug
 
-# Debug build of Xen
-%{__make} %{HVSOR_OPTIONS} -C xen clean
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
-    KCONFIG_CONFIG=../buildconfigs/config-debug olddefconfig
-%{?_cov_wrap} %{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
-    KCONFIG_CONFIG=../buildconfigs/config-debug build
-%{__make} %{HVSOR_OPTIONS} -C xen XEN_VENDORVERSION=-%{release}-d \
-    KCONFIG_CONFIG=../buildconfigs/config-debug MAP
-
-cp xen/xen.gz %{buildroot}/boot/%{name}-%{version}-%{release}-d.gz
-cp xen/System.map %{buildroot}/boot/%{name}-%{version}-%{release}-d.map
-cp xen/xen-syms %{buildroot}/boot/%{name}-syms-%{version}-%{release}-d
-cp buildconfigs/config-debug %{buildroot}/boot/%{name}-%{version}-%{release}-d.config
-
-# do not strip the hypervisor-debuginfo targerts
-chmod -x %{buildroot}/boot/xen-syms-*
-
-# Regular build of PV shim
-cp buildconfigs/config-pvshim-release xen/arch/x86/configs/pvshim_defconfig
-%{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir xen-shim
-%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim \
-    %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim-release
-%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim-syms \
-    %{buildroot}/usr/lib/debug/%{_libexecdir}/%{name}/boot/xen-shim-syms-release
-
-# Debug build of PV shim
-%{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir clean
-cp buildconfigs/config-pvshim-debug xen/arch/x86/configs/pvshim_defconfig
-%{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} -C tools/firmware/xen-dir xen-shim
-%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim \
-    %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim-debug
-%{__install} -D -m 644 tools/firmware/xen-dir/xen-shim-syms \
-    %{buildroot}/usr/lib/debug/%{_libexecdir}/%{name}/boot/xen-shim-syms-debug
+# Install release & debug shims
+install_shim () { # $1=outdir $2=suffix
+    %{__install} -p -D -m 644 xen/$1/xen      %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim-$2
+    %{__install} -p -D -m 644 xen/$1/xen-syms %{buildroot}/usr/lib/debug%{_libexecdir}/%{name}/boot/xen-shim-syms-$2
+}
+install_shim build-shim-release release
+install_shim build-shim-debug   debug
 
 # choose between debug and release PV shim build
 %if %{default_debug_hypervisor}
-ln -sf xen-shim-debug %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
+ln -sf xen-shim-debug %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %else
-ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
+ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %endif
 
-# Build tools and man pages
-%{?_cov_wrap} %{__make} %{TOOLS_OPTIONS} install-tools
-%{__make} %{TOOLS_OPTIONS} -C docs install-man-pages
+# Build test case metadata
+%{__python} %{SOURCE5} -i %{buildroot}%{_libexecdir}/%{name} -o %{buildroot}%{_datadir}/xen-dom0-tests-metadata.json
 
 %{__install} -D -m 644 %{SOURCE1} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
 %{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/xen/xl.conf
@@ -292,19 +322,19 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{?_cov_install}
 
 %files hypervisor
-/boot/%{name}-%{version}-%{release}.gz
-/boot/%{name}-%{version}-%{release}.map
-/boot/%{name}-%{version}-%{release}.config
-/boot/%{name}-%{version}-%{release}-d.gz
-/boot/%{name}-%{version}-%{release}-d.map
-/boot/%{name}-%{version}-%{release}-d.config
+/boot/%{name}-%{version}-%{hv_rel}.gz
+/boot/%{name}-%{version}-%{hv_rel}.map
+/boot/%{name}-%{version}-%{hv_rel}.config
+/boot/%{name}-%{version}-%{hv_rel}-d.gz
+/boot/%{name}-%{version}-%{hv_rel}-d.map
+/boot/%{name}-%{version}-%{hv_rel}-d.config
 %config %{_sysconfdir}/sysconfig/kernel-xen
 %license COPYING
 %ghost %attr(0644,root,root) %{_sysconfdir}/sysconfig/kernel-xen-args
 
 %files hypervisor-debuginfo
-/boot/%{name}-syms-%{version}-%{release}
-/boot/%{name}-syms-%{version}-%{release}-d
+/boot/%{name}-syms-%{version}-%{hv_rel}
+/boot/%{name}-syms-%{version}-%{hv_rel}-d
 
 %files tools
 %{_bindir}/xenstore
@@ -775,33 +805,37 @@ ln -sf xen-shim-release %{buildroot}/%{_libexecdir}/%{name}/boot/xen-shim
 %{py_sitearch}/xen/lowlevel/xc.so
 
 %files dom0-tests
-%{_libexecdir}/%{name}/bin/depriv-fd-checker
+%exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker
 %{_libexecdir}/%{name}/bin/test-cpu-policy
 %{_libexecdir}/%{name}/bin/test-xenstore
+%{_datadir}/xen-dom0-tests-metadata.json
+
+%files lp-devel_%{version}_%{xsrel}
+%{lp_devel_dir}
 
 %doc
 
 %post hypervisor
 # Update the debug and release symlinks
-ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen-debug.gz
-ln -sf %{name}-%{version}-%{release}.gz /boot/xen-release.gz
+ln -sf %{name}-%{version}-%{hv_rel}-d.gz /boot/xen-debug.gz
+ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen-release.gz
 
 # Point /boot/xen.gz appropriately
 if [ ! -e /boot/xen.gz ]; then
 %if %{default_debug_hypervisor}
     # Use a debug hypervisor by default
-    ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen.gz
+    ln -sf %{name}-%{version}-%{hv_rel}-d.gz /boot/xen.gz
 %else
     # Use a production hypervisor by default
-    ln -sf %{name}-%{version}-%{release}.gz /boot/xen.gz
+    ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
 %endif
 else
     # Else look at the current link, and whether it is debug
     path="`readlink -f /boot/xen.gz`"
     if [ ${path} != ${path%%-d.gz} ]; then
-        ln -sf %{name}-%{version}-%{release}-d.gz /boot/xen.gz
+        ln -sf %{name}-%{version}-%{hv_rel}-d.gz /boot/xen.gz
     else
-        ln -sf %{name}-%{version}-%{release}.gz /boot/xen.gz
+        ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
     fi
 fi
 
@@ -810,7 +844,7 @@ if [ -e %{_sysconfdir}/sysconfig/kernel ] && ! grep -q '^HYPERVISOR' %{_sysconfd
 fi
 
 mkdir -p %{_rundir}/reboot-required.d/%{name}
-touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
+touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 
 %if %with_systemd
 %post dom0-tools
