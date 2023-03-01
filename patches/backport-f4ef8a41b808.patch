@@ -1,0 +1,79 @@
+From f4ef8a41b80831db2136bdaff9f946a1a4b051e7 Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Tue, 21 Feb 2023 15:08:05 +0100
+Subject: x86/ucode/AMD: apply the patch early on every logical thread
+
+The original issue has been reported on AMD Bulldozer-based CPUs where
+ucode loading loses the LWP feature bit in order to gain the IBPB bit.
+LWP disabling is per-SMT/CMT core modification and needs to happen on
+each sibling thread despite the shared microcode engine. Otherwise,
+logical CPUs will end up with different cpuid capabilities.
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=216211
+
+Guests running under Xen happen to be not affected because of levelling
+logic for the feature masking/override MSRs which causes the LWP bit to
+fall out and hides the issue. The latest recommendation from AMD, after
+discussing this bug, is to load ucode on every logical CPU.
+
+In Linux kernel this issue has been addressed by e7ad18d1169c
+("x86/microcode/AMD: Apply the patch early on every logical thread").
+Follow the same approach in Xen.
+
+Introduce SAME_UCODE match result and use it for early AMD ucode
+loading.
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/microcode_amd.c b/xen/arch/x86/microcode_amd.c
+index 67c8a54cac..b0d99e97e3 100644
+--- a/xen/arch/x86/microcode_amd.c
++++ b/xen/arch/x86/microcode_amd.c
+@@ -177,11 +177,16 @@ static enum microcode_match_result microcode_fits(
+         return MIS_UCODE;
+     }
+ 
+-    if ( mc_header->patch_id <= sig->rev )
++    if ( mc_header->patch_id < sig->rev )
+     {
+-        pr_debug("microcode: patch is already at required level or greater.\n");
++        pr_debug("microcode: patch is already at a greater level.\n");
+         return OLD_UCODE;
+     }
++    else if ( mc_header->patch_id == sig->rev )
++    {
++        pr_debug("microcode: patch is at the same level.\n");
++        return SAME_UCODE;
++    }
+ 
+     pr_debug("microcode: CPU%d found a matching microcode update with version %#x (current=%#x)\n",
+              cpu, mc_header->patch_id, sig->rev);
+@@ -191,7 +196,13 @@ static enum microcode_match_result microcode_fits(
+ 
+ static bool match_cpu(const struct microcode_patch *patch)
+ {
+-    return patch && (microcode_fits(patch->mc_amd) == NEW_UCODE);
++    enum microcode_match_result res = microcode_fits(patch->mc_amd);
++
++    /*
++     * Allow application of the same revision to pick up SMT-specific changes
++     * even if the revision of the other SMT thread is already up-to-date.
++     */
++    return patch && (res == NEW_UCODE || res == SAME_UCODE);
+ }
+ 
+ static void free_patch(void *mc)
+diff --git a/xen/include/asm-x86/microcode.h b/xen/include/asm-x86/microcode.h
+index e1350bdc63..80820193f2 100644
+--- a/xen/include/asm-x86/microcode.h
++++ b/xen/include/asm-x86/microcode.h
+@@ -4,7 +4,8 @@
+ #include <xen/percpu.h>
+ 
+ enum microcode_match_result {
+-    OLD_UCODE, /* signature matched, but revision id is older or equal */
++    OLD_UCODE, /* signature matched, but revision id is older */
++    SAME_UCODE, /* signature matched, but revision id is the same */
+     NEW_UCODE, /* signature matched, but revision id is newer */
+     MIS_UCODE, /* signature mismatched */
+ };
