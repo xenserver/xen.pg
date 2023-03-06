@@ -1,0 +1,170 @@
+From 93527bc2a813588f111bdaeff280dd972dd1d3a0 Mon Sep 17 00:00:00 2001
+From: Sergey Dyasli <sergey.dyasli@citrix.com>
+Date: Thu, 2 Mar 2023 19:54:37 +0000
+Subject: [PATCH] Add PV-IOMMU elf note
+
+Add XS_ELFNOTE_PV_IOMMU which Dom0 kernel will set if it knows how
+to handle PV-IOMMU.  Introduce xs_elf_notes for XenServer-specific
+ELF notes in order not to modify the upstream ABI.
+
+Add IOMMU_FEAT_XS_PV_IOMMU to let pv-iommu layer to know about the
+presence of the new ELF note.
+
+Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+diff --git a/xen/arch/x86/pv/dom0_build.c b/xen/arch/x86/pv/dom0_build.c
+index 9a97cf4abf..68cb0a6083 100644
+--- a/xen/arch/x86/pv/dom0_build.c
++++ b/xen/arch/x86/pv/dom0_build.c
+@@ -896,7 +896,11 @@ int __init dom0_construct_pv(struct domain *d,
+     BUG_ON(rc != 0);
+ 
+     if ( d->domain_id == hardware_domid )
++    {
++        if ( parms.xs_elf_notes[XS_ELFNOTE_PV_IOMMU].data.num != 0 )
++            iommu_set_feature(d, IOMMU_FEAT_XS_PV_IOMMU);
+         iommu_hwdom_init(d);
++    }
+ 
+     /* Activate shadow mode, if requested.  Reuse the pv_l1tf tasklet. */
+ #ifdef CONFIG_SHADOW_PAGING
+diff --git a/xen/common/libelf/libelf-dominfo.c b/xen/common/libelf/libelf-dominfo.c
+index 508f08db42..f71b764e8f 100644
+--- a/xen/common/libelf/libelf-dominfo.c
++++ b/xen/common/libelf/libelf-dominfo.c
+@@ -220,6 +220,53 @@ elf_errorstatus elf_xen_parse_note(struct elf_binary *elf,
+     return 0;
+ }
+ 
++/* mostly copy-paste of elf_xen_parse_note() */
++elf_errorstatus elf_xs_parse_note(struct elf_binary *elf,
++                       struct elf_dom_parms *parms,
++                       ELF_HANDLE_DECL(elf_note) note)
++{
++/* *INDENT-OFF* */
++    static const struct {
++        char *name;
++        bool str;
++    } note_desc[] = {
++        [XS_ELFNOTE_PV_IOMMU] = { "XS_PV_IOMMU", 0},
++    };
++/* *INDENT-ON* */
++
++    const char *str = NULL;
++    uint64_t val = 0;
++    unsigned type = elf_uval(elf, note, type);
++
++    if ( (type >= sizeof(note_desc) / sizeof(note_desc[0])) ||
++         (note_desc[type].name == NULL) )
++    {
++        elf_msg(elf, "XS ELF: note: unknown (%#x)\n", type);
++        return 0;
++    }
++
++    if ( note_desc[type].str )
++    {
++        str = elf_strval(elf, elf_note_desc(elf, note));
++        if (str == NULL)
++            /* elf_strval will mark elf broken if it fails so no need to log */
++            return 0;
++        elf_msg(elf, "XS ELF: note: %s = \"%s\"\n", note_desc[type].name, str);
++        parms->xs_elf_notes[type].type = XEN_ENT_STR;
++        parms->xs_elf_notes[type].data.str = str;
++    }
++    else
++    {
++        val = elf_note_numeric(elf, note);
++        elf_msg(elf, "XS ELF: note: %s = %#" PRIx64 "\n", note_desc[type].name, val);
++        parms->xs_elf_notes[type].type = XEN_ENT_LONG;
++        parms->xs_elf_notes[type].data.num = val;
++    }
++    parms->xs_elf_notes[type].name = note_desc[type].name;
++
++    return 0;
++}
++
+ #define ELF_NOTE_INVALID (~0U)
+ 
+ static unsigned elf_xen_parse_notes(struct elf_binary *elf,
+@@ -251,6 +298,11 @@ static unsigned elf_xen_parse_notes(struct elf_binary *elf,
+         note_name = elf_note_name(elf, note);
+         if ( note_name == NULL )
+             continue;
++        if ( !strcmp(note_name, "XS") )
++        {
++            elf_xs_parse_note(elf, parms, note);
++            continue;
++        }
+         if ( strcmp(note_name, "Xen") )
+             continue;
+         if ( elf_xen_parse_note(elf, parms, note) )
+diff --git a/xen/common/pv_iommu.c b/xen/common/pv_iommu.c
+index ec9403fda8..65d72af6e1 100644
+--- a/xen/common/pv_iommu.c
++++ b/xen/common/pv_iommu.c
+@@ -91,6 +91,9 @@ int can_use_iommu_check(struct domain *d)
+     if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
+         return 0;
+ 
++    if ( !iommu_has_feature(d, IOMMU_FEAT_XS_PV_IOMMU) )
++        return 0;
++
+     return 1;
+ }
+ 
+diff --git a/xen/include/public/elfnote.h b/xen/include/public/elfnote.h
+index 181cbc4ec7..f8a78e182f 100644
+--- a/xen/include/public/elfnote.h
++++ b/xen/include/public/elfnote.h
+@@ -270,6 +270,18 @@
+  */
+ #define XEN_ELFNOTE_DUMPCORE_FORMAT_VERSION     0x2000003
+ 
++
++/* XenServer specific ELF notes */
++
++/*
++ * If this note is present, Dom0 can use PV-IOMMU.
++ * Xen should initialise PV-IOMMU only if Dom0 supports it. Otherwise it leads
++ * to DMA errors.
++ */
++#define XS_ELFNOTE_PV_IOMMU               0
++
++#define XS_ELFNOTE_MAX XS_ELFNOTE_PV_IOMMU
++
+ #endif /* __XEN_PUBLIC_ELFNOTE_H__ */
+ 
+ /*
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index 80ddbc1e27..e6d8d1920e 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -145,6 +145,7 @@ int __must_check iommu_iotlb_flush_all(struct domain *d,
+ enum iommu_feature
+ {
+     IOMMU_FEAT_COHERENT_WALK,
++    IOMMU_FEAT_XS_PV_IOMMU,
+     IOMMU_FEAT_count
+ };
+ 
+diff --git a/xen/include/xen/libelf.h b/xen/include/xen/libelf.h
+index b73998150f..7aace154d4 100644
+--- a/xen/include/xen/libelf.h
++++ b/xen/include/xen/libelf.h
+@@ -412,6 +412,7 @@ struct elf_dom_parms {
+     elf_ptrval elf_note_start;
+     elf_ptrval elf_note_end;
+     struct xen_elfnote elf_notes[XEN_ELFNOTE_MAX + 1];
++    struct xen_elfnote xs_elf_notes[XS_ELFNOTE_MAX + 1];
+ 
+     /* parsed */
+     char guest_os[16];
+@@ -451,6 +452,9 @@ int elf_xen_parse_features(const char *features,
+ int elf_xen_parse_note(struct elf_binary *elf,
+                        struct elf_dom_parms *parms,
+                        ELF_HANDLE_DECL(elf_note) note);
++int elf_xs_parse_note(struct elf_binary *elf,
++                       struct elf_dom_parms *parms,
++                       ELF_HANDLE_DECL(elf_note) note);
+ int elf_xen_parse_guest_info(struct elf_binary *elf,
+                              struct elf_dom_parms *parms);
+ int elf_xen_parse(struct elf_binary *elf,
