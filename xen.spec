@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.41
+%global hv_rel 10.42
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -885,6 +885,15 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Mar 6 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.42
+- Fixes for
+  - XSA-427 CVE-2022-42332
+  - XSA-428 CVE-2022-42333 CVE-2022-42334
+  - XSA-429 CVE-2022-42331
+- Move partial python library from xen-tools to xen-dom0-tools.  The content
+  was all specific to dom0, and ineligible to be used elsewhere.
+- Reintroduce the python2 pygrub/libfsimage bindings.
+
 * Fri Mar 3 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.41
 - Load AMD microcode on all logical processors.
 - Switch to using Python 3.  Retain Python 2 builds of xen.lowlevel in the
