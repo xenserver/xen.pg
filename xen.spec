@@ -355,14 +355,6 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{_bindir}/xenstore-rm
 %{_bindir}/xenstore-watch
 %{_bindir}/xenstore-write
-%{py_sitearch}/%{name}/__init__.py*
-%{py_sitearch}/%{name}/__pycache__/
-%{py_sitearch}/%{name}/lowlevel/__init__.py*
-%{py_sitearch}/%{name}/lowlevel/__pycache__/
-%{py_sitearch}/%{name}/lowlevel/xs*.so
-%{python2_sitearch}/%{name}/__init__.py*
-%{python2_sitearch}/%{name}/lowlevel/__init__.py*
-%{python2_sitearch}/%{name}/lowlevel/xs.so
 
 %files devel
 %{_includedir}/%{name}/COPYING
@@ -563,9 +555,12 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{py_sitearch}/grub/__pycache__/
 %{py_sitearch}/pygrub-*.egg-info
 %{py_sitearch}/xen-*.egg-info
-#{py_sitearch}/xen/__init__.py*           - Must not duplicate xen-tools
-#{py_sitearch}/xen/lowlevel/__init__.py*  - Must not duplicate xen-tools
+%{py_sitearch}/xen/__init__.py*
+%{py_sitearch}/xen/__pycache__/
+%{py_sitearch}/xen/lowlevel/__init__.py*
+%{py_sitearch}/xen/lowlevel/__pycache__/
 %{py_sitearch}/xen/lowlevel/xc*.so
+%{py_sitearch}/xen/lowlevel/xs*.so
 %{py_sitearch}/xen/migration/__init__.py*
 %{py_sitearch}/xen/migration/__pycache__/
 %{py_sitearch}/xen/migration/legacy.py*
@@ -576,7 +571,10 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{py_sitearch}/xen/migration/verify.py*
 %{py_sitearch}/xen/migration/xl.py*
 %{python2_sitearch}/xen-*.egg-info
+%{python2_sitearch}/xen/__init__.py*
+%{python2_sitearch}/xen/lowlevel/__init__.py*
 %{python2_sitearch}/xen/lowlevel/xc*.so
+%{python2_sitearch}/xen/lowlevel/xs.so
 %{python2_sitearch}/xen/migration/*.py*
 
 %{_libexecdir}/%{name}/bin/convert-legacy-stream
