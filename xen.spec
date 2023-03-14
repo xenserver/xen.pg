@@ -547,35 +547,17 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{_bindir}/xencons
 %{_bindir}/xencov_split
 %{_bindir}/xentrace_format
-%{py_sitearch}/xenfsimage*.so
-%{py_sitearch}/grub/ExtLinuxConf.py*
-%{py_sitearch}/grub/GrubConf.py*
-%{py_sitearch}/grub/LiloConf.py*
-%{py_sitearch}/grub/__init__.py*
-%{py_sitearch}/grub/__pycache__/
-%{py_sitearch}/pygrub-*.egg-info
-%{py_sitearch}/xen-*.egg-info
-%{py_sitearch}/xen/__init__.py*
-%{py_sitearch}/xen/__pycache__/
-%{py_sitearch}/xen/lowlevel/__init__.py*
-%{py_sitearch}/xen/lowlevel/__pycache__/
-%{py_sitearch}/xen/lowlevel/xc*.so
-%{py_sitearch}/xen/lowlevel/xs*.so
-%{py_sitearch}/xen/migration/__init__.py*
-%{py_sitearch}/xen/migration/__pycache__/
-%{py_sitearch}/xen/migration/legacy.py*
-%{py_sitearch}/xen/migration/libxc.py*
-%{py_sitearch}/xen/migration/libxl.py*
-%{py_sitearch}/xen/migration/public.py*
-%{py_sitearch}/xen/migration/tests.py*
-%{py_sitearch}/xen/migration/verify.py*
-%{py_sitearch}/xen/migration/xl.py*
-%{python2_sitearch}/xen-*.egg-info
-%{python2_sitearch}/xen/__init__.py*
-%{python2_sitearch}/xen/lowlevel/__init__.py*
-%{python2_sitearch}/xen/lowlevel/xc*.so
-%{python2_sitearch}/xen/lowlevel/xs.so
-%{python2_sitearch}/xen/migration/*.py*
+
+# Pygrub python libs
+%{py_sitearch}/grub/
+%{py_sitearch}/xenfsimage.cpython*.so
+%{py_sitearch}/pygrub-0.6-py*.egg-info
+
+# Xen python libs
+%{py_sitearch}/xen-3.0-py*.egg-info
+%{py_sitearch}/xen/
+%{python2_sitearch}/xen-3.0-py*.egg-info
+%{python2_sitearch}/xen/
 
 %{_libexecdir}/%{name}/bin/convert-legacy-stream
 %{_libexecdir}/%{name}/bin/init-xenstore-domain
