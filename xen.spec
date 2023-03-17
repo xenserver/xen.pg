@@ -547,7 +547,7 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{_bindir}/xen-cpuid
 %{_bindir}/xen-detect
 %{_bindir}/xenalyze
-%{_bindir}/xencons
+%exclude %{_bindir}/xencons
 %{_bindir}/xencov_split
 %{_bindir}/xentrace_format
 
@@ -578,7 +578,7 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{_libexecdir}/%{name}/bin/xendomains
 %{_libexecdir}/%{name}/bin/xenguest
 %{_libexecdir}/%{name}/bin/xenpaging
-%{_libexecdir}/%{name}/bin/xenpvnetboot
+%exclude %{_libexecdir}/%{name}/bin/xenpvnetboot
 %{_libexecdir}/%{name}/boot/hvmloader
 %{_libexecdir}/%{name}/boot/xen-shim
 %{_libexecdir}/%{name}/boot/xen-shim-release
