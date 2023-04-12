@@ -183,13 +183,6 @@ Requires: xen-dom0-libs-devel = %{version}
 %description ocaml-devel
 This package contains the Xen Hypervisor ocaml headers.
 
-%package installer-files
-Summary: Xen files for the XenServer installer
-License: LGPLv2
-%description installer-files
-This package contains the minimal subset of libraries and binaries required in
-the XenServer installer environment.
-
 %package dom0-tests
 Summary: Xen Hypervisor tests
 License: GPLv2
@@ -799,20 +792,6 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{_libdir}/ocaml/xentoollog/xentoollog.cmi
 %{_libdir}/ocaml/xentoollog/xentoollog.cmx
 %{_libdir}/ocaml/xentoollog/xentoollog.cmxa
-
-%files installer-files
-%{_libdir}/libxenctrl.so.4.13
-%{_libdir}/libxenctrl.so.4.13.0
-%{_libdir}/libxenguest.so.4.13
-%{_libdir}/libxenguest.so.4.13.0
-%{py_sitearch}/xen/__init__.py*
-%{py_sitearch}/xen/__pycache__/
-%{py_sitearch}/xen/lowlevel/__init__.py*
-%{py_sitearch}/xen/lowlevel/__pycache__/
-%{py_sitearch}/xen/lowlevel/xc*.so
-%{python2_sitearch}/xen/__init__*.py*
-%{python2_sitearch}/xen/lowlevel/__init__*.py*
-%{python2_sitearch}/xen/lowlevel/xc.so
 
 %files dom0-tests
 %exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker
