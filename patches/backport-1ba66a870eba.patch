@@ -1,0 +1,209 @@
+From 1ba66a870eba43d52d3e5e7af1a055bf5b16b30d Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 10 Mar 2020 15:25:58 +0100
+Subject: AMD/IOMMU: without XT, x2APIC needs to be forced into physical mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The wider cluster mode APIC IDs aren't generally representable. Convert
+the iommu_intremap variable into a tristate, allowing the AMD IOMMU
+driver to signal this special restriction to the apic_x2apic_probe().
+(Note: assignments to the variable get adjusted, while existing
+consumers - all assuming a boolean property - are left alone.)
+
+While we are not aware of any hardware/firmware with this as a
+restriction, it is a situation which could be created on fully x2apic-
+capable systems via firmware settings.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+
+diff --git a/xen/arch/x86/genapic/x2apic.c b/xen/arch/x86/genapic/x2apic.c
+index 1cb16bc10d87..319e039a1cd8 100644
+--- a/xen/arch/x86/genapic/x2apic.c
++++ b/xen/arch/x86/genapic/x2apic.c
+@@ -235,12 +235,21 @@ const struct genapic *__init apic_x2apic_probe(void)
+         x2apic_phys = !iommu_intremap ||
+                       (acpi_gbl_FADT.flags & ACPI_FADT_APIC_PHYSICAL);
+     }
+-    else if ( !x2apic_phys && !iommu_intremap )
+-    {
+-        printk("WARNING: x2APIC cluster mode is not supported without interrupt remapping\n"
+-               "x2APIC: forcing phys mode\n");
+-        x2apic_phys = true;
+-    }
++    else if ( !x2apic_phys )
++        switch ( iommu_intremap )
++        {
++        case iommu_intremap_off:
++        case iommu_intremap_restricted:
++            printk("WARNING: x2APIC cluster mode is not supported %s interrupt remapping -"
++                   " forcing phys mode\n",
++                   iommu_intremap == iommu_intremap_off ? "without"
++                                                        : "with restricted");
++            x2apic_phys = true;
++            break;
++
++        case iommu_intremap_full:
++            break;
++        }
+ 
+     if ( x2apic_phys )
+         return &apic_x2apic_phys;
+diff --git a/xen/drivers/passthrough/amd/iommu_init.c b/xen/drivers/passthrough/amd/iommu_init.c
+index 43c4eadcd71e..01a5b3870e4d 100644
+--- a/xen/drivers/passthrough/amd/iommu_init.c
++++ b/xen/drivers/passthrough/amd/iommu_init.c
+@@ -1194,7 +1194,7 @@ static void __init amd_iommu_init_cleanup(void)
+ 
+     iommu_enabled = 0;
+     iommu_hwdom_passthrough = false;
+-    iommu_intremap = 0;
++    iommu_intremap = iommu_intremap_off;
+     iommuv2_enabled = 0;
+ }
+ 
+@@ -1468,6 +1468,9 @@ int __init amd_iommu_prepare(bool xt)
+         iommu->ctrl.int_cap_xt_en = xt && has_xt;
+     }
+ 
++    if ( iommu_intremap && !has_xt )
++        iommu_intremap = iommu_intremap_restricted;
++
+     rc = amd_iommu_update_ivrs_mapping_acpi();
+ 
+  error_out:
+diff --git a/xen/drivers/passthrough/amd/pci_amd_iommu.c b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+index e5c02ca71065..7dc07570012c 100644
+--- a/xen/drivers/passthrough/amd/pci_amd_iommu.c
++++ b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+@@ -276,7 +276,7 @@ int __init acpi_ivrs_init(void)
+ 
+     if ( (amd_iommu_detect_acpi() !=0) || (iommu_found() == 0) )
+     {
+-        iommu_intremap = 0;
++        iommu_intremap = iommu_intremap_off;
+         return -ENODEV;
+     }
+ 
+diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
+index 9aef696d90eb..a40fd994f6d8 100644
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -34,7 +34,7 @@ bool __read_mostly iommu_quarantine = true;
+ bool_t __read_mostly iommu_igfx = 1;
+ bool_t __read_mostly iommu_snoop = 1;
+ bool_t __read_mostly iommu_qinval = 1;
+-bool_t __read_mostly iommu_intremap = 1;
++enum iommu_intremap __read_mostly iommu_intremap = iommu_intremap_full;
+ bool_t __read_mostly iommu_crash_disable;
+ 
+ static bool __hwdom_initdata iommu_hwdom_none;
+@@ -90,7 +90,7 @@ static int __init parse_iommu_param(const char *s)
+         else if ( (val = parse_boolean("qinval", s, ss)) >= 0 )
+             iommu_qinval = val;
+         else if ( (val = parse_boolean("intremap", s, ss)) >= 0 )
+-            iommu_intremap = val;
++            iommu_intremap = val ? iommu_intremap_full : iommu_intremap_off;
+         else if ( (val = parse_boolean("intpost", s, ss)) >= 0 )
+             iommu_intpost = val;
+ #ifdef CONFIG_KEXEC
+@@ -481,7 +481,7 @@ int __init iommu_setup(void)
+         iommu_enabled = (rc == 0);
+     }
+     if ( !iommu_enabled )
+-        iommu_intremap = 0;
++        iommu_intremap = iommu_intremap_off;
+ 
+     if ( (force_iommu && !iommu_enabled) ||
+          (force_intremap && !iommu_intremap) )
+@@ -563,7 +563,8 @@ void iommu_crash_shutdown(void)
+ 
+     if ( iommu_enabled )
+         iommu_get_ops()->crash_shutdown();
+-    iommu_enabled = iommu_intremap = iommu_intpost = 0;
++    iommu_enabled = iommu_intpost = 0;
++    iommu_intremap = iommu_intremap_off;
+ }
+ 
+ int iommu_get_reserved_device_memory(iommu_grdm_t *func, void *ctxt)
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index 5df1c2d4db88..37d8054e9069 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -2332,7 +2332,7 @@ static int __must_check init_vtd_hw(bool resume)
+         {
+             if ( ioapic_to_iommu(IO_APIC_ID(apic)) == NULL )
+             {
+-                iommu_intremap = 0;
++                iommu_intremap = iommu_intremap_off;
+                 dprintk(XENLOG_ERR VTDPREFIX,
+                     "ioapic_to_iommu: ioapic %#x (id: %#x) is NULL! "
+                     "Will not try to enable Interrupt Remapping.\n",
+@@ -2348,7 +2348,7 @@ static int __must_check init_vtd_hw(bool resume)
+             iommu = drhd->iommu;
+             if ( enable_intremap(iommu, 0) != 0 )
+             {
+-                iommu_intremap = 0;
++                iommu_intremap = iommu_intremap_off;
+                 dprintk(XENLOG_WARNING VTDPREFIX,
+                         "Interrupt Remapping not enabled\n");
+ 
+@@ -2466,7 +2466,7 @@ static int __init vtd_setup(void)
+             reg_inval_supported = false;
+ 
+         if ( iommu_intremap && !ecap_intr_remap(iommu->ecap) )
+-            iommu_intremap = 0;
++            iommu_intremap = iommu_intremap_off;
+ 
+         /*
+          * We cannot use posted interrupt if X86_FEATURE_CX16 is
+@@ -2498,7 +2498,7 @@ static int __init vtd_setup(void)
+ 
+     if ( !iommu_qinval && iommu_intremap )
+     {
+-        iommu_intremap = 0;
++        iommu_intremap = iommu_intremap_off;
+         dprintk(XENLOG_WARNING VTDPREFIX, "Interrupt Remapping disabled "
+             "since Queued Invalidation isn't supported or enabled.\n");
+     }
+@@ -2525,7 +2525,7 @@ static int __init vtd_setup(void)
+     iommu_snoop = 0;
+     iommu_hwdom_passthrough = false;
+     iommu_qinval = 0;
+-    iommu_intremap = 0;
++    iommu_intremap = iommu_intremap_off;
+     iommu_intpost = 0;
+     return ret;
+ }
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index c94579fe92b9..8793064e4d3f 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -54,7 +54,22 @@ static inline bool_t dfn_eq(dfn_t x, dfn_t y)
+ 
+ extern bool_t iommu_enable, iommu_enabled;
+ extern bool force_iommu, iommu_quarantine, iommu_verbose, iommu_igfx;
+-extern bool_t iommu_snoop, iommu_qinval, iommu_intremap, iommu_intpost;
++extern bool_t iommu_snoop, iommu_qinval, iommu_intpost;
++extern enum __packed iommu_intremap {
++   /*
++    * In order to allow traditional boolean uses of the iommu_intremap
++    * variable, the "off" value has to come first (yielding a value of zero).
++    */
++   iommu_intremap_off,
++#ifdef CONFIG_X86
++   /*
++    * Interrupt remapping enabled, but only able to generate interrupts
++    * with an 8-bit APIC ID.
++    */
++   iommu_intremap_restricted,
++#endif
++   iommu_intremap_full,
++} iommu_intremap;
+ 
+ #if defined(CONFIG_IOMMU_FORCE_PT_SHARE)
+ #define iommu_hap_pt_share true
