@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.42
+%global hv_rel 10.43
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -864,6 +864,20 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Apr 17 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.43
+- Remove the NR_IOMMUs compile time limit.  This is necessary to boot on
+  4-socket Sapphire Rapids systems.
+- Cope booting in x2APIC mode on AMD systems without XT mode.
+- Allow creating domains with grant settings larger than dom0.
+- Remove sequential microcode application support.  Only parallel application
+  is supported by the HW vendors.
+- Introduce an elfnote for Dom0 <-> Xen negotiation of the activation of
+  PV-IOMMU.
+- Increase the size of the serial transmit buffer.
+- Backport python3 shebang fixes.  Drop obsolete scripts.
+- Remove the xen-installer-files subpackage.  It was a vestigial remnant of an
+  old build system.
+
 * Mon Mar 6 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.42
 - Fixes for
   - XSA-427 CVE-2022-42332
