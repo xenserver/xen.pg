@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.30
+%global hv_rel 9.31
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -875,6 +875,17 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Apr 17 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.31
+- Remove the NR_IOMMUs compile time limit.  This is necessary to boot on
+  4-socket Sapphire Rapids systems.
+- Cope booting in x2APIC mode on AMD systems without XT mode.
+- Load AMD microcode on all logical processors.
+- Fixes for
+  - XSA-427 CVE-2022-42332
+  - XSA-428 CVE-2022-42333 CVE-2022-42334
+  - XSA-429 CVE-2022-42331
+- Increase the size of the serial transmit buffer.
+
 * Mon Feb 6 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.30
 - Fix for XSA-426 CVE-2022-27672.
 - Fix memory corruption issues in the Ocaml bindings.
