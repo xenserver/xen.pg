@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.43
+%global hv_rel 10.44
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -143,6 +143,7 @@ Summary: Xen Hypervisor Domain 0 tools
 License: GPLv2 and LGPLv2 and MIT
 Requires: xen-dom0-libs = %{version}
 Requires: xen-tools = %{version}
+Obsoletes: xen-installer-files <= 4.13.5-10.42
 Requires: edk2
 Requires: ipxe
 %if %with_systemd
@@ -157,6 +158,7 @@ This package contains the Xen Hypervisor control domain tools.
 Summary: Xen Hypervisor Domain 0 libraries
 License: GPLv2 and LGPLv2 and MIT
 Requires: xen-hypervisor = %{version}
+Obsoletes: xen-installer-files <= 4.13.5-10.42
 %description dom0-libs
 This package contains the Xen Hypervisor control domain libraries.
 
@@ -864,6 +866,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed Apr 27 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.44
+- Add Obsoletes following the removal of xen-installer-files.
+
 * Mon Apr 17 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.43
 - Remove the NR_IOMMUs compile time limit.  This is necessary to boot on
   4-socket Sapphire Rapids systems.
