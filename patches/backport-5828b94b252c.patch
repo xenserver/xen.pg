@@ -1,17 +1,22 @@
-acpi: Make TPM version configurable.
+From 5828b94b252ca29c8ef4a7464b9dd32a5f8a7ded Mon Sep 17 00:00:00 2001
+From: Jennifer Herbert <jennifer.herbert@citrix.com>
+Date: Mon, 8 May 2023 14:13:56 +0200
+Subject: acpi: make TPM version configurable
 
-This patch makes the TPM version, for which the ACPI libary probes,
-configurable.  If acpi_config.tpm_verison is set to 1, it indicates that 1.2
-(TCPA) should be probed.
-I have also added to hvmloader an option to allow setting this new config,
-which can be triggered by setting the platform/tpm_verion xenstore key.
+This patch makes the TPM version, for which the ACPI library probes, configurable.
+If acpi_config.tpm_verison is set to 1, it indicates that 1.2 (TCPA) should be probed.
+I have also added to hvmloader an option to allow setting this new config, which can
+be triggered by setting the platform/tpm_verion xenstore key.
 
 Signed-off-by: Jennifer Herbert <jennifer.herbert@citrix.com>
+Reviewed-by: Jason Andryuk <jandryuk@gmail.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+
 diff --git a/docs/misc/xenstore-paths.pandoc b/docs/misc/xenstore-paths.pandoc
-index 7e85c35805..112c3b22ef 100644
+index 0a6b36146e9e..b090306ade39 100644
 --- a/docs/misc/xenstore-paths.pandoc
 +++ b/docs/misc/xenstore-paths.pandoc
-@@ -262,6 +262,14 @@ at the guest physical address in HVM_PARAM_VM_GENERATION_ID_ADDR.
+@@ -262,6 +262,15 @@ at the guest physical address in HVM_PARAM_VM_GENERATION_ID_ADDR.
  See Microsoft's "Virtual Machine Generation ID" specification for the
  circumstances where the generation ID needs to be changed.
  
@@ -20,46 +25,73 @@ index 7e85c35805..112c3b22ef 100644
 +
 +The TPM version to be probed for.
 +
-+A value of 1 indicates to probe for TPM 1.2. If unset, or an
-+invalid version, then no TPM is probed.
++A value of 1 indicates to probe for TPM 1.2.
++A value of 0 or an invalid value will result in no TPM being probed.
++If unset, a default of 1 is assumed.
 +
  ### Frontend device paths
  
  Paravirtual device frontends are generally specified by their own
 diff --git a/tools/firmware/hvmloader/util.c b/tools/firmware/hvmloader/util.c
-index 7da144b0bb..2d9f40cb02 100644
+index 7da144b0bb15..7499a84359ce 100644
 --- a/tools/firmware/hvmloader/util.c
 +++ b/tools/firmware/hvmloader/util.c
-@@ -994,13 +994,22 @@ void hvmloader_acpi_build_tables(struct acpi_config *config,
+@@ -920,6 +920,8 @@ void hvmloader_acpi_build_tables(struct acpi_config *config,
+ {
+     const char *s;
+     struct acpi_ctxt ctxt;
++    long long tpm_version;
++    char *end;
+ 
+     /* Allocate and initialise the acpi info area. */
+     mem_hole_populate_ram(ACPI_INFO_PHYSICAL_ADDRESS >> PAGE_SHIFT, 1);
+@@ -967,8 +969,6 @@ void hvmloader_acpi_build_tables(struct acpi_config *config,
+     s = xenstore_read("platform/generation-id", "0:0");
+     if ( s )
+     {
+-        char *end;
+-
+         config->vm_gid[0] = strtoll(s, &end, 0);
+         config->vm_gid[1] = 0;
+         if ( end && end[0] == ':' )
+@@ -994,13 +994,27 @@ void hvmloader_acpi_build_tables(struct acpi_config *config,
      if ( !strncmp(xenstore_read("platform/acpi_laptop_slate", "0"), "1", 1)  )
          config->table_flags |= ACPI_HAS_SSDT_LAPTOP_SLATE;
  
 -    config->table_flags |= (ACPI_HAS_TCPA | ACPI_HAS_IOAPIC |
-+    config->table_flags |= (ACPI_HAS_TPM | ACPI_HAS_IOAPIC |
-                             ACPI_HAS_WAET | ACPI_HAS_PMTIMER |
-                             ACPI_HAS_BUTTONS | ACPI_HAS_VGA |
-                             ACPI_HAS_8042 | ACPI_HAS_CMOS_RTC);
+-                            ACPI_HAS_WAET | ACPI_HAS_PMTIMER |
+-                            ACPI_HAS_BUTTONS | ACPI_HAS_VGA |
+-                            ACPI_HAS_8042 | ACPI_HAS_CMOS_RTC);
++    config->table_flags |= (ACPI_HAS_IOAPIC | ACPI_HAS_WAET |
++                            ACPI_HAS_PMTIMER | ACPI_HAS_BUTTONS |
++                            ACPI_HAS_VGA | ACPI_HAS_8042 |
++                            ACPI_HAS_CMOS_RTC);
      config->acpi_revision = 4;
  
 -    config->tis_hdr = (uint16_t *)ACPI_TIS_HDR_ADDRESS;
-+    s = xenstore_read("platform/tpm_version", "0");
-+    config->tpm_version = strtoll(s, NULL, 0);
++    config->tpm_version = 0;
++    s = xenstore_read("platform/tpm_version", "1");
++    tpm_version = strtoll(s, &end, 0);
 +
-+    switch( config->tpm_version )
++    if ( end[0] == '\0' )
 +    {
-+    case 1:
-+        config->table_flags |= ACPI_HAS_TPM;
-+        config->tis_hdr = (uint16_t *)ACPI_TIS_HDR_ADDRESS;
-+        break;
++        switch ( tpm_version )
++        {
++        case 1:
++            config->table_flags |= ACPI_HAS_TPM;
++            config->tis_hdr = (uint16_t *)ACPI_TIS_HDR_ADDRESS;
++            config->tpm_version = 1;
++            break;
++        }
 +    }
  
      config->numa.nr_vmemranges = nr_vmemranges;
      config->numa.nr_vnodes = nr_vnodes;
 diff --git a/tools/libacpi/build.c b/tools/libacpi/build.c
-index 9b9e886f9c..4581762e59 100644
+index fe2db66a62e6..bb0d0557d43d 100644
 --- a/tools/libacpi/build.c
 +++ b/tools/libacpi/build.c
-@@ -413,38 +413,46 @@ static int construct_secondary_tables(struct acpi_ctxt *ctxt,
+@@ -409,38 +409,46 @@ static int construct_secondary_tables(struct acpi_ctxt *ctxt,
          memcpy(ssdt, ssdt_laptop_slate, sizeof(ssdt_laptop_slate));
          table_ptrs[nr_tables++] = ctxt->mem_ops.v2p(ctxt, ssdt);
      }
@@ -68,8 +100,8 @@ index 9b9e886f9c..4581762e59 100644
 -    if ( (config->table_flags & ACPI_HAS_TCPA) &&
 -         (config->tis_hdr[0] != 0 && config->tis_hdr[0] != 0xffff) &&
 -         (config->tis_hdr[1] != 0 && config->tis_hdr[1] != 0xffff) )
-+    /* TPM and SSDT. */
-+    if (config->table_flags & ACPI_HAS_TPM)
++    /* TPM and its SSDT. */
++    if ( config->table_flags & ACPI_HAS_TPM )
      {
 -        ssdt = ctxt->mem_ops.alloc(ctxt, sizeof(ssdt_tpm), 16);
 -        if (!ssdt) return -1;
@@ -90,7 +122,7 @@ index 9b9e886f9c..4581762e59 100644
 -        tcpa->header.creator_id   = ACPI_CREATOR_ID;
 -        tcpa->header.creator_revision = ACPI_CREATOR_REVISION;
 -        if ( (lasa = ctxt->mem_ops.alloc(ctxt, ACPI_2_0_TCPA_LAML_SIZE, 16)) != NULL )
-+        switch (config->tpm_version)
++        switch ( config->tpm_version )
          {
 -            tcpa->lasa = ctxt->mem_ops.v2p(ctxt, lasa);
 -            tcpa->laml = ACPI_2_0_TCPA_LAML_SIZE;
@@ -99,9 +131,8 @@ index 9b9e886f9c..4581762e59 100644
 -                         offsetof(struct acpi_header, checksum),
 -                         tcpa->header.length);
 +        case 1:
-+            if (!config->tis_hdr ||
-+                config->tis_hdr[0] == 0 || config->tis_hdr[0] == 0xffff ||
-+                config->tis_hdr[1] == 0 || config->tis_hdr[1] == 0xffff)
++            if ( config->tis_hdr[0] == 0 || config->tis_hdr[0] == 0xffff ||
++                 config->tis_hdr[1] == 0 || config->tis_hdr[1] == 0xffff )
 +                break;
 +
 +            ssdt = ctxt->mem_ops.alloc(ctxt, sizeof(ssdt_tpm), 16);
@@ -123,7 +154,8 @@ index 9b9e886f9c..4581762e59 100644
 +            tcpa->header.creator_id   = ACPI_CREATOR_ID;
 +            tcpa->header.creator_revision = ACPI_CREATOR_REVISION;
 +
-+            if ( (lasa = ctxt->mem_ops.alloc(ctxt, ACPI_2_0_TCPA_LAML_SIZE, 16)) != NULL )
++            lasa = ctxt->mem_ops.alloc(ctxt, ACPI_2_0_TCPA_LAML_SIZE, 16);
++            if ( lasa )
 +            {
 +                tcpa->lasa = ctxt->mem_ops.v2p(ctxt, lasa);
 +                tcpa->laml = ACPI_2_0_TCPA_LAML_SIZE;
@@ -137,7 +169,7 @@ index 9b9e886f9c..4581762e59 100644
      }
  
 diff --git a/tools/libacpi/libacpi.h b/tools/libacpi/libacpi.h
-index a2efd23b0b..9143616130 100644
+index a2efd23b0b4b..f69452401f47 100644
 --- a/tools/libacpi/libacpi.h
 +++ b/tools/libacpi/libacpi.h
 @@ -27,7 +27,7 @@
@@ -149,13 +181,11 @@ index a2efd23b0b..9143616130 100644
  #define ACPI_HAS_IOAPIC            (1<<8)
  #define ACPI_HAS_WAET              (1<<9)
  #define ACPI_HAS_PMTIMER           (1<<10)
-@@ -78,8 +78,8 @@ struct acpi_config {
-     struct acpi_numa numa;
-     const struct hvm_info_table *hvminfo;
+@@ -66,6 +66,7 @@ struct acpi_config {
  
+     uint32_t table_flags;
+     uint8_t acpi_revision;
 +    uint8_t tpm_version;
-     const uint16_t *tis_hdr;
--
-     /*
-      * Address where acpi_info should be placed.
-      * This must match the OperationRegion(BIOS, SystemMemory, ....)
+ 
+     uint64_t vm_gid[2];
+     unsigned long vm_gid_addr; /* OUT parameter */
