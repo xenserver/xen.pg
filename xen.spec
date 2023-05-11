@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.44
+%global hv_rel 10.45
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -103,7 +103,7 @@ Summary: The Xen Hypervisor
 License: GPLv2
 Requires(post): coreutils grep
 %description hypervisor
-This package contains the Xen Project Hypervisor with selected patches provided by Citrix.
+This package contains the Xen Project Hypervisor combined with the XenServer patchqueue.
 
 %package hypervisor-debuginfo
 Summary: The Xen Hypervisor debug information
@@ -866,6 +866,17 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Thu May 11 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.45
+- Ignore VCPU_SSHOTTMR_future entirely.  The only known user of this is Linux
+  prior to v4.7, and the usage is buggy.  This resolves guest crashes during
+  migration.
+- Improve Xen's early boot checking of its own alignment.  In case of a
+  bootloader error, this turns a crash with no diagnostics into a clear error
+  message.
+- Drop XENMEM_get_mfn_from_pfn technical debt, the use of which has been
+  replaced by PV-IOMMU.
+- Minor specfile improvements; branding, and a bad changelog date.
+
 * Thu Apr 27 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.44
 - Add Obsoletes following the removal of xen-installer-files.
 
