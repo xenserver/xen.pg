@@ -799,6 +799,7 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker
 %{_libexecdir}/%{name}/bin/test-cpu-policy
 %{_libexecdir}/%{name}/bin/test-xenstore
+%{_libexecdir}/%{name}/bin/test_x86_emulator
 %{_datadir}/xen-dom0-tests-metadata.json
 
 %files lp-devel_%{version}_%{release}

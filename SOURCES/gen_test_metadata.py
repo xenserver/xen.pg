@@ -37,7 +37,7 @@ def find_tests(test_folder):
     def is_file_executable(file):
         return os.access(file, os.X_OK)
 
-    test_pattern = r"test-*"
+    test_pattern = r"test[-_]*"
     test_cases = []
     # path, folders, files
     for path, _, files in os.walk(test_folder):
