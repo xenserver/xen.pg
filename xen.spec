@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.46
+%global hv_rel 10.47
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -867,6 +867,10 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Tue Jun 06 2023 Pau Ruiz Safont <pau.ruizsafont@cloud.com> - 4.13.5-10.47
+- Backport late microcode loading changes.
+- Rebuild with Ocaml 4.14.
+
 * Fri May 19 2023 Roger Pau Monné <roger.pau@citrix.com> - 4.13.5-10.46
 - Fix AMD-Vi assert.
 - Remove broken not built code in pv-iommu.
