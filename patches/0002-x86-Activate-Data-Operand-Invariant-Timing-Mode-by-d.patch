@@ -1,4 +1,4 @@
-From a2b90bf323684496038ed7d3612eaa6cf39c969c Mon Sep 17 00:00:00 2001
+From 0df6fc66f982df5ec39a56bcec58ad0176809a03 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Tue, 4 Oct 2022 14:41:33 +0100
 Subject: x86: Activate Data Operand Invariant Timing Mode by default
@@ -25,7 +25,7 @@ forward.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
-index ca114703c198..8ffe84e61715 100644
+index cba6baffdab8..b9fb6373d29f 100644
 --- a/xen/arch/x86/cpu/common.c
 +++ b/xen/arch/x86/cpu/common.c
 @@ -204,6 +204,34 @@ void ctxt_switch_levelling(const struct vcpu *next)
@@ -63,7 +63,7 @@ index ca114703c198..8ffe84e61715 100644
  bool_t opt_cpu_info;
  boolean_param("cpuinfo", opt_cpu_info);
  
-@@ -500,6 +528,7 @@ void identify_cpu(struct cpuinfo_x86 *c)
+@@ -503,6 +531,7 @@ void identify_cpu(struct cpuinfo_x86 *c)
  	/* Now the feature flags better reflect actual CPU features! */
  
  	xstate_init(c);
@@ -72,26 +72,27 @@ index ca114703c198..8ffe84e61715 100644
  #ifdef NOISY_CAPS
  	printk(KERN_DEBUG "CPU: After all inits, caps:");
 diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
-index 17ea70797809..954043d4f177 100644
+index d5d370f12f43..8e17be898f8c 100644
 --- a/xen/arch/x86/cpuid.c
 +++ b/xen/arch/x86/cpuid.c
-@@ -66,7 +66,10 @@ static int __init parse_xen_cpuid(const char *s)
-             if ( (val = parse_boolean(mid->name, s, ss)) >= 0 )
-             {
-                 if ( unlikely(mid->bit == ~0u) )
--                    ;
-+                {
-+                    if ( strcmp(mid->name, "doitm") == 0 )
-+                        opt_doitm = val;
-+                }
-                 else if ( !val )
-                     setup_clear_cpu_cap(mid->bit);
-                 else if ( mid->bit == X86_FEATURE_RDRAND &&
+@@ -98,7 +98,12 @@ static void __init _parse_xen_cpuid(
+     const char *name, unsigned int feat, bool val)
+ {
+     if ( unlikely(feat == ~0u) )
++    {
++        if ( strcmp(name, "doitm") == 0 )
++            opt_doitm = val;
++
+         return;
++    }
+ 
+     if ( !val )
+         setup_clear_cpu_cap(feat);
 diff --git a/xen/include/asm-x86/msr-index.h b/xen/include/asm-x86/msr-index.h
-index a8dba509d6c8..af6c30339b1b 100644
+index e770feede2f8..4f9fc771367a 100644
 --- a/xen/include/asm-x86/msr-index.h
 +++ b/xen/include/asm-x86/msr-index.h
-@@ -56,6 +56,7 @@
+@@ -62,6 +62,7 @@
  #define ARCH_CAPS_IF_PSCHANGE_MC_NO	(_AC(1, ULL) << 6)
  #define ARCH_CAPS_TSX_CTRL		(_AC(1, ULL) << 7)
  #define ARCH_CAPS_TAA_NO		(_AC(1, ULL) << 8)
@@ -99,7 +100,7 @@ index a8dba509d6c8..af6c30339b1b 100644
  #define ARCH_CAPS_SBDR_SSDP_NO		(_AC(1, ULL) << 13)
  #define ARCH_CAPS_FBSDP_NO		(_AC(1, ULL) << 14)
  #define ARCH_CAPS_PSDP_NO		(_AC(1, ULL) << 15)
-@@ -240,6 +241,9 @@
+@@ -249,6 +250,9 @@
  #define MSR_PL3_SSP                         0x000006a7
  #define MSR_INTERRUPT_SSP_TABLE             0x000006a8
  
@@ -123,10 +124,10 @@ index 7b31c7eea230..31430d888541 100644
  
  #endif /* __ASM_X86_PROCESSOR_H */
 diff --git a/xen/tools/gen-cpuid.py b/xen/tools/gen-cpuid.py
-index c249600362f1..21928efab7cb 100755
+index 01587364f1bd..2bd6fd8db6c4 100755
 --- a/xen/tools/gen-cpuid.py
 +++ b/xen/tools/gen-cpuid.py
-@@ -300,6 +300,8 @@ def crunch_numbers(state):
+@@ -318,6 +318,8 @@ def crunch_numbers(state):
      # specially
      #
      pseduo_names = (
