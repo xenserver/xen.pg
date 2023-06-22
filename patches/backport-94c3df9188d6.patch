@@ -1,0 +1,100 @@
+From 94c3df9188d6deed6fe213754492b11b9d409262 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 15 Dec 2021 16:30:25 +0000
+Subject: x86/cpuid: Factor common parsing out of parse_xen_cpuid()
+
+dom0-cpuid= is going to want to reuse the common parsing loop, so factor it
+out into parse_cpuid().
+
+Irritatingly, despite being static const, the features[] array gets duplicated
+each time parse_cpuid() is inlined.  As it is a large (and ever growing with
+new CPU features) datastructure, move it to being file scope so all inlines
+use the same single object.
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpuid.c b/xen/arch/x86/cpuid.c
+index ebe40c2a8d4e..143b9cce0812 100644
+--- a/xen/arch/x86/cpuid.c
++++ b/xen/arch/x86/cpuid.c
+@@ -19,17 +19,26 @@ static const uint32_t hvm_shadow_featuremask[] = INIT_HVM_SHADOW_FEATURES;
+ static const uint32_t hvm_hap_featuremask[] = INIT_HVM_HAP_FEATURES;
+ static const uint32_t deep_features[] = INIT_DEEP_FEATURES;
+ 
+-static int __init parse_xen_cpuid(const char *s)
++static const struct feature_name {
++    const char *name;
++    unsigned int bit;
++} feature_names[] __initconstrel = INIT_FEATURE_NAMES;
++
++/*
++ * Parse a list of cpuid feature names -> bool, calling the callback for any
++ * matches found.
++ *
++ * always_inline, because this is init code only and we really don't want a
++ * function pointer call in the middle of the loop.
++ */
++static int __init always_inline parse_cpuid(
++    const char *s, void (*callback)(unsigned int feat, bool val))
+ {
+     const char *ss;
+     int val, rc = 0;
+ 
+     do {
+-        static const struct feature {
+-            const char *name;
+-            unsigned int bit;
+-        } features[] __initconstrel = INIT_FEATURE_NAMES;
+-        const struct feature *lhs, *rhs, *mid = NULL /* GCC... */;
++        const struct feature_name *lhs, *rhs, *mid = NULL /* GCC... */;
+         const char *feat;
+ 
+         ss = strchr(s, ',');
+@@ -42,8 +51,8 @@ static int __init parse_xen_cpuid(const char *s)
+             feat += 3;
+ 
+         /* (Re)initalise lhs and rhs for binary search. */
+-        lhs = features;
+-        rhs = features + ARRAY_SIZE(features);
++        lhs = feature_names;
++        rhs = feature_names + ARRAY_SIZE(feature_names);
+ 
+         while ( lhs < rhs )
+         {
+@@ -65,11 +74,7 @@ static int __init parse_xen_cpuid(const char *s)
+ 
+             if ( (val = parse_boolean(mid->name, s, ss)) >= 0 )
+             {
+-                if ( !val )
+-                    setup_clear_cpu_cap(mid->bit);
+-                else if ( mid->bit == X86_FEATURE_RDRAND &&
+-                          (cpuid_ecx(1) & cpufeat_mask(X86_FEATURE_RDRAND)) )
+-                    setup_force_cpu_cap(X86_FEATURE_RDRAND);
++                callback(mid->bit, val);
+                 mid = NULL;
+             }
+ 
+@@ -88,6 +93,20 @@ static int __init parse_xen_cpuid(const char *s)
+ 
+     return rc;
+ }
++
++static void __init _parse_xen_cpuid(unsigned int feat, bool val)
++{
++    if ( !val )
++        setup_clear_cpu_cap(feat);
++    else if ( feat == X86_FEATURE_RDRAND &&
++              (cpuid_ecx(1) & cpufeat_mask(X86_FEATURE_RDRAND)) )
++        setup_force_cpu_cap(X86_FEATURE_RDRAND);
++}
++
++static int __init parse_xen_cpuid(const char *s)
++{
++    return parse_cpuid(s, _parse_xen_cpuid);
++}
+ custom_param("cpuid", parse_xen_cpuid);
+ 
+ #define EMPTY_LEAF ((struct cpuid_leaf){})
