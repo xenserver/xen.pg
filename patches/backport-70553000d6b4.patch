@@ -1,0 +1,86 @@
+From 70553000d6b44dd7c271a35932b0b3e1f22c5532 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 12 May 2023 15:37:02 +0100
+Subject: x86/boot: Record MSR_ARCH_CAPS for the Raw and Host CPU policy
+
+Extend x86_cpu_policy_fill_native() with a read of ARCH_CAPS based on the
+CPUID information just read, removing the specially handling in
+calculate_raw_cpu_policy().
+
+Right now, the only use of x86_cpu_policy_fill_native() outside of Xen is the
+unit tests.  Getting MSR data in this context is left to whomever first
+encounters a genuine need to have it.
+
+Extend generic_identify() to read ARCH_CAPS into x86_capability[], which is
+fed into the Host Policy.  This in turn means there's no need to special case
+arch_caps in calculate_host_policy().
+
+No practical change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu-policy.c b/xen/arch/x86/cpu-policy.c
+index 600d8de838b6..46d75a19e5af 100644
+--- a/xen/arch/x86/cpu-policy.c
++++ b/xen/arch/x86/cpu-policy.c
+@@ -344,9 +344,6 @@ void calculate_raw_cpu_policy(void)
+ 
+     /* 0x000000ce  MSR_INTEL_PLATFORM_INFO */
+     /* Was already added by probe_cpuid_faulting() */
+-
+-    if ( cpu_has_arch_caps )
+-        rdmsrl(MSR_ARCH_CAPABILITIES, p->arch_caps.raw);
+ }
+ 
+ static void __init calculate_host_policy(void)
+@@ -399,15 +396,6 @@ static void __init calculate_host_policy(void)
+     /* 0x000000ce  MSR_INTEL_PLATFORM_INFO */
+     /* probe_cpuid_faulting() sanity checks presence of MISC_FEATURES_ENABLES */
+     p->platform_info.cpuid_faulting = cpu_has_cpuid_faulting;
+-
+-    /* Temporary, until we have known_features[] for feature bits in MSRs. */
+-    p->arch_caps.raw = raw_cpu_policy.arch_caps.raw &
+-        (ARCH_CAPS_RDCL_NO | ARCH_CAPS_IBRS_ALL | ARCH_CAPS_RSBA |
+-         ARCH_CAPS_SKIP_L1DFL | ARCH_CAPS_SSB_NO | ARCH_CAPS_MDS_NO |
+-         ARCH_CAPS_IF_PSCHANGE_MC_NO | ARCH_CAPS_TSX_CTRL | ARCH_CAPS_TAA_NO |
+-         ARCH_CAPS_SBDR_SSDP_NO | ARCH_CAPS_FBSDP_NO | ARCH_CAPS_PSDP_NO |
+-         ARCH_CAPS_FB_CLEAR | ARCH_CAPS_RRSBA | ARCH_CAPS_BHI_NO |
+-         ARCH_CAPS_PBRSB_NO);
+ }
+ 
+ static void __init guest_common_feature_adjustments(uint32_t *fs)
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 163fe347e111..d07e5eadb161 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -434,6 +434,11 @@ static void generic_identify(struct cpuinfo_x86 *c)
+ 		cpuid_count(0xd, 1,
+ 			    &c->x86_capability[FEATURESET_Da1],
+ 			    &tmp, &tmp, &tmp);
++
++	if (test_bit(X86_FEATURE_ARCH_CAPS, c->x86_capability))
++		rdmsr(MSR_ARCH_CAPABILITIES,
++		      c->x86_capability[FEATURESET_m10Al],
++		      c->x86_capability[FEATURESET_m10Ah]);
+ }
+ 
+ /*
+diff --git a/xen/lib/x86/cpuid.c b/xen/lib/x86/cpuid.c
+index 6df37317abfe..06f426e79509 100644
+--- a/xen/lib/x86/cpuid.c
++++ b/xen/lib/x86/cpuid.c
+@@ -222,7 +222,12 @@ void x86_cpu_policy_fill_native(struct cpu_policy *p)
+                           ARRAY_SIZE(p->extd.raw) - 1); ++i )
+         cpuid_leaf(0x80000000 + i, &p->extd.raw[i]);
+ 
+-    /* TODO MSRs */
++#ifdef __XEN__
++    /* TODO MSR_PLATFORM_INFO */
++
++    if ( p->feat.arch_caps )
++        rdmsrl(MSR_ARCH_CAPABILITIES, p->arch_caps.raw);
++#endif
+ 
+     x86_cpu_policy_recalc_synth(p);
+ }
