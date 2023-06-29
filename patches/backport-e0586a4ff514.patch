@@ -1,0 +1,148 @@
+From e0586a4ff514590eec50185e2440b97f9a31cb7f Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 24 May 2023 15:41:21 +0100
+Subject: x86/cpu-policy: Derive RSBA/RRSBA for guest policies
+
+The RSBA bit, "RSB Alternative", means that the RSB may use alternative
+predictors when empty.  From a practical point of view, this mean "Retpoline
+not safe".
+
+Enhanced IBRS (officially IBRS_ALL in Intel's docs, previously IBRS_ATT) is a
+statement that IBRS is implemented in hardware (as opposed to the form
+retrofitted to existing CPUs in microcode).
+
+The RRSBA bit, "Restricted-RSBA", is a combination of RSBA, and the eIBRS
+property that predictions are tagged with the mode in which they were learnt.
+Therefore, it means "when eIBRS is active, the RSB may fall back to
+alternative predictors but restricted to the current prediction mode".  As
+such, it's stronger statement than RSBA, but still means "Retpoline not safe".
+
+CPUs are not expected to enumerate both RSBA and RRSBA.
+
+Add feature dependencies for EIBRS and RRSBA.  While technically they're not
+linked, absolutely nothing good can come of letting the guest see RRSBA
+without EIBRS.  Nor a guest seeing EIBRS without IBRSB.  Furthermore, we use
+this dependency to simplify the max derivation logic.
+
+The max policies gets RSBA and RRSBA unconditionally set (with the EIBRS
+dependency maybe hiding RRSBA).  We can run any VM, even if it has been told
+"somewhere you might run, Retpoline isn't safe".
+
+The default policies are more complicated.  A guest shouldn't see both bits,
+but it needs to see one if the current host suffers from any form of RSBA, and
+which bit it needs to see depends on whether eIBRS is visible or not.
+Therefore, the calculation must be performed after sanitise_featureset().
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu-policy.c b/xen/arch/x86/cpu-policy.c
+index a1c6f4a72578..2e4f3ccf7c65 100644
+--- a/xen/arch/x86/cpu-policy.c
++++ b/xen/arch/x86/cpu-policy.c
+@@ -457,6 +457,21 @@ static void __init calculate_pv_max_policy(void)
+     guest_common_feature_adjustments(fs);
+ 
+     sanitise_featureset(fs);
++
++    /*
++     * If the host suffers from RSBA of any form, and the guest can see
++     * MSR_ARCH_CAPS, reflect the appropriate RSBA/RRSBA property to the guest
++     * depending on the visibility of eIBRS.
++     */
++    if ( test_bit(X86_FEATURE_ARCH_CAPS, fs) &&
++         (cpu_has_rsba || cpu_has_rrsba) )
++    {
++        bool eibrs = test_bit(X86_FEATURE_EIBRS, fs);
++
++        __set_bit(eibrs ? X86_FEATURE_RRSBA
++                        : X86_FEATURE_RSBA, fs);
++    }
++
+     x86_cpu_featureset_to_policy(fs, p);
+     recalculate_xstate(p);
+ 
+@@ -520,6 +535,21 @@ static void __init calculate_hvm_max_policy(void)
+     guest_common_feature_adjustments(fs);
+ 
+     sanitise_featureset(fs);
++
++    /*
++     * If the host suffers from RSBA of any form, and the guest can see
++     * MSR_ARCH_CAPS, reflect the appropriate RSBA/RRSBA property to the guest
++     * depending on the visibility of eIBRS.
++     */
++    if ( test_bit(X86_FEATURE_ARCH_CAPS, fs) &&
++         (cpu_has_rsba || cpu_has_rrsba) )
++    {
++        bool eibrs = test_bit(X86_FEATURE_EIBRS, fs);
++
++        __set_bit(eibrs ? X86_FEATURE_RRSBA
++                        : X86_FEATURE_RSBA, fs);
++    }
++
+     x86_cpu_featureset_to_policy(fs, p);
+     recalculate_xstate(p);
+ 
+@@ -672,8 +702,17 @@ void recalculate_cpuid_policy(struct domain *d)
+          * Retpoline not safe)", so these need to be visible to a guest in all
+          * cases, even when it's only some other server in the pool which
+          * suffers the identified behaviour.
++         *
++         * We can always run any VM which has previously (or will
++         * subsequently) run on hardware where Retpoline is not safe.
++         * Note:
++         *  - The dependency logic may hide RRSBA for other reasons.
++         *  - The max policy does not constitute a sensible configuration to
++         *    run a guest in.
+          */
+         __set_bit(X86_FEATURE_ARCH_CAPS, fs);
++        __set_bit(X86_FEATURE_RSBA, fs);
++        __set_bit(X86_FEATURE_RRSBA, fs);
+     }
+ 
+     /* Clamp the toolstacks choices to reality. */
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index 0e21bed9cfe7..2c6007f7c376 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -296,7 +296,7 @@ XEN_CPUFEATURE(BHI_CTRL,           13*32+ 4) /*   MSR_SPEC_CTRL.BHI_DIS_S */
+ /* Intel-defined CPU features, MSR_ARCH_CAPS 0x10a.eax, word 16 */
+ XEN_CPUFEATURE(RDCL_NO,            16*32+ 0) /*A  No Rogue Data Cache Load (Meltdown) */
+ XEN_CPUFEATURE(EIBRS,              16*32+ 1) /*A  Enhanced IBRS */
+-XEN_CPUFEATURE(RSBA,               16*32+ 2) /*!A RSB Alternative (Retpoline not safe) */
++XEN_CPUFEATURE(RSBA,               16*32+ 2) /*!  RSB Alternative (Retpoline not safe) */
+ XEN_CPUFEATURE(SKIP_L1DFL,         16*32+ 3) /*   Don't need to flush L1D on VMEntry */
+ XEN_CPUFEATURE(INTEL_SSB_NO,       16*32+ 4) /*A  No Speculative Store Bypass */
+ XEN_CPUFEATURE(MDS_NO,             16*32+ 5) /*A  No Microarchitectural Data Sampling */
+@@ -312,7 +312,7 @@ XEN_CPUFEATURE(FBSDP_NO,           16*32+14) /*A  No Fill Buffer Stale Data Prop
+ XEN_CPUFEATURE(PSDP_NO,            16*32+15) /*A  No Primary Stale Data Propagation */
+ XEN_CPUFEATURE(FB_CLEAR,           16*32+17) /*A  Fill Buffers cleared by VERW */
+ XEN_CPUFEATURE(FB_CLEAR_CTRL,      16*32+18) /*   MSR_OPT_CPU_CTRL.FB_CLEAR_DIS */
+-XEN_CPUFEATURE(RRSBA,              16*32+19) /*!A Restricted RSB Alternative */
++XEN_CPUFEATURE(RRSBA,              16*32+19) /*!  Restricted RSB Alternative */
+ XEN_CPUFEATURE(BHI_NO,             16*32+20) /*A  No Branch History Injection  */
+ XEN_CPUFEATURE(XAPIC_STATUS,       16*32+21) /*   MSR_XAPIC_DISABLE_STATUS */
+ XEN_CPUFEATURE(OVRCLK_STATUS,      16*32+23) /*   MSR_OVERCLOCKING_STATUS */
+diff --git a/xen/tools/gen-cpuid.py b/xen/tools/gen-cpuid.py
+index 8973202b1c31..9932cf3c5ffa 100755
+--- a/xen/tools/gen-cpuid.py
++++ b/xen/tools/gen-cpuid.py
+@@ -306,13 +306,16 @@ def crunch_numbers(state):
+         # IBRSB/IBRS, and we pass this MSR directly to guests.  Treating them
+         # as dependent features simplifies Xen's logic, and prevents the guest
+         # from seeing implausible configurations.
+-        IBRSB: [STIBP, SSBD, INTEL_PSFD],
++        IBRSB: [STIBP, SSBD, INTEL_PSFD, EIBRS],
+         IBRS: [AMD_STIBP, AMD_SSBD, PSFD,
+                IBRS_ALWAYS, IBRS_FAST, IBRS_SAME_MODE],
+         AMD_STIBP: [STIBP_ALWAYS],
+ 
+         # The ARCH_CAPS CPUID bit enumerates the availability of the whole register.
+         ARCH_CAPS: list(range(RDCL_NO, RDCL_NO + 64)),
++
++        # The behaviour described by RRSBA depend on eIBRS being active.
++        EIBRS: [RRSBA],
+     }
+ 
+     deep_features = tuple(sorted(deps.keys()))
