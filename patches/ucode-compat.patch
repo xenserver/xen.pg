@@ -1,0 +1,129 @@
+Compatibility with older Xens.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index d424ebc3f1e5..c11c06639bd1 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -1244,6 +1244,7 @@ typedef uint32_t xc_node_to_node_dist_t;
+ int xc_physinfo(xc_interface *xch, xc_physinfo_t *info);
+ int xc_cputopoinfo(xc_interface *xch, unsigned *max_cpus,
+                    xc_cputopo_t *cputopo);
++int xc_platform_op(xc_interface *xch, struct xen_platform_op *op);
+ int xc_microcode_update(xc_interface *xch, const void *buf, size_t len);
+ int xc_get_cpu_version(xc_interface *xch, struct xenpf_pcpu_version *cpu_ver);
+ int xc_get_ucode_revision(xc_interface *xch,
+diff --git a/tools/libxc/xc_misc.c b/tools/libxc/xc_misc.c
+index c45ef86db42e..55c09af69de0 100644
+--- a/tools/libxc/xc_misc.c
++++ b/tools/libxc/xc_misc.c
+@@ -284,6 +284,11 @@ int xc_get_ucode_revision(xc_interface *xch,
+     return 0;
+ }
+ 
++int xc_platform_op(xc_interface *xch, struct xen_platform_op *op)
++{
++    return do_platform_op(xch, op);
++}
++
+ int xc_cputopoinfo(xc_interface *xch, unsigned *max_cpus,
+                    xc_cputopo_t *cputopo)
+ {
+diff --git a/tools/misc/xen-ucode.c b/tools/misc/xen-ucode.c
+index c6ae6498d659..8e40d2e2c6e2 100644
+--- a/tools/misc/xen-ucode.c
++++ b/tools/misc/xen-ucode.c
+@@ -12,20 +12,68 @@
+ #include <fcntl.h>
+ #include <xenctrl.h>
+ 
++#include <xen-tools/libs.h>
++
+ static xc_interface *xch;
+ 
+ static const char intel_id[] = "GenuineIntel";
+ static const char   amd_id[] = "AuthenticAMD";
+ 
++struct xenpf_old_pcpu_version {
++    /* IN */
++    uint32_t xen_cpuid;
++    /* OUT */
++    /* The maxium cpu_id that is present */
++    uint32_t max_present;
++    char vendor_id[12];
++    uint32_t family;
++    uint32_t model;
++    uint32_t stepping;
++    uint32_t cpu_signature;    /* ABI delta */
++    uint32_t pf;               /* |         */
++    uint32_t ucode_revision;   /* |         */
++};
++
++/*
++ * The XenServer patchqueue, prior to the patch which introduced this change,
++ * extended 'struct xenpf_pcpu_version' with cpu_signature, pf and
++ * ucode_revision.  Upstream, this information is provided by
++ * XENPF_get_ucode_revision instead.
++ *
++ * Provide a local xc_get_cpu_version() which copies more data out of the
++ * xen_platform_op union, so the data can be examined if
++ * xc_get_ucode_revision() doesn't appear to exist.
++ */
++static int xc_get_old_cpu_version(xc_interface *xch, struct xenpf_old_pcpu_version *cpu_ver)
++{
++    int ret;
++    struct xen_platform_op op = {
++        .cmd = XENPF_get_cpu_version,
++        .u.pcpu_version.xen_cpuid = cpu_ver->xen_cpuid,
++    };
++
++    ret = xc_platform_op(xch, &op);
++    if ( ret != 0 )
++        return ret;
++
++    BUILD_BUG_ON(sizeof(struct xenpf_pcpu_version) != 32);
++    BUILD_BUG_ON(sizeof(struct xenpf_old_pcpu_version) != 44);
++    BUILD_BUG_ON(sizeof(struct xenpf_old_pcpu_version) > sizeof(op.u));
++
++    memcpy(cpu_ver, &op.u, sizeof(*cpu_ver));
++
++    return 0;
++}
++
+ static void show_curr_cpu(FILE *f)
+ {
+     int ret;
+-    struct xenpf_pcpu_version cpu_ver = { .xen_cpuid = 0 };
++    struct xenpf_old_pcpu_version cpu_ver = { .xen_cpuid = 0 };
+     struct xenpf_ucode_revision ucode_rev = { .cpu = 0 };
+     /* Always exit with 2 when called during usage-info */
+     int exit_code = (f == stderr) ? 2 : 1;
+ 
+-    ret = xc_get_cpu_version(xch, &cpu_ver);
++    ret = xc_get_old_cpu_version(xch, &cpu_ver);
+     if ( ret )
+     {
+         fprintf(stderr, "Failed to get CPU information. (err: %s)\n",
+@@ -36,11 +84,21 @@ static void show_curr_cpu(FILE *f)
+     ret = xc_get_ucode_revision(xch, &ucode_rev);
+     if ( ret )
+     {
++        if ( errno == ENOSYS &&
++             cpu_ver.cpu_signature && cpu_ver.ucode_revision )
++        {
++            ucode_rev.signature = cpu_ver.cpu_signature;
++            ucode_rev.pf = cpu_ver.pf;
++            ucode_rev.revision = cpu_ver.ucode_revision;
++            goto got_details;
++        }
++
+         fprintf(stderr, "Failed to get microcode information. (err: %s)\n",
+                 strerror(errno));
+         exit(exit_code);
+     }
+ 
++ got_details:
+     /*
+      * Print signature in a form that allows to quickly identify which ucode
+      * blob to load, e.g.:
