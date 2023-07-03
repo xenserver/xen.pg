@@ -34,7 +34,7 @@ Name:    xen
 Version: 4.13.5
 Release: %{?xsrel}%{?dist}
 License: GPLv2 and LGPLv2 and MIT and Public Domain
-URL:     http://www.xenproject.org
+URL:     https://www.xenproject.org
 Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{package_srccommit}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
@@ -105,7 +105,7 @@ Summary: The Xen Hypervisor
 License: GPLv2
 Requires(post): coreutils grep
 %description hypervisor
-This package contains the Xen Project Hypervisor with selected patches provided by Citrix.
+This package contains the Xen Project Hypervisor combined with the XenServer patchqueue.
 
 %package hypervisor-debuginfo
 Summary: The Xen Hypervisor debug information
