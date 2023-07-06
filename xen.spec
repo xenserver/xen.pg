@@ -55,7 +55,14 @@ BuildRequires: python2-devel
 BuildRequires: python2-rpm-macros
 %endif
 
-BuildRequires: devtoolset-11-gcc devtoolset-11-binutils
+%if 0%{?xenserver} < 9
+BuildRequires: devtoolset-11-binutils
+BuildRequires: devtoolset-11-gcc
+%global _devtoolset_enable source /opt/rh/devtoolset-11/enable
+%else
+BuildRequires: binutils
+BuildRequires: gcc
+%endif
 
 # For HVMLoader and 16/32bit firmware
 BuildRequires: dev86 iasl
@@ -213,7 +220,7 @@ echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
 
 %build
 
-source /opt/rh/devtoolset-11/enable
+%{?_devtoolset_enable}
 export XEN_TARGET_ARCH=%{_arch}
 export PYTHON="%{__python}"
 
@@ -279,7 +286,7 @@ build_xen ""           config-pvshim-debug    build-shim-debug
 
 %install
 
-source /opt/rh/devtoolset-11/enable
+%{?_devtoolset_enable}
 export XEN_TARGET_ARCH=%{_arch}
 export PYTHON="%{__python}"
 
