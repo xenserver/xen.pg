@@ -1,0 +1,168 @@
+From 28d9a6f8cfb71cb91af1a1d269ee2b039f210f0d Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 17 Jul 2023 14:57:13 +0100
+Subject: Libxc CPU policy helpers
+
+Used by Xenopsd's xenctrlext library to offload calculations for simplicity of
+hotfixing.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+
+diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
+index d424ebc3f1e5..d64a41730a26 100644
+--- a/tools/libxc/include/xenctrl.h
++++ b/tools/libxc/include/xenctrl.h
+@@ -2549,6 +2549,11 @@ int xc_set_domain_cpu_policy(xc_interface *xch, uint32_t domid,
+ 
+ uint32_t xc_get_cpu_featureset_size(void);
+ 
++void xc_combine_cpu_featuresets(
++    const uint32_t *p1, const uint32_t *p2, uint32_t *out, size_t len);
++const char *xc_cpu_featuresets_are_compatible(
++    const uint32_t *vm, const uint32_t *host, size_t len, char err[128]);
++
+ enum xc_static_cpu_featuremask {
+     XC_FEATUREMASK_KNOWN,
+     XC_FEATUREMASK_SPECIAL,
+diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
+index 2f7b4a32223c..8a25fecbc28e 100644
+--- a/tools/libxc/xc_cpuid_x86.c
++++ b/tools/libxc/xc_cpuid_x86.c
+@@ -689,3 +689,109 @@ out:
+ 
+     return rc;
+ }
++
++/*
++ * Combine @p1 and @p2 which expected to be Guest PV/HVM default featuresets.
++ *
++ * Neither policy are necesserily relevant to this host, so no querying
++ * Xen. The caller passes us 3 bitmaps (p1, p2, out) of @len words.
++ *
++ * This is mostly an intersection of p1 and p2, but RSBA/RRSBA needs
++ * calculating appropriately.
++ */
++void xc_combine_cpu_featuresets(
++    const uint32_t *p1, const uint32_t *p2, uint32_t *out, size_t len)
++{
++    size_t i;
++
++    for ( i = 0; i < len; ++i )
++        out[i] = p1[i] & p2[i];
++
++    /*
++     * Recalculate the RSBA/RRSBA bit.  If either p1 or p2 suffer any form of
++     * (R)RSBA, so must the resulting policy, and which depends on whether the
++     * eIBRS is visible.
++     */
++    if ( len > (X86_FEATURE_EIBRS >> 5) &&
++         test_bit(X86_FEATURE_ARCH_CAPS, out) &&
++         (test_bit(X86_FEATURE_RSBA, p1) || test_bit(X86_FEATURE_RRSBA, p1) ||
++          test_bit(X86_FEATURE_RSBA, p2) || test_bit(X86_FEATURE_RRSBA, p2)) )
++    {
++        bool eibrs = test_bit(X86_FEATURE_EIBRS, out);
++
++        clear_bit(X86_FEATURE_RSBA, out);
++        clear_bit(X86_FEATURE_RRSBA, out);
++
++        set_bit(eibrs ? X86_FEATURE_RRSBA
++                      : X86_FEATURE_RSBA, out);
++    }
++}
++
++static const struct bit_name {
++    const char *name;
++    unsigned int bit;
++} bit_names[] = INIT_BIT_NAMES;
++
++static int compare_bit_name(const void *_l, const void *_r)
++{
++    const struct bit_name *l = _l, *r = _r;
++
++    return l->bit - r->bit;
++}
++
++static const char *feat_name(unsigned int feat)
++{
++    struct bit_name key = { .bit = feat }, *res;
++
++    res = bsearch(&key, bit_names, ARRAY_SIZE(bit_names),
++                  sizeof(bit_names[0]), compare_bit_name);
++
++    return res ? res->name : NULL;
++}
++
++/*
++ * Check if @vm can run on @host.  The caller passes t bitmaps (vm, host) of
++ * @len words, and some scratch space for an error string.
++ *
++ * Returns NULL on success, or a string describing the missing features on
++ * error.
++ */
++const char *xc_cpu_featuresets_are_compatible(
++    const uint32_t *vm, const uint32_t *host, size_t len, char err[128])
++{
++    size_t i, space = 128;
++    uint32_t missing;
++    char *p = err;
++
++    for ( i = 0; i < len; ++i )
++    {
++        missing = vm[i] & ~host[i];
++        if ( missing )
++            goto not_compatible;
++    }
++
++    /* Compatible */
++    return NULL;
++
++ not_compatible:
++    /* Not compatible.  Render the missing features. */
++
++    while ( missing && (p - err) < 128 )
++    {
++        unsigned int bit = ffs(missing) - 1;
++        uint32_t feat = i * 32 + bit;
++        const char *name = feat_name(feat);
++        int nr;
++
++        if ( name )
++            nr = snprintf(p, space, " %s", name);
++        else
++            nr = snprintf(p, space, " <%zu*32+%u>", i, bit);
++
++        p += nr;
++        missing &= ~(1u << bit);
++    }
++    err[127] = '\0';
++
++    return err + 1; /* Trim leading space */
++}
+diff --git a/xen/tools/gen-cpuid.py b/xen/tools/gen-cpuid.py
+index da6fba2f822f..9f53ef726d2f 100755
+--- a/xen/tools/gen-cpuid.py
++++ b/xen/tools/gen-cpuid.py
+@@ -441,6 +441,22 @@ def write_results(state):
+     state.output.write(
+ """}
+ 
++#define INIT_BIT_NAMES { \\
++""")
++
++    try:
++        _tmp = state.names.iteritems()
++    except AttributeError:
++        _tmp = state.names.items()
++
++    for bit, name in sorted(_tmp):
++        state.output.write(
++            '    { "%s", %sU },\\\n' % (name, bit)
++            )
++
++    state.output.write(
++"""}
++
+ """)
+ 
+     state.bitfields += ["uint32_t :32 /* placeholder */"] * 4
