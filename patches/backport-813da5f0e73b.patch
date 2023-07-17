@@ -1,0 +1,101 @@
+From 813da5f0e73b8cbd2ac3c7922506e58c28cd736d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Mon, 17 Jul 2023 10:31:10 +0200
+Subject: x86/ioapic: sanitize IO-APIC pins before enabling lapic LVTERR/ESR
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The current logic to init the local APIC and the IO-APIC does init the
+local APIC LVTERR/ESR before doing any sanitization on the IO-APIC pin
+configuration.  It's already noted on enable_IO_APIC() that Xen
+shouldn't trust the IO-APIC being empty at bootup.
+
+At XenServer we have a system where the IO-APIC 0 is handed to Xen
+with pin 0 unmasked, set to Fixed delivery mode, edge triggered and
+with a vector of 0 (all fields of the RTE are zeroed).  Once the local
+APIC LVTERR/ESR is enabled periodic injections from such pin cause the
+local APIC to in turn inject periodic error vectors:
+
+APIC error on CPU0: 00(40), Received illegal vector
+APIC error on CPU0: 40(40), Received illegal vector
+APIC error on CPU0: 40(40), Received illegal vector
+APIC error on CPU0: 40(40), Received illegal vector
+APIC error on CPU0: 40(40), Received illegal vector
+APIC error on CPU0: 40(40), Received illegal vector
+
+That prevents Xen from booting.
+
+Move the masking of the IO-APIC pins ahead of the setup of the local
+APIC.  This has the side effect of also moving the detection of the
+pin where the i8259 is connected, as such detection must be done
+before masking any pins.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/apic.c b/xen/arch/x86/apic.c
+index cf8847990814..29cb90619b5a 100644
+--- a/xen/arch/x86/apic.c
++++ b/xen/arch/x86/apic.c
+@@ -1481,6 +1481,10 @@ int __init APIC_init_uniprocessor (void)
+     physids_clear(phys_cpu_present_map);
+     physid_set(boot_cpu_physical_apicid, phys_cpu_present_map);
+ 
++    if ( !skip_ioapic_setup && nr_ioapics )
++        /* Sanitize the IO-APIC pins before enabling the lapic LVTERR/ESR. */
++        enable_IO_APIC();
++
+     setup_local_APIC();
+ 
+     if (nmi_watchdog == NMI_LOCAL_APIC)
+diff --git a/xen/arch/x86/io_apic.c b/xen/arch/x86/io_apic.c
+index f33689a45e8e..583f60cca268 100644
+--- a/xen/arch/x86/io_apic.c
++++ b/xen/arch/x86/io_apic.c
+@@ -1257,7 +1257,7 @@ static void _print_IO_APIC_keyhandler(unsigned char key)
+     __print_IO_APIC(0);
+ }
+ 
+-static void __init enable_IO_APIC(void)
++void __init enable_IO_APIC(void)
+ {
+     int i8259_apic, i8259_pin;
+     int i, apic;
+@@ -2052,8 +2052,6 @@ static void __init ioapic_pm_state_alloc(void)
+ 
+ void __init setup_IO_APIC(void)
+ {
+-    enable_IO_APIC();
+-
+     if (acpi_ioapic)
+         io_apic_irqs = ~0;	/* all IRQs go through IOAPIC */
+     else
+diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
+index 0c0e70841df2..8d0264335109 100644
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -1160,6 +1160,11 @@ void __init smp_prepare_cpus(void)
+     verify_local_APIC();
+ 
+     connect_bsp_APIC();
++
++    if ( !skip_ioapic_setup && nr_ioapics )
++        /* Sanitize the IO-APIC pins before enabling the lapic LVTERR/ESR. */
++        enable_IO_APIC();
++
+     setup_local_APIC();
+ 
+     if ( !skip_ioapic_setup && nr_ioapics )
+diff --git a/xen/include/asm-x86/irq.h b/xen/include/asm-x86/irq.h
+index 640d54370e8b..bfd43800d2d8 100644
+--- a/xen/include/asm-x86/irq.h
++++ b/xen/include/asm-x86/irq.h
+@@ -123,6 +123,7 @@ bool bogus_8259A_irq(unsigned int irq);
+ int i8259A_suspend(void);
+ int i8259A_resume(void);
+ 
++void enable_IO_APIC(void);
+ void setup_IO_APIC(void);
+ void disable_IO_APIC(void);
+ void setup_ioapic_dest(void);
