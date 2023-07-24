@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.47
+%global hv_rel 10.48
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -867,6 +867,13 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Jul 24 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.48
+- Fix for XSA-433 CVE-2023-20593.
+- Limit scheduler loadbalancing to once per millisecond.  This improves
+  performance on large systems.
+- Mask IO-APIC pins before enabling LVTERR/ESR.  This fixes issues booting if
+  firmware leaves the IO-APIC in a bad state.
+
 * Tue Jun 06 2023 Pau Ruiz Safont <pau.ruizsafont@cloud.com> - 4.13.5-10.47
 - Backport late microcode loading changes.
 - Rebuild with Ocaml 4.14.
