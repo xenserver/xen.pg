@@ -1,0 +1,136 @@
+From cdc48cb5a74b10c2b07a09d2f554756d730bfee3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Fri, 28 Jul 2023 09:39:44 +0200
+Subject: x86/ioapic: add a raw field to RTE struct
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Further changes will require access to the full RTE as a single value
+in order to pass it to IOMMU interrupt remapping handlers.
+
+No functional change intended.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/io_apic.c b/xen/arch/x86/io_apic.c
+index 5902b9157640..3e1feff1749a 100644
+--- a/xen/arch/x86/io_apic.c
++++ b/xen/arch/x86/io_apic.c
+@@ -2359,7 +2359,7 @@ int ioapic_guest_read(unsigned long physbase, unsigned int reg, u32 *pval)
+ int ioapic_guest_write(unsigned long physbase, unsigned int reg, u32 val)
+ {
+     int apic, pin, irq, ret, pirq;
+-    struct IO_APIC_route_entry rte = { 0 };
++    struct IO_APIC_route_entry rte = { };
+     unsigned long flags;
+     struct irq_desc *desc;
+ 
+diff --git a/xen/drivers/passthrough/amd/iommu_intr.c b/xen/drivers/passthrough/amd/iommu_intr.c
+index 5e92c023f8ae..4c08a7015f42 100644
+--- a/xen/drivers/passthrough/amd/iommu_intr.c
++++ b/xen/drivers/passthrough/amd/iommu_intr.c
+@@ -354,8 +354,8 @@ static int update_intremap_entry_from_ioapic(
+ void amd_iommu_ioapic_update_ire(
+     unsigned int apic, unsigned int reg, unsigned int value)
+ {
+-    struct IO_APIC_route_entry old_rte = { 0 };
+-    struct IO_APIC_route_entry new_rte = { 0 };
++    struct IO_APIC_route_entry old_rte = { };
++    struct IO_APIC_route_entry new_rte = { };
+     unsigned int rte_lo = (reg & 1) ? reg - 1 : reg;
+     unsigned int pin = (reg - 0x10) / 2;
+     int seg, bdf, rc;
+diff --git a/xen/drivers/passthrough/vtd/intremap.c b/xen/drivers/passthrough/vtd/intremap.c
+index a2f02c1bea44..a91978c8c35d 100644
+--- a/xen/drivers/passthrough/vtd/intremap.c
++++ b/xen/drivers/passthrough/vtd/intremap.c
+@@ -419,7 +419,7 @@ unsigned int io_apic_read_remap_rte(
+ {
+     unsigned int ioapic_pin = (reg - 0x10) / 2;
+     int index;
+-    struct IO_xAPIC_route_entry old_rte = { 0 };
++    struct IO_xAPIC_route_entry old_rte = { };
+     int rte_upper = (reg & 1) ? 1 : 0;
+     struct vtd_iommu *iommu = ioapic_to_iommu(IO_APIC_ID(apic));
+ 
+@@ -442,7 +442,7 @@ void io_apic_write_remap_rte(
+     unsigned int apic, unsigned int reg, unsigned int value)
+ {
+     unsigned int ioapic_pin = (reg - 0x10) / 2;
+-    struct IO_xAPIC_route_entry old_rte = { 0 };
++    struct IO_xAPIC_route_entry old_rte = { };
+     struct IO_APIC_route_remap_entry *remap_rte;
+     unsigned int rte_upper = (reg & 1) ? 1 : 0;
+     struct vtd_iommu *iommu = ioapic_to_iommu(IO_APIC_ID(apic));
+diff --git a/xen/include/asm-x86/io_apic.h b/xen/include/asm-x86/io_apic.h
+index 22873380f8a0..f6371f37b096 100644
+--- a/xen/include/asm-x86/io_apic.h
++++ b/xen/include/asm-x86/io_apic.h
+@@ -89,35 +89,38 @@ enum ioapic_irq_destination_types {
+ };
+ 
+ struct IO_APIC_route_entry {
+-    unsigned int vector:8;
+-    unsigned int delivery_mode:3; /*
+-                                   * 000: FIXED
+-                                   * 001: lowest prio
+-                                   * 111: ExtINT
+-                                   */
+-    unsigned int dest_mode:1;     /* 0: physical, 1: logical */
+-    unsigned int delivery_status:1;
+-    unsigned int polarity:1;      /* 0: low, 1: high */
+-    unsigned int irr:1;
+-    unsigned int trigger:1;       /* 0: edge, 1: level */
+-    unsigned int mask:1;          /* 0: enabled, 1: disabled */
+-    unsigned int __reserved_2:15;
+-
+     union {
+         struct {
+-            unsigned int __reserved_1:24;
+-            unsigned int physical_dest:4;
+-            unsigned int __reserved_2:4;
+-        } physical;
+-
+-        struct {
+-            unsigned int __reserved_1:24;
+-            unsigned int logical_dest:8;
+-        } logical;
+-
+-        /* used when Interrupt Remapping with EIM is enabled */
+-        unsigned int dest32;
+-    } dest;
++            unsigned int vector:8;
++            unsigned int delivery_mode:3; /*
++                                           * 000: FIXED
++                                           * 001: lowest prio
++                                           * 111: ExtINT
++                                           */
++            unsigned int dest_mode:1;     /* 0: physical, 1: logical */
++            unsigned int delivery_status:1;
++            unsigned int polarity:1;      /* 0: low, 1: high */
++            unsigned int irr:1;
++            unsigned int trigger:1;       /* 0: edge, 1: level */
++            unsigned int mask:1;          /* 0: enabled, 1: disabled */
++            unsigned int __reserved_2:15;
++
++            union {
++                struct {
++                    unsigned int __reserved_1:24;
++                    unsigned int physical_dest:4;
++                    unsigned int __reserved_2:4;
++                } physical;
++
++                struct {
++                    unsigned int __reserved_1:24;
++                    unsigned int logical_dest:8;
++                } logical;
++                unsigned int dest32;
++            } dest;
++        };
++        uint64_t raw;
++    };
+ };
+ 
+ /*
