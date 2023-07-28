@@ -1,0 +1,446 @@
+From 3e033172b0250446bfe119f31c7f0f51684b0472 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Tue, 1 Aug 2023 11:48:39 +0200
+Subject: x86/iommu: pass full IO-APIC RTE for remapping table update
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+So that the remapping entry can be updated atomically when possible.
+
+Doing such update atomically will avoid Xen having to mask the IO-APIC
+pin prior to performing any interrupt movements (ie: changing the
+destination and vector fields), as the interrupt remapping entry is
+always consistent.
+
+This also simplifies some of the logic on both VT-d and AMD-Vi
+implementations, as having the full RTE available instead of half of
+it avoids to possibly read and update the missing other half from
+hardware.
+
+While there remove the explicit zeroing of new_ire fields in
+ioapic_rte_to_remap_entry() and initialize the variable at definition
+so all fields are zeroed.  Note fields could be also initialized with
+final values at definition, but I found that likely too much to be
+done at this time.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/io_apic.c b/xen/arch/x86/io_apic.c
+index 9e10884a9e8c..128b6a9c9913 100644
+--- a/xen/arch/x86/io_apic.c
++++ b/xen/arch/x86/io_apic.c
+@@ -273,10 +273,7 @@ void __ioapic_write_entry(
+         __io_apic_write(apic, 0x10 + 2 * pin, eu.w1);
+     }
+     else
+-    {
+-        iommu_update_ire_from_apic(apic, 0x11 + 2 * pin, eu.w2);
+-        iommu_update_ire_from_apic(apic, 0x10 + 2 * pin, eu.w1);
+-    }
++        iommu_update_ire_from_apic(apic, pin, e.raw);
+ }
+ 
+ static void ioapic_write_entry(
+diff --git a/xen/drivers/passthrough/amd/iommu_intr.c b/xen/drivers/passthrough/amd/iommu_intr.c
+index ecff6f292a89..2efa82b6bee4 100644
+--- a/xen/drivers/passthrough/amd/iommu_intr.c
++++ b/xen/drivers/passthrough/amd/iommu_intr.c
+@@ -247,11 +247,6 @@ static void update_intremap_entry(const struct amd_iommu *iommu,
+     }
+ }
+ 
+-static inline int get_rte_index(const struct IO_APIC_route_entry *rte)
+-{
+-    return rte->vector | (rte->delivery_mode << 8);
+-}
+-
+ static inline void set_rte_index(struct IO_APIC_route_entry *rte, int offset)
+ {
+     rte->vector = (u8)offset;
+@@ -267,7 +262,6 @@ static int update_intremap_entry_from_ioapic(
+     int bdf,
+     struct amd_iommu *iommu,
+     struct IO_APIC_route_entry *rte,
+-    bool_t lo_update,
+     u16 *index)
+ {
+     unsigned long flags;
+@@ -317,31 +311,6 @@ static int update_intremap_entry_from_ioapic(
+         spin_lock(lock);
+     }
+ 
+-    if ( fresh )
+-        /* nothing */;
+-    else if ( !lo_update )
+-    {
+-        /*
+-         * Low half of incoming RTE is already in remapped format,
+-         * so need to recover vector and delivery mode from IRTE.
+-         */
+-        ASSERT(get_rte_index(rte) == offset);
+-        if ( iommu->ctrl.ga_en )
+-            vector = entry.ptr128->full.vector;
+-        else
+-            vector = entry.ptr32->flds.vector;
+-        /* The IntType fields match for both formats. */
+-        delivery_mode = entry.ptr32->flds.int_type;
+-    }
+-    else if ( x2apic_enabled )
+-    {
+-        /*
+-         * High half of incoming RTE was read from the I/O APIC and hence may
+-         * not hold the full destination, so need to recover full destination
+-         * from IRTE.
+-         */
+-        dest = get_full_dest(entry.ptr128);
+-    }
+     update_intremap_entry(iommu, entry, vector, delivery_mode, dest_mode, dest);
+ 
+     spin_unlock_irqrestore(lock, flags);
+@@ -352,14 +321,11 @@ static int update_intremap_entry_from_ioapic(
+ }
+ 
+ void amd_iommu_ioapic_update_ire(
+-    unsigned int apic, unsigned int reg, unsigned int value)
++    unsigned int apic, unsigned int pin, uint64_t rte)
+ {
+-    struct IO_APIC_route_entry old_rte = { };
+-    struct IO_APIC_route_entry new_rte = { };
+-    unsigned int rte_lo = (reg & 1) ? reg - 1 : reg;
+-    unsigned int pin = (reg - 0x10) / 2;
++    struct IO_APIC_route_entry old_rte;
++    struct IO_APIC_route_entry new_rte = { .raw = rte };
+     int seg, bdf, rc;
+-    bool saved_mask, fresh = false;
+     struct amd_iommu *iommu;
+     unsigned int idx;
+ 
+@@ -375,58 +341,23 @@ void amd_iommu_ioapic_update_ire(
+     {
+         AMD_IOMMU_DEBUG("Fail to find iommu for ioapic device id ="
+                         " %04x:%04x\n", seg, bdf);
+-        __io_apic_write(apic, reg, value);
++        __ioapic_write_entry(apic, pin, true, new_rte);
+         return;
+     }
+ 
+-    /* save io-apic rte lower 32 bits */
+-    *((u32 *)&old_rte) =  __io_apic_read(apic, rte_lo);
+-    saved_mask = old_rte.mask;
+-
+-    if ( reg == rte_lo )
+-    {
+-        *((u32 *)&new_rte) = value;
+-        /* read upper 32 bits from io-apic rte */
+-        *(((u32 *)&new_rte) + 1) = __io_apic_read(apic, reg + 1);
+-    }
+-    else
+-    {
+-        *((u32 *)&new_rte) = *((u32 *)&old_rte);
+-        *(((u32 *)&new_rte) + 1) = value;
+-    }
+-
+-    if ( ioapic_sbdf[idx].pin_2_idx[pin] >= INTREMAP_MAX_ENTRIES )
+-    {
+-        ASSERT(saved_mask);
+-
+-        /*
+-         * There's nowhere except the IRTE to store a full 32-bit destination,
+-         * so we may not bypass entry allocation and updating of the low RTE
+-         * half in the (usual) case of the high RTE half getting written first.
+-         */
+-        if ( new_rte.mask && !x2apic_enabled )
+-        {
+-            __io_apic_write(apic, reg, value);
+-            return;
+-        }
+-
+-        fresh = true;
+-    }
+-
++    old_rte = __ioapic_read_entry(apic, pin, true);
+     /* mask the interrupt while we change the intremap table */
+-    if ( !saved_mask )
++    if ( !old_rte.mask )
+     {
+         old_rte.mask = 1;
+-        __io_apic_write(apic, rte_lo, *((u32 *)&old_rte));
++        __ioapic_write_entry(apic, pin, true, old_rte);
+     }
+ 
+     /* Update interrupt remapping entry */
+     rc = update_intremap_entry_from_ioapic(
+-             bdf, iommu, &new_rte, reg == rte_lo,
++             bdf, iommu, &new_rte,
+              &ioapic_sbdf[idx].pin_2_idx[pin]);
+ 
+-    __io_apic_write(apic, reg, ((u32 *)&new_rte)[reg != rte_lo]);
+-
+     if ( rc )
+     {
+         /* Keep the entry masked. */
+@@ -435,20 +366,7 @@ void amd_iommu_ioapic_update_ire(
+         return;
+     }
+ 
+-    /* For lower bits access, return directly to avoid double writes */
+-    if ( reg == rte_lo )
+-        return;
+-
+-    /*
+-     * Unmask the interrupt after we have updated the intremap table. Also
+-     * write the low half if a fresh entry was allocated for a high half
+-     * update in x2APIC mode.
+-     */
+-    if ( !saved_mask || (x2apic_enabled && fresh) )
+-    {
+-        old_rte.mask = saved_mask;
+-        __io_apic_write(apic, rte_lo, *((u32 *)&old_rte));
+-    }
++    __ioapic_write_entry(apic, pin, true, new_rte);
+ }
+ 
+ unsigned int amd_iommu_read_ioapic_from_ire(
+diff --git a/xen/drivers/passthrough/vtd/extern.h b/xen/drivers/passthrough/vtd/extern.h
+index 3defe9677f06..e74d13a15ee8 100644
+--- a/xen/drivers/passthrough/vtd/extern.h
++++ b/xen/drivers/passthrough/vtd/extern.h
+@@ -93,7 +93,7 @@ int intel_iommu_get_reserved_device_memory(iommu_grdm_t *func, void *ctxt);
+ 
+ unsigned int io_apic_read_remap_rte(unsigned int apic, unsigned int reg);
+ void io_apic_write_remap_rte(unsigned int apic,
+-                             unsigned int reg, unsigned int value);
++                             unsigned int reg, uint64_t rte);
+ 
+ struct msi_desc;
+ struct msi_msg;
+diff --git a/xen/drivers/passthrough/vtd/intremap.c b/xen/drivers/passthrough/vtd/intremap.c
+index b6bde64d089d..32b433a47354 100644
+--- a/xen/drivers/passthrough/vtd/intremap.c
++++ b/xen/drivers/passthrough/vtd/intremap.c
+@@ -328,15 +328,14 @@ static int remap_entry_to_ioapic_rte(
+ 
+ static int ioapic_rte_to_remap_entry(struct vtd_iommu *iommu,
+     int apic, unsigned int ioapic_pin, struct IO_xAPIC_route_entry *old_rte,
+-    unsigned int rte_upper, unsigned int value)
++    struct IO_xAPIC_route_entry new_rte)
+ {
+     struct iremap_entry *iremap_entry = NULL, *iremap_entries;
+     struct iremap_entry new_ire;
+     struct IO_APIC_route_remap_entry *remap_rte;
+-    struct IO_xAPIC_route_entry new_rte;
+     int index;
+     unsigned long flags;
+-    bool init = false;
++    bool init = false, masked = old_rte->mask;
+ 
+     remap_rte = (struct IO_APIC_route_remap_entry *) old_rte;
+     spin_lock_irqsave(&iommu->intremap.lock, flags);
+@@ -364,48 +363,40 @@ static int ioapic_rte_to_remap_entry(struct vtd_iommu *iommu,
+ 
+     new_ire = *iremap_entry;
+ 
+-    if ( rte_upper )
+-    {
+-        if ( x2apic_enabled )
+-            new_ire.remap.dst = value;
+-        else
+-            new_ire.remap.dst = (value >> 24) << 8;
+-    }
++    if ( x2apic_enabled )
++        new_ire.remap.dst = new_rte.dest.dest32;
+     else
+-    {
+-        *(((u32 *)&new_rte) + 0) = value;
+-        new_ire.remap.fpd = 0;
+-        new_ire.remap.dm = new_rte.dest_mode;
+-        new_ire.remap.tm = new_rte.trigger;
+-        new_ire.remap.dlm = new_rte.delivery_mode;
+-        /* Hardware require RH = 1 for LPR delivery mode */
+-        new_ire.remap.rh = (new_ire.remap.dlm == dest_LowestPrio);
+-        new_ire.remap.avail = 0;
+-        new_ire.remap.res_1 = 0;
+-        new_ire.remap.vector = new_rte.vector;
+-        new_ire.remap.res_2 = 0;
+-
+-        set_ioapic_source_id(IO_APIC_ID(apic), &new_ire);
+-        new_ire.remap.res_3 = 0;
+-        new_ire.remap.res_4 = 0;
+-        new_ire.remap.p = 1;     /* finally, set present bit */
+-
+-        /* now construct new ioapic rte entry */
+-        remap_rte->vector = new_rte.vector;
+-        remap_rte->delivery_mode = 0;    /* has to be 0 for remap format */
+-        remap_rte->index_15 = (index >> 15) & 0x1;
+-        remap_rte->index_0_14 = index & 0x7fff;
+-
+-        remap_rte->delivery_status = new_rte.delivery_status;
+-        remap_rte->polarity = new_rte.polarity;
+-        remap_rte->irr = new_rte.irr;
+-        remap_rte->trigger = new_rte.trigger;
+-        remap_rte->mask = new_rte.mask;
+-        remap_rte->reserved = 0;
+-        remap_rte->format = 1;    /* indicate remap format */
+-    }
+-
+-    update_irte(iommu, iremap_entry, &new_ire, !init);
++        new_ire.remap.dst = GET_xAPIC_ID(new_rte.dest.dest32) << 8;
++
++    new_ire.remap.dm = new_rte.dest_mode;
++    new_ire.remap.tm = new_rte.trigger;
++    new_ire.remap.dlm = new_rte.delivery_mode;
++    /* Hardware require RH = 1 for LPR delivery mode. */
++    new_ire.remap.rh = (new_ire.remap.dlm == dest_LowestPrio);
++    new_ire.remap.vector = new_rte.vector;
++
++    set_ioapic_source_id(IO_APIC_ID(apic), &new_ire);
++    /* Finally, set present bit. */
++    new_ire.remap.p = 1;
++
++    /* Now construct new ioapic rte entry. */
++    remap_rte->vector = new_rte.vector;
++    /* Has to be 0 for remap format. */
++    remap_rte->delivery_mode = 0;
++    remap_rte->index_15 = (index >> 15) & 0x1;
++    remap_rte->index_0_14 = index & 0x7fff;
++
++    remap_rte->delivery_status = new_rte.delivery_status;
++    remap_rte->polarity = new_rte.polarity;
++    remap_rte->irr = new_rte.irr;
++    remap_rte->trigger = new_rte.trigger;
++    remap_rte->mask = new_rte.mask;
++    remap_rte->reserved = 0;
++    /* Indicate remap format. */
++    remap_rte->format = 1;
++
++    /* If cmpxchg16b is not available the caller must mask the IO-APIC pin. */
++    update_irte(iommu, iremap_entry, &new_ire, !init && !masked);
+     iommu_sync_cache(iremap_entry, sizeof(*iremap_entry));
+     iommu_flush_iec_index(iommu, 0, index);
+ 
+@@ -439,36 +430,42 @@ unsigned int io_apic_read_remap_rte(
+ }
+ 
+ void io_apic_write_remap_rte(
+-    unsigned int apic, unsigned int reg, unsigned int value)
++    unsigned int apic, unsigned int pin, uint64_t rte)
+ {
+-    unsigned int pin = (reg - 0x10) / 2;
++    struct IO_xAPIC_route_entry new_rte = { .raw = rte };
+     struct IO_xAPIC_route_entry old_rte = { };
+-    struct IO_APIC_route_remap_entry *remap_rte;
+-    unsigned int rte_upper = (reg & 1) ? 1 : 0;
+     struct vtd_iommu *iommu = ioapic_to_iommu(IO_APIC_ID(apic));
+-    int saved_mask;
+-
+-    old_rte = __ioapic_read_entry(apic, pin, true);
+-
+-    remap_rte = (struct IO_APIC_route_remap_entry *) &old_rte;
+-
+-    /* mask the interrupt while we change the intremap table */
+-    saved_mask = remap_rte->mask;
+-    remap_rte->mask = 1;
+-    __io_apic_write(apic, reg & ~1, *(u32 *)&old_rte);
+-    remap_rte->mask = saved_mask;
++    bool masked = true;
++    int rc;
+ 
+-    if ( ioapic_rte_to_remap_entry(iommu, apic, pin,
+-                                   &old_rte, rte_upper, value) )
++    if ( !cpu_has_cx16 )
+     {
+-        __io_apic_write(apic, reg, value);
++       /*
++        * Cannot atomically update the IRTE entry: mask the IO-APIC pin to
++        * avoid interrupts seeing an inconsistent IRTE entry.
++        */
++        old_rte = __ioapic_read_entry(apic, pin, true);
++        if ( !old_rte.mask )
++        {
++            masked = false;
++            old_rte.mask = 1;
++            __ioapic_write_entry(apic, pin, true, old_rte);
++        }
++    }
+ 
+-        /* Recover the original value of 'mask' bit */
+-        if ( rte_upper )
+-            __io_apic_write(apic, reg & ~1, *(u32 *)&old_rte);
++    rc = ioapic_rte_to_remap_entry(iommu, apic, pin, &old_rte, new_rte);
++    if ( rc )
++    {
++        if ( !masked )
++        {
++            /* Recover the original value of 'mask' bit */
++            old_rte.mask = 0;
++            __ioapic_write_entry(apic, pin, true, old_rte);
++        }
++        return;
+     }
+-    else
+-        __ioapic_write_entry(apic, pin, true, old_rte);
++    /* old_rte will contain the updated IO-APIC RTE on success. */
++    __ioapic_write_entry(apic, pin, true, old_rte);
+ }
+ 
+ static void set_msi_source_id(struct pci_dev *pdev, struct iremap_entry *ire)
+diff --git a/xen/drivers/passthrough/x86/iommu.c b/xen/drivers/passthrough/x86/iommu.c
+index f900bff60b21..39cc3f18b5dd 100644
+--- a/xen/drivers/passthrough/x86/iommu.c
++++ b/xen/drivers/passthrough/x86/iommu.c
+@@ -97,9 +97,9 @@ int iommu_enable_x2apic(void)
+ }
+ 
+ void iommu_update_ire_from_apic(
+-    unsigned int apic, unsigned int reg, unsigned int value)
++    unsigned int apic, unsigned int pin, uint64_t rte)
+ {
+-    iommu_vcall(&iommu_ops, update_ire_from_apic, apic, reg, value);
++    iommu_vcall(&iommu_ops, update_ire_from_apic, apic, pin, rte);
+ }
+ 
+ unsigned int iommu_read_apic_from_ire(unsigned int apic, unsigned int reg)
+diff --git a/xen/include/asm-x86/hvm/svm/amd-iommu-proto.h b/xen/include/asm-x86/hvm/svm/amd-iommu-proto.h
+index df08d38e67c0..a6cf4c72056a 100644
+--- a/xen/include/asm-x86/hvm/svm/amd-iommu-proto.h
++++ b/xen/include/asm-x86/hvm/svm/amd-iommu-proto.h
+@@ -115,7 +115,7 @@ int amd_iommu_free_intremap_table(
+ unsigned int amd_iommu_intremap_table_order(
+     const void *irt, const struct amd_iommu *iommu);
+ void amd_iommu_ioapic_update_ire(
+-    unsigned int apic, unsigned int reg, unsigned int value);
++    unsigned int apic, unsigned int pin, uint64_t rte);
+ unsigned int amd_iommu_read_ioapic_from_ire(
+     unsigned int apic, unsigned int reg);
+ int amd_iommu_msi_msg_update_ire(
+diff --git a/xen/include/asm-x86/iommu.h b/xen/include/asm-x86/iommu.h
+index b9903db24e36..4a9364da3b81 100644
+--- a/xen/include/asm-x86/iommu.h
++++ b/xen/include/asm-x86/iommu.h
+@@ -86,7 +86,8 @@ struct iommu_init_ops {
+ 
+ extern const struct iommu_init_ops *iommu_init_ops;
+ 
+-void iommu_update_ire_from_apic(unsigned int apic, unsigned int reg, unsigned int value);
++void iommu_update_ire_from_apic(unsigned int apic, unsigned int pin,
++                                uint64_t rte);
+ unsigned int iommu_read_apic_from_ire(unsigned int apic, unsigned int reg);
+ int iommu_setup_hpet_msi(struct msi_desc *);
+ 
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index 8793064e4d3f..a2009cfe11fa 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -259,7 +259,8 @@ struct iommu_ops {
+     int (*enable_x2apic)(void);
+     void (*disable_x2apic)(void);
+ 
+-    void (*update_ire_from_apic)(unsigned int apic, unsigned int reg, unsigned int value);
++    void (*update_ire_from_apic)(unsigned int apic, unsigned int pin,
++                                 uint64_t rte);
+     unsigned int (*read_apic_from_ire)(unsigned int apic, unsigned int reg);
+ 
+     int (*setup_hpet_msi)(struct msi_desc *);
