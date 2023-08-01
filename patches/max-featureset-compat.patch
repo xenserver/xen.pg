@@ -1,5 +1,5 @@
 diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
-index 2f7b4a32223c..f0a4bd4e2806 100644
+index 8a25fecbc28e..6bbd0193b5ed 100644
 --- a/tools/libxc/xc_cpuid_x86.c
 +++ b/tools/libxc/xc_cpuid_x86.c
 @@ -55,8 +55,8 @@ int xc_get_cpu_levelling_caps(xc_interface *xch, uint32_t *caps)
@@ -13,13 +13,14 @@ index 2f7b4a32223c..f0a4bd4e2806 100644
  {
      DECLARE_SYSCTL;
      DECLARE_HYPERCALL_BOUNCE(featureset,
-@@ -82,6 +82,123 @@ int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
+@@ -82,6 +82,140 @@ int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
      return ret;
  }
  
 +int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
 +                          uint32_t *nr, uint32_t *fs)
 +{
++    uint32_t raw_fs[FEATURESET_NR_ENTRIES] = {}, raw_nr = ARRAY_SIZE(raw_fs);
 +    uint32_t host_fs[FEATURESET_NR_ENTRIES] = {}, host_nr = ARRAY_SIZE(host_fs);
 +    unsigned int vendor;
 +    int ret;
@@ -29,11 +30,16 @@ index 2f7b4a32223c..f0a4bd4e2806 100644
 +        return xc_get_cpu_featureset_(xch, index, nr, fs);
 +
 +    /*
-+     * Fake up a *_max featureset.  Obtain the host, and pv/hvm default.
++     * Fake up a *_max featureset.  Obtain the raw, host, and pv/hvm default.
 +     *
 +     * This is used by xenopsd to pass to the toolstack of the incoming
 +     * domain, to allow it to establish migration safety.
 +     */
++    ret = xc_get_cpu_featureset_(
++        xch, XEN_SYSCTL_cpu_featureset_raw, &raw_nr, raw_fs);
++    if ( ret && errno != ENOBUFS )
++        return ret;
++
 +    ret = xc_get_cpu_featureset_(
 +        xch, XEN_SYSCTL_cpu_featureset_host, &host_nr, host_fs);
 +    if ( ret && errno != ENOBUFS )
@@ -69,6 +75,17 @@ index 2f7b4a32223c..f0a4bd4e2806 100644
 +    clear_bit(X86_FEATURE_RTM, fs);
 +    if ( test_bit(X86_FEATURE_RTM, host_fs) )
 +        set_bit(X86_FEATURE_RTM, fs);
++
++    /*
++     * The Gather Data Sampling microcode mitigation (August 2023) has an
++     * adverse performance impact on the CLWB instruction on SKX/CLX/CPX.
++     *
++     * We hid CLWB in the host policy to stop Xen using it, but VMs which
++     * have previously seen the CLWB feature can safely run on this CPU.
++     */
++    if ( test_bit(X86_FEATURE_CLWB, raw_fs) &&
++         !test_bit(X86_FEATURE_CLWB, host_fs) )
++        set_bit(X86_FEATURE_CLWB, fs);
 +
 +    if ( index == XEN_SYSCTL_cpu_featureset_hvm_max )
 +    {
