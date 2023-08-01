@@ -1,0 +1,49 @@
+From e3e3edb0420f7a42fda28187eb6fe362126c2e30 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 27 Feb 2023 15:36:49 +0000
+Subject: x86/cpu-policy: Hide CLWB by default on SKX/CLX/CPX
+
+The August 2023 microcode for GDS has an impact on the CLWB instruction.  See
+code comments for full details.
+
+This is part of XSA-435 / CVE-2022-40982
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu/intel.c b/xen/arch/x86/cpu/intel.c
+index ebb9d92400e0..2551fb282e2d 100644
+--- a/xen/arch/x86/cpu/intel.c
++++ b/xen/arch/x86/cpu/intel.c
+@@ -446,6 +446,18 @@ static void init_intel(struct cpuinfo_x86 *c)
+ 	     ( c->cpuid_level >= 0x00000006 ) &&
+ 	     ( cpuid_eax(0x00000006) & (1u<<2) ) )
+ 		__set_bit(X86_FEATURE_ARAT, c->x86_capability);
++
++	/*
++	 * The Gather Data Sampling microcode mitigation (August 2023) has an
++	 * adverse performance impact on the CLWB instruction on SKX/CLX/CPX.
++	 *
++	 * On this model, CLWB has equivalent behaviour to CLFLUSHOPT but the
++	 * latter is not impacted.  Hide CLWB to cause Xen to fall back to
++	 * using CLFLUSHOPT instead.
++	 */
++	if (c == &boot_cpu_data &&
++	    c->x86 == 6 && c->x86_model == 0x55 /* INTEL_FAM6_SKYLAKE_X */)
++		setup_clear_cpu_cap(X86_FEATURE_CLWB);
+ }
+ 
+ const struct cpu_dev intel_cpu_dev = {
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index d3296359f85d..6f7552a5e533 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -214,7 +214,7 @@ XEN_CPUFEATURE(ADX,           5*32+19) /*A  ADCX, ADOX instructions */
+ XEN_CPUFEATURE(SMAP,          5*32+20) /*S  Supervisor Mode Access Prevention */
+ XEN_CPUFEATURE(AVX512_IFMA,   5*32+21) /*A  AVX-512 Integer Fused Multiply Add */
+ XEN_CPUFEATURE(CLFLUSHOPT,    5*32+23) /*A  CLFLUSHOPT instruction */
+-XEN_CPUFEATURE(CLWB,          5*32+24) /*A  CLWB instruction */
++XEN_CPUFEATURE(CLWB,          5*32+24) /*!A CLWB instruction */
+ XEN_CPUFEATURE(AVX512PF,      5*32+26) /*A  AVX-512 Prefetch Instructions */
+ XEN_CPUFEATURE(AVX512ER,      5*32+27) /*A  AVX-512 Exponent & Reciprocal Instrs */
+ XEN_CPUFEATURE(AVX512CD,      5*32+28) /*A  AVX-512 Conflict Detection Instrs */
