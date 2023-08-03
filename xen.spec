@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.48
+%global hv_rel 10.49
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -867,6 +867,16 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Thu Aug 3 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.49
+- Fix bug in XSA-433 fix, which accidentally disabled a hardware errata
+  workaround.
+- Update IO-APIC IRTEs atomically.  Fixes a race condition which causes
+  interrupts to be routed badly, often with "No irq handler for vector"
+  errors.
+- Expose MSR_ARCH_CAPS to guests on all Intel hardware by default.  On Cascade
+  Lake and later hardware, guests now see the bits stating hardware immunity
+  to various speculative vulnerabilities.
+
 * Mon Jul 24 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.48
 - Fix for XSA-433 CVE-2023-20593.
 - Limit scheduler loadbalancing to once per millisecond.  This improves
