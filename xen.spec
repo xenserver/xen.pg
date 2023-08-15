@@ -48,9 +48,12 @@ BuildRequires: python3-rpm-macros
 %global py_sitearch %{python3_sitearch}
 %global __python %{__python3}
 
+%if 0%{?xenserver} < 9
 # Interim, build Python2 bindings too
+%global py2_compat 1
 BuildRequires: python2-devel
 BuildRequires: python2-rpm-macros
+%endif
 
 BuildRequires: devtoolset-11-gcc devtoolset-11-binutils
 
@@ -234,9 +237,11 @@ cp -a . ../livepatch-src/
 %{?_cov_wrap} %{make_build} build-tools
 %{make_build} -C docs man-pages
 
+%if 0%{?py2_compat}
 # Interim python2 bindings too
 %{make_build} DESTDIR=%{buildroot} PYTHON=python2 -C tools/python
 %{make_build} DESTDIR=%{buildroot} PYTHON=python2 -C tools/pygrub
+%endif
 
 # The hypervisor build system can't cope with RPM's {C,LD}FLAGS
 unset CFLAGS
@@ -281,10 +286,12 @@ export PYTHON="%{__python}"
 # The existence of this directory causes ocamlfind to put things in it
 mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 
+%if 0%{?py2_compat}
 # Interim python2 bindings.  Must be installed ahead of the main install-tools
 # so the Python3 scripts take priority.
 %{make_build} DESTDIR=%{buildroot} PYTHON=python2 install -C tools/python
 %{make_build} DESTDIR=%{buildroot} PYTHON=python2 install -C tools/pygrub
+%endif
 
 # Install tools and man pages
 %{make_build} DESTDIR=%{buildroot} install-tools
@@ -550,15 +557,21 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %{py_sitearch}/grub/
 %{py_sitearch}/xenfsimage.cpython*.so
 %{py_sitearch}/pygrub-0.6-py*.egg-info
+
+%if 0%{?py2_compat}
 %{python2_sitearch}/grub/
 %{python2_sitearch}/xenfsimage.so
 %{python2_sitearch}/pygrub-0.6-py*.egg-info
+%endif
 
 # Xen python libs
 %{py_sitearch}/xen-3.0-py*.egg-info
 %{py_sitearch}/xen/
+
+%if 0%{?py2_compat}
 %{python2_sitearch}/xen-3.0-py*.egg-info
 %{python2_sitearch}/xen/
+%endif
 
 %{_libexecdir}/%{name}/bin/convert-legacy-stream
 %{_libexecdir}/%{name}/bin/init-xenstore-domain
