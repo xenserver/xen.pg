@@ -1,11 +1,11 @@
 # -*- rpm-spec -*-
 
 # Commitish for Source0, required by tooling.
-%global package_srccommit RELEASE-4.13.5
+%global package_srccommit RELEASE-4.17.3
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.60
+%global hv_rel 1
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -29,7 +29,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.13.5
+Version: 4.17.3
 Release: %{?xsrel}%{?dist}
 License: GPLv2 and LGPLv2 and MIT and Public Domain
 URL:     https://www.xenproject.org
@@ -68,6 +68,10 @@ BuildRequires: python2-rpm-macros
         }
     end
 
+    -- For Kconfig
+    table.insert(deps, 'bison')
+    table.insert(deps, 'flex')
+
     for _, dep in ipairs(deps) do
         print(rpm.expand("%1") .. ': ' .. dep .. '\\n')
     end
@@ -83,7 +87,7 @@ BuildRequires: python2-rpm-macros
 BuildRequires: dev86 iasl
 
 # For the domain builder (decompression and hashing)
-BuildRequires: zlib-devel bzip2-devel xz-devel
+BuildRequires: zlib-devel bzip2-devel xz-devel libzstd-devel
 BuildRequires: openssl-devel
 
 # For libxl
@@ -277,24 +281,16 @@ build_xen () { # $1=vendorversion $2=buildconfig $3=outdir $4=cov
     [ -n "$1" ] && ver="XEN_VENDORVERSION=$1"
     [ -n "$4" ] && cov="%{?_cov_wrap}"
 
-    mk="$cov %{make_build} -C xen $ver"
+    mk="$cov %{make_build} -C xen $ver O=$3"
 
-    cp -a buildconfigs/$2 xen/.config
+    mkdir xen/$3 && cp -a buildconfigs/$2 xen/$3/.config
     $mk olddefconfig
-    $mk build
-    $mk MAP
-
-    mkdir -p xen/$3
-    cp -a xen/xen xen/xen.gz xen/System.map xen/xen-syms xen/.config xen/$3
+    $mk build MAP
 }
 
 # Builds of Xen
 build_xen -%{hv_rel}   config-release         build-xen-release
-
-%{make_build} -C xen clean
 build_xen -%{hv_rel}-d config-debug           build-xen-debug      cov
-
-%{make_build} -C xen clean
 build_xen ""           config-pvshim          build-shim
 
 
@@ -376,8 +372,10 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_includedir}/%{name}/COPYING
 %{_includedir}/%{name}/arch-arm.h
 %{_includedir}/%{name}/arch-arm/hvm/save.h
+%{_includedir}/%{name}/arch-arm/smccc.h
 %{_includedir}/%{name}/arch-x86/cpuid.h
 %{_includedir}/%{name}/arch-x86/cpufeatureset.h
+%{_includedir}/%{name}/arch-x86/guest-acpi.h
 %{_includedir}/%{name}/arch-x86/hvm/save.h
 %{_includedir}/%{name}/arch-x86/hvm/start_info.h
 %{_includedir}/%{name}/arch-x86/pmu.h
@@ -411,6 +409,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_includedir}/%{name}/hvm/params.h
 %{_includedir}/%{name}/hvm/pvdrivers.h
 %{_includedir}/%{name}/hvm/save.h
+%{_includedir}/%{name}/hypfs.h
 %{_includedir}/%{name}/io/9pfs.h
 %{_includedir}/%{name}/io/blkif.h
 %{_includedir}/%{name}/io/cameraif.h
@@ -461,16 +460,20 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/libxenevtchn.so.1.2
 %{_libdir}/libxengnttab.so.1
 %{_libdir}/libxengnttab.so.1.2
-%{_libdir}/libxenstore.so.3.0
-%{_libdir}/libxenstore.so.3.0.3
+%{_libdir}/libxenstore.so.4
+%{_libdir}/libxenstore.so.4.0
 %{_libdir}/libxentoolcore.so.1
 %{_libdir}/libxentoolcore.so.1.0
 %{_libdir}/libxentoollog.so.1
 %{_libdir}/libxentoollog.so.1.0
-%{_libdir}/libxenvchan.so.4.13
-%{_libdir}/libxenvchan.so.4.13.0
+%{_libdir}/libxenvchan.so.4.17
+%{_libdir}/libxenvchan.so.4.17.0
 
 %files libs-devel
+
+# Common
+%{_includedir}/xen_list.h
+
 # Lib Xen Evtchn
 %{_includedir}/xenevtchn.h
 %{_libdir}/libxenevtchn.a
@@ -512,7 +515,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/pkgconfig/xenvchan.pc
 
 %files dom0-tools
-%{_sysconfdir}/bash_completion.d/xl.sh
+%{_sysconfdir}/bash_completion.d/xl
 %exclude %{_sysconfdir}/rc.d/init.d/xencommons
 %exclude %{_sysconfdir}/rc.d/init.d/xendomains
 %exclude %{_sysconfdir}/rc.d/init.d/xendriverdomain
@@ -545,18 +548,18 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_sysconfdir}/xen/scripts/vif-openvswitch
 %{_sysconfdir}/xen/scripts/vif-route
 %{_sysconfdir}/xen/scripts/vif-setup
-%{_sysconfdir}/xen/scripts/vif2
 %{_sysconfdir}/xen/scripts/vscsi
 %{_sysconfdir}/xen/scripts/xen-hotplug-common.sh
 %{_sysconfdir}/xen/scripts/xen-network-common.sh
 %{_sysconfdir}/xen/scripts/xen-script-common.sh
 %exclude %{_sysconfdir}/%{name}/cpupool
 %exclude %{_sysconfdir}/%{name}/README
-%exclude %{_sysconfdir}/%{name}/README.incompatibilities
 %exclude %{_sysconfdir}/%{name}/xlexample.hvm
+%exclude %{_sysconfdir}/%{name}/xlexample.pvhlinux
 %exclude %{_sysconfdir}/%{name}/xlexample.pvlinux
 %config %{_sysconfdir}/xen/xl.conf
 %{_bindir}/pygrub
+%{_bindir}/vchan-socket-proxy
 %{_bindir}/xen-cpuid
 %{_bindir}/xen-detect
 %{_bindir}/xenalyze
@@ -608,6 +611,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_sbindir}/flask-setenforce
 %{_sbindir}/gdbsx
 %{_sbindir}/oxenstored
+%{_sbindir}/xen-access
 %{_sbindir}/xen-diag
 %{_sbindir}/xen-hptool
 %{_sbindir}/xen-hvmcrash
@@ -616,13 +620,16 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_sbindir}/xen-livepatch
 %{_sbindir}/xen-lowmemd
 %{_sbindir}/xen-mceinj
+%{_sbindir}/xen-memshare
 %{_sbindir}/xen-mfndump
 %{_sbindir}/xen-spec-ctrl
 %{_sbindir}/xen-ucode
 %{_sbindir}/xen-vmdebug
+%{_sbindir}/xen-vmtrace
 %{_sbindir}/xenbaked
 %{_sbindir}/xenconsoled
 %{_sbindir}/xencov
+%{_sbindir}/xenhypfs
 %{_sbindir}/xenmon
 %{_sbindir}/xenperf
 %{_sbindir}/xenpm
@@ -635,6 +642,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_sbindir}/xenwatchdogd
 %{_sbindir}/xl
 %exclude %{_sbindir}/xenlockprof
+%{_mandir}/man1/xenhypfs.1.gz
 %{_mandir}/man1/xentop.1.gz
 %{_mandir}/man1/xentrace_format.1.gz
 %{_mandir}/man1/xenstore-chmod.1.gz
@@ -645,6 +653,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_mandir}/man1/xl.1.gz
 %{_mandir}/man5/xl-disk-configuration.5.gz
 %{_mandir}/man5/xl-network-configuration.5.gz
+%{_mandir}/man5/xl-pci-configuration.5.gz
 %{_mandir}/man5/xl.cfg.5.gz
 %{_mandir}/man5/xl.conf.5.gz
 %{_mandir}/man5/xlcpupool.cfg.5.gz
@@ -659,7 +668,6 @@ install_xen -%{hv_rel}-d build-xen-debug
 %dir /var/log/xen
 %if %with_systemd
 %{_unitdir}/proc-xen.mount
-%{_unitdir}/var-lib-xenstored.mount
 %{_unitdir}/xen-init-dom0.service
 %{_unitdir}/xen-watchdog.service
 %{_unitdir}/xenconsoled.service
@@ -672,23 +680,25 @@ install_xen -%{hv_rel}-d build-xen-debug
 
 %files dom0-libs
 %{_libdir}/libxencall.so.1
-%{_libdir}/libxencall.so.1.2
-%{_libdir}/libxenctrl.so.4.13
-%{_libdir}/libxenctrl.so.4.13.0
+%{_libdir}/libxencall.so.1.3
+%{_libdir}/libxenctrl.so.4.17
+%{_libdir}/libxenctrl.so.4.17.0
 %{_libdir}/libxendevicemodel.so.1
 %{_libdir}/libxendevicemodel.so.1.4
 %{_libdir}/libxenforeignmemory.so.1
-%{_libdir}/libxenforeignmemory.so.1.3
-%{_libdir}/libxenfsimage.so.4.13
-%{_libdir}/libxenfsimage.so.4.13.0
-%{_libdir}/libxenguest.so.4.13
-%{_libdir}/libxenguest.so.4.13.0
-%{_libdir}/libxenlight.so.4.13
-%{_libdir}/libxenlight.so.4.13.0
-%{_libdir}/libxenstat.so.4.13
-%{_libdir}/libxenstat.so.4.13.0
-%{_libdir}/libxlutil.so.4.13
-%{_libdir}/libxlutil.so.4.13.0
+%{_libdir}/libxenforeignmemory.so.1.4
+%{_libdir}/libxenfsimage.so.4.17
+%{_libdir}/libxenfsimage.so.4.17.0
+%{_libdir}/libxenguest.so.4.17
+%{_libdir}/libxenguest.so.4.17.0
+%{_libdir}/libxenhypfs.so.1
+%{_libdir}/libxenhypfs.so.1.0
+%{_libdir}/libxenlight.so.4.17
+%{_libdir}/libxenlight.so.4.17.0
+%{_libdir}/libxenstat.so.4.17
+%{_libdir}/libxenstat.so.4.17.0
+%{_libdir}/libxlutil.so.4.17
+%{_libdir}/libxlutil.so.4.17.0
 %{_libdir}/xenfsimage/btrfs/fsimage.so
 %{_libdir}/xenfsimage/ext2fs-lib/fsimage.so
 %{_libdir}/xenfsimage/fat/fsimage.so
@@ -730,7 +740,11 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/libxenguest.so
 %{_libdir}/pkgconfig/xenguest.pc
 
-%{_includedir}/_libxl_list.h
+%{_includedir}/xenhypfs.h
+%{_libdir}/libxenhypfs.a
+%{_libdir}/libxenhypfs.so
+%{_libdir}/pkgconfig/xenhypfs.pc
+
 %{_includedir}/_libxl_types.h
 %{_includedir}/_libxl_types_json.h
 %{_includedir}/libxl.h
@@ -820,6 +834,9 @@ install_xen -%{hv_rel}-d build-xen-debug
 %files dom0-tests
 %exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker
 %{_libexecdir}/%{name}/bin/test-cpu-policy
+%{_libexecdir}/%{name}/bin/test-paging-mempool
+%{_libexecdir}/%{name}/bin/test-resource
+%{_libexecdir}/%{name}/bin/test-tsx
 %{_libexecdir}/%{name}/bin/test-xenstore
 %{_libexecdir}/%{name}/bin/test_x86_emulator
 %{_datadir}/xen-dom0-tests-metadata.json
