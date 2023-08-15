@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
         emit $1
     else
         # Something more complex.  Ask `git rev-list`
-        for R in `git rev-list $1`; do
+        for R in `git rev-list --reverse $1`; do
             emit $R
         done
     fi
