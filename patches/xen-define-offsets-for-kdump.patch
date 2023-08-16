@@ -2,32 +2,36 @@ Cause to be defined all those extra Xen symbol offsets that kdump needs
 to navigate its way around a memory image.
 
 diff --git a/xen/Makefile b/xen/Makefile
-index 223c0c8be4..49c77e3319 100644
+index eea21829111b..8f3d923cf10f 100644
 --- a/xen/Makefile
 +++ b/xen/Makefile
-@@ -244,6 +244,7 @@ _cscope:
- .PHONY: _MAP
- _MAP:
- 	$(NM) -n $(TARGET)-syms | grep -v '\(compiled\)\|\(\.o$$\)\|\( [aUw] \)\|\(\.\.ng$$\)\|\(LASH[RL]DI\)' > System.map
-+	cat include/asm/asm-offsets.h | awk '/^#define __ASM_OFFSETS_H__/ { next } ; /^#define / { printf "%016x - +%s\n", $$3, $$2 }' >> System.map
+@@ -636,7 +636,9 @@ cscope:
  
- .PHONY: FORCE
- FORCE:
+ .PHONY: _MAP
+ _MAP: $(TARGET)
+-	$(NM) -n $(TARGET)-syms | grep -v '\(compiled\)\|\(\.o$$\)\|\( [aUw] \)\|\(\.\.ng$$\)\|\(LASH[RL]DI\)' > System.map
++	{ $(NM) -n $(TARGET)-syms | grep -v '\(compiled\)\|\(\.o$$\)\|\( [aUw] \)\|\(\.\.ng$$\)\|\(LASH[RL]DI\)'; \
++	awk < arch/$(SRCARCH)/include/asm/asm-offsets.h \
++	'/^#define __ASM_OFFSETS_H__/ { next } ; /^#define / { printf "%016x - +%s\n", $$3, $$2 }'; } > System.map
+ 
+ %.o %.i %.s: %.c tools_fixdep FORCE
+ 	$(Q)$(MAKE) $(build)=$(*D) $(*D)/$(@F)
 diff --git a/xen/arch/x86/x86_64/asm-offsets.c b/xen/arch/x86/x86_64/asm-offsets.c
-index 5df15e26f1..5c3a163073 100644
+index 287dac101ad4..65756c6b6c79 100644
 --- a/xen/arch/x86/x86_64/asm-offsets.c
 +++ b/xen/arch/x86/x86_64/asm-offsets.c
-@@ -13,6 +13,9 @@
+@@ -15,6 +15,10 @@
  #include <asm/hardirq.h>
  #include <xen/multiboot.h>
  #include <xen/multiboot2.h>
 +#include <public/sysctl.h>
 +#include <xen/symbols.h>
 +#include <xen/livepatch.h>
++#include <xen/livepatch_payload.h>
  
  #define DEFINE(_sym, _val)                                                 \
      asm volatile ("\n.ascii\"==>#define " #_sym " %0 /* " #_val " */<==\"" \
-@@ -49,6 +52,49 @@ void __dummy__(void)
+@@ -51,6 +55,51 @@ void __dummy__(void)
      OFFSET(UREGS_kernel_sizeof, struct cpu_user_regs, es);
      BLANK();
  
@@ -41,7 +45,9 @@ index 5df15e26f1..5c3a163073 100644
 +    OFFSET(DOMAIN_is_privileged, struct domain, is_privileged);
 +    OFFSET(DOMAIN_tot_pages, struct domain, tot_pages);
 +    OFFSET(DOMAIN_max_pages, struct domain, max_pages);
++#ifdef CONFIG_MEM_SHARING
 +    OFFSET(DOMAIN_shr_pages, struct domain, shr_pages);
++#endif
 +    OFFSET(DOMAIN_has_32bit_shinfo, struct domain, arch.has_32bit_shinfo);
 +    OFFSET(DOMAIN_pause_count, struct domain, pause_count);
 +    OFFSET(DOMAIN_handle, struct domain, handle);
@@ -58,7 +64,7 @@ index 5df15e26f1..5c3a163073 100644
 +    DEFINE(VIRT_DIRECTMAP_START, DIRECTMAP_VIRT_START);
 +    DEFINE(VIRT_DIRECTMAP_END, DIRECTMAP_VIRT_END);
 +
-+    DEFINE(XEN_DEBUG, debug_build());
++    DEFINE(XEN_DEBUG, IS_ENABLED(CONFIG_DEBUG));
 +    DEFINE(XEN_STACK_SIZE, STACK_SIZE);
 +    DEFINE(XEN_PRIMARY_STACK_SIZE, PRIMARY_STACK_SIZE);
 +#ifdef MEMORY_GUARD
@@ -77,39 +83,39 @@ index 5df15e26f1..5c3a163073 100644
      OFFSET(VCPU_processor, struct vcpu, processor);
      OFFSET(VCPU_domain, struct vcpu, domain);
      OFFSET(VCPU_vcpu_info, struct vcpu, vcpu_info);
-@@ -70,9 +116,15 @@ void __dummy__(void)
+@@ -72,9 +121,15 @@ void __dummy__(void)
      OFFSET(VCPU_kernel_ss, struct vcpu, arch.pv.kernel_ss);
      OFFSET(VCPU_iopl, struct vcpu, arch.pv.iopl);
-     OFFSET(VCPU_guest_context_flags, struct vcpu, arch.vgc_flags);
+     OFFSET(VCPU_guest_context_flags, struct vcpu, arch.pv.vgc_flags);
 +    OFFSET(VCPU_user_regs, struct vcpu, arch.user_regs);
 +    OFFSET(VCPU_flags, struct vcpu, arch.flags);
 +    OFFSET(VCPU_guest_table_user, struct vcpu, arch.guest_table_user);
 +    OFFSET(VCPU_guest_table, struct vcpu, arch.guest_table);
      OFFSET(VCPU_cr3, struct vcpu, arch.cr3);
      OFFSET(VCPU_arch_msrs, struct vcpu, arch.msrs);
-     OFFSET(VCPU_nmi_pending, struct vcpu, nmi_pending);
+     OFFSET(VCPU_nmi_pending, struct vcpu, arch.nmi_pending);
 +    OFFSET(VCPU_pause_flags, struct vcpu, pause_flags);
 +    OFFSET(VCPU_pause_count, struct vcpu, pause_count);
-     OFFSET(VCPU_mce_pending, struct vcpu, mce_pending);
-     OFFSET(VCPU_nmi_old_mask, struct vcpu, nmi_state.old_mask);
-     OFFSET(VCPU_mce_old_mask, struct vcpu, mce_state.old_mask);
-@@ -80,6 +132,7 @@ void __dummy__(void)
+     OFFSET(VCPU_mce_pending, struct vcpu, arch.mce_pending);
+     OFFSET(VCPU_nmi_old_mask, struct vcpu, arch.nmi_state.old_mask);
+     OFFSET(VCPU_mce_old_mask, struct vcpu, arch.mce_state.old_mask);
+@@ -82,6 +137,7 @@ void __dummy__(void)
      DEFINE(VCPU_TRAP_NMI, VCPU_TRAP_NMI);
      DEFINE(VCPU_TRAP_MCE, VCPU_TRAP_MCE);
      DEFINE(_VGCF_syscall_disables_events,  _VGCF_syscall_disables_events);
 +    DEFINE(VCPU_sizeof, sizeof(struct vcpu));
      BLANK();
  
-     OFFSET(VCPU_svm_vmcb_pa, struct vcpu, arch.hvm.svm.vmcb_pa);
-@@ -110,6 +163,7 @@ void __dummy__(void)
-     BLANK();
+ #ifdef CONFIG_HVM
+@@ -118,6 +174,7 @@ void __dummy__(void)
+ #endif
  
      OFFSET(CPUINFO_guest_cpu_user_regs, struct cpu_info, guest_cpu_user_regs);
 +    OFFSET(CPUINFO_processor_id, struct cpu_info, processor_id);
      OFFSET(CPUINFO_verw_sel, struct cpu_info, verw_sel);
      OFFSET(CPUINFO_current_vcpu, struct cpu_info, current_vcpu);
      OFFSET(CPUINFO_per_cpu_offset, struct cpu_info, per_cpu_offset);
-@@ -170,4 +224,29 @@ void __dummy__(void)
+@@ -178,4 +235,29 @@ void __dummy__(void)
      BLANK();
  
      OFFSET(DOMAIN_vm_assist, struct domain, vm_assist);

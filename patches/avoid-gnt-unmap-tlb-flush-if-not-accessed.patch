@@ -5,6 +5,46 @@ not accessed whilst it was mapped.
 
 Signed-off-by: Malcolm Crossley <malcolm.crossley@citrix.com>
 Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
+diff --git a/xen/arch/x86/include/asm/grant_table.h b/xen/arch/x86/include/asm/grant_table.h
+index 5c23cec90c8f..dbb011f972b2 100644
+--- a/xen/arch/x86/include/asm/grant_table.h
++++ b/xen/arch/x86/include/asm/grant_table.h
+@@ -25,11 +25,11 @@ static inline int create_grant_host_mapping(uint64_t addr, mfn_t frame,
+ 
+ static inline int replace_grant_host_mapping(uint64_t addr, mfn_t frame,
+                                              uint64_t new_addr,
+-                                             unsigned int flags)
++                                             unsigned int flags, int *page_accessed)
+ {
+     if ( paging_mode_external(current->domain) )
+         return replace_grant_p2m_mapping(addr, frame, new_addr, flags);
+-    return replace_grant_pv_mapping(addr, frame, new_addr, flags);
++    return replace_grant_pv_mapping(addr, frame, new_addr, flags, page_accessed);
+ }
+ 
+ #define gnttab_set_frame_gfn(gt, st, idx, gfn, mfn)                      \
+diff --git a/xen/arch/x86/include/asm/pv/grant_table.h b/xen/arch/x86/include/asm/pv/grant_table.h
+index 85442b60749f..6fd1cf67df7f 100644
+--- a/xen/arch/x86/include/asm/pv/grant_table.h
++++ b/xen/arch/x86/include/asm/pv/grant_table.h
+@@ -26,7 +26,7 @@
+ int create_grant_pv_mapping(uint64_t addr, mfn_t frame,
+                             unsigned int flags, unsigned int cache_flags);
+ int replace_grant_pv_mapping(uint64_t addr, mfn_t frame,
+-                             uint64_t new_addr, unsigned int flags);
++                             uint64_t new_addr, unsigned int flags, int *page_accessed);
+ 
+ #else
+ 
+@@ -40,7 +40,7 @@ static inline int create_grant_pv_mapping(uint64_t addr, mfn_t frame,
+ }
+ 
+ static inline int replace_grant_pv_mapping(uint64_t addr, mfn_t frame,
+-                                           uint64_t new_addr, unsigned int flags)
++                                           uint64_t new_addr, unsigned int flags, int *page_accessed)
+ {
+     return GNTST_general_error;
+ }
 diff --git a/xen/arch/x86/pv/grant_table.c b/xen/arch/x86/pv/grant_table.c
 index 81c72e61ed55..b8e5da195f5b 100644
 --- a/xen/arch/x86/pv/grant_table.c
@@ -62,10 +102,10 @@ index 81c72e61ed55..b8e5da195f5b 100644
  
   out_unlock:
 diff --git a/xen/arch/x86/pv/mm.h b/xen/arch/x86/pv/mm.h
-index a1bd473b2918..eb06b5178f26 100644
+index 5a117c735d5e..8edf45fb2b62 100644
 --- a/xen/arch/x86/pv/mm.h
 +++ b/xen/arch/x86/pv/mm.h
-@@ -36,49 +36,56 @@ static inline l1_pgentry_t guest_get_eff_l1e(unsigned long linear)
+@@ -45,13 +45,14 @@ static inline l1_pgentry_t guest_get_eff_kern_l1e(unsigned long linear)
   * How to write an entry to the guest pagetables.
   * Returns false for failure (pointer not valid), true for success.
   */
@@ -80,32 +120,18 @@ index a1bd473b2918..eb06b5178f26 100644
  #ifndef PTE_UPDATE_WITH_CMPXCHG
 -    if ( !preserve_ad )
 +    if ( !preserve_ad && !use_cmpxchg )
-     {
-         rv = paging_write_guest_entry(v, p, new, mfn);
-     }
+         paging_write_guest_entry(v, p, new, mfn);
      else
  #endif
-     {
--        intpte_t t = old;
-+        intpte_t t = *old;
- 
-         for ( ; ; )
-         {
-             intpte_t _new = new;
+@@ -61,22 +62,28 @@ static inline bool update_intpte(intpte_t *p, intpte_t old, intpte_t new,
+             intpte_t _new = new, t;
  
              if ( preserve_ad )
 -                _new |= old & (_PAGE_ACCESSED | _PAGE_DIRTY);
 +                _new |= *old & (_PAGE_ACCESSED | _PAGE_DIRTY);
  
-             rv = paging_cmpxchg_guest_entry(v, p, &t, _new, mfn);
-             if ( unlikely(rv == 0) )
-             {
-                 gdprintk(XENLOG_WARNING,
-                          "Failed to update %" PRIpte " -> %" PRIpte
--                         ": saw %" PRIpte "\n", old, _new, t);
-+                         ": saw %" PRIpte "\n", *old, _new, t);
-                 break;
-             }
+-            t = paging_cmpxchg_guest_entry(v, p, old, _new, mfn);
++            t = paging_cmpxchg_guest_entry(v, p, *old, _new, mfn);
  
 -            if ( t == old )
 +            if ( t == *old )
@@ -132,10 +158,10 @@ index a1bd473b2918..eb06b5178f26 100644
   * Macro that wraps the appropriate type-changes around update_intpte().
   * Arguments are: type, ptr, old, new, mfn, vcpu
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index 46468c86b363..eea367f7429a 100644
+index ad773a6996c4..4a683809b71a 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
-@@ -204,6 +204,7 @@ struct gnttab_unmap_common {
+@@ -258,6 +258,7 @@ struct gnttab_unmap_common {
  
      /* Return */
      int16_t status;
@@ -143,7 +169,7 @@ index 46468c86b363..eea367f7429a 100644
  
      /* Shared state beteen *_unmap and *_unmap_complete */
      uint16_t done;
-@@ -212,6 +213,12 @@ struct gnttab_unmap_common {
+@@ -266,6 +267,12 @@ struct gnttab_unmap_common {
      grant_ref_t ref;
  };
  
@@ -156,7 +182,7 @@ index 46468c86b363..eea367f7429a 100644
  /* Number of unmap operations that are done between each tlb flush */
  #define GNTTAB_UNMAP_BATCH_SIZE 32
  
-@@ -1230,7 +1237,10 @@ map_grant_ref(
+@@ -1306,7 +1313,10 @@ map_grant_ref(
   undo_out:
      if ( host_map_created )
      {
@@ -168,7 +194,7 @@ index 46468c86b363..eea367f7429a 100644
          gnttab_flush_tlb(ld);
      }
  
-@@ -1313,6 +1323,8 @@ unmap_common(
+@@ -1375,6 +1385,8 @@ unmap_common(
      ld = current->domain;
      lgt = ld->grant_table;
  
@@ -177,7 +203,7 @@ index 46468c86b363..eea367f7429a 100644
      if ( unlikely(op->handle >= lgt->maptrack_limit) )
      {
          gdprintk(XENLOG_INFO, "Bad d%d handle %#x\n",
-@@ -1411,7 +1423,7 @@ unmap_common(
+@@ -1473,7 +1485,7 @@ unmap_common(
      {
          if ( (rc = replace_grant_host_mapping(op->host_addr,
                                                op->mfn, op->new_addr,
@@ -186,7 +212,7 @@ index 46468c86b363..eea367f7429a 100644
              goto act_release_out;
  
          map->flags &= ~GNTMAP_host_map;
-@@ -1597,28 +1609,42 @@ static long
+@@ -1650,28 +1662,42 @@ static long
  gnttab_unmap_grant_ref(
      XEN_GUEST_HANDLE_PARAM(gnttab_unmap_grant_ref_t) uop, unsigned int count)
  {
@@ -232,55 +258,16 @@ index 46468c86b363..eea367f7429a 100644
          for ( i = 0; i < partial_done; i++ )
              unmap_common_complete(&common[i]);
  
-@@ -4189,6 +4215,11 @@ static void gnttab_usage_print_all(unsigned char key)
-     printk("%s [ key '%c' pressed\n", __func__, key);
-     for_each_domain ( d )
-         gnttab_usage_print(d);
+@@ -4279,6 +4305,12 @@ static void cf_check gnttab_usage_print_all(unsigned char key)
+ 
+     rcu_read_unlock(&domlist_read_lock);
+ 
 +#ifndef NDEBUG
 +    printk("Grant unmap tlb flush performed %i\n", atomic_read(&grant_unmap_tlb_flush_done));
 +    printk("Grant unmap tlb flush avoided %i\n", atomic_read(&grant_unmap_tlb_flush_avoided));
 +    printk("Grant unmap operations %i\n", atomic_read(&grant_unmap_operations));
 +#endif
++
      printk("%s ] done\n", __func__);
  }
  
-diff --git a/xen/include/asm-x86/grant_table.h b/xen/include/asm-x86/grant_table.h
-index 84e32960c034..23bcd998a3f0 100644
---- a/xen/include/asm-x86/grant_table.h
-+++ b/xen/include/asm-x86/grant_table.h
-@@ -28,11 +28,11 @@ static inline int create_grant_host_mapping(uint64_t addr, mfn_t frame,
- 
- static inline int replace_grant_host_mapping(uint64_t addr, mfn_t frame,
-                                              uint64_t new_addr,
--                                             unsigned int flags)
-+                                             unsigned int flags, int *page_accessed)
- {
-     if ( paging_mode_external(current->domain) )
-         return replace_grant_p2m_mapping(addr, frame, new_addr, flags);
--    return replace_grant_pv_mapping(addr, frame, new_addr, flags);
-+    return replace_grant_pv_mapping(addr, frame, new_addr, flags, page_accessed);
- }
- 
- #define gnttab_init_arch(gt) 0
-diff --git a/xen/include/asm-x86/pv/grant_table.h b/xen/include/asm-x86/pv/grant_table.h
-index 85442b60749f..6fd1cf67df7f 100644
---- a/xen/include/asm-x86/pv/grant_table.h
-+++ b/xen/include/asm-x86/pv/grant_table.h
-@@ -26,7 +26,7 @@
- int create_grant_pv_mapping(uint64_t addr, mfn_t frame,
-                             unsigned int flags, unsigned int cache_flags);
- int replace_grant_pv_mapping(uint64_t addr, mfn_t frame,
--                             uint64_t new_addr, unsigned int flags);
-+                             uint64_t new_addr, unsigned int flags, int *page_accessed);
- 
- #else
- 
-@@ -40,7 +40,7 @@ static inline int create_grant_pv_mapping(uint64_t addr, mfn_t frame,
- }
- 
- static inline int replace_grant_pv_mapping(uint64_t addr, mfn_t frame,
--                                           uint64_t new_addr, unsigned int flags)
-+                                           uint64_t new_addr, unsigned int flags, int *page_accessed)
- {
-     return GNTST_general_error;
- }

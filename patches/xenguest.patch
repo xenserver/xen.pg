@@ -1,8 +1,8 @@
 diff --git a/tools/Makefile b/tools/Makefile
-index 7b1f6c4d2868..6037602fd257 100644
+index 4906fdbc237c..bbb7df5b619d 100644
 --- a/tools/Makefile
 +++ b/tools/Makefile
-@@ -341,3 +341,7 @@ subtree-force-update-all:
+@@ -287,3 +287,7 @@ subtree-force-update-all:
  	$(MAKE) qemu-xen-dir-force-update
  	$(MAKE) qemu-xen-traditional-dir-force-update
  	$(MAKE) -C firmware subtree-force-update-all
@@ -21,7 +21,7 @@ index 000000000000..d9cef6c5b469
 +*dsdt*
 diff --git a/tools/xenguest/Makefile b/tools/xenguest/Makefile
 new file mode 100644
-index 000000000000..1e88cb87ad66
+index 000000000000..bbad8370201a
 --- /dev/null
 +++ b/tools/xenguest/Makefile
 @@ -0,0 +1,45 @@
@@ -29,7 +29,7 @@ index 000000000000..1e88cb87ad66
 +include $(XEN_ROOT)/tools/Rules.mk
 +
 +CFLAGS += -Werror -Wshadow -Wno-unused-result
-+CFLAGS += -I. -I$(XEN_ROOT)/tools/libxc -include $(XEN_ROOT)/tools/config.h -I$(XEN_ROOT)/tools
++CFLAGS += -I$(XEN_ROOT)/tools/libs/ctrl -include $(XEN_ROOT)/tools/config.h -I$(XEN_ROOT)/tools
 +CFLAGS += $(CFLAGS_libxentoollog) $(CFLAGS_libxenctrl) $(CFLAGS_libguest) $(CFLAGS_libxenstore)
 +CFLAGS += -D_GNU_SOURCE -DXC_WANT_COMPAT_MAP_FOREIGN_API
 +CFLAGS += $(CFLAGS_libxentoolcore)
@@ -829,10 +829,10 @@ index 000000000000..835d05eb8882
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 000000000000..982ca1d4df1a
+index 000000000000..d01699630680
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1831 @@
+@@ -0,0 +1,1833 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -863,7 +863,6 @@ index 000000000000..982ca1d4df1a
 +#include <xenctrl.h>
 +#include <xenguest.h>
 +#include <xenstore.h>
-+#include <xc_dom.h>
 +#include <xen-tools/libs.h>
 +#include <xen/hvm/hvm_info_table.h>
 +#include <xen/hvm/hvm_xs_strings.h>
@@ -1102,7 +1101,7 @@ index 000000000000..982ca1d4df1a
 +    return rc;
 +}
 +
-+static int construct_cpuid_policy(const struct flags *f, bool hvm)
++static int construct_cpuid_policy(const struct flags *f, bool hvm, bool restore)
 +{
 +    int rc = -1;
 +
@@ -1150,8 +1149,9 @@ index 000000000000..982ca1d4df1a
 +    if ( f->nomigrate && test_bit(X86_FEATURE_ITSC, host_featureset) )
 +        set_bit(X86_FEATURE_ITSC, featureset);
 +
-+    rc = xc_cpuid_apply_policy(xch, domid, featureset, nr_features,
-+                               0, f->cores_per_socket);
++    rc = xc_cpuid_apply_policy(xch, domid, restore, featureset, nr_features,
++                               0, 0, f->nested_virt, f->cores_per_socket,
++                               NULL, NULL);
 +
 + out:
 +    free(featureset);
@@ -1465,7 +1465,7 @@ index 000000000000..982ca1d4df1a
 +    *console_mfn = xc_dom_p2m(dom, dom->console_pfn);
 +    *store_mfn = xc_dom_p2m(dom, dom->xenstore_pfn);
 +
-+    if ( construct_cpuid_policy(&f, false) )
++    if ( construct_cpuid_policy(&f, false, false) )
 +        failwith_oss_xc("construct_cpuid_policy");
 +
 +    strncpy(protocol, xc_domain_get_native_protocol(xch, domid), 64);
@@ -1711,9 +1711,7 @@ index 000000000000..982ca1d4df1a
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_VIRIDIAN, feature_mask);
 +}
 +
-+static int hvm_build_set_params(int store_evtchn, unsigned long *store_mfn,
-+                                int console_evtchn, unsigned long *console_mfn,
-+                                bool is_pvh, struct flags *f)
++static int hvm_build_set_params(bool is_pvh, struct flags *f)
 +{
 +    struct hvm_info_table *va_hvm;
 +    uint8_t *va_map;
@@ -1732,19 +1730,10 @@ index 000000000000..982ca1d4df1a
 +        munmap(va_map, XC_PAGE_SIZE);
 +    }
 +
-+    xc_get_hvm_param(xch, domid, HVM_PARAM_STORE_PFN, store_mfn);
-+
 +    if (f->viridian)
 +        hvm_set_viridian_features(f);
 +
-+    xc_set_hvm_param(xch, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_HPET_ENABLED, f->hpet);
-+    if ( f->nested_virt )
-+        xc_set_hvm_param(xch, domid, HVM_PARAM_NESTEDHVM, f->nested_virt);
-+    if ( f->nomigrate )
-+        xc_domain_disable_migrate(xch, domid);
-+    xc_get_hvm_param(xch, domid, HVM_PARAM_CONSOLE_PFN, console_mfn);
-+    xc_set_hvm_param(xch, domid, HVM_PARAM_CONSOLE_EVTCHN, console_evtchn);
 +    xc_set_hvm_param(xch, domid, HVM_PARAM_TRIPLE_FAULT_REASON, SHUTDOWN_crash);
 +
 +    /*
@@ -2464,12 +2453,14 @@ index 000000000000..982ca1d4df1a
 +    if ( xc_dom_gnttab_init(dom) )
 +        failwith_oss_xc("xc_dom_gnttab_init");
 +
-+    r = hvm_build_set_params(store_evtchn, store_mfn,
-+                             console_evtchn, console_mfn, is_pvh, &f);
++    r = hvm_build_set_params(is_pvh, &f);
 +    if ( r )
 +        failwith_oss_xc("hvm_build_params");
 +
-+    r = construct_cpuid_policy(&f, !is_pvh);
++    *store_mfn = dom->xenstore_pfn;
++    *console_mfn = dom->console_pfn;
++
++    r = construct_cpuid_policy(&f, !is_pvh, false);
 +    if ( r )
 +        failwith_oss_xc("construct_cpuid_policy");
 +
@@ -2611,12 +2602,27 @@ index 000000000000..982ca1d4df1a
 +    return rc;
 +}
 +
++static int static_data_done(unsigned int missing, void *data)
++{
++    const struct flags *f = data;
++
++    if ( missing & XGR_SDD_MISSING_CPUID &&
++         construct_cpuid_policy(f, f->dominfo.hap, true) )
++        failwith_oss_xc("construct_cpuid_policy");
++
++    return 0;
++}
++
 +int stub_xc_domain_restore(int fd, int store_evtchn, int console_evtchn,
 +                           int hvm,
 +                           unsigned long *store_mfn, unsigned long *console_mfn)
 +{
 +    int r = 0;
 +    struct flags f = {};
++    struct restore_callbacks cbs = {
++        .static_data_done = static_data_done,
++        .data = &f,
++    };
 +
 +    get_flags(&f);
 +
@@ -2632,14 +2638,10 @@ index 000000000000..982ca1d4df1a
 +
 +    configure_vcpus(&f);
 +
-+    r = construct_cpuid_policy(&f, hvm);
-+    if ( r )
-+        failwith_oss_xc("construct_cpuid_policy");
-+
 +    r = xc_domain_restore(xch, fd, domid,
 +                          store_evtchn, store_mfn, 0,
 +                          console_evtchn, console_mfn, 0,
-+                          XC_STREAM_PLAIN, NULL, -1);
++                          XC_STREAM_PLAIN, &cbs, -1);
 +    if ( r )
 +        failwith_oss_xc("xc_domain_restore");
 +
@@ -2666,7 +2668,7 @@ index 000000000000..982ca1d4df1a
 + */
 diff --git a/tools/xenguest/xg_emu.c b/tools/xenguest/xg_emu.c
 new file mode 100644
-index 000000000000..e17997f246ba
+index 000000000000..4aab7e5b18b1
 --- /dev/null
 +++ b/tools/xenguest/xg_emu.c
 @@ -0,0 +1,426 @@
@@ -2789,7 +2791,7 @@ index 000000000000..e17997f246ba
 +        last_sent = stats.total_written;
 +        last_iter = stats.iteration;
 +
-+        xg_info("Checking live policy.  %ld / %d for %d",
++        xg_info("Checking live policy.  %ld / %ld for %d",
 +                stats.dirty_count, stats.total_written, stats.iteration);
 +        r = emp_send_event_migrate_progress(*cli, stats.total_written,
 +                                            stats.dirty_count,

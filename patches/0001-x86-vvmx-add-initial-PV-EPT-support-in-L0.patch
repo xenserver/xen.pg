@@ -10,10 +10,10 @@ above, also breaks page combining.
 
 Signed-off-by: Sergey Dyasli <sergey.dyasli@citrix.com>
 diff --git a/xen/arch/x86/hvm/vmx/vvmx.c b/xen/arch/x86/hvm/vmx/vvmx.c
-index d8ab167d6220..42e30ee5ecc7 100644
+index 5f5445147585..ac59c348ff86 100644
 --- a/xen/arch/x86/hvm/vmx/vvmx.c
 +++ b/xen/arch/x86/hvm/vmx/vvmx.c
-@@ -27,6 +27,8 @@
+@@ -28,6 +28,8 @@
  #include <asm/hvm/vmx/vvmx.h>
  #include <asm/hvm/nestedhvm.h>
  
@@ -22,7 +22,7 @@ index d8ab167d6220..42e30ee5ecc7 100644
  static DEFINE_PER_CPU(u64 *, vvmcs_buf);
  
  static void nvmx_purge_vvmcs(struct vcpu *v);
-@@ -1936,19 +1938,116 @@ static int nvmx_handle_vmwrite(struct cpu_user_regs *regs)
+@@ -2018,19 +2020,117 @@ static int nvmx_handle_vmwrite(struct cpu_user_regs *regs)
      return X86EMUL_OKAY;
  }
  
@@ -42,6 +42,7 @@ index d8ab167d6220..42e30ee5ecc7 100644
 +{
 +    struct domain *d = v->domain;
 +    struct p2m_domain *L1p2m;
++    struct npfec npfec = {};
 +
 +    paddr_t L2_gpa = desc->L2_gpa & PAGE_MASK;
 +
@@ -76,7 +77,7 @@ index d8ab167d6220..42e30ee5ecc7 100644
 +    /* We assume that all required L1 --> L0 mappings are present */
 +    rv = nestedhap_walk_L0_p2m(p2m_get_hostp2m(d), nL1_gpa,
 +                               &L0_gpa, &L10_p2mt, &L10_p2ma, &L10_order,
-+                               false, false, false);
++                               npfec);
 +
 +    if ( rv != NESTEDHVM_PAGEFAULT_DONE )
 +    {
@@ -141,7 +142,7 @@ index d8ab167d6220..42e30ee5ecc7 100644
          np2m_flush_base(current, eptp);
          break;
      }
-@@ -1956,6 +2055,20 @@ static int nvmx_handle_invept(struct cpu_user_regs *regs)
+@@ -2038,6 +2138,20 @@ static int nvmx_handle_invept(struct cpu_user_regs *regs)
          p2m_flush_nestedp2m(current->domain);
          __invept(INVEPT_ALL_CONTEXT, 0);
          break;
@@ -162,11 +163,48 @@ index d8ab167d6220..42e30ee5ecc7 100644
      default:
          vmfail(regs, VMX_INSN_INVEPT_INVVPID_INVALID_OP);
          return X86EMUL_OKAY;
+diff --git a/xen/arch/x86/include/asm/hvm/vmx/vmx.h b/xen/arch/x86/include/asm/hvm/vmx/vmx.h
+index c2ebdd6864a5..2e36f48ec74a 100644
+--- a/xen/arch/x86/include/asm/hvm/vmx/vmx.h
++++ b/xen/arch/x86/include/asm/hvm/vmx/vmx.h
+@@ -307,6 +307,7 @@ extern uint8_t posted_intr_vector;
+ 
+ #define INVEPT_SINGLE_CONTEXT   1
+ #define INVEPT_ALL_CONTEXT      2
++#define INVEPT_PVEPT_CONTEXT    0x88d8
+ 
+ #define cpu_has_vmx_vpid_invvpid_individual_addr                    \
+     (vmx_ept_vpid_cap & VMX_VPID_INVVPID_INDIVIDUAL_ADDR)
+diff --git a/xen/arch/x86/include/asm/p2m.h b/xen/arch/x86/include/asm/p2m.h
+index 1552c6459d2e..eebf927a6fb9 100644
+--- a/xen/arch/x86/include/asm/p2m.h
++++ b/xen/arch/x86/include/asm/p2m.h
+@@ -820,11 +820,20 @@ void p2m_flush_nestedp2m(struct domain *d);
+ /* Flushes the np2m specified by np2m_base (if it exists) */
+ void np2m_flush_base(struct vcpu *v, unsigned long np2m_base);
+ 
++struct p2m_domain *np2m_get_by_base_locked(struct vcpu *v, uint64_t np2m_base);
++
+ void hap_p2m_init(struct p2m_domain *p2m);
+ void shadow_p2m_init(struct p2m_domain *p2m);
+ 
+ void cf_check nestedp2m_write_p2m_entry_post(
+     struct p2m_domain *p2m, unsigned int oflags);
++void
++nestedhap_fix_p2m(struct vcpu *v, struct p2m_domain *p2m,
++                  paddr_t L2_gpa, paddr_t L0_gpa,
++                  unsigned int page_order, p2m_type_t p2mt, p2m_access_t p2ma);
++int nestedhap_walk_L0_p2m(
++    struct p2m_domain *p2m, paddr_t L1_gpa, paddr_t *L0_gpa, p2m_type_t *p2mt,
++    p2m_access_t *p2ma, unsigned int *page_order, struct npfec npfec);
+ 
+ /*
+  * Alternate p2m: shadow p2m tables used for alternate memory views
 diff --git a/xen/arch/x86/mm/hap/nested_hap.c b/xen/arch/x86/mm/hap/nested_hap.c
-index f92ddc5206ba..e0919290060c 100644
+index dbe5ad23a112..4a1012cf1096 100644
 --- a/xen/arch/x86/mm/hap/nested_hap.c
 +++ b/xen/arch/x86/mm/hap/nested_hap.c
-@@ -94,7 +94,7 @@ nestedp2m_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
+@@ -81,7 +81,7 @@ nestedp2m_write_p2m_entry_post(struct p2m_domain *p2m, unsigned int oflags)
  /********************************************/
  /*          NESTED VIRT FUNCTIONS           */
  /********************************************/
@@ -175,20 +213,20 @@ index f92ddc5206ba..e0919290060c 100644
  nestedhap_fix_p2m(struct vcpu *v, struct p2m_domain *p2m, 
                    paddr_t L2_gpa, paddr_t L0_gpa,
                    unsigned int page_order, p2m_type_t p2mt, p2m_access_t p2ma)
-@@ -146,7 +146,7 @@ nestedhap_walk_L1_p2m(struct vcpu *v, paddr_t L2_gpa, paddr_t *L1_gpa,
+@@ -117,7 +117,7 @@ nestedhap_fix_p2m(struct vcpu *v, struct p2m_domain *p2m,
   * walk is successful, the translated value is returned in L0_gpa. The return 
   * value tells the upper level what to do.
   */
--static int
-+int
- nestedhap_walk_L0_p2m(struct p2m_domain *p2m, paddr_t L1_gpa, paddr_t *L0_gpa,
-                       p2m_type_t *p2mt, p2m_access_t *p2ma,
-                       unsigned int *page_order,
+-static int nestedhap_walk_L0_p2m(
++int nestedhap_walk_L0_p2m(
+     struct p2m_domain *p2m, paddr_t L1_gpa, paddr_t *L0_gpa, p2m_type_t *p2mt,
+     p2m_access_t *p2ma, unsigned int *page_order, struct npfec npfec)
+ {
 diff --git a/xen/arch/x86/mm/p2m.c b/xen/arch/x86/mm/p2m.c
-index a6bfda010a6f..b101055dc862 100644
+index c1cff377093c..dbc45325abd6 100644
 --- a/xen/arch/x86/mm/p2m.c
 +++ b/xen/arch/x86/mm/p2m.c
-@@ -2120,6 +2120,29 @@ void np2m_flush_base(struct vcpu *v, unsigned long np2m_base)
+@@ -1767,6 +1767,29 @@ void np2m_flush_base(struct vcpu *v, unsigned long np2m_base)
      nestedp2m_unlock(d);
  }
  
@@ -218,39 +256,3 @@ index a6bfda010a6f..b101055dc862 100644
  static void assign_np2m(struct vcpu *v, struct p2m_domain *p2m)
  {
      struct nestedvcpu *nv = &vcpu_nestedhvm(v);
-diff --git a/xen/include/asm-x86/hvm/vmx/vmx.h b/xen/include/asm-x86/hvm/vmx/vmx.h
-index 591c59803093..f533c454c864 100644
---- a/xen/include/asm-x86/hvm/vmx/vmx.h
-+++ b/xen/include/asm-x86/hvm/vmx/vmx.h
-@@ -307,6 +307,7 @@ extern uint8_t posted_intr_vector;
- 
- #define INVEPT_SINGLE_CONTEXT   1
- #define INVEPT_ALL_CONTEXT      2
-+#define INVEPT_PVEPT_CONTEXT    0x88d8
- 
- #define cpu_has_vmx_vpid_invvpid_individual_addr                    \
-     (vmx_ept_vpid_cap & VMX_VPID_INVVPID_INDIVIDUAL_ADDR)
-diff --git a/xen/include/asm-x86/p2m.h b/xen/include/asm-x86/p2m.h
-index 22efec903165..8a6adc6d6e6c 100644
---- a/xen/include/asm-x86/p2m.h
-+++ b/xen/include/asm-x86/p2m.h
-@@ -853,8 +853,19 @@ void p2m_flush_nestedp2m(struct domain *d);
- /* Flushes the np2m specified by np2m_base (if it exists) */
- void np2m_flush_base(struct vcpu *v, unsigned long np2m_base);
- 
-+struct p2m_domain *np2m_get_by_base_locked(struct vcpu *v, uint64_t np2m_base);
-+
- int nestedp2m_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
-     l1_pgentry_t *p, l1_pgentry_t new, unsigned int level);
-+void
-+nestedhap_fix_p2m(struct vcpu *v, struct p2m_domain *p2m,
-+                  paddr_t L2_gpa, paddr_t L0_gpa,
-+                  unsigned int page_order, p2m_type_t p2mt, p2m_access_t p2ma);
-+int
-+nestedhap_walk_L0_p2m(struct p2m_domain *p2m, paddr_t L1_gpa, paddr_t *L0_gpa,
-+                      p2m_type_t *p2mt, p2m_access_t *p2ma,
-+                      unsigned int *page_order,
-+                      bool_t access_r, bool_t access_w, bool_t access_x);
- 
- /*
-  * Alternate p2m: shadow p2m tables used for alternate memory views
