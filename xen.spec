@@ -22,9 +22,10 @@
 
 %define lp_devel_dir %{_usrsrc}/xen-%{version}-%{release}
 
-# Prevent RPM adding Provides/Requires to lp-devel package
+# Prevent RPM adding Provides/Requires to lp-devel package, or mangling shebangs
 %global __provides_exclude_from ^%{lp_devel_dir}/.*$
 %global __requires_exclude_from ^%{lp_devel_dir}/.*$
+%global __brp_mangle_shebangs_exclude_from ^%{lp_devel_dir}/.*$
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
