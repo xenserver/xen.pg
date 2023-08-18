@@ -18,9 +18,6 @@
 %define with_sysv 0
 %define with_systemd 1
 
-# Use the production hypervisor by default
-%define default_debug_hypervisor 0
-
 %define base_dir  %{name}-%{version}
 
 %define lp_devel_dir %{_usrsrc}/xen-%{version}-%{release}
@@ -327,11 +324,7 @@ install_shim build-shim-release release
 install_shim build-shim-debug   debug
 
 # choose between debug and release PV shim build
-%if %{default_debug_hypervisor}
-ln -sf xen-shim-debug %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
-%else
 ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
-%endif
 
 # Build test case metadata
 %{__python} %{SOURCE5} -i %{buildroot}%{_libexecdir}/%{name} -o %{buildroot}%{_datadir}/xen-dom0-tests-metadata.json
@@ -834,13 +827,8 @@ ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen-release.gz
 
 # Point /boot/xen.gz appropriately
 if [ ! -e /boot/xen.gz ]; then
-%if %{default_debug_hypervisor}
-    # Use a debug hypervisor by default
-    ln -sf %{name}-%{version}-%{hv_rel}-d.gz /boot/xen.gz
-%else
     # Use a production hypervisor by default
     ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
-%endif
 else
     # Else look at the current link, and whether it is debug
     path="`readlink -f /boot/xen.gz`"
