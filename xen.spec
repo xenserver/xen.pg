@@ -275,10 +275,7 @@ build_xen -%{hv_rel}   config-release         build-xen-release
 build_xen -%{hv_rel}-d config-debug           build-xen-debug      cov
 
 %{make_build} -C xen clean
-build_xen ""           config-pvshim-release  build-shim-release
-
-%{make_build} -C xen clean
-build_xen ""           config-pvshim-debug    build-shim-debug
+build_xen ""           config-pvshim          build-shim
 
 
 %install
@@ -315,16 +312,9 @@ install_xen () { # $1=vendorversion $2=outdir
 install_xen -%{hv_rel}   build-xen-release
 install_xen -%{hv_rel}-d build-xen-debug
 
-# Install release & debug shims
-install_shim () { # $1=outdir $2=suffix
-    %{__install} -p -D -m 644 xen/$1/xen      %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim-$2
-    %{__install} -p -D -m 644 xen/$1/xen-syms %{buildroot}/usr/lib/debug%{_libexecdir}/%{name}/boot/xen-shim-syms-$2
-}
-install_shim build-shim-release release
-install_shim build-shim-debug   debug
-
-# choose between debug and release PV shim build
-ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
+# Install release shim
+%{__install} -p -D -m 644 xen/build-shim/xen      %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
+%{__install} -p -D -m 644 xen/build-shim/xen-syms %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim-syms
 
 # Build test case metadata
 %{__python} %{SOURCE5} -i %{buildroot}%{_libexecdir}/%{name} -o %{buildroot}%{_datadir}/xen-dom0-tests-metadata.json
@@ -348,6 +338,7 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %files hypervisor-debuginfo
 /boot/%{name}-syms-%{version}-%{hv_rel}
 /boot/%{name}-syms-%{version}-%{hv_rel}-d
+%{_libexecdir}/%{name}/boot/xen-shim-syms
 
 %files tools
 %{_bindir}/xenstore
@@ -589,8 +580,6 @@ ln -sf xen-shim-release %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim
 %exclude %{_libexecdir}/%{name}/bin/xenpvnetboot
 %{_libexecdir}/%{name}/boot/hvmloader
 %{_libexecdir}/%{name}/boot/xen-shim
-%{_libexecdir}/%{name}/boot/xen-shim-release
-%{_libexecdir}/%{name}/boot/xen-shim-debug
 %{_sbindir}/flask-get-bool
 %{_sbindir}/flask-getenforce
 %{_sbindir}/flask-label-pci
