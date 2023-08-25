@@ -1,5 +1,5 @@
 diff --git a/tools/libxc/xc_cpuid_x86.c b/tools/libxc/xc_cpuid_x86.c
-index 8a25fecbc28e..6bbd0193b5ed 100644
+index 8a25fecbc28e..ac0ebf152819 100644
 --- a/tools/libxc/xc_cpuid_x86.c
 +++ b/tools/libxc/xc_cpuid_x86.c
 @@ -55,8 +55,8 @@ int xc_get_cpu_levelling_caps(xc_interface *xch, uint32_t *caps)
@@ -13,7 +13,7 @@ index 8a25fecbc28e..6bbd0193b5ed 100644
  {
      DECLARE_SYSCTL;
      DECLARE_HYPERCALL_BOUNCE(featureset,
-@@ -82,6 +82,140 @@ int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
+@@ -82,6 +82,142 @@ int xc_get_cpu_featureset(xc_interface *xch, uint32_t index,
      return ret;
  }
  
@@ -22,6 +22,7 @@ index 8a25fecbc28e..6bbd0193b5ed 100644
 +{
 +    uint32_t raw_fs[FEATURESET_NR_ENTRIES] = {}, raw_nr = ARRAY_SIZE(raw_fs);
 +    uint32_t host_fs[FEATURESET_NR_ENTRIES] = {}, host_nr = ARRAY_SIZE(host_fs);
++    struct cpuid_leaf l;
 +    unsigned int vendor;
 +    int ret;
 +
@@ -48,6 +49,9 @@ index 8a25fecbc28e..6bbd0193b5ed 100644
 +    ret = xc_get_cpu_featureset_(xch, index - 2, nr, fs);
 +    if ( ret )
 +        return ret;
++
++    cpuid_leaf(0, &l);
++    vendor = x86_cpuid_lookup_vendor(l.b, l.c, l.d);
 +
 +    /*
 +     * Xen 4.7 had the common features duplicated.  4.8 changed this, to only
@@ -87,13 +91,35 @@ index 8a25fecbc28e..6bbd0193b5ed 100644
 +         !test_bit(X86_FEATURE_CLWB, host_fs) )
 +        set_bit(X86_FEATURE_CLWB, fs);
 +
++    switch ( vendor )
++    {
++    case X86_VENDOR_INTEL:
++        /*
++         * MSR_ARCH_CAPS is just feature data, and we can offer it to guests
++         * unconditionally, although limit it to Intel systems as it is highly
++         * uarch-specific.
++         *
++         * In particular, the RSBA and RRSBA bits mean "you might migrate to a
++         * system where RSB underflow uses alternative predictors (a.k.a
++         * Retpoline not safe)", so these need to be visible to a guest in all
++         * cases, even when it's only some other server in the pool which
++         * suffers the identified behaviour.
++         *
++         * We can always run any VM which has previously (or will
++         * subsequently) run on hardware where Retpoline is not safe.
++         * Note:
++         *  - The dependency logic may hide RRSBA for other reasons.
++         *  - The max policy does not constitute a sensible configuration to
++         *    run a guest in.
++         */
++        set_bit(X86_FEATURE_ARCH_CAPS, fs);
++        set_bit(X86_FEATURE_RSBA, fs);
++        set_bit(X86_FEATURE_RRSBA, fs);
++        break;
++    }
++
 +    if ( index == XEN_SYSCTL_cpu_featureset_hvm_max )
 +    {
-+        struct cpuid_leaf l;
-+
-+        cpuid_leaf(0, &l);
-+        vendor = x86_cpuid_lookup_vendor(l.b, l.c, l.d);
-+
 +        /*
 +         * Xen 4.7 used to falsely advertise IBS, and 4.8 fixed this.
 +         * However, the old xenopsd workaround fix for this didn't limit the
@@ -120,30 +146,6 @@ index 8a25fecbc28e..6bbd0193b5ed 100644
 +             * was visible to guests at the time.
 +             */
 +            set_bit(X86_FEATURE_LWP, fs);
-+            break;
-+
-+        case X86_VENDOR_INTEL:
-+            /*
-+             * MSR_ARCH_CAPS is just feature data, and we can offer it to guests
-+             * unconditionally, although limit it to Intel systems as it is highly
-+             * uarch-specific.
-+             *
-+             * In particular, the RSBA and RRSBA bits mean "you might migrate to a
-+             * system where RSB underflow uses alternative predictors (a.k.a
-+             * Retpoline not safe)", so these need to be visible to a guest in all
-+             * cases, even when it's only some other server in the pool which
-+             * suffers the identified behaviour.
-+             *
-+             * We can always run any VM which has previously (or will
-+             * subsequently) run on hardware where Retpoline is not safe.
-+             * Note:
-+             *  - The dependency logic may hide RRSBA for other reasons.
-+             *  - The max policy does not constitute a sensible configuration to
-+             *    run a guest in.
-+             */
-+            set_bit(X86_FEATURE_ARCH_CAPS, fs);
-+            set_bit(X86_FEATURE_RSBA, fs);
-+            set_bit(X86_FEATURE_RRSBA, fs);
 +            break;
 +        }
 +    }
