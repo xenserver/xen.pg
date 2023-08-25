@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.50
+%global hv_rel 10.51
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -865,6 +865,21 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Aug 25 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.51
+- Further fix for XSA-433.  Extend the chicken-bit workaround to all CPUs
+  which appear to be a Zen2 microarchtiecture, even those not on the published
+  model list.
+- Fix for AMD errata #1474.  Disable C6 after 1000 days of uptime on AMD Zen2
+  systems to avoid a crash at ~1044 days.
+- Fix for MSR_ARCH_CAPS boot-time calculations for PV guests.
+- Remove the debug PV-shim hypervisor.  The release build is still present and
+  operates as before.
+- Remove TBOOT and XENOPROF support in Xen.  Both are obsolete and the latter
+  leaves benign-but-alarming messages in logs.
+- Remove the "pod" command line option.  This was intended as a further
+  workaround for XSA-246, but wasn't effective owing to poor error handling
+  elsewhere.
+
 * Thu Aug 3 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.50
 - Fixes for
   - XSA-434 CVE-2023-20569
