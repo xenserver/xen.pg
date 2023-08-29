@@ -1,0 +1,64 @@
+From 47342d8f490c3e9f0db76d2423c83543a07b0427 Mon Sep 17 00:00:00 2001
+From: Simon Gaiser <simon@invisiblethingslab.com>
+Date: Mon, 7 Aug 2023 11:38:25 +0200
+Subject: x86/ACPI: Ignore entries with invalid APIC IDs when parsing MADT
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+It seems some firmwares put dummy entries in the ACPI MADT table for non
+existing processors. On my NUC11TNHi5 those have the invalid APIC ID
+0xff. Linux already has code to handle those cases both in
+acpi_parse_lapic [1] as well as in acpi_parse_x2apic [2]. So add the
+same check to Xen.
+
+Link: https://git.kernel.org/torvalds/c/f3bf1dbe64b62a2058dd1944c00990df203e8e7a # [1]
+Link: https://git.kernel.org/torvalds/c/10daf10ab154e31237a8c07242be3063fb6a9bf4 # [2]
+Signed-off-by: Simon Gaiser <simon@invisiblethingslab.com>
+Acked-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/acpi/boot.c b/xen/arch/x86/acpi/boot.c
+index 54b72d716bed..ead41bd535b5 100644
+--- a/xen/arch/x86/acpi/boot.c
++++ b/xen/arch/x86/acpi/boot.c
+@@ -87,14 +87,17 @@ acpi_parse_x2apic(struct acpi_subtable_header *header, const unsigned long end)
+ 	if (BAD_MADT_ENTRY(processor, end))
+ 		return -EINVAL;
+ 
++	/* Ignore entries with invalid x2APIC ID */
++	if (processor->local_apic_id == 0xffffffff)
++		return 0;
++
+ 	/* Don't register processors that cannot be onlined. */
+ 	if (madt_revision >= 5 &&
+ 	    !(processor->lapic_flags & ACPI_MADT_ENABLED) &&
+ 	    !(processor->lapic_flags & ACPI_MADT_ONLINE_CAPABLE))
+ 		return 0;
+ 
+-	if ((processor->lapic_flags & ACPI_MADT_ENABLED) ||
+-	    processor->local_apic_id != 0xffffffff || opt_cpu_info) {
++	if ((processor->lapic_flags & ACPI_MADT_ENABLED) || opt_cpu_info) {
+ 		acpi_table_print_madt_entry(header);
+ 		log = true;
+ 	}
+@@ -143,14 +146,17 @@ acpi_parse_lapic(struct acpi_subtable_header * header, const unsigned long end)
+ 	if (BAD_MADT_ENTRY(processor, end))
+ 		return -EINVAL;
+ 
++	/* Ignore entries with invalid APIC ID */
++	if (processor->id == 0xff)
++		return 0;
++
+ 	/* Don't register processors that cannot be onlined. */
+ 	if (madt_revision >= 5 &&
+ 	    !(processor->lapic_flags & ACPI_MADT_ENABLED) &&
+ 	    !(processor->lapic_flags & ACPI_MADT_ONLINE_CAPABLE))
+ 		return 0;
+ 
+-	if ((processor->lapic_flags & ACPI_MADT_ENABLED) ||
+-	    processor->id != 0xff || opt_cpu_info)
++	if ((processor->lapic_flags & ACPI_MADT_ENABLED) || opt_cpu_info)
+ 		acpi_table_print_madt_entry(header);
+ 
+ 	/* Record local apic id only when enabled */
