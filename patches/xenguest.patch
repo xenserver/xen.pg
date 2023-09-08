@@ -829,10 +829,10 @@ index 000000000000..835d05eb8882
 + */
 diff --git a/tools/xenguest/xenguest_stubs.c b/tools/xenguest/xenguest_stubs.c
 new file mode 100644
-index 000000000000..e445cffe27ae
+index 000000000000..982ca1d4df1a
 --- /dev/null
 +++ b/tools/xenguest/xenguest_stubs.c
-@@ -0,0 +1,1762 @@
+@@ -0,0 +1,1831 @@
 +/*
 + * Copyright (C) 2006-2009 Citrix Systems Inc.
 + *
@@ -853,6 +853,8 @@ index 000000000000..e445cffe27ae
 +#include <stdarg.h>
 +
 +#include <errno.h>
++#include <fcntl.h>
++#include <libgen.h>
 +#include <sys/mman.h>
 +#include <sys/types.h>
 +#include <sys/stat.h>
@@ -1763,54 +1765,119 @@ index 000000000000..e445cffe27ae
 +    return rc;
 +}
 +
++#ifdef OVMF_PATH
++/*
++ * Returns the path to the OVMF firmware. Caller must free() the path on
++ * success. Returns 0 on success or -errno on failure.
++ */
++static int get_ovmf_path(char **path_out)
++{
++    char *key = xenstore_gets("platform/ovmf-override");
++
++    if ( key )
++    {
++        char *dir, *path;
++        int ret = 0;
++
++        /* Check the xenstore key is a simple filename */
++        if ( strchr(key, '/') )
++        {
++            xg_err("ovmf-override key '%s' must be a filename, not a path\n", key);
++            free(key);
++            return -EINVAL;
++        }
++
++        /* Construct a path relative to the directory of the default path */
++        dir = strdup(OVMF_PATH);
++        if ( !dir )
++        {
++            ret = -errno;
++            free(key);
++            return ret;
++        }
++
++        if ( asprintf(&path, "%s/%s", dirname(dir), key) == -1 )
++        {
++            ret = -errno;
++            path = NULL;
++        }
++
++        free(dir);
++        free(key);
++
++        *path_out = path;
++        return ret;
++    }
++
++    *path_out = strdup(OVMF_PATH);
++    return *path_out ? 0 : -errno;
++}
++#endif
++
++/*
++ * Loads the appropriate firmware according to the xenstore key
++ * "hvmloader/bios". Does nothing if the key is not present or empty.
++ * Returns an error if requested to load an unknown firmware type.
++ * Returns 0 on success or -errno on failure.
++ */
 +static int hvm_load_firmware_module(struct xc_dom_image *dom)
 +{
-+#ifdef OVMF_PATH
-+    FILE *f;
 +    struct stat st;
 +    struct xc_hvm_firmware_module *m = &dom->system_firmware_module;
 +    char *tmp = xenstore_gets("hvmloader/bios");
++    char *path = NULL;
++    int ret, fd;
 +
-+    if ( !tmp )
++    if ( !tmp || !strcmp(tmp, "") )
 +        return 0;
 +
 +    if ( strcmp(tmp, "ovmf") )
 +    {
++        xg_err("Unsupported bios type '%s'\n", tmp);
 +        free(tmp);
-+        return -1;
++        return -ENOTSUP;
 +    }
 +    free(tmp);
 +
-+    f = fopen(OVMF_PATH, "r");
-+    if ( !f )
-+        return -1;
++#ifdef OVMF_PATH
++    ret = get_ovmf_path(&path);
++    if ( ret )
++        return ret;
 +
-+    if ( fstat(fileno(f), &st) == -1 )
++    fd = open(path, O_RDONLY | O_NOFOLLOW);
++    if ( fd == -1 )
 +    {
-+        fclose(f);
-+        return -1;
++        ret = -errno;
++        goto out;
++    }
++
++    if ( fstat(fd, &st) == -1 )
++    {
++        ret = -errno;
++        goto out;
 +    }
 +
 +    m->length = st.st_size;
-+    m->data = malloc(m->length);
-+    if ( !m->data )
++    m->data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
++    if ( m->data == MAP_FAILED )
 +    {
-+        fclose(f);
-+        return -1;
++        ret = -errno;
++        goto out;
 +    }
 +
-+    if ( fread(m->data, 1, m->length, f) != m->length )
-+    {
-+        fclose(f);
-+        free(m->data);
-+        return -1;
-+    }
++    xg_info("Loaded OVMF from %s\n", path);
++    ret = 0;
 +
-+    fclose(f);
++out:
++    free(path);
++    if ( fd >= 0 )
++        close(fd);
 +
-+    xg_info("Loaded OVMF from %s\n", OVMF_PATH);
++    return ret;
++#else
++    xg_err("Unsupported bios type 'ovmf'\n");
++    return -ENOTSUP;
 +#endif
-+    return 0;
 +}
 +
 +static int pci_get_id(uint16_t seg, uint8_t bus, uint8_t dev, uint8_t func,
@@ -1974,6 +2041,7 @@ index 000000000000..e445cffe27ae
 +    bool allow_memory_relocate = ALLOW_MEMORY_RELOCATE;
 +    bool apply_mxgpu_workaround = false;
 +    char *s;
++    int ret;
 +
 +    if ( pci_passthrough_sbdf_list )
 +    {
@@ -2155,10 +2223,11 @@ index 000000000000..e445cffe27ae
 +    dom->mmio_size = mmio_size;
 +    dom->mmio_start = mmio_start;
 +
-+    if ( hvm_load_firmware_module(dom) )
++    ret = hvm_load_firmware_module(dom);
++    if ( ret )
 +    {
 +        xg_err("xenguest: Failed to load firmware module: %s\n",
-+               strerror(errno));
++               strerror(-ret));
 +        exit(1);
 +    }
 +

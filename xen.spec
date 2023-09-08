@@ -232,7 +232,7 @@ export PYTHON="%{__python}"
            --with-xenstored=oxenstored \
            --with-system-qemu=%{_libdir}/xen/bin/qemu-system-i386 \
            --with-system-ipxe=/usr/share/ipxe/ipxe.bin \
-           --with-system-ovmf=/usr/share/edk2/OVMF.fd
+           --with-system-ovmf=/usr/share/edk2/OVMF-release.fd
 
 # Take a snapshot of the configured source tree for livepatches
 mkdir ../livepatch-src
