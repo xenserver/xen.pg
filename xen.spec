@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.51
+%global hv_rel 10.52
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -865,6 +865,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Tue Sep 19 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.52
+- Fix for XSA-439 / CVE-2023-20588.
+- Ignore MADT entries with invalid APIC_IDs.
+- Fix the emulation of VPBLENDMW with a mask and memory operand.
+- Fix a incorrect diagnostic about spurious interrupts.
+
 * Fri Aug 25 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.51
 - Further fix for XSA-433.  Extend the chicken-bit workaround to all CPUs
   which appear to be a Zen2 microarchtiecture, even those not on the published
