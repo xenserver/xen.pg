@@ -1,0 +1,79 @@
+From: Kevin Lampis <klampis@cloud.com>
+Subject: Set and check livepatch_list buffer sizes
+
+When issuing a livepatch_list hypercall include the sizes of the relevant
+buffers so they can be checked by the hypercall filter.
+
+This is only strictly needed to make the not-upstreamable hypercall filter
+work. However, it is probably a worthwile improvement on its own.
+
+Signed-off-by: Kevin Lampis <klampis@cloud.com>
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/tools/libs/ctrl/xc_misc.c b/tools/libs/ctrl/xc_misc.c
+index 271b0a2e8b..4e04e49137 100644
+--- a/tools/libs/ctrl/xc_misc.c
++++ b/tools/libs/ctrl/xc_misc.c
+@@ -867,6 +867,9 @@ int xc_livepatch_list(xc_interface *xch, const unsigned int max,
+         set_xen_guest_handle(sysctl.u.livepatch.u.list.metadata, metadata);
+         set_xen_guest_handle(sysctl.u.livepatch.u.list.metadata_len, metadata_len);
+ 
++        sysctl.u.livepatch.u.list.name_total_size = name_sz;
++        sysctl.u.livepatch.u.list.metadata_total_size = metadata_sz;
++
+         rc = do_sysctl(xch, &sysctl);
+         /*
+          * From here on we MUST call xc_hypercall_bounce. If rc < 0 we
+diff --git a/xen/common/livepatch.c b/xen/common/livepatch.c
+index 6f16d1ec7e..5cc29e1a00 100644
+--- a/xen/common/livepatch.c
++++ b/xen/common/livepatch.c
+@@ -1245,11 +1245,10 @@ static int livepatch_list(struct xen_sysctl_livepatch_list *list)
+         return -EINVAL;
+     }
+ 
+-    list->name_total_size = 0;
+-    list->metadata_total_size = 0;
+     if ( list->nr )
+     {
+         size_t name_offset = 0, metadata_offset = 0;
++        uint32_t name_total_copied = 0, metadata_total_copied = 0;
+ 
+         list_for_each_entry( data, &payload_list, list )
+         {
+@@ -1262,10 +1261,17 @@ static int livepatch_list(struct xen_sysctl_livepatch_list *list)
+             status.rc = data->rc;
+ 
+             name_len = strlen(data->name) + 1;
+-            list->name_total_size += name_len;
+-
+             metadata_len = data->metadata.len;
+-            list->metadata_total_size += metadata_len;
++
++            if ( ((uint64_t)name_total_copied + name_len) > list->name_total_size ||
++                ((uint64_t)metadata_total_copied + metadata_len) > list->metadata_total_size )
++            {
++                rc = -ENOMEM;
++                break;
++            }
++
++            name_total_copied += name_len;
++            metadata_total_copied += metadata_len;
+ 
+             if ( !guest_handle_subrange_okay(list->name, name_offset,
+                                              name_offset + name_len - 1) ||
+@@ -1296,9 +1302,15 @@ static int livepatch_list(struct xen_sysctl_livepatch_list *list)
+             if ( (idx >= list->nr) || hypercall_preempt_check() )
+                 break;
+         }
++
++        list->name_total_size = name_total_copied;
++        list->metadata_total_size = metadata_total_copied;
+     }
+     else
+     {
++        list->name_total_size = 0;
++        list->metadata_total_size = 0;
++
+         list_for_each_entry( data, &payload_list, list )
+         {
+             list->name_total_size += strlen(data->name) + 1;

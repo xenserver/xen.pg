@@ -1,0 +1,77 @@
+From: Gerald Elder-Vass <gerald.elder-vass@cloud.com>
+Subject: Add SBAT section to the PE binary
+
+The SBAT section provides a way for the binary to declare a generation
+id for its upstream source and any vendor changes applied. A compatible
+loader can then revoke vulnerable binaries by generation, using the
+binary's declared generation id(s) to determine if it is safe to load.
+
+More information about SBAT is available here:
+https://github.com/rhboot/shim/blob/main/SBAT.md
+
+Populate the SBAT section in the Xen binary by using the information
+in xen/arch/x86/sbat.csv.
+
+On XenServer, the version and release fields are populated by the spec
+file during the build process.
+
+Signed-off-by: Gerald Elder-Vass <gerald.elder-vass@cloud.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@cloud.com>
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index e476ac0cc1..6641bbbd71 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -74,6 +74,7 @@ obj-$(CONFIG_TBOOT) += tboot.o
+ obj-y += hpet.o
+ obj-y += vm_event.o
+ obj-y += xstate.o
++obj-y += sbat_data.o
+ 
+ ifneq ($(CONFIG_PV_SHIM_EXCLUSIVE),y)
+ obj-y += domctl.o
+@@ -267,6 +268,9 @@ $(obj)/efi.lds: AFLAGS-y += -DEFI
+ $(obj)/xen.lds $(obj)/efi.lds: $(src)/xen.lds.S FORCE
+ 	$(call if_changed_dep,cpp_lds_S)
+ 
++$(obj)/sbat_data.o: $(src)/sbat.csv
++	$(OBJCOPY) -I binary -O elf64-x86-64 --rename-section .data=.sbat,readonly,data,contents $(srcdir)/sbat.csv $@
++
+ clean-files := \
+     include/asm/asm-macros.* \
+     $(objtree)/.xen-syms.[0-9]* \
+diff --git a/xen/arch/x86/sbat.csv b/xen/arch/x86/sbat.csv
+new file mode 100644
+index 0000000000..a34e7fd1ca
+--- /dev/null
++++ b/xen/arch/x86/sbat.csv
+@@ -0,0 +1,3 @@
++sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
++xen,1,Linux Foundation,xen,@@VERSION@@,https://xenproject.org/
++xen.xs,1,Cloud Software Group,xen,@@VERSION@@-@@RELEASE@@,mailto:secure@citrix.com
+diff --git a/xen/arch/x86/xen.lds.S b/xen/arch/x86/xen.lds.S
+index 8930e14fc4..623b5f643e 100644
+--- a/xen/arch/x86/xen.lds.S
++++ b/xen/arch/x86/xen.lds.S
+@@ -356,6 +356,8 @@ SECTIONS
+     *(.reloc)
+     __base_relocs_end = .;
+   }
++
++  .sbat (NOLOAD) : { *(.sbat) }
+ #elif defined(XEN_BUILD_EFI)
+   /*
+    * Due to the way EFI support is currently implemented, these two symbols
+diff --git a/xen/include/xen/xen.lds.h b/xen/include/xen/xen.lds.h
+index 06b7110837..5246a090b3 100644
+--- a/xen/include/xen/xen.lds.h
++++ b/xen/include/xen/xen.lds.h
+@@ -82,7 +82,8 @@
+        *(.comment.*) \
+        *(.note.*)
+ #else
+-#define DISCARD_EFI_SECTIONS
++#define DISCARD_EFI_SECTIONS \
++       *(.sbat)
+ #endif
+ 
+ /* Sections to be discarded. */

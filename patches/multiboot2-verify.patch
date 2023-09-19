@@ -1,0 +1,89 @@
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Subject: Verify the dom0 kernel in the multiboot2 path
+
+Now that it is possible to boot via multiboot2 binary with Secure Boot enabled,
+the dom0 kernel needs to be verified.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/arch/x86/boot/head.S b/xen/arch/x86/boot/head.S
+index 038403890230..37b89ab09c25 100644
+--- a/xen/arch/x86/boot/head.S
++++ b/xen/arch/x86/boot/head.S
+@@ -349,10 +349,13 @@ __efi64_mb2_start:
+         /* Keep the stack aligned. Do not pop a single item off it. */
+         mov     (%rsp),%rdi
+ 
++        mov     %rbx, %rcx
++
+         /*
+          * efi_multiboot2() is called according to System V AMD64 ABI:
+          *   - IN:  %rdi - EFI ImageHandle, %rsi - EFI SystemTable,
+          *          %rdx - MB2 cmdline
++         *          %rcx - Multiboot information.
+          */
+         call    efi_multiboot2
+ 
+diff --git a/xen/arch/x86/efi/efi-boot.h b/xen/arch/x86/efi/efi-boot.h
+index f282358435f1..0cd66ab3fdb4 100644
+--- a/xen/arch/x86/efi/efi-boot.h
++++ b/xen/arch/x86/efi/efi-boot.h
+@@ -3,6 +3,7 @@
+  * is intended to be included by common/efi/boot.c _only_, and
+  * therefore can define arch specific global variables.
+  */
++#include <xen/multiboot2.h>
+ #include <xen/vga.h>
+ #include <asm/e820.h>
+ #include <asm/edd.h>
+@@ -815,9 +816,41 @@ static const char *__init get_option(const char *cmd, const char *opt)
+     return o;
+ }
+ 
++static void __init efi_verify_dom0(uint64_t mbi_in)
++{
++    uint64_t ptr;
++    const multiboot2_tag_t *tag;
++    const multiboot2_tag_module_t *kernel = NULL;
++    const multiboot2_fixed_t *mbi_fix = _p(mbi_in);
++    EFI_SHIM_LOCK_PROTOCOL *shim_lock;
++    EFI_STATUS status;
++
++    ptr = ROUNDUP(mbi_in + sizeof(*mbi_fix), MULTIBOOT2_TAG_ALIGN);
++
++    for ( tag = _p(ptr); (uint64_t)tag - mbi_in < mbi_fix->total_size;
++          tag = _p(ROUNDUP((uint64_t)tag + tag->size, MULTIBOOT2_TAG_ALIGN)) )
++    {
++        if ( tag->type == MULTIBOOT2_TAG_TYPE_MODULE )
++        {
++            kernel = (const multiboot2_tag_module_t *)tag;
++            break;
++        } else if ( tag->type == MULTIBOOT2_TAG_TYPE_END )
++            break;
++    }
++
++    if (!kernel)
++        return;
++
++    if ( !EFI_ERROR(efi_bs->LocateProtocol(&((EFI_GUID)SHIM_LOCK_PROTOCOL_GUID),
++                                           NULL, (void **)&shim_lock)) &&
++         (status = shim_lock->Verify(_p(kernel->mod_start), kernel->mod_end - kernel->mod_start)) != EFI_SUCCESS )
++        PrintErrMesg(L"Dom0 kernel image could not be verified", status);
++}
++
+ void asmlinkage __init efi_multiboot2(EFI_HANDLE ImageHandle,
+                                       EFI_SYSTEM_TABLE *SystemTable,
+-                                      const char *cmdline)
++                                      const char *cmdline,
++                                      uint64_t mbi_in)
+ {
+     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
+     EFI_HANDLE gop_handle;
+@@ -909,6 +942,8 @@ void asmlinkage __init efi_multiboot2(EFI_HANDLE ImageHandle,
+ 
+     efi_relocate_esrt(SystemTable);
+ 
++    efi_verify_dom0(mbi_in);
++
+     efi_exit_boot(ImageHandle, SystemTable);
+ }
+ 

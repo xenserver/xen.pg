@@ -1,0 +1,109 @@
+From: Kevin Lampis <klampis@cloud.com>
+Subject: livepatch: Embed public key in Xen
+
+Make it possible to embed a public key in Xen to be used when verifying live
+patch payloads. Inclusion of the public key is optional.
+
+To avoid needing to include a DER / X.509 parser in the hypervisor, the public
+key is unpacked at build time and included in a form that is convenient for the
+hypervisor to consume. This is different approach from that used by Linux which
+embeds the entire X.509 certificate and builds a parser for it.
+
+Signed-off-by: Kevin Lampis <klampis@cloud.com>
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/common/Kconfig b/xen/common/Kconfig
+index fa5e954388e1..aa9025b1d40c 100644
+--- a/xen/common/Kconfig
++++ b/xen/common/Kconfig
+@@ -465,6 +465,25 @@ config SUPPRESS_DUPLICATE_SYMBOL_WARNINGS
+ 	  to produce many duplicate names) may select this to avoid the
+ 	  build becoming overly verbose.
+ 
++config PAYLOAD_SIGNING
++	bool "Verify signed LivePatch payloads"
++	default n
++	depends on LIVEPATCH
++	select CRYPTO
++	help
++	  Verify signed LivePatch payloads using an RSA public key built
++	  into the Xen hypervisor. Selecting this option requires a
++	  public key in PEM format to be available for embedding during
++	  the build.
++
++config PAYLOAD_SIG_KEY
++	string "File name of payload signing public key"
++	default "signing_key.pem"
++	depends on PAYLOAD_SIGNING
++	help
++	  The file name of an RSA public key in PEM format to be used for
++	  verifying signed LivePatch payloads.
++
+ config CMDLINE
+ 	string "Built-in hypervisor command string" if EXPERT
+ 	default ""
+diff --git a/xen/crypto/.gitignore b/xen/crypto/.gitignore
+new file mode 100644
+index 000000000000..01630968e1c8
+--- /dev/null
++++ b/xen/crypto/.gitignore
+@@ -0,0 +1 @@
++signing_key.pem
+diff --git a/xen/crypto/Makefile b/xen/crypto/Makefile
+index a7dd6d0c9a5c..b5ccb1759543 100644
+--- a/xen/crypto/Makefile
++++ b/xen/crypto/Makefile
+@@ -1,3 +1,14 @@
+ obj-y += rijndael.o
+ obj-y += vmac.o
++obj-$(CONFIG_PAYLOAD_SIGNING) += builtin_payload_key.o
++
++ifeq ($(CONFIG_PAYLOAD_SIGNING),y)
++key_path := $(srctree)/crypto/$(patsubst "%",%,$(CONFIG_PAYLOAD_SIG_KEY))
++$(obj)/builtin_payload_key.bin: $(key_path) $(srctree)/tools/extract-key.py
++	$(srctree)/tools/extract-key.py < $< > $@.new
++	$(call move-if-changed,$@.new,$@)
++
++$(obj)/builtin_payload_key.S: $(srctree)/tools/binfile $(obj)/builtin_payload_key.bin FORCE
++	$(call if_changed,binfile,$(obj)/builtin_payload_key.bin xen_livepatch_key_data)
++endif
+ obj-y += sha256.o
+diff --git a/xen/tools/extract-key.py b/xen/tools/extract-key.py
+new file mode 100755
+index 000000000000..479c97ee9200
+--- /dev/null
++++ b/xen/tools/extract-key.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++import binascii
++import struct
++import sys
++import subprocess
++import re
++
++# Decode a certificate into a format suitable for embedding in Xen.
++
++out = subprocess.check_output(['openssl', 'rsa', '-pubin', '-inform', 'PEM',
++                               '-noout', '-text'], stdin=sys.stdin,
++                               universal_newlines=True)
++combined = ''
++for line in out.split('\n'):
++    line = line.rstrip()
++    if line.startswith("    "):
++        combined += line.strip().replace(':', '')
++    match = re.match("Exponent: .* \(0x(.*)\)", line)
++    if match:
++        e = match.group(1)
++
++n = combined.lstrip('0')
++if len(n) % 2 == 1:
++    n = '0' + n
++n = binascii.unhexlify(n)
++e = e.lstrip('0')
++if len(e) % 2 == 1:
++    e = '0' + e
++e = binascii.unhexlify(e)
++
++sys.stdout.buffer.write(struct.pack('I', len(n)))
++sys.stdout.buffer.write(n)
++sys.stdout.buffer.write(struct.pack('I', len(e)))
++sys.stdout.buffer.write(e)

@@ -1,0 +1,900 @@
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Subject: CP-48923: Include purgatory in Xen
+
+Purgatory is a binary that runs between two kernels during kexec. When Secure
+Boot is enabled, it should be signed and verified before being loaded and
+executed.
+
+Currently, purgatory is built as part of kexec-tools and dynamically modified
+before being loaded. This prevents signing it at build time. To fix this, build
+purgatory as a separate object in Xen and modify it at load time in Xen itself.
+This is the same approach used by Linux.
+
+No behavioural change with this patch other than the puratory binary being
+included in Xen.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index 21c12114b9d2..eb9ba8d83003 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -1,6 +1,7 @@
+ obj-y += acpi/
+ obj-y += boot/
+ obj-y += cpu/
++obj-$(CONFIG_KEXEC) += purgatory/
+ obj-y += efi/
+ obj-y += genapic/
+ obj-$(CONFIG_GUEST) += guest/
+diff --git a/xen/arch/x86/purgatory/.gitignore b/xen/arch/x86/purgatory/.gitignore
+new file mode 100644
+index 000000000000..9353e3ff26a6
+--- /dev/null
++++ b/xen/arch/x86/purgatory/.gitignore
+@@ -0,0 +1,3 @@
++purgatory.chk
++kexec-purgatory.S
++purgatory.ro
+diff --git a/xen/arch/x86/purgatory/Makefile b/xen/arch/x86/purgatory/Makefile
+new file mode 100644
+index 000000000000..211264e4dafc
+--- /dev/null
++++ b/xen/arch/x86/purgatory/Makefile
+@@ -0,0 +1,64 @@
++cc_common_flags = -Wall -Os -g0                                \
++                    -nostdinc                                  \
++                    -mcmodel=large                             \
++                    -fno-builtin                               \
++                    -ffreestanding                             \
++                    -fno-zero-initialized-in-bss               \
++                    -fno-stack-protector                       \
++                    -fno-PIC                                   \
++                    -fno-PIE                                   \
++                    -fno-tree-vectorize                        \
++                    -D__XEN__                                  \
++                    -D__PURGATORY__                            \
++                    -include $(srctree)/include/xen/config.h   \
++                    -I$(srctree)/$(src)                        \
++                    -I$(objtree)/include                       \
++                    -I$(srctree)/include                       \
++                    -I$(objtree)/arch/x86/include              \
++                    -I$(srctree)/arch/x86/include              \
++                    -I$(objtree)/arch/x86/include/generated
++
++cmd_cc_purg = $(CC) $(cc_common_flags)               \
++                  -c $< -o $@
++
++cmd_cc_as_purg = $(CC) $(cc_common_flags)            \
++		     -D__ASSEMBLY__                  \
++                     -c $< -o $@
++
++cmd_ld_purg = $(LD) --no-undefined               \
++                -z nodefaultlib                  \
++                -z noexecstack                   \
++                -e purgatory_start               \
++                -S $(real-prereqs) -o $@
++
++cmd_ldr_purg = $(cmd_ld_purg) -r
++
++purgatory-y := purgatory.o stack.o setup-x86_64.o sha2-256.o entry64.o memcmp.o
++PURGATORY_OBJS = $(addprefix $(obj)/,$(purgatory-y))
++
++$(obj)/%.o: $(src)/%.c $(src)/config.h
++	$(call if_changed,cc_purg)
++
++$(obj)/%.o: $(src)/%.S $(src)/config.h
++	$(call if_changed,cc_as_purg)
++
++$(obj)/sha2-256.o: $(srctree)/lib/sha2-256.c $(src)/config.h
++	$(call if_changed,cc_purg)
++
++$(obj)/memcmp.o: $(srctree)/lib/memcmp.c $(src)/config.h
++	$(call if_changed,cc_purg)
++
++$(obj)/purgatory.ro: $(PURGATORY_OBJS) FORCE
++		$(call if_changed,ldr_purg)
++
++$(obj)/purgatory.chk: $(obj)/purgatory.ro FORCE
++		$(call if_changed,ld_purg)
++
++$(obj)/kexec-purgatory.o: $(obj)/purgatory.ro $(obj)/purgatory.chk
++
++$(obj)/kexec-purgatory.S: $(srctree)/tools/binfile FORCE
++	$(call if_changed,binfile,$(obj)/purgatory.ro kexec_purgatory)
++
++targets += kexec-purgatory.S
++
++obj-y += kexec-purgatory.o
+diff --git a/xen/arch/x86/purgatory/config.h b/xen/arch/x86/purgatory/config.h
+new file mode 100644
+index 000000000000..50d23a9816a3
+--- /dev/null
++++ b/xen/arch/x86/purgatory/config.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (C) 2024 Cloud Software Group Inc.
++ */
++
++#ifndef __PURGATORY_CONFIG_H__
++#define __PURGATORY_CONFIG_H__
++
++#define BALIGN(size) .balign size
++
++#undef ENTRY
++#define ENTRY(name)         \
++    name:
++
++#define END(name)           \
++    name##_end:
++
++#undef GLOBAL
++#define GLOBAL(name)        \
++    .globl name;            \
++    ENTRY(name)
++
++#define GLOBAL_END(name)    \
++    .globl name##_end;      \
++    END(name)
++
++#define SYM_T_DATA 1
++
++#define ASM_INT(name, val)  \
++    .type name, SYM_T_DATA; \
++    BALIGN(4);              \
++    .hidden name;           \
++    GLOBAL(name)            \
++    .long (val);            \
++    .size name, . - name
++
++#endif // __PURGATORY_CONFIG_H__
+diff --git a/xen/arch/x86/purgatory/entry64.S b/xen/arch/x86/purgatory/entry64.S
+new file mode 100644
+index 000000000000..31800416feb5
+--- /dev/null
++++ b/xen/arch/x86/purgatory/entry64.S
+@@ -0,0 +1,108 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2003,2004  Eric Biederman (ebiederm@xmission.com)
++ * Copyright (C) 2014  Red Hat Inc.
++ * Copyright (C) 2024  Cloud Software Group Inc.
++
++ * Author(s): Vivek Goyal <vgoyal@redhat.com>
++ *
++ * This code has been adapted from kexec-tools and Linux.
++ */
++
++#include "config.h"
++
++    .text
++    .code64
++
++BALIGN(16)
++GLOBAL(entry64)
++    /* Setup a gdt that should be preserved */
++    lgdt gdt(%rip)
++
++    /* load the data segments */
++    movl    $0x18, %eax     /* data segment */
++    movl    %eax, %ds
++    movl    %eax, %es
++    movl    %eax, %ss
++    movl    %eax, %fs
++    movl    %eax, %gs
++
++    /* Setup new stack */
++    leaq    stack_init(%rip), %rsp
++    pushq   $0x10 /* CS */
++    leaq    new_cs_exit(%rip), %rax
++    pushq   %rax
++    lretq
++ENTRY(new_cs_exit)
++
++    /* Load the registers */
++    movq    rax(%rip), %rax
++    movq    rbx(%rip), %rbx
++    movq    rcx(%rip), %rcx
++    movq    rdx(%rip), %rdx
++    movq    rsi(%rip), %rsi
++    movq    rdi(%rip), %rdi
++    movq    rsp(%rip), %rsp
++    movq    rbp(%rip), %rbp
++    movq    r8(%rip), %r8
++    movq    r9(%rip), %r9
++    movq    r10(%rip), %r10
++    movq    r11(%rip), %r11
++    movq    r12(%rip), %r12
++    movq    r13(%rip), %r13
++    movq    r14(%rip), %r14
++    movq    r15(%rip), %r15
++
++    /* Jump to the new code... */
++    jmpq    *rip(%rip)
++END(entry64)
++
++    .section ".rodata"
++
++BALIGN(4)
++GLOBAL(entry64_regs)
++rax:    .quad 0x0
++rbx:    .quad 0x0
++rcx:    .quad 0x0
++rdx:    .quad 0x0
++rsi:    .quad 0x0
++rdi:    .quad 0x0
++rsp:    .quad 0x0
++rbp:    .quad 0x0
++r8:     .quad 0x0
++r9:     .quad 0x0
++r10:    .quad 0x0
++r11:    .quad 0x0
++r12:    .quad 0x0
++r13:    .quad 0x0
++r14:    .quad 0x0
++r15:    .quad 0x0
++rip:    .quad 0x0
++END(entry64_regs)
++    .size entry64_regs, entry64_regs_end - entry64_regs
++
++    /* GDT */
++    .section ".rodata"
++
++BALIGN(16)
++ENTRY(gdt)
++    /*
++     * 0x00 unusable segment
++     * 0x08 unused
++     * so use them as gdt ptr
++     */
++    .word gdt_end - gdt - 1
++    .quad gdt
++    .word 0, 0, 0
++
++    /* 0x10 4GB flat code segment */
++    .word 0xFFFF, 0x0000, 0x9A00, 0x00AF
++
++    /* 0x18 4GB flat data segment */
++    .word 0xFFFF, 0x0000, 0x9200, 0x00CF
++END(gdt)
++
++ENTRY(stack)
++    .quad   0, 0
++END(stack)
++ENTRY(stack_init)
+diff --git a/xen/arch/x86/purgatory/purgatory.c b/xen/arch/x86/purgatory/purgatory.c
+new file mode 100644
+index 000000000000..3ae79b98154d
+--- /dev/null
++++ b/xen/arch/x86/purgatory/purgatory.c
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * purgatory: Runs between two kernels
++ *
++ * Copyright (C) 2014 Red Hat Inc.
++ * Copyright (C) 2024  Cloud Software Group Inc.
++ *
++ * Author:
++ *       Vivek Goyal <vgoyal@redhat.com>
++ *
++ * This code has been imported from kexec-tools.
++ */
++
++#include <xen/sha2.h>
++#include <xen/string.h>
++
++struct sha256_region {
++    uint64_t start;
++    uint64_t len;
++};
++
++typedef uint8_t sha256_digest_t[SHA2_256_DIGEST_SIZE];
++
++#define SHA256_REGIONS 16
++
++struct sha256_region sha256_regions[SHA256_REGIONS] = {};
++sha256_digest_t sha256_digest = { };
++
++int verify_sha256_digest(void)
++{
++    struct sha256_region *ptr, *end;
++    sha256_digest_t digest;
++    struct sha2_256_state ctx;
++    sha2_256_init(&ctx);
++    end = &sha256_regions[sizeof(sha256_regions) / sizeof(sha256_regions[0])];
++
++    for ( ptr = sha256_regions; ptr < end; ptr++ )
++        sha2_256_update(&ctx, (uint8_t *)((uintptr_t)ptr->start), ptr->len);
++
++    sha2_256_final(&ctx, digest);
++
++    if ( memcmp(digest, sha256_digest, sizeof(digest)) != 0 )
++        return 1;
++
++    return 0;
++}
++
++void purgatory(void)
++{
++    int ret;
++
++    ret = verify_sha256_digest();
++    if ( ret )
++    {
++        /* loop forever */
++        for ( ; ; )
++            ;
++    }
++}
+diff --git a/xen/arch/x86/purgatory/setup-x86_64.S b/xen/arch/x86/purgatory/setup-x86_64.S
+new file mode 100644
+index 000000000000..5f13ba30b6ac
+--- /dev/null
++++ b/xen/arch/x86/purgatory/setup-x86_64.S
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * purgatory:  setup code
++ *
++ * Copyright (C) 2003,2004  Eric Biederman (ebiederm@xmission.com)
++ * Copyright (C) 2014 Red Hat Inc.
++ * Copyright (C) 2024  Cloud Software Group Inc.
++ *
++ * This code has been adapted from kexec-tools and Linux.
++ */
++
++#include "config.h"
++
++    .text
++    .code64
++
++BALIGN(16)
++GLOBAL(purgatory_start)
++
++    /* Load a gdt so I know what the segment registers are */
++    lgdt    gdt(%rip)
++
++    /* load the data segments */
++    movl    $0x18, %eax /* data segment */
++    movl    %eax, %ds
++    movl    %eax, %es
++    movl    %eax, %ss
++    movl    %eax, %fs
++    movl    %eax, %gs
++
++    /* Setup a stack */
++    leaq    lstack_end(%rip), %rsp
++
++    /* Call the C code */
++    call purgatory
++    jmp entry64
++END(purgatory_start)
++
++    .section ".rodata"
++
++BALIGN(16)
++ENTRY(gdt)
++    /* 0x00 unusable segment
++     * 0x08 unused
++     * so use them as the gdt ptr
++     */
++    .word   gdt_end - gdt - 1
++    .quad   gdt
++    .word   0, 0, 0
++
++    /* 0x10 4GB flat code segment */
++    .word   0xFFFF, 0x0000, 0x9A00, 0x00AF
++
++    /* 0x18 4GB flat data segment */
++    .word   0xFFFF, 0x0000, 0x9200, 0x00CF
++END(gdt)
++
++    .bss
++
++BALIGN(4096)
++ENTRY(lstack)
++    .skip 4096
++END(lstack)
+diff --git a/xen/arch/x86/purgatory/sha256.h b/xen/arch/x86/purgatory/sha256.h
+new file mode 100644
+index 000000000000..3b027a153c0b
+--- /dev/null
++++ b/xen/arch/x86/purgatory/sha256.h
+@@ -0,0 +1,21 @@
++#ifndef SHA256_H
++#define SHA256_H
++
++#include "util.h"
++
++typedef struct
++{
++	size_t total[2];
++	uint32_t state[8];
++	uint8_t  buffer[64];
++}
++sha256_context;
++
++typedef uint8_t sha256_digest_t[32];
++
++void sha256_starts( sha256_context *ctx );
++void sha256_update( sha256_context *ctx, const uint8_t *input, size_t length );
++void sha256_finish( sha256_context *ctx, sha256_digest_t digest );
++
++
++#endif /* SHA256_H */
+diff --git a/xen/arch/x86/purgatory/stack.S b/xen/arch/x86/purgatory/stack.S
+new file mode 100644
+index 000000000000..5c7256d7fcec
+--- /dev/null
++++ b/xen/arch/x86/purgatory/stack.S
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * purgatory:  stack
++ *
++ * Copyright (C) 2014 Red Hat Inc.
++ * Copyright (C) 2024  Cloud Software Group Inc.
++ *
++ *	This code has been adapted from kexec-tools and Linux.
++ */
++
++#include "config.h"
++
++	/* A stack for the loaded kernel.
++	 * Separate and in the data section so it can be prepopulated.
++	 */
++	.data
++
++BALIGN(4096)
++GLOBAL(stack)
++	.skip 4096
++GLOBAL_END(stack)
+diff --git a/xen/crypto/Makefile b/xen/crypto/Makefile
+index db29655333a3..a7dd6d0c9a5c 100644
+--- a/xen/crypto/Makefile
++++ b/xen/crypto/Makefile
+@@ -1,2 +1,3 @@
+ obj-y += rijndael.o
+ obj-y += vmac.o
++obj-y += sha256.o
+diff --git a/xen/crypto/sha256.c b/xen/crypto/sha256.c
+new file mode 100644
+index 000000000000..6a3604d2e3d4
+--- /dev/null
++++ b/xen/crypto/sha256.c
+@@ -0,0 +1,367 @@
++/*
++ *  FIPS-180-2 compliant SHA-256 implementation
++ *
++ *  Copyright (C) 2001-2003  Christophe Devine
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <xen/string.h>
++#include <xen/sha256.h>
++
++#define GET_UINT32(n,b,i)                            \
++{                                                    \
++	(n) = 	( (uint32_t) (b)[(i)    ] << 24 ) |  \
++		( (uint32_t) (b)[(i) + 1] << 16 ) |  \
++		( (uint32_t) (b)[(i) + 2] <<  8 ) |  \
++		( (uint32_t) (b)[(i) + 3]       );   \
++}
++
++#define PUT_UINT32(n,b,i)                       \
++{                                               \
++	(b)[(i)    ] = (uint8_t) ( (n) >> 24 ); \
++	(b)[(i) + 1] = (uint8_t) ( (n) >> 16 ); \
++	(b)[(i) + 2] = (uint8_t) ( (n) >>  8 ); \
++	(b)[(i) + 3] = (uint8_t) ( (n)       ); \
++}
++
++void sha256_starts( sha256_context *ctx )
++{
++	ctx->total[0] = 0;
++	ctx->total[1] = 0;
++
++	ctx->state[0] = 0x6A09E667;
++	ctx->state[1] = 0xBB67AE85;
++	ctx->state[2] = 0x3C6EF372;
++	ctx->state[3] = 0xA54FF53A;
++	ctx->state[4] = 0x510E527F;
++	ctx->state[5] = 0x9B05688C;
++	ctx->state[6] = 0x1F83D9AB;
++	ctx->state[7] = 0x5BE0CD19;
++}
++
++void sha256_process( sha256_context *ctx, const uint8_t data[64] )
++{
++	uint32_t temp1, temp2, W[64];
++	uint32_t A, B, C, D, E, F, G, H;
++
++	GET_UINT32( W[0],  data,  0 );
++	GET_UINT32( W[1],  data,  4 );
++	GET_UINT32( W[2],  data,  8 );
++	GET_UINT32( W[3],  data, 12 );
++	GET_UINT32( W[4],  data, 16 );
++	GET_UINT32( W[5],  data, 20 );
++	GET_UINT32( W[6],  data, 24 );
++	GET_UINT32( W[7],  data, 28 );
++	GET_UINT32( W[8],  data, 32 );
++	GET_UINT32( W[9],  data, 36 );
++	GET_UINT32( W[10], data, 40 );
++	GET_UINT32( W[11], data, 44 );
++	GET_UINT32( W[12], data, 48 );
++	GET_UINT32( W[13], data, 52 );
++	GET_UINT32( W[14], data, 56 );
++	GET_UINT32( W[15], data, 60 );
++
++#define  SHR(x,n) ((x & 0xFFFFFFFF) >> n)
++#define ROTR(x,n) (SHR(x,n) | (x << (32 - n)))
++
++#define S0(x) (ROTR(x, 7) ^ ROTR(x,18) ^  SHR(x, 3))
++#define S1(x) (ROTR(x,17) ^ ROTR(x,19) ^  SHR(x,10))
++
++#define S2(x) (ROTR(x, 2) ^ ROTR(x,13) ^ ROTR(x,22))
++#define S3(x) (ROTR(x, 6) ^ ROTR(x,11) ^ ROTR(x,25))
++
++#define F0(x,y,z) ((x & y) | (z & (x | y)))
++#define F1(x,y,z) (z ^ (x & (y ^ z)))
++
++#define R(t)                                    \
++(                                               \
++	W[t] = S1(W[t -  2]) + W[t -  7] +      \
++		S0(W[t - 15]) + W[t - 16]       \
++)
++
++#define P(a,b,c,d,e,f,g,h,x,K)                  \
++{                                               \
++	temp1 = h + S3(e) + F1(e,f,g) + K + x;  \
++	temp2 = S2(a) + F0(a,b,c);              \
++	d += temp1; h = temp1 + temp2;          \
++}
++
++	A = ctx->state[0];
++	B = ctx->state[1];
++	C = ctx->state[2];
++	D = ctx->state[3];
++	E = ctx->state[4];
++	F = ctx->state[5];
++	G = ctx->state[6];
++	H = ctx->state[7];
++
++	P( A, B, C, D, E, F, G, H, W[ 0], 0x428A2F98 );
++	P( H, A, B, C, D, E, F, G, W[ 1], 0x71374491 );
++	P( G, H, A, B, C, D, E, F, W[ 2], 0xB5C0FBCF );
++	P( F, G, H, A, B, C, D, E, W[ 3], 0xE9B5DBA5 );
++	P( E, F, G, H, A, B, C, D, W[ 4], 0x3956C25B );
++	P( D, E, F, G, H, A, B, C, W[ 5], 0x59F111F1 );
++	P( C, D, E, F, G, H, A, B, W[ 6], 0x923F82A4 );
++	P( B, C, D, E, F, G, H, A, W[ 7], 0xAB1C5ED5 );
++	P( A, B, C, D, E, F, G, H, W[ 8], 0xD807AA98 );
++	P( H, A, B, C, D, E, F, G, W[ 9], 0x12835B01 );
++	P( G, H, A, B, C, D, E, F, W[10], 0x243185BE );
++	P( F, G, H, A, B, C, D, E, W[11], 0x550C7DC3 );
++	P( E, F, G, H, A, B, C, D, W[12], 0x72BE5D74 );
++	P( D, E, F, G, H, A, B, C, W[13], 0x80DEB1FE );
++	P( C, D, E, F, G, H, A, B, W[14], 0x9BDC06A7 );
++	P( B, C, D, E, F, G, H, A, W[15], 0xC19BF174 );
++	P( A, B, C, D, E, F, G, H, R(16), 0xE49B69C1 );
++	P( H, A, B, C, D, E, F, G, R(17), 0xEFBE4786 );
++	P( G, H, A, B, C, D, E, F, R(18), 0x0FC19DC6 );
++	P( F, G, H, A, B, C, D, E, R(19), 0x240CA1CC );
++	P( E, F, G, H, A, B, C, D, R(20), 0x2DE92C6F );
++	P( D, E, F, G, H, A, B, C, R(21), 0x4A7484AA );
++	P( C, D, E, F, G, H, A, B, R(22), 0x5CB0A9DC );
++	P( B, C, D, E, F, G, H, A, R(23), 0x76F988DA );
++	P( A, B, C, D, E, F, G, H, R(24), 0x983E5152 );
++	P( H, A, B, C, D, E, F, G, R(25), 0xA831C66D );
++	P( G, H, A, B, C, D, E, F, R(26), 0xB00327C8 );
++	P( F, G, H, A, B, C, D, E, R(27), 0xBF597FC7 );
++	P( E, F, G, H, A, B, C, D, R(28), 0xC6E00BF3 );
++	P( D, E, F, G, H, A, B, C, R(29), 0xD5A79147 );
++	P( C, D, E, F, G, H, A, B, R(30), 0x06CA6351 );
++	P( B, C, D, E, F, G, H, A, R(31), 0x14292967 );
++	P( A, B, C, D, E, F, G, H, R(32), 0x27B70A85 );
++	P( H, A, B, C, D, E, F, G, R(33), 0x2E1B2138 );
++	P( G, H, A, B, C, D, E, F, R(34), 0x4D2C6DFC );
++	P( F, G, H, A, B, C, D, E, R(35), 0x53380D13 );
++	P( E, F, G, H, A, B, C, D, R(36), 0x650A7354 );
++	P( D, E, F, G, H, A, B, C, R(37), 0x766A0ABB );
++	P( C, D, E, F, G, H, A, B, R(38), 0x81C2C92E );
++	P( B, C, D, E, F, G, H, A, R(39), 0x92722C85 );
++	P( A, B, C, D, E, F, G, H, R(40), 0xA2BFE8A1 );
++	P( H, A, B, C, D, E, F, G, R(41), 0xA81A664B );
++	P( G, H, A, B, C, D, E, F, R(42), 0xC24B8B70 );
++	P( F, G, H, A, B, C, D, E, R(43), 0xC76C51A3 );
++	P( E, F, G, H, A, B, C, D, R(44), 0xD192E819 );
++	P( D, E, F, G, H, A, B, C, R(45), 0xD6990624 );
++	P( C, D, E, F, G, H, A, B, R(46), 0xF40E3585 );
++	P( B, C, D, E, F, G, H, A, R(47), 0x106AA070 );
++	P( A, B, C, D, E, F, G, H, R(48), 0x19A4C116 );
++	P( H, A, B, C, D, E, F, G, R(49), 0x1E376C08 );
++	P( G, H, A, B, C, D, E, F, R(50), 0x2748774C );
++	P( F, G, H, A, B, C, D, E, R(51), 0x34B0BCB5 );
++	P( E, F, G, H, A, B, C, D, R(52), 0x391C0CB3 );
++	P( D, E, F, G, H, A, B, C, R(53), 0x4ED8AA4A );
++	P( C, D, E, F, G, H, A, B, R(54), 0x5B9CCA4F );
++	P( B, C, D, E, F, G, H, A, R(55), 0x682E6FF3 );
++	P( A, B, C, D, E, F, G, H, R(56), 0x748F82EE );
++	P( H, A, B, C, D, E, F, G, R(57), 0x78A5636F );
++	P( G, H, A, B, C, D, E, F, R(58), 0x84C87814 );
++	P( F, G, H, A, B, C, D, E, R(59), 0x8CC70208 );
++	P( E, F, G, H, A, B, C, D, R(60), 0x90BEFFFA );
++	P( D, E, F, G, H, A, B, C, R(61), 0xA4506CEB );
++	P( C, D, E, F, G, H, A, B, R(62), 0xBEF9A3F7 );
++	P( B, C, D, E, F, G, H, A, R(63), 0xC67178F2 );
++
++	ctx->state[0] += A;
++	ctx->state[1] += B;
++	ctx->state[2] += C;
++	ctx->state[3] += D;
++	ctx->state[4] += E;
++	ctx->state[5] += F;
++	ctx->state[6] += G;
++	ctx->state[7] += H;
++}
++
++void sha256_update( sha256_context *ctx, const uint8_t *input, size_t length )
++{
++	size_t left, fill;
++
++	if( ! length ) return;
++
++	left = ctx->total[0] & 0x3F;
++	fill = 64 - left;
++
++	ctx->total[0] += length;
++	ctx->total[0] &= 0xFFFFFFFF;
++
++	if( ctx->total[0] < length )
++		ctx->total[1]++;
++
++	if( left && length >= fill )
++	{
++		memcpy( ctx->buffer + left, input, fill );
++		sha256_process( ctx, ctx->buffer );
++		length -= fill;
++		input  += fill;
++		left = 0;
++	}
++
++	while( length >= 64 )
++	{
++		sha256_process( ctx, input );
++		length -= 64;
++		input  += 64;
++	}
++
++	if( length )
++	{
++		memcpy(ctx->buffer + left, input, length);
++	}
++}
++
++static uint8_t sha256_padding[64] =
++{
++ 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
++};
++
++void sha256_finish( sha256_context *ctx, sha256_digest_t digest )
++{
++	uint32_t last, padn;
++	uint32_t high, low;
++	uint8_t msglen[8];
++
++	high = ( ctx->total[0] >> 29 )
++		| ( ctx->total[1] <<  3 );
++	low  = ( ctx->total[0] <<  3 );
++
++	PUT_UINT32( high, msglen, 0 );
++	PUT_UINT32( low,  msglen, 4 );
++
++	last = ctx->total[0] & 0x3F;
++	padn = ( last < 56 ) ? ( 56 - last ) : ( 120 - last );
++
++	sha256_update( ctx, sha256_padding, padn );
++	sha256_update( ctx, msglen, 8 );
++
++	PUT_UINT32( ctx->state[0], digest,  0 );
++	PUT_UINT32( ctx->state[1], digest,  4 );
++	PUT_UINT32( ctx->state[2], digest,  8 );
++	PUT_UINT32( ctx->state[3], digest, 12 );
++	PUT_UINT32( ctx->state[4], digest, 16 );
++	PUT_UINT32( ctx->state[5], digest, 20 );
++	PUT_UINT32( ctx->state[6], digest, 24 );
++	PUT_UINT32( ctx->state[7], digest, 28 );
++}
++
++#ifdef TEST
++
++#include <stdlib.h>
++#include <stdio.h>
++
++/*
++ * those are the standard FIPS-180-2 test vectors
++ */
++
++static char *msg[] =
++{
++	"abc",
++	"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
++	NULL
++};
++
++static char *val[] =
++{
++	"ba7816bf8f01cfea414140de5dae2223" \
++	"b00361a396177a9cb410ff61f20015ad",
++	"248d6a61d20638b8e5c026930c3e6039" \
++	"a33ce45964ff2167f6ecedd419db06c1",
++	"cdc76e5c9914fb9281a1c7e284d73e67" \
++	"f1809a48a497200e046d39ccc7112cd0"
++};
++
++int main( int argc, char *argv[] )
++{
++	FILE *f;
++	int i, j;
++	char output[65];
++	sha256_context ctx;
++	unsigned char buf[1000];
++	unsigned char sha256sum[32];
++
++	if( argc < 2 )
++	{
++		printf( "\n SHA-256 Validation Tests:\n\n" );
++
++		for( i = 0; i < 3; i++ )
++		{
++			printf( " Test %d ", i + 1 );
++
++			sha256_starts( &ctx );
++
++			if( i < 2 )
++			{
++				sha256_update( &ctx, (uint8_t *) msg[i],
++					strlen( msg[i] ) );
++			}
++			else
++			{
++				memset( buf, 'a', 1000 );
++
++				for( j = 0; j < 1000; j++ )
++				{
++					sha256_update( &ctx, (uint8_t *) buf, 1000 );
++				}
++			}
++
++			sha256_finish( &ctx, sha256sum );
++
++			for( j = 0; j < 32; j++ )
++			{
++				sprintf( output + j * 2, "%02x", sha256sum[j] );
++			}
++
++			if( memcmp( output, val[i], 64 ) )
++			{
++				printf( "failed!\n" );
++				return( 1 );
++			}
++
++			printf( "passed.\n" );
++		}
++
++		printf( "\n" );
++	}
++	else
++	{
++		if( ! ( f = fopen( argv[1], "rb" ) ) )
++		{
++			perror( "fopen" );
++			return( 1 );
++		}
++
++		sha256_starts( &ctx );
++
++		while( ( i = fread( buf, 1, sizeof( buf ), f ) ) > 0 )
++		{
++			sha256_update( &ctx, buf, i );
++		}
++
++		sha256_finish( &ctx, sha256sum );
++
++		for( j = 0; j < 32; j++ )
++		{
++			printf( "%02x", sha256sum[j] );
++		}
++
++		printf( "  %s\n", argv[1] );
++	}
++
++	return( 0 );
++}
++
++#endif
++
+diff --git a/xen/include/xen/sha256.h b/xen/include/xen/sha256.h
+new file mode 100644
+index 000000000000..0214b745ff80
+--- /dev/null
++++ b/xen/include/xen/sha256.h
+@@ -0,0 +1,48 @@
++/*
++ *  FIPS-180-2 compliant SHA-256 implementation
++ *
++ *  Copyright (C) 2001-2003  Christophe Devine
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#ifndef SHA256_H
++#define SHA256_H
++
++#include <xen/types.h>
++
++typedef struct
++{
++	size_t total[2];
++	uint32_t state[8];
++	uint8_t  buffer[64];
++}
++sha256_context;
++
++typedef struct
++{
++	uint64_t start;
++	uint64_t len;
++}
++sha256_region_t;
++
++typedef uint8_t sha256_digest_t[32];
++
++void sha256_starts( sha256_context *ctx );
++void sha256_update( sha256_context *ctx, const uint8_t *input, size_t length );
++void sha256_finish( sha256_context *ctx, sha256_digest_t digest );
++
++
++#endif /* SHA256_H */
+diff --git a/xen/lib/sha2-256.c b/xen/lib/sha2-256.c
+index 896a257ed9b7..95680455c1e2 100644
+--- a/xen/lib/sha2-256.c
++++ b/xen/lib/sha2-256.c
+@@ -208,7 +208,7 @@ void sha2_256_digest(uint8_t digest[SHA2_256_DIGEST_SIZE],
+     sha2_256_final(&s, digest);
+ }
+ 
+-#ifdef CONFIG_SELF_TESTS
++#if defined(CONFIG_SELF_TESTS) && !defined(__PURGATORY__)
+ 
+ #include <xen/init.h>
+ #include <xen/lib.h>

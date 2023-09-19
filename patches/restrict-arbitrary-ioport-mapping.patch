@@ -1,0 +1,121 @@
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Subject: Prevent arbitrary ioport mapping
+
+When Xen is locked down, check whether the ioports being mapped belongs to a
+device assigned to the target domain. This prevents a malicious dom0 userspace
+mapping ioports into a domain and then using it to control a device to attack
+dom0 kernel space.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index ecdab90aea7e..44055c8ede85 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -228,7 +228,8 @@ long arch_do_domctl(
+         if ( (fp + np) <= fp || (fp + np) > MAX_IOPORTS )
+             ret = -EINVAL;
+         else if ( !ioports_access_permitted(currd, fp, fp + np - 1) ||
+-                  xsm_ioport_permission(XSM_HOOK, d, fp, fp + np - 1, allow) )
++                  xsm_ioport_permission(XSM_HOOK, d, fp, fp + np - 1, allow) ||
++                  check_ioport_access(d, fp, fp + np - 1) )
+             ret = -EPERM;
+         else if ( allow )
+             ret = ioports_permit_access(d, fp, fp + np - 1);
+@@ -644,6 +645,8 @@ long arch_do_domctl(
+                 g2m_ioport->np = np;
+                 list_add_tail(&g2m_ioport->list, &hvm->g2m_ioport_list);
+             }
++            if ( !ret )
++                ret = check_ioport_access(d, fmp, fmp + np - 1);
+             if ( !ret )
+                 ret = ioports_permit_access(d, fmp, fmp + np - 1);
+             if ( ret && !found && g2m_ioport )
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index d998c0fd5647..8d6ec7b4e522 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -33,6 +33,7 @@
+ #include <xen/tasklet.h>
+ #include <xen/vpci.h>
+ #include <xen/msi.h>
++#include <xen/lockdown.h>
+ #include <xsm/xsm.h>
+ #include "ats.h"
+ 
+@@ -574,6 +575,62 @@ struct pci_dev *pci_get_pdev(const struct domain *d, pci_sbdf_t sbdf)
+     return NULL;
+ }
+ 
++int check_ioport_access(const struct domain *d, unsigned int port_start,
++                        unsigned int port_end)
++{
++    struct pci_dev *pdev;
++    int rc = 0;
++
++    if ( !is_locked_down() )
++        return 0;
++
++    pcidevs_lock();
++    list_for_each_entry ( pdev, &d->pdev_list, domain_list )
++    {
++        unsigned int i;
++
++        if ( pdev->info.is_virtfn )
++            continue;
++
++        if ( (pci_conf_read8(pdev->sbdf, PCI_HEADER_TYPE) & 0x7f) !=
++                PCI_HEADER_TYPE_NORMAL )
++            continue;
++
++        for ( i = 0; i < PCI_HEADER_NORMAL_NR_BARS; i++ )
++        {
++            uint32_t size;
++            unsigned int idx = PCI_BASE_ADDRESS_0 + i * 4;
++            uint32_t bar = pci_conf_read32(pdev->sbdf, idx);
++
++            if ( (bar & PCI_BASE_ADDRESS_SPACE) == PCI_BASE_ADDRESS_SPACE_MEMORY )
++            {
++                if ( (bar & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
++                        PCI_BASE_ADDRESS_MEM_TYPE_64 )
++                    i++;
++                continue;
++            }
++
++            pci_conf_write32(pdev->sbdf, idx, ~0);
++            size = pci_conf_read32(pdev->sbdf, idx) & PCI_BASE_ADDRESS_IO_MASK;
++            size = ~size + 1;
++            pci_conf_write32(pdev->sbdf, idx, bar);
++
++            if ( port_start >= (bar & PCI_BASE_ADDRESS_IO_MASK) &&
++                 port_end <= ((bar & PCI_BASE_ADDRESS_IO_MASK) + size - 1) )
++            {
++                rc = 0;
++                goto out;
++            }
++        }
++    }
++
++    rc = -ENOENT;
++
++out:
++    pcidevs_unlock();
++    return rc;
++}
++
+ /**
+  * pci_enable_acs - enable ACS if hardware support it
+  * @dev: the PCI device
+diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
+index e0c95b217d85..dec8f79fad94 100644
+--- a/xen/include/xen/pci.h
++++ b/xen/include/xen/pci.h
+@@ -264,6 +264,9 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
+                           unsigned int *bus_p, unsigned int *dev_p,
+                           unsigned int *func_p, bool *def_seg);
+ 
++int check_ioport_access(const struct domain *d, unsigned int port_start,
++                        unsigned int port_end);
++
+ #define PCI_BAR_VF      (1u << 0)
+ #define PCI_BAR_LAST    (1u << 1)
+ #define PCI_BAR_ROM     (1u << 2)

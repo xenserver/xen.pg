@@ -1,0 +1,137 @@
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Subject: Add lockdown mode
+
+The intention of lockdown mode is to prevent attacks from a rogue dom0
+userspace from compromising the system. Lockdown mode can be controlled by a
+Kconfig option and a command-line parameter. It is also enabled automatically
+when Secure Boot is enabled and it cannot be disabled in that case.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index cc098069a80f..4d6ef1ba25d0 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -26,6 +26,7 @@
+ #include <xen/nodemask.h>
+ #include <xen/virtual_region.h>
+ #include <xen/watchdog.h>
++#include <xen/lockdown.h>
+ #include <public/version.h>
+ #ifdef CONFIG_COMPAT
+ #include <compat/platform.h>
+diff --git a/xen/common/Kconfig b/xen/common/Kconfig
+index 565ceda741b9..35ea5398c389 100644
+--- a/xen/common/Kconfig
++++ b/xen/common/Kconfig
+@@ -513,4 +513,12 @@ config TRACEBUFFER
+ 	  to be collected at run time for debugging or performance analysis.
+ 	  Memory and execution overhead when not active is minimal.
+ 
++config LOCKDOWN_DEFAULT
++	bool "Enable lockdown mode by default"
++	default n
++	help
++	  Lockdown mode prevents attacks from a rogue dom0 userspace from
++	  compromising the system. This is automatically enabled when Secure
++	  Boot is enabled.
++
+ endmenu
+diff --git a/xen/common/Makefile b/xen/common/Makefile
+index d3f04e6570b5..5496b0c1fd3d 100644
+--- a/xen/common/Makefile
++++ b/xen/common/Makefile
+@@ -24,6 +24,7 @@ obj-y += keyhandler.o
+ obj-$(CONFIG_KEXEC) += kexec.o
+ obj-$(CONFIG_KEXEC) += kimage.o
+ obj-$(CONFIG_LIVEPATCH) += livepatch.o livepatch_elf.o
++obj-y += lockdown.o
+ obj-$(CONFIG_MEM_ACCESS) += mem_access.o
+ obj-y += memory.o
+ obj-y += multicall.o
+diff --git a/xen/common/kernel.c b/xen/common/kernel.c
+index b44b2439ca8e..394193b5c1de 100644
+--- a/xen/common/kernel.c
++++ b/xen/common/kernel.c
+@@ -214,6 +214,9 @@ static void __init _cmdline_parse(const char *cmdline)
+  */
+ void __init cmdline_parse(const char *cmdline)
+ {
++    /* Call this early since it affects command-line parsing */
++    lockdown_init(cmdline);
++
+     if ( opt_builtin_cmdline[0] )
+     {
+         printk("Built-in command line: %s\n", opt_builtin_cmdline);
+diff --git a/xen/common/lockdown.c b/xen/common/lockdown.c
+new file mode 100644
+index 000000000000..935911dfd071
+--- /dev/null
++++ b/xen/common/lockdown.c
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include <xen/efi.h>
++#include <xen/kernel.h>
++#include <xen/lockdown.h>
++#include <xen/param.h>
++#include <xen/string.h>
++
++static bool __ro_after_init lockdown = IS_ENABLED(CONFIG_LOCKDOWN_DEFAULT);
++ignore_param("lockdown");
++
++bool is_locked_down(void)
++{
++    return lockdown;
++}
++
++void __init lockdown_init(const char *cmdline)
++{
++    if ( efi_secure_boot )
++    {
++        printk("Enabling lockdown mode because Secure Boot is enabled\n");
++        lockdown = true;
++    }
++    else
++    {
++        while ( *cmdline )
++        {
++            size_t param_len, name_len;
++            int ret;
++
++            cmdline += strspn(cmdline, " \n\r\t");
++            param_len = strcspn(cmdline, " \n\r\t");
++            name_len = strcspn(cmdline, "= \n\r\t");
++
++            if ( !strncmp(cmdline, "lockdown", max(name_len, strlen("lockdown"))) ||
++                 !strncmp(cmdline, "no-lockdown", max(name_len, strlen("no-lockdown"))) )
++            {
++                ret = parse_boolean("lockdown", cmdline, cmdline + param_len);
++                if ( ret >= 0 )
++                {
++                    lockdown = ret;
++                    printk("Lockdown mode set from command-line\n");
++                    break;
++                }
++            }
++
++            cmdline += param_len;
++        }
++    }
++
++    printk("Lockdown mode is %s\n", lockdown ? "enabled" : "disabled");
++}
+diff --git a/xen/include/xen/lockdown.h b/xen/include/xen/lockdown.h
+new file mode 100644
+index 000000000000..b2baa31caac8
+--- /dev/null
++++ b/xen/include/xen/lockdown.h
+@@ -0,0 +1,9 @@
++#ifndef XEN__LOCKDOWN_H
++#define XEN__LOCKDOWN_H
++
++#include <xen/types.h>
++
++bool is_locked_down(void);
++void lockdown_init(const char *cmdline);
++
++#endif /* XEN__LOCKDOWN_H */

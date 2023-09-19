@@ -1,0 +1,78 @@
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Subject: efi: Add a function to check if Secure Boot mode is enabled
+
+Also cache it to avoid needing to repeatedly ask the firmware.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/common/efi/boot.c b/xen/common/efi/boot.c
+index 3ac6cd522b0e..dd99b88e13f4 100644
+--- a/xen/common/efi/boot.c
++++ b/xen/common/efi/boot.c
+@@ -850,6 +850,27 @@ static void __init pre_parse(const struct file *file)
+                    " last line will be ignored.\r\n");
+ }
+ 
++static void __init init_secure_boot_mode(void)
++{
++    EFI_STATUS status;
++    EFI_GUID gv_uuid = EFI_GLOBAL_VARIABLE;
++    uint8_t data = 0;
++    UINTN size = sizeof(data);
++    UINT32 attr = 0;
++    status = efi_rs->GetVariable((CHAR16 *)L"SecureBoot", &gv_uuid, &attr,
++                                 &size, &data);
++
++    if ( status == EFI_NOT_FOUND ||
++         (status == EFI_SUCCESS &&
++          attr == (EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS) &&
++          size == 1 && data == 0) )
++        /* Platform does not support Secure Boot or it's disabled. */
++        efi_secure_boot = false;
++    else
++        /* Everything else play it safe and assume enabled. */
++        efi_secure_boot = true;
++}
++
+ static void __init efi_init(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+ {
+     efi_ih = ImageHandle;
+@@ -864,6 +885,8 @@ static void __init efi_init(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTabl
+ 
+     StdOut = SystemTable->ConOut;
+     StdErr = SystemTable->StdErr ?: StdOut;
++
++    init_secure_boot_mode();
+ }
+ 
+ static void __init efi_console_set_mode(void)
+diff --git a/xen/common/efi/runtime.c b/xen/common/efi/runtime.c
+index d952c3ba785e..a1e228b2fca7 100644
+--- a/xen/common/efi/runtime.c
++++ b/xen/common/efi/runtime.c
+@@ -39,6 +39,9 @@ void efi_rs_leave(struct efi_rs_state *state);
+ unsigned int __read_mostly efi_num_ct;
+ const EFI_CONFIGURATION_TABLE *__read_mostly efi_ct;
+ 
++#if defined(CONFIG_X86) && !defined(CONFIG_PV_SHIM)
++bool __ro_after_init efi_secure_boot;
++#endif
+ unsigned int __read_mostly efi_version;
+ unsigned int __read_mostly efi_fw_revision;
+ const CHAR16 *__read_mostly efi_fw_vendor;
+diff --git a/xen/include/xen/efi.h b/xen/include/xen/efi.h
+index 160804e29444..ae10ac62d015 100644
+--- a/xen/include/xen/efi.h
++++ b/xen/include/xen/efi.h
+@@ -40,6 +40,12 @@ static inline bool efi_enabled(unsigned int feature)
+ }
+ #endif
+ 
++#if defined(CONFIG_X86) && !defined(CONFIG_PV_SHIM)
++extern bool efi_secure_boot;
++#else
++#define efi_secure_boot false
++#endif
++
+ void efi_init_memory(void);
+ bool efi_boot_mem_unused(unsigned long *start, unsigned long *end);
+ bool efi_rs_using_pgtables(void);

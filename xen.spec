@@ -131,6 +131,14 @@ BuildRequires: systemd
 BuildRequires: systemd-rpm-macros
 %endif
 
+# For embedded live patching certificate
+BuildRequires: openssl
+BuildRequires: nss-tools
+BuildRequires: python3-xssign
+
+# For signing
+BuildRequires: xssign-macros
+
 # Need cov-analysis if coverity is enabled
 %{?_cov_buildrequires}
 
@@ -149,6 +157,15 @@ Summary: The Xen Hypervisor debug information
 License: GPLv2
 %description hypervisor-debuginfo
 This package contains the Xen Hypervisor debug information.
+
+%package hypervisor-elf
+Summary: The Xen Hypervisor ELF binaries
+License: GPLv2
+Requires(post): coreutils grep
+%description hypervisor-elf
+This package contains the Xen Project Hypervisor combined with the XenServer
+patchqueue in ELF form (xen.gz). This is needed when upgrading from older
+releases of XenServer that do not support booting a multiboot2 PE-based binary.
 
 %package tools
 Summary: Xen Hypervisor general tools
@@ -264,10 +281,24 @@ export PYTHON="%{__python}"
            --with-system-ipxe=/usr/share/ipxe/ipxe.bin \
            --with-system-ovmf=/usr/share/edk2/OVMF-release.fd
 
+
+%fetchcert -c XEN_LP_SIGN_KEY_XS9 -o livepatch.cer
+openssl x509 -pubkey -outform pem -in livepatch.cer -out xen/crypto/signing_key.pem
+
+# Format sbat.csv with version/release
+sed -i -e 's/@@VERSION@@/%{version}/g' \
+       -e 's/@@RELEASE@@/%{release}/g' xen/arch/x86/sbat.csv
+
 # Take a snapshot of the configured source tree for livepatches
 mkdir ../livepatch-src
 cp -a . ../livepatch-src/
 echo %{?_devtoolset_enable} > ../livepatch-src/prepare-build
+
+# Check if there are any changes in the public headers.
+# Any changes here must be checked. If necessary, update the hypercall
+# filter code in the dom0 kernel. To resolve this, copy xen/include/public to
+# public-abi and refresh public-abi.patch.
+diff -Naur public-abi xen/include/public
 
 # Build tools and man pages
 %{?_cov_wrap} %{make_build} build-tools
@@ -294,6 +325,10 @@ build_xen () { # $1=vendorversion $2=buildconfig $3=outdir $4=cov
     mkdir xen/$3 && cp -a buildconfigs/$2 xen/$3/.config
     $mk olddefconfig
     $mk build MAP
+    if [ -f xen/$3/xen.pe ]; then
+        %sign -c XEN_SIGN_KEY_XS9 -i xen/$3/xen.pe -o xen/$3/xen-signed.pe
+        mv -f xen/$3/xen-signed.pe xen/$3/xen.efi
+    fi
 }
 
 # Builds of Xen
@@ -333,6 +368,7 @@ install_xen () { # $1=vendorversion $2=outdir
     %{__install} -p -D -m 644 xen/$2/System.map %{buildroot}/boot/xen-%{version}$1.map
     %{__install} -p -D -m 644 xen/$2/.config    %{buildroot}/boot/xen-%{version}$1.config
     %{__install} -p -D -m 644 xen/$2/xen-syms   %{buildroot}/boot/xen-syms-%{version}$1
+    %{__install} -p -D -m 644 xen/$2/xen.efi    %{buildroot}/boot/xen-%{version}$1.efi
 }
 install_xen -%{hv_rel}   build-xen-release
 install_xen -%{hv_rel}-d build-xen-debug
@@ -350,10 +386,10 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{?_cov_install}
 
 %files hypervisor
-/boot/%{name}-%{version}-%{hv_rel}.gz
+/boot/%{name}-%{version}-%{hv_rel}.efi
 /boot/%{name}-%{version}-%{hv_rel}.map
 /boot/%{name}-%{version}-%{hv_rel}.config
-/boot/%{name}-%{version}-%{hv_rel}-d.gz
+/boot/%{name}-%{version}-%{hv_rel}-d.efi
 /boot/%{name}-%{version}-%{hv_rel}-d.map
 /boot/%{name}-%{version}-%{hv_rel}-d.config
 %config %{_sysconfdir}/sysconfig/kernel-xen
@@ -364,6 +400,10 @@ install_xen -%{hv_rel}-d build-xen-debug
 /boot/%{name}-syms-%{version}-%{hv_rel}
 /boot/%{name}-syms-%{version}-%{hv_rel}-d
 %{_libexecdir}/%{name}/boot/xen-shim-syms
+
+%files hypervisor-elf
+/boot/%{name}-%{version}-%{hv_rel}.gz
+/boot/%{name}-%{version}-%{hv_rel}-d.gz
 
 %files tools
 %{_bindir}/xenstore
@@ -832,23 +872,23 @@ install_xen -%{hv_rel}-d build-xen-debug
 
 %post hypervisor
 # Update the debug and release symlinks
-ln -sf %{name}-%{version}-%{hv_rel}-d.gz /boot/xen-debug.gz
-ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen-release.gz
+ln -sf %{name}-%{version}-%{hv_rel}-d.efi /boot/xen-debug.efi
+ln -sf %{name}-%{version}-%{hv_rel}.efi /boot/xen-release.efi
 
-# Point /boot/xen.gz appropriately
-if [ ! -e /boot/xen.gz ]; then
+# Point /boot/xen.efi appropriately
+if [ ! -e /boot/xen.efi ]; then
     # Use a production hypervisor by default
-    ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
-elif [ ! -L /boot/xen.gz ]; then
+    ln -sf %{name}-%{version}-%{hv_rel}.efi /boot/xen.efi
+elif [ ! -L /boot/xen.efi ]; then
     # Use the production hypervisor, but keep it unlinked
-    cp -f /boot/%{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
+    cp -f /boot/%{name}-%{version}-%{hv_rel}.efi /boot/xen.efi
 else
     # Else look at the current link, and whether it is debug
-    path="`readlink -f /boot/xen.gz`"
-    if [ ${path} != ${path%%-d.gz} ]; then
-        ln -sf %{name}-%{version}-%{hv_rel}-d.gz /boot/xen.gz
+    path="`readlink -f /boot/xen.efi`"
+    if [ ${path} != ${path%%-d.efi} ]; then
+        ln -sf %{name}-%{version}-%{hv_rel}-d.efi /boot/xen.efi
     else
-        ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
+        ln -sf %{name}-%{version}-%{hv_rel}.efi /boot/xen.efi
     fi
 fi
 
