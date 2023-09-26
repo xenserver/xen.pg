@@ -548,12 +548,12 @@ install_xen -%{hv_rel}-d build-xen-debug
 # Pygrub python libs
 %{py_sitearch}/grub/
 %{py_sitearch}/xenfsimage.cpython*.so
-%{py_sitearch}/pygrub-0.6-py*.egg-info
+%{py_sitearch}/pygrub-0.7-py*.egg-info
 
 %if 0%{?py2_compat}
 %{python2_sitearch}/grub/
 %{python2_sitearch}/xenfsimage.so
-%{python2_sitearch}/pygrub-0.6-py*.egg-info
+%{python2_sitearch}/pygrub-0.7-py*.egg-info
 %endif
 
 # Xen python libs
