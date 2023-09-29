@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.52
+%global hv_rel 10.53
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -865,6 +865,15 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Sep 29 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.53
+- Fixes for
+  - XSA-438 CVE-2023-34322
+  - XSA-440 CVE-2023-34323
+  - XSA-442 CVE-2023-34326
+  - XSA-443 CVE-2023-34325
+  - XSA-444 CVE-2023-34327 CVE-2023-34328
+- Pygrub extended to deprivilege itself before operating on guest disks.
+
 * Tue Sep 19 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.52
 - Fix for XSA-439 / CVE-2023-20588.
 - Ignore MADT entries with invalid APIC_IDs.
