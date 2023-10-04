@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.36
+%global hv_rel 9.37
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -875,6 +875,28 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed Oct 4 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.37
+- Fixes for
+  - XSA-438 CVE-2023-34322
+  - XSA-439 CVE-2023-20588
+  - XSA-440 CVE-2023-34323
+  - XSA-442 CVE-2023-34326
+  - XSA-443 CVE-2023-34325
+  - XSA-444 CVE-2023-34327 CVE-2023-34328
+- Pygrub extended to deprivilege itself before operating on guest disks.
+- Ignore MADT entries with invalid APIC_IDs.
+- Fix the emulation of VPBLENDMW with a mask and memory operand.
+- Fix a incorrect diagnostic about spurious interrupts.
+- Update IO-APIC IRTEs atomically.  Fixes a race condition which causes
+  interrupts to be routed badly, often with "No irq handler for vector"
+  errors.
+- Further fix for XSA-433.  Extend the chicken-bit workaround to all CPUs
+  which appear to be a Zen2 microarchtiecture, even those not on the published
+  model list.
+- Fix for AMD errata #1474.  Disable C6 after 1000 days of uptime on AMD Zen2
+  systems to avoid a crash at ~1044 days.
+- Fix for MSR_ARCH_CAPS boot-time calculations for PV guests.
+
 * Thu Aug 3 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.36
 - Fixes for
   - XSA-434 CVE-2023-20569
