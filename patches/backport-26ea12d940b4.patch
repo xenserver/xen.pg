@@ -1,0 +1,99 @@
+From 26ea12d940b47689f0eab315afd84f8c6eb5bd81 Mon Sep 17 00:00:00 2001
+From: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Date: Fri, 13 Oct 2023 16:38:01 +0100
+Subject: x86/amd: Address AMD erratum #1485
+
+This erratum has been observed to cause #UD exceptions.
+
+Fix adapted off Linux's mailing list:
+  https://lore.kernel.org/lkml/D99589F4-BC5D-430B-87B2-72C20370CF57@exactcode.com/T/#u
+
+Signed-off-by: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-acked-by: Henry Wang <Henry.Wang@arm.com>
+
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index 76ed4023f988..9c5d52e58d9b 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -753,6 +753,27 @@ static void zen2_disable_c6(void *arg)
+ 	wrmsrl(MSR_AMD_CSTATE_CFG, val & mask);
+ }
+ 
++static void amd_check_erratum_1485(void)
++{
++	uint64_t val, chickenbit = (1 << 5);
++
++	if (cpu_has_hypervisor || boot_cpu_data.x86 != 0x19 || !is_zen4_uarch())
++		return;
++
++	rdmsrl(MSR_AMD64_BP_CFG, val);
++
++	if (val & chickenbit)
++		return;
++
++	/*
++	 * BP_CFG is a core-scoped MSR. There's a benign race on this write
++	 * on the case where 2 threads perform the previous check at the
++	 * same time before the chickenbit is set. It's benign because the
++	 * value being written is the same on both.
++	 */
++	wrmsrl(MSR_AMD64_BP_CFG, val | chickenbit);
++}
++
+ static void init_amd(struct cpuinfo_x86 *c)
+ {
+ 	u32 l, h;
+@@ -1014,6 +1035,7 @@ static void init_amd(struct cpuinfo_x86 *c)
+ 		disable_c1_ramping();
+ 
+ 	amd_check_zenbleed();
++	amd_check_erratum_1485();
+ 
+ 	if (zen2_c6_disabled)
+ 		zen2_disable_c6(NULL);
+diff --git a/xen/include/asm-x86/amd.h b/xen/include/asm-x86/amd.h
+index 7fe1e19217df..0fdac37fe452 100644
+--- a/xen/include/asm-x86/amd.h
++++ b/xen/include/asm-x86/amd.h
+@@ -145,11 +145,16 @@
+  * Hygon (Fam18h) but without simple model number rules.  Instead, use STIBP
+  * as a heuristic that distinguishes the two.
+  *
++ * For Zen3 and Zen4 (Fam19h) the heuristic is the presence of AutoIBRS, as
++ * it's Zen4-specific.
++ *
+  * The caller is required to perform the appropriate vendor/family checks
+  * first.
+  */
+ #define is_zen1_uarch() (!boot_cpu_has(X86_FEATURE_AMD_STIBP))
+ #define is_zen2_uarch()   boot_cpu_has(X86_FEATURE_AMD_STIBP)
++#define is_zen3_uarch() (!boot_cpu_has(X86_FEATURE_AUTO_IBRS))
++#define is_zen4_uarch()   boot_cpu_has(X86_FEATURE_AUTO_IBRS)
+ 
+ struct cpuinfo_x86;
+ int cpu_has_amd_erratum(const struct cpuinfo_x86 *, int, ...);
+diff --git a/xen/include/asm-x86/msr-index.h b/xen/include/asm-x86/msr-index.h
+index 098aa06b1eb4..bda8e2c265c6 100644
+--- a/xen/include/asm-x86/msr-index.h
++++ b/xen/include/asm-x86/msr-index.h
+@@ -331,6 +331,7 @@
+ #define MSR_AMD64_DC_CFG		0xc0011022
+ #define MSR_AMD64_DE_CFG		0xc0011029
+ #define AMD64_DE_CFG_LFENCE_SERIALISE	(_AC(1, ULL) << 1)
++#define MSR_AMD64_BP_CFG		0xc001102e
+ #define MSR_AMD64_DE_CFG2		0xc00110e3
+ 
+ #define MSR_AMD64_DR0_ADDRESS_MASK	0xc0011027
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index bac8a9f1b40b..6a86afdc4577 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -280,6 +280,7 @@ XEN_CPUFEATURE(AVX512_BF16,  10*32+ 5) /*A  AVX512 BFloat16 Instructions */
+ 
+ /* AMD-defined CPU features, CPUID level 0x80000021.eax, word 11 */
+ XEN_CPUFEATURE(LFENCE_DISPATCH,    11*32+ 2) /*A  LFENCE always serializing */
++XEN_CPUFEATURE(AUTO_IBRS,          11*32+ 8) /*   Automatic IBRS */
+ XEN_CPUFEATURE(SBPB,               11*32+27) /*A  Selective Branch Predictor Barrier */
+ XEN_CPUFEATURE(IBPB_BRTYPE,        11*32+28) /*A  IBPB flushes Branch Type predictions too */
+ XEN_CPUFEATURE(SRSO_NO,            11*32+29) /*A  Hardware not vulenrable to Speculative Return Stack Overflow */
