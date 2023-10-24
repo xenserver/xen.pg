@@ -1,0 +1,81 @@
+From 4bb882fe6e4430782101fe06379649df1bbd458a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Thu, 19 Oct 2023 09:52:43 +0200
+Subject: x86/pvh: fix identity mapping of low 1MB
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The mapping of memory regions below the 1MB mark was all done by the PVH dom0
+builder code, causing the region to be avoided by the arch specific IOMMU
+hardware domain initialization code.  That lead to the IOMMU being enabled
+without reserved regions in the low 1MB identity mapped in the p2m for PVH
+hardware domains.  Firmware which happens to be missing RMRR/IVMD ranges
+describing E820 reserved regions in the low 1MB would transiently trigger IOMMU
+faults until the p2m is populated by the PVH dom0 builder:
+
+AMD-Vi: IO_PAGE_FAULT: 0000:00:13.1 d0 addr 00000000000eb380 flags 0x20 RW
+AMD-Vi: IO_PAGE_FAULT: 0000:00:13.1 d0 addr 00000000000eb340 flags 0
+AMD-Vi: IO_PAGE_FAULT: 0000:00:13.2 d0 addr 00000000000ea1c0 flags 0
+AMD-Vi: IO_PAGE_FAULT: 0000:00:14.5 d0 addr 00000000000eb480 flags 0x20 RW
+AMD-Vi: IO_PAGE_FAULT: 0000:00:12.0 d0 addr 00000000000eb080 flags 0x20 RW
+AMD-Vi: IO_PAGE_FAULT: 0000:00:14.5 d0 addr 00000000000eb400 flags 0
+AMD-Vi: IO_PAGE_FAULT: 0000:00:12.0 d0 addr 00000000000eb040 flags 0
+
+Those errors have been observed on the osstest pinot{0,1} boxes (AMD Fam15h
+Opteron(tm) Processor 3350 HE).
+
+Rely on the IOMMU arch init code to create any identity mappings for reserved
+regions in the low 1MB range (like it already does for reserved regions
+elsewhere), and leave the mapping of any holes to be performed by the dom0
+builder code.
+
+Fixes: 6b4f6a31ace1 ('x86/PVH: de-duplicate mappings for first Mb of Dom0 memory')
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Release-acked-by: Henry Wang <Henry.Wang@arm.com>
+
+diff --git a/xen/arch/x86/hvm/dom0_build.c b/xen/arch/x86/hvm/dom0_build.c
+index ba99742078c8..e63c07d6c1cf 100644
+--- a/xen/arch/x86/hvm/dom0_build.c
++++ b/xen/arch/x86/hvm/dom0_build.c
+@@ -461,7 +461,7 @@ static int __init pvh_populate_p2m(struct domain *d)
+         }
+     }
+ 
+-    /* Non-RAM regions of space below 1MB get identity mapped. */
++    /* Identity map everything below 1MB that's not already mapped. */
+     for ( i = rc = 0; i < MB1_PAGES; ++i )
+     {
+         p2m_type_t p2mt;
+@@ -472,8 +472,9 @@ static int __init pvh_populate_p2m(struct domain *d)
+                                     p2m_get_hostp2m(d)->default_access);
+         else
+             /*
+-             * If the p2m entry is already set it must belong to a RMRR and
+-             * already be identity mapped, or be a RAM region.
++             * If the p2m entry is already set it must belong to a reserved
++             * region (e.g. RMRR/IVMD) and be identity mapped, or else be a
++             * RAM region.
+              */
+             ASSERT(p2mt == p2m_ram_rw || mfn_eq(mfn, _mfn(i)));
+         put_gfn(d, i);
+diff --git a/xen/drivers/passthrough/x86/iommu.c b/xen/drivers/passthrough/x86/iommu.c
+index 39cc3f18b5dd..a237ca14745d 100644
+--- a/xen/drivers/passthrough/x86/iommu.c
++++ b/xen/drivers/passthrough/x86/iommu.c
+@@ -313,13 +313,7 @@ void __hwdom_init arch_iommu_hwdom_init(struct domain *d)
+     max_pfn = (GB(4) >> PAGE_SHIFT) - 1;
+     top = max(max_pdx, pfn_to_pdx(max_pfn) + 1);
+ 
+-    /*
+-     * First Mb will get mapped in one go by pvh_populate_p2m(). Avoid
+-     * setting up potentially conflicting mappings here.
+-     */
+-    i = paging_mode_translate(d) ? PFN_DOWN(MB(1)) : 0;
+-
+-    for ( ; i < top; i++ )
++    for ( i = 0; i < top; i++ )
+     {
+         unsigned long pfn = pdx_to_pfn(i);
+         int rc;
