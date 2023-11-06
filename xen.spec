@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.37
+%global hv_rel 9.38
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -875,6 +875,13 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Nov 6 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.38
+- Fixes for
+  - XSA-445 CVE-2023-46835
+  - XSA-446 CVE-2023-46836
+- Fix for AMD erratum #1485, which has been observed to cause #UD exception on
+  AMD Zen4 systems.
+
 * Wed Oct 4 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.37
 - Fixes for
   - XSA-438 CVE-2023-34322
