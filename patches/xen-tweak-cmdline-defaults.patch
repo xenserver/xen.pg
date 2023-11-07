@@ -36,38 +36,8 @@ XenServer changes to Xen command line default options.
 
 * Disable 32bit PV guests by default in non-shim configurations.
 
-* Use x2APIC in physical destination mode to prevent APIC vector shortage.
-
 * Serial console TX size bumped to 128K to prevent loosing output.
 
-diff --git a/xen/arch/x86/genapic/x2apic.c b/xen/arch/x86/genapic/x2apic.c
-index 319e039a1cd8..d647c8e9290c 100644
---- a/xen/arch/x86/genapic/x2apic.c
-+++ b/xen/arch/x86/genapic/x2apic.c
-@@ -220,20 +220,15 @@ static struct notifier_block x2apic_cpu_nfb = {
-    .notifier_call = update_clusterinfo
- };
- 
--static s8 __initdata x2apic_phys = -1; /* By default we use logical cluster mode. */
-+static s8 __initdata x2apic_phys = -1; /* By default we use physical mode. */
- boolean_param("x2apic_phys", x2apic_phys);
- 
- const struct genapic *__init apic_x2apic_probe(void)
- {
-     if ( x2apic_phys < 0 )
-     {
--        /*
--         * Force physical mode if there's no interrupt remapping support: The
--         * ID in clustered mode requires a 32 bit destination field due to
--         * the usage of the high 16 bits to hold the cluster ID.
--         */
--        x2apic_phys = !iommu_intremap ||
--                      (acpi_gbl_FADT.flags & ACPI_FADT_APIC_PHYSICAL);
-+        /* Use physical mode by default unless requested in FADT. */
-+        x2apic_phys = !(acpi_gbl_FADT.flags & ACPI_FADT_APIC_CLUSTER);
-     }
-     else if ( !x2apic_phys )
-         switch ( iommu_intremap )
 diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
 index 44b147664452..f86e852523a0 100644
 --- a/xen/arch/x86/hvm/vmx/vmcs.c
@@ -91,7 +61,7 @@ index 44b147664452..f86e852523a0 100644
  static int __init parse_ept_param(const char *s)
  {
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index f642c52f9bb4..e860d350dab9 100644
+index 9a6ee2bcba6c..499cb26dbb6b 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
 @@ -187,7 +187,7 @@ static uint32_t base_disallow_mask;
@@ -103,7 +73,7 @@ index f642c52f9bb4..e860d350dab9 100644
  
  static int __init parse_mmio_relax(const char *s)
  {
-@@ -675,7 +675,7 @@ static void dec_linear_uses(struct page_info *pg)
+@@ -674,7 +674,7 @@ static void dec_linear_uses(struct page_info *pg)
   *     frame if it is mapped by a different root table. This is sufficient and
   *     also necessary to allow validation of a root table mapping itself.
   */
@@ -126,10 +96,10 @@ index 856dc0b0cef8..6434be41ba52 100644
  static int __init parse_watchdog(const char *s)
  {
 diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
-index 365a432e2bf4..3449f1891796 100644
+index 972c415288a3..e27eceffee20 100644
 --- a/xen/arch/x86/setup.c
 +++ b/xen/arch/x86/setup.c
-@@ -1604,6 +1604,9 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+@@ -1605,6 +1605,9 @@ void __init noreturn __start_xen(unsigned long mbi_p)
  
      set_in_cr4(X86_CR4_OSFXSR | X86_CR4_OSXMMEXCPT);
  
@@ -153,10 +123,10 @@ index 50621f767c53..4e879b4470d1 100644
          reboot_type = BOOT_KBD;
      else
 diff --git a/xen/arch/x86/time.c b/xen/arch/x86/time.c
-index 5b9c355d7096..05e52edd3f32 100644
+index 4dd678d3311d..b7c832139127 100644
 --- a/xen/arch/x86/time.c
 +++ b/xen/arch/x86/time.c
-@@ -941,7 +941,7 @@ static unsigned long get_cmos_time(void)
+@@ -942,7 +942,7 @@ static unsigned long get_cmos_time(void)
      unsigned long flags;
      struct rtc_time rtc;
      unsigned int seconds = 60;
@@ -166,7 +136,7 @@ index 5b9c355d7096..05e52edd3f32 100644
  
      if ( likely(!(acpi_gbl_FADT.boot_flags & ACPI_FADT_NO_CMOS_RTC)) )
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 443f3dd7050f..bd344e255da5 100644
+index 8f44e0f7a7f0..218f476eeb59 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
 @@ -86,11 +86,7 @@
@@ -182,7 +152,7 @@ index 443f3dd7050f..bd344e255da5 100644
  
  DEFINE_PER_CPU(uint64_t, efer);
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index dc165a6c8458..40253575b22c 100644
+index 53152b44ea12..e3f420f6b447 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
 @@ -247,7 +247,7 @@ static int late_hwdom_init(struct domain *d)
@@ -221,7 +191,7 @@ index 36bd3ae75050..fa76f469af70 100644
  
  #ifdef CONFIG_SCRUB_DEBUG
 diff --git a/xen/drivers/char/console.c b/xen/drivers/char/console.c
-index 948a926a6242..3b00dfb6f51b 100644
+index 6959cd76bfa8..2fab935af598 100644
 --- a/xen/drivers/char/console.c
 +++ b/xen/drivers/char/console.c
 @@ -76,16 +76,16 @@ enum con_timestamp_mode
