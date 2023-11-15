@@ -53,14 +53,31 @@ BuildRequires: python2-devel
 BuildRequires: python2-rpm-macros
 %endif
 
+# These build dependencies are needed for building the xen.gz as
+# well as live patches.
+%define core_builddeps() %{lua:
+    if rpm.expand("0%{?xenserver}") < '9' then
+        deps = {
+            'devtoolset-11-binutils',
+            'devtoolset-11-gcc'
+        }
+    else
+        deps = {
+            'binutils',
+            'gcc'
+        }
+    end
+
+    for _, dep in ipairs(deps) do
+        print(rpm.expand("%1") .. ': ' .. dep .. '\\n')
+    end
+}
+
 %if 0%{?xenserver} < 9
-BuildRequires: devtoolset-11-binutils
-BuildRequires: devtoolset-11-gcc
 %global _devtoolset_enable source /opt/rh/devtoolset-11/enable
-%else
-BuildRequires: binutils
-BuildRequires: gcc
 %endif
+
+%{core_builddeps BuildRequires}
 
 # For HVMLoader and 16/32bit firmware
 BuildRequires: dev86 iasl
@@ -202,6 +219,7 @@ This package contains test cases for the Xen Hypervisor.
 %package lp-devel_%{version}_%{release}
 License: GPLv2
 Summary: Development package for building livepatches
+%{core_builddeps Requires}
 %description lp-devel_%{version}_%{release}
 Contains the prepared source files, config, and xen-syms for building live
 patches against base version %{version}-%{release}.
@@ -237,6 +255,7 @@ export PYTHON="%{__python}"
 # Take a snapshot of the configured source tree for livepatches
 mkdir ../livepatch-src
 cp -a . ../livepatch-src/
+echo %{?_devtoolset_enable} > ../livepatch-src/prepare-build
 
 # Build tools and man pages
 %{?_cov_wrap} %{make_build} build-tools
