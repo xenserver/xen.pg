@@ -26,7 +26,7 @@ index 8eb2293a529d..8c915b838168 100644
  	allow $1 $2:security check_context;
  	allow $1 $2:shadow enable;
 diff --git a/tools/libxc/include/xenctrl.h b/tools/libxc/include/xenctrl.h
-index 30f142d25c04..97c915b111fd 100644
+index d64a41730a26..8c860d4b8d01 100644
 --- a/tools/libxc/include/xenctrl.h
 +++ b/tools/libxc/include/xenctrl.h
 @@ -469,6 +469,7 @@ typedef struct xc_dominfo {
@@ -37,7 +37,7 @@ index 30f142d25c04..97c915b111fd 100644
  
  typedef union 
  {
-@@ -1445,6 +1446,11 @@ int xc_domain_get_pod_target(xc_interface *xch,
+@@ -1446,6 +1447,11 @@ int xc_domain_get_pod_target(xc_interface *xch,
                               uint64_t *pod_cache_pages,
                               uint64_t *pod_entries);
  
@@ -50,28 +50,26 @@ index 30f142d25c04..97c915b111fd 100644
                                  uint32_t domid,
                                  uint32_t first_port,
 diff --git a/tools/libxc/xc_domain.c b/tools/libxc/xc_domain.c
-index 8baf6ee669e6..24340f40a9fc 100644
+index 8baf6ee669e6..3cbc6f731720 100644
 --- a/tools/libxc/xc_domain.c
 +++ b/tools/libxc/xc_domain.c
-@@ -1343,6 +1343,24 @@ int xc_vcpu_getinfo(xc_interface *xch,
+@@ -1343,6 +1343,22 @@ int xc_vcpu_getinfo(xc_interface *xch,
      return rc;
  }
  
 +int xc_get_runstate_info(xc_interface *xch, uint32_t domid, xc_runstate_info_t *info)
 +{
-+    int ret = -EBADF;
-+    DECLARE_DOMCTL;
++    struct xen_domctl domctl = {
++        .cmd = XEN_DOMCTL_get_runstate_info,
++        .domain = domid,
++    };
++    int ret = do_domctl(xch, &domctl);
 +
-+    domctl.cmd = XEN_DOMCTL_get_runstate_info;
-+    domctl.domain = domid;
-+
-+    ret = do_domctl(xch, &domctl);
-+    if (ret < 0) {
-+        ERROR("get runstate info");
++    if ( ret < 0 )
 +        return ret;
-+    }
 +
 +    memcpy(info, &domctl.u.domain_runstate, sizeof(*info));
++
 +    return ret;
 +}
 +
@@ -79,7 +77,7 @@ index 8baf6ee669e6..24340f40a9fc 100644
                                  uint32_t domid,
                                  uint32_t first_port,
 diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
-index a1ff175bc403..4ac920404c8e 100644
+index dd63976854f6..23d3aa19fa3e 100644
 --- a/tools/ocaml/libs/xc/xenctrl.ml
 +++ b/tools/ocaml/libs/xc/xenctrl.ml
 @@ -81,6 +81,18 @@ type domctl_create_config =
@@ -143,7 +141,7 @@ index 7bf08bfe603f..81f51f16a103 100644
         = "stub_xc_domain_ioport_permission"
  external domain_iomem_permission: handle -> domid -> nativeint -> nativeint -> bool -> unit
 diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
-index c8c49d4cb7f7..642f3610cd15 100644
+index 1a790d1c3079..b9c382b75c12 100644
 --- a/tools/ocaml/libs/xc/xenctrl_stubs.c
 +++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
 @@ -490,6 +490,34 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch, value domid, value vcpu)
@@ -182,7 +180,7 @@ index c8c49d4cb7f7..642f3610cd15 100644
                                          value cpu)
  {
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index 40253575b22c..593eb4081f5a 100644
+index e3f420f6b447..c3178d2fa6bb 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
 @@ -396,6 +396,7 @@ struct domain *domain_create(domid_t domid,
@@ -210,7 +208,7 @@ index 6c903f23b963..1c7e071037b2 100644
          ret = arch_do_domctl(op, d, u_domctl);
          break;
 diff --git a/xen/common/schedule.c b/xen/common/schedule.c
-index 062b81117e84..dcd5f1d08906 100644
+index 062b81117e84..43fe5bc23297 100644
 --- a/xen/common/schedule.c
 +++ b/xen/common/schedule.c
 @@ -257,9 +257,30 @@ static inline void vcpu_urgent_count_update(struct vcpu *v)
@@ -244,7 +242,7 @@ index 062b81117e84..dcd5f1d08906 100644
      s_time_t delta;
      struct sched_unit *unit = v->sched_unit;
  
-@@ -285,6 +306,45 @@ static inline void vcpu_runstate_change(
+@@ -285,6 +306,46 @@ static inline void vcpu_runstate_change(
      }
  
      v->runstate.state = new_state;
@@ -262,10 +260,11 @@ index 062b81117e84..dcd5f1d08906 100644
 +        d->runstate.state_entry_time = new_entry_time;
 +
 +        /* Determine new runstate.  First, see what states we have */
-+        for_each_vcpu(d, ov) {
++        for_each_vcpu(d, ov)
++        {
 +            /* Don't count vcpus that have beent taken offline by the guest */
-+            if ( !(ov->runstate.state == RUNSTATE_offline
-+                   && test_bit(_VPF_down, &ov->pause_flags)) )
++            if ( !(ov->runstate.state == RUNSTATE_offline &&
++                   test_bit(_VPF_down, &ov->pause_flags)) )
 +               mask |= (1 << ov->runstate.state);
 +        }
 +
@@ -290,7 +289,7 @@ index 062b81117e84..dcd5f1d08906 100644
  }
  
  void sched_guest_idle(void (*idle) (void), unsigned int cpu)
-@@ -329,6 +389,20 @@ void vcpu_runstate_get(struct vcpu *v, struct vcpu_runstate_info *runstate)
+@@ -329,6 +390,20 @@ void vcpu_runstate_get(struct vcpu *v, struct vcpu_runstate_info *runstate)
      rcu_read_unlock(&sched_res_rculock);
  }
  
@@ -312,10 +311,10 @@ index 062b81117e84..dcd5f1d08906 100644
  {
      struct vcpu_runstate_info state = { 0 };
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index 83bf89997278..3ef28ad77305 100644
+index d24ca7f42ef9..8185c4b2739e 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1129,6 +1129,46 @@ struct xen_domctl_vuart_op {
+@@ -1127,6 +1127,46 @@ struct xen_domctl_vuart_op {
                                   */
  };
  
@@ -362,7 +361,7 @@ index 83bf89997278..3ef28ad77305 100644
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1213,6 +1253,7 @@ struct xen_domctl {
+@@ -1211,6 +1251,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_vuart_op                      81
  #define XEN_DOMCTL_get_cpu_policy                82
  #define XEN_DOMCTL_set_cpu_policy                83
@@ -370,7 +369,7 @@ index 83bf89997278..3ef28ad77305 100644
  #define XEN_DOMCTL_gdbsx_guestmemio            1000
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
-@@ -1263,6 +1304,7 @@ struct xen_domctl {
+@@ -1261,6 +1302,7 @@ struct xen_domctl {
          struct xen_domctl_set_access_required access_required;
          struct xen_domctl_audit_p2m         audit_p2m;
          struct xen_domctl_set_virq_handler  set_virq_handler;
