@@ -56,7 +56,7 @@ BuildRequires: python2-rpm-macros
 # These build dependencies are needed for building the xen.gz as
 # well as live patches.
 %define core_builddeps() %{lua:
-    if rpm.expand("0%{?xenserver}") < '9' then
+    if tonumber(rpm.expand("0%{?xenserver}")) < 9 then
         deps = {
             'devtoolset-11-binutils',
             'devtoolset-11-gcc'
