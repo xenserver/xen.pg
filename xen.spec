@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.57
+%global hv_rel 10.58
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,11 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Dec 4 2023 Alejandro Vallejo <alejandro.vallejo@cloud.com> - 4.13.5-10.58
+- Remove limit of 64 CPUs from hvmloader.
+- Fix pygrub incompatibility with python3.
+- Improve the livepatch infrastructure.
+
 * Wed Nov 8 2023 Roger Pau Monné <roger.pau@citrix.com> - 4.13.5-10.57
 - Add new x2APIC 'Mixed mode' driver, and use it by default.
 
