@@ -1,0 +1,114 @@
+From 23db507a01a4ec5259ec0ab43d296a41b1c326ba Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Thu, 21 Dec 2023 11:08:31 +0100
+Subject: x86/amd: Extend CPU erratum #1474 fix to more affected models
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Erratum #1474 has now been extended to cover models from family 17h ranges
+00-2Fh, so the errata now covers all the models released under Family
+17h (Zen, Zen+ and Zen2).
+
+Additionally extend the workaround to Family 18h (Hygon), since it's based on
+the Zen architecture and very likely affected.
+
+Rename all the zen2 related symbols to fam17, since the errata doesn't
+exclusively affect Zen2 anymore.
+
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
+index 9c5d52e58d9b..95db2100029e 100644
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -51,7 +51,7 @@ boolean_param("allow_unsafe", opt_allow_unsafe);
+ /* Signal whether the ACPI C1E quirk is required. */
+ bool __read_mostly amd_acpi_c1e_quirk;
+ 
+-static bool __read_mostly zen2_c6_disabled;
++static bool __read_mostly fam17_c6_disabled;
+ 
+ static inline int rdmsr_amd_safe(unsigned int msr, unsigned int *lo,
+ 				 unsigned int *hi)
+@@ -727,24 +727,24 @@ void amd_check_zenbleed(void)
+ 		       val & chickenbit ? "chickenbit" : "microcode");
+ }
+ 
+-static void zen2_disable_c6(void *arg)
++static void fam17_disable_c6(void *arg)
+ {
+ 	/* Disable C6 by clearing the CCR{0,1,2}_CC6EN bits. */
+ 	const uint64_t mask = ~((1ul << 6) | (1ul << 14) | (1ul << 22));
+ 	uint64_t val;
+ 
+-	if (!zen2_c6_disabled) {
++	if (!fam17_c6_disabled) {
+ 		printk(XENLOG_WARNING
+     "Disabling C6 after 1000 days apparent uptime due to AMD errata 1474\n");
+-		zen2_c6_disabled = true;
++		fam17_c6_disabled = true;
+ 		/*
+ 		 * Prevent CPU hotplug so that started CPUs will either see
+-		 * zen2_c6_disabled set, or will be handled by
++		 * fam17_c6_disabled set, or will be handled by
+ 		 * smp_call_function().
+ 		 */
+ 		while (!get_cpu_maps())
+ 			process_pending_softirqs();
+-		smp_call_function(zen2_disable_c6, NULL, 0);
++		smp_call_function(fam17_disable_c6, NULL, 0);
+ 		put_cpu_maps();
+ 	}
+ 
+@@ -1037,8 +1037,8 @@ static void init_amd(struct cpuinfo_x86 *c)
+ 	amd_check_zenbleed();
+ 	amd_check_erratum_1485();
+ 
+-	if (zen2_c6_disabled)
+-		zen2_disable_c6(NULL);
++	if (fam17_c6_disabled)
++		fam17_disable_c6(NULL);
+ 
+ 	check_syscfg_dram_mod_en();
+ }
+@@ -1048,7 +1048,7 @@ const struct cpu_dev amd_cpu_dev = {
+ 	.c_init		= init_amd,
+ };
+ 
+-static int __init zen2_c6_errata_check(void)
++static int __init amd_check_erratum_1474(void)
+ {
+ 	/*
+ 	 * Errata #1474: A Core May Hang After About 1044 Days
+@@ -1056,7 +1056,8 @@ static int __init zen2_c6_errata_check(void)
+ 	 */
+ 	s_time_t delta;
+ 
+-	if (cpu_has_hypervisor || boot_cpu_data.x86 != 0x17 || !is_zen2_uarch())
++	if (cpu_has_hypervisor ||
++	    (boot_cpu_data.x86 != 0x17 && boot_cpu_data.x86 != 0x18))
+ 		return 0;
+ 
+ 	/*
+@@ -1071,10 +1072,10 @@ static int __init zen2_c6_errata_check(void)
+ 	if (delta > 0) {
+ 		static struct timer errata_c6;
+ 
+-		init_timer(&errata_c6, zen2_disable_c6, NULL, 0);
++		init_timer(&errata_c6, fam17_disable_c6, NULL, 0);
+ 		set_timer(&errata_c6, NOW() + delta);
+ 	} else
+-		zen2_disable_c6(NULL);
++		fam17_disable_c6(NULL);
+ 
+ 	return 0;
+ }
+@@ -1082,4 +1083,4 @@ static int __init zen2_c6_errata_check(void)
+  * Must be executed after early_time_init() for tsc_ticks2ns() to have been
+  * calibrated.  That prevents us doing the check in init_amd().
+  */
+-presmp_initcall(zen2_c6_errata_check);
++presmp_initcall(amd_check_erratum_1474);
