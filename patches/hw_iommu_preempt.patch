@@ -1,0 +1,36 @@
+x86/iommu: avoid skipping preemption check
+
+The current placement of the preemption check allows it to be bypassed if the
+pfn matching the 'i' index is not mapped.  Fix by moving the preemption check
+before any possible loop early continuation, and at the same time lower the
+threshold.
+
+Note this patch is not applicable upstream, as the code has changed and
+starting from 4.17 no longer has this issue.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+---
+diff --git a/xen/drivers/passthrough/x86/iommu.c b/xen/drivers/passthrough/x86/iommu.c
+index a237ca14745d..16f52753c051 100644
+--- a/xen/drivers/passthrough/x86/iommu.c
++++ b/xen/drivers/passthrough/x86/iommu.c
+@@ -318,6 +318,9 @@ void __hwdom_init arch_iommu_hwdom_init(struct domain *d)
+         unsigned long pfn = pdx_to_pfn(i);
+         int rc;
+ 
++        if ( !(i & 0xffff) )
++            process_pending_softirqs();
++
+         if ( !hwdom_iommu_map(d, pfn, max_pfn) )
+             continue;
+ 
+@@ -330,9 +333,6 @@ void __hwdom_init arch_iommu_hwdom_init(struct domain *d)
+         if ( rc )
+             printk(XENLOG_WARNING "%pd: identity %smapping of %lx failed: %d\n",
+                    d, !paging_mode_translate(d) ? "IOMMU " : "", pfn, rc);
+-
+-        if (!(i & 0xfffff))
+-            process_pending_softirqs();
+     }
+ 
+     /* Use if to avoid compiler warning */
