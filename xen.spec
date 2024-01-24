@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10.59
+%global hv_rel 10.60
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -887,6 +887,11 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed Jan 24 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.60
+- Fix watchdog setup on Intel Sapphire Rapids and Emerald Rapids platforms.
+- Adjust preemption during IOMMU setup to avoid triggering the watchdog.
+- Extend AMD #1474 (crash after ~1044 days) workaround to Zen1 platforms.
+
 * Tue Dec 19 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.59
 - Enable AVX-512 by default for Intel IceLake and later CPUs.
 - Rebuild with updated Ocaml 4.14 runtime.
