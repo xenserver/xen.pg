@@ -838,6 +838,9 @@ ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen-release.gz
 if [ ! -e /boot/xen.gz ]; then
     # Use a production hypervisor by default
     ln -sf %{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
+elif [ ! -L /boot/xen.gz ]; then
+    # Use the production hypervisor, but keep it unlinked
+    cp -f /boot/%{name}-%{version}-%{hv_rel}.gz /boot/xen.gz
 else
     # Else look at the current link, and whether it is debug
     path="`readlink -f /boot/xen.gz`"
