@@ -886,6 +886,13 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Jan 26 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-1
+- Update to Xen 4.17
+  Major highlights:
+    - CET-SS, CET-IBT and IOMMU Superpages used on capable hardware
+    - PV32, PV_LINEAR_PT and SHADOW_PAGING now compiled out
+    - NX and HAP (Intel EPT or AMD NPT) support in hardware is now mandatory
+
 * Wed Jan 24 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.60
 - Fix watchdog setup on Intel Sapphire Rapids and Emerald Rapids platforms.
 - Adjust preemption during IOMMU setup to avoid triggering the watchdog.
