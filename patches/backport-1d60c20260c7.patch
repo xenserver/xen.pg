@@ -1,0 +1,65 @@
+From 1d60c20260c7e82fe5344d06c20d718e0cc03b8b Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 14 Dec 2021 16:51:28 +0000
+Subject: x86/hvm: Support PKS for HAP guests
+
+With all infrastructure in place, advertise the PKS CPUID bit to HAP guests,
+and let them set CR4.PKS.
+
+Experiment with a tweak to the layout of hvm_cr4_guest_valid_bits() so future
+additions will be just a single added line.
+
+The current context switching behaviour is tied to how VT-x works, so leave a
+safety check in the short term.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu-policy.c b/xen/arch/x86/cpu-policy.c
+index f0f2c8a1c0fd..4c50a342565a 100644
+--- a/xen/arch/x86/cpu-policy.c
++++ b/xen/arch/x86/cpu-policy.c
+@@ -660,6 +660,15 @@ static void __init calculate_hvm_max_policy(void)
+             __clear_bit(X86_FEATURE_XSAVES, fs);
+     }
+ 
++    /*
++     * Xen doesn't use PKS, so the guest support for it has opted to not use
++     * the VMCS load/save controls for efficiency reasons.  This depends on
++     * the exact vmentry/exit behaviour, so don't expose PKS in other
++     * situations until someone has cross-checked the behaviour for safety.
++     */
++    if ( !cpu_has_vmx )
++        __clear_bit(X86_FEATURE_PKS, fs);
++
+     guest_common_max_feature_adjustments(fs);
+     guest_common_feature_adjustments(fs);
+ 
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index f7c6e2d4ef6a..866527b6b749 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -968,7 +968,9 @@ unsigned long hvm_cr4_guest_valid_bits(const struct domain *d)
+             (p->feat.smep     ? X86_CR4_SMEP              : 0) |
+             (p->feat.smap     ? X86_CR4_SMAP              : 0) |
+             (p->feat.pku      ? X86_CR4_PKE               : 0) |
+-            (cet              ? X86_CR4_CET               : 0));
++            (cet              ? X86_CR4_CET               : 0) |
++            (p->feat.pks      ? X86_CR4_PKS               : 0) |
++            0);
+ }
+ 
+ static int cf_check hvm_load_cpu_ctxt(struct domain *d, hvm_domain_context_t *h)
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index d3f02947aa62..876415a2244d 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -227,7 +227,7 @@ XEN_CPUFEATURE(CLDEMOTE,      6*32+25) /*A  CLDEMOTE instruction */
+ XEN_CPUFEATURE(MOVDIRI,       6*32+27) /*a  MOVDIRI instruction */
+ XEN_CPUFEATURE(MOVDIR64B,     6*32+28) /*a  MOVDIR64B instruction */
+ XEN_CPUFEATURE(ENQCMD,        6*32+29) /*   ENQCMD{,S} instructions */
+-XEN_CPUFEATURE(PKS,           6*32+31) /*   Protection Key for Supervisor */
++XEN_CPUFEATURE(PKS,           6*32+31) /*H  Protection Key for Supervisor */
+ 
+ /* AMD-defined CPU features, CPUID level 0x80000007.edx, word 7 */
+ XEN_CPUFEATURE(HW_PSTATE,     7*32+ 7) /*   Hardware Pstates */

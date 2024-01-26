@@ -1,0 +1,193 @@
+From 88a9501a848aade858a3bbda75f20cdf7c3c2f9a Mon Sep 17 00:00:00 2001
+From: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Date: Tue, 8 Aug 2023 14:02:19 +0100
+Subject: xen/pdx: Reorder pdx.[ch]
+
+The next patch compiles out compression-related chunks, and it's helpful to
+have them grouped together beforehand.
+
+No functional change.
+
+Signed-off-by: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/common/pdx.c b/xen/common/pdx.c
+index 3c88ceeb9c64..d3d38965bde9 100644
+--- a/xen/common/pdx.c
++++ b/xen/common/pdx.c
+@@ -20,6 +20,35 @@
+ #include <xen/bitops.h>
+ #include <xen/nospec.h>
+ 
++/**
++ * Maximum (non-inclusive) usable pdx. Must be
++ * modifiable after init due to memory hotplug
++ */
++unsigned long __read_mostly max_pdx;
++
++unsigned long __read_mostly pdx_group_valid[BITS_TO_LONGS(
++    (FRAMETABLE_NR + PDX_GROUP_COUNT - 1) / PDX_GROUP_COUNT)] = { [0] = 1 };
++
++bool __mfn_valid(unsigned long mfn)
++{
++    if ( unlikely(evaluate_nospec(mfn >= max_page)) )
++        return false;
++    return likely(!(mfn & pfn_hole_mask)) &&
++           likely(test_bit(pfn_to_pdx(mfn) / PDX_GROUP_COUNT,
++                           pdx_group_valid));
++}
++
++void set_pdx_range(unsigned long smfn, unsigned long emfn)
++{
++    unsigned long idx, eidx;
++
++    idx = pfn_to_pdx(smfn) / PDX_GROUP_COUNT;
++    eidx = (pfn_to_pdx(emfn - 1) + PDX_GROUP_COUNT) / PDX_GROUP_COUNT;
++
++    for ( ; idx < eidx; ++idx )
++        __set_bit(idx, pdx_group_valid);
++}
++
+ /*
+  * Diagram to make sense of the following variables. The masks and shifts
+  * are done on mfn values in order to convert to/from pdx:
+@@ -47,12 +76,6 @@
+  * ones.
+  */
+ 
+-/**
+- * Maximum (non-inclusive) usable pdx. Must be
+- * modifiable after init due to memory hotplug
+- */
+-unsigned long __read_mostly max_pdx;
+-
+ /** Mask for the lower non-compressible bits of an mfn */
+ unsigned long __ro_after_init pfn_pdx_bottom_mask = ~0UL;
+ 
+@@ -75,18 +98,6 @@ unsigned long __ro_after_init pfn_hole_mask = 0;
+ /** Number of bits of the "compressible" bit slice of an mfn */
+ unsigned int __ro_after_init pfn_pdx_hole_shift = 0;
+ 
+-unsigned long __read_mostly pdx_group_valid[BITS_TO_LONGS(
+-    (FRAMETABLE_NR + PDX_GROUP_COUNT - 1) / PDX_GROUP_COUNT)] = { [0] = 1 };
+-
+-bool __mfn_valid(unsigned long mfn)
+-{
+-    if ( unlikely(evaluate_nospec(mfn >= max_page)) )
+-        return false;
+-    return likely(!(mfn & pfn_hole_mask)) &&
+-           likely(test_bit(pfn_to_pdx(mfn) / PDX_GROUP_COUNT,
+-                           pdx_group_valid));
+-}
+-
+ /* Sets all bits from the most-significant 1-bit down to the LSB */
+ static uint64_t fill_mask(uint64_t mask)
+ {
+@@ -124,17 +135,6 @@ uint64_t pdx_region_mask(uint64_t base, uint64_t len)
+     return fill_mask(base ^ (base + len - 1));
+ }
+ 
+-void set_pdx_range(unsigned long smfn, unsigned long emfn)
+-{
+-    unsigned long idx, eidx;
+-
+-    idx = pfn_to_pdx(smfn) / PDX_GROUP_COUNT;
+-    eidx = (pfn_to_pdx(emfn - 1) + PDX_GROUP_COUNT) / PDX_GROUP_COUNT;
+-
+-    for ( ; idx < eidx; ++idx )
+-        __set_bit(idx, pdx_group_valid);
+-}
+-
+ void __init pfn_pdx_hole_setup(unsigned long mask)
+ {
+     unsigned int i, j, bottom_shift = 0, hole_shift = 0;
+diff --git a/xen/include/xen/pdx.h b/xen/include/xen/pdx.h
+index c1b18a213809..f3fbc4273aa4 100644
+--- a/xen/include/xen/pdx.h
++++ b/xen/include/xen/pdx.h
+@@ -70,15 +70,41 @@
+ #ifdef CONFIG_HAS_PDX
+ 
+ extern unsigned long max_pdx;
+-extern unsigned long pfn_pdx_bottom_mask, ma_va_bottom_mask;
+-extern unsigned int pfn_pdx_hole_shift;
+-extern unsigned long pfn_hole_mask;
+-extern unsigned long pfn_top_mask, ma_top_mask;
+ 
+ #define PDX_GROUP_COUNT ((1 << PDX_GROUP_SHIFT) / \
+                          (sizeof(*frame_table) & -sizeof(*frame_table)))
+ extern unsigned long pdx_group_valid[];
+ 
++/**
++ * Mark [smfn, emfn) as allocatable in the frame table
++ *
++ * @param smfn Start mfn
++ * @param emfn End mfn
++ */
++void set_pdx_range(unsigned long smfn, unsigned long emfn);
++
++/**
++ * Invoked to determine if an mfn has an associated valid frame table entry
++ *
++ * In order for it to be legal it must pass bounds, grouping and
++ * compression sanity checks.
++ *
++ * @param mfn To-be-checked mfn
++ * @return True iff all checks pass
++ */
++bool __mfn_valid(unsigned long mfn);
++
++#define page_to_pdx(pg)  ((pg) - frame_table)
++#define pdx_to_page(pdx) gcc11_wrap(frame_table + (pdx))
++
++#define mfn_to_pdx(mfn) pfn_to_pdx(mfn_x(mfn))
++#define pdx_to_mfn(pdx) _mfn(pdx_to_pfn(pdx))
++
++extern unsigned long pfn_pdx_bottom_mask, ma_va_bottom_mask;
++extern unsigned int pfn_pdx_hole_shift;
++extern unsigned long pfn_hole_mask;
++extern unsigned long pfn_top_mask, ma_top_mask;
++
+ /**
+  * Validate a region's compatibility with the current compression runtime
+  *
+@@ -120,28 +146,6 @@ uint64_t pdx_region_mask(uint64_t base, uint64_t len);
+  */
+ uint64_t pdx_init_mask(uint64_t base_addr);
+ 
+-/**
+- * Mark [smfn, emfn) as accesible in the frame table
+- *
+- * @param smfn Start mfn
+- * @param emfn End mfn
+- */
+-void set_pdx_range(unsigned long smfn, unsigned long emfn);
+-
+-#define page_to_pdx(pg)  ((pg) - frame_table)
+-#define pdx_to_page(pdx) gcc11_wrap(frame_table + (pdx))
+-
+-/**
+- * Invoked to determine if an mfn has an associated valid frame table entry
+- *
+- * In order for it to be legal it must pass bounds, grouping and
+- * compression sanity checks.
+- *
+- * @param mfn To-be-checked mfn
+- * @return True iff all checks pass
+- */
+-bool __mfn_valid(unsigned long mfn);
+-
+ /**
+  * Map pfn to its corresponding pdx
+  *
+@@ -166,9 +170,6 @@ static inline unsigned long pdx_to_pfn(unsigned long pdx)
+            ((pdx << pfn_pdx_hole_shift) & pfn_top_mask);
+ }
+ 
+-#define mfn_to_pdx(mfn) pfn_to_pdx(mfn_x(mfn))
+-#define pdx_to_mfn(pdx) _mfn(pdx_to_pfn(pdx))
+-
+ /**
+  * Computes the offset into the direct map of an maddr
+  *

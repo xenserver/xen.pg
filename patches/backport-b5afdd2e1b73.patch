@@ -1,0 +1,242 @@
+From b5afdd2e1b7381a0a5f7fde0b40755d8088b6433 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 14 Dec 2021 16:51:28 +0000
+Subject: x86/hvm: Context switch MSR_PKRS
+
+Under PKS, MSR_PKRS is available and based on the CPUID policy alone, and
+usable independently of CR4.PKS.  See the large comment in prot-key.h for
+details of the context switching arrangement.
+
+Use WRMSRNS right away, as we don't care about serialsing properties for
+context switching this MSR.
+
+Sanitise MSR_PKRS on boot.  In anticipation of wanting to use PKS for Xen in
+the future, arrange for the sanitisation to occur prior to potentially setting
+CR4.PKS; if PKEY0.{AD,WD} leak in from a previous context, we will triple
+fault immediately on setting CR4.PKS.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <JBeulich@suse.com>
+
+diff --git a/xen/arch/x86/acpi/power.c b/xen/arch/x86/acpi/power.c
+index b76f673acb1a..ecdbf92a4ebf 100644
+--- a/xen/arch/x86/acpi/power.c
++++ b/xen/arch/x86/acpi/power.c
+@@ -30,6 +30,7 @@
+ #include <asm/apic.h>
+ #include <asm/io_apic.h>
+ #include <asm/microcode.h>
++#include <asm/prot-key.h>
+ #include <asm/spec_ctrl.h>
+ #include <acpi/cpufreq/cpufreq.h>
+ 
+@@ -300,6 +301,15 @@ static int enter_state(u32 state)
+ 
+     update_mcu_opt_ctrl();
+ 
++    /*
++     * This should be before restoring CR4, but that is earlier in asm and
++     * awkward.  Instead, we rely on MSR_PKRS being something sane out of S3
++     * (0, or Xen's previous value) until this point, where we need to become
++     * certain that Xen's cache matches reality.
++     */
++    if ( cpu_has_pks )
++        wrpkrs_and_cache(0);
++
+     /* (re)initialise SYSCALL/SYSENTER state, amongst other things. */
+     percpu_traps_init();
+ 
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index ffd3ec973e2c..af8271800cde 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -60,6 +60,8 @@ static unsigned int forced_caps[NCAPINTS];
+ 
+ DEFINE_PER_CPU(bool, full_gdt_loaded);
+ 
++DEFINE_PER_CPU(uint32_t, pkrs);
++
+ void __init setup_clear_cpu_cap(unsigned int cap)
+ {
+ 	const uint32_t *dfs;
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 072288a5ef11..e43220f0a5e3 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -58,6 +58,7 @@
+ #include <asm/event.h>
+ #include <asm/mce.h>
+ #include <asm/monitor.h>
++#include <asm/prot-key.h>
+ #include <public/arch-x86/cpuid.h>
+ 
+ static bool_t __initdata opt_force_ept;
+@@ -672,6 +673,7 @@ static void vmx_restore_host_msrs(void)
+ 
+ static void vmx_save_guest_msrs(struct vcpu *v)
+ {
++    const struct cpu_policy *cp = v->domain->arch.cpu_policy;
+     struct vcpu_msrs *msrs = v->arch.msrs;
+ 
+     /*
+@@ -685,10 +687,14 @@ static void vmx_save_guest_msrs(struct vcpu *v)
+         rdmsrl(MSR_RTIT_OUTPUT_MASK, msrs->rtit.output_mask);
+         rdmsrl(MSR_RTIT_STATUS, msrs->rtit.status);
+     }
++
++    if ( cp->feat.pks )
++        msrs->pkrs = rdpkrs_and_cache();
+ }
+ 
+ static void vmx_restore_guest_msrs(struct vcpu *v)
+ {
++    const struct cpu_policy *cp = v->domain->arch.cpu_policy;
+     const struct vcpu_msrs *msrs = v->arch.msrs;
+ 
+     write_gs_shadow(v->arch.hvm.vmx.shadow_gs);
+@@ -705,6 +711,9 @@ static void vmx_restore_guest_msrs(struct vcpu *v)
+         wrmsrl(MSR_RTIT_OUTPUT_MASK, msrs->rtit.output_mask);
+         wrmsrl(MSR_RTIT_STATUS, msrs->rtit.status);
+     }
++
++    if ( cp->feat.pks )
++        wrpkrs(msrs->pkrs);
+ }
+ 
+ void vmx_update_cpu_exec_control(struct vcpu *v)
+diff --git a/xen/arch/x86/include/asm/msr.h b/xen/arch/x86/include/asm/msr.h
+index 68e23df9ebb3..1d8ea9f26faa 100644
+--- a/xen/arch/x86/include/asm/msr.h
++++ b/xen/arch/x86/include/asm/msr.h
+@@ -367,6 +367,15 @@ struct vcpu_msrs
+         };
+     } rtit;
+ 
++    /*
++     * 0x000006e1 - MSR_PKRS - Protection Key Supervisor.
++     *
++     * Exposed R/W to guests.  Xen doesn't use PKS yet, so only context
++     * switched per vcpu.  When in current context, live value is in hardware,
++     * and this value is stale.
++     */
++    uint32_t pkrs;
++
+     /* 0x00000da0 - MSR_IA32_XSS */
+     struct {
+         uint64_t raw;
+diff --git a/xen/arch/x86/include/asm/prot-key.h b/xen/arch/x86/include/asm/prot-key.h
+index 63a2e22f3fa0..0dcd31b7ea68 100644
+--- a/xen/arch/x86/include/asm/prot-key.h
++++ b/xen/arch/x86/include/asm/prot-key.h
+@@ -5,8 +5,11 @@
+ #ifndef ASM_PROT_KEY_H
+ #define ASM_PROT_KEY_H
+ 
++#include <xen/percpu.h>
+ #include <xen/types.h>
+ 
++#include <asm/msr.h>
++
+ #define PKEY_AD 1 /* Access Disable */
+ #define PKEY_WD 2 /* Write Disable */
+ 
+@@ -28,4 +31,55 @@ static inline void wrpkru(uint32_t pkru)
+                    :: "a" (pkru), "d" (0), "c" (0) );
+ }
+ 
++/*
++ * Xen does not use PKS.
++ *
++ * Guest kernel use is expected to be one default key, except for tiny windows
++ * with a double write to switch to a non-default key in a permitted critical
++ * section.
++ *
++ * As such, we want MSR_PKRS un-intercepted.  Furthermore, as we only need it
++ * in Xen for emulation or migration purposes (i.e. possibly never in a
++ * domain's lifetime), we don't want to re-sync the hardware value on every
++ * vmexit.
++ *
++ * Therefore, we read and cache the guest value in ctxt_switch_from(), in the
++ * expectation that we can short-circuit the write in ctxt_switch_to().
++ * During regular operations in current context, the guest value is in
++ * hardware and the per-cpu cache is stale.
++ */
++DECLARE_PER_CPU(uint32_t, pkrs);
++
++static inline uint32_t rdpkrs(void)
++{
++    uint32_t pkrs, tmp;
++
++    rdmsr(MSR_PKRS, pkrs, tmp);
++
++    return pkrs;
++}
++
++static inline uint32_t rdpkrs_and_cache(void)
++{
++    return this_cpu(pkrs) = rdpkrs();
++}
++
++static inline void wrpkrs(uint32_t pkrs)
++{
++    uint32_t *this_pkrs = &this_cpu(pkrs);
++
++    if ( *this_pkrs != pkrs )
++    {
++        *this_pkrs = pkrs;
++
++        wrmsr_ns(MSR_PKRS, pkrs, 0);
++    }
++}
++
++static inline void wrpkrs_and_cache(uint32_t pkrs)
++{
++    this_cpu(pkrs) = pkrs;
++    wrmsr_ns(MSR_PKRS, pkrs, 0);
++}
++
+ #endif /* ASM_PROT_KEY_H */
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index c90ce0c5a2fe..4be3fb846b10 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -54,6 +54,7 @@
+ #include <asm/spec_ctrl.h>
+ #include <asm/guest.h>
+ #include <asm/microcode.h>
++#include <asm/prot-key.h>
+ #include <asm/pv/domain.h>
+ 
+ /* opt_nosmp: If true, secondary processors are ignored. */
+@@ -1849,6 +1850,9 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+     if ( opt_invpcid && cpu_has_invpcid )
+         use_invpcid = true;
+ 
++    if ( cpu_has_pks )
++        wrpkrs_and_cache(0); /* Must be before setting CR4.PKS */
++
+     init_speculation_mitigations();
+ 
+     init_idle_domain();
+diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
+index 7aa899dac336..1889fa2a3159 100644
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -42,6 +42,7 @@
+ #include <asm/microcode.h>
+ #include <asm/msr.h>
+ #include <asm/mtrr.h>
++#include <asm/prot-key.h>
+ #include <asm/setup.h>
+ #include <asm/spec_ctrl.h>
+ #include <asm/time.h>
+@@ -364,6 +365,9 @@ void start_secondary(void *unused)
+ 
+     /* Full exception support from here on in. */
+ 
++    if ( cpu_has_pks )
++        wrpkrs_and_cache(0); /* Must be before setting CR4.PKS */
++
+     /* Safe to enable feature such as CR4.MCE with the IDT set up now. */
+     write_cr4(mmu_cr4_features);
+ 

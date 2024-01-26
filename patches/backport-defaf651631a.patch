@@ -1,0 +1,70 @@
+From defaf651631a1b1cbbf62eef49f2e935aa58d8bc Mon Sep 17 00:00:00 2001
+From: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Date: Tue, 30 May 2023 14:58:53 +0100
+Subject: x86/hvm: Expose Automatic IBRS to guests
+
+Expose AutoIBRS to HVM guests. EFER is swapped by VMRUN, so Xen only has to
+make sure writes to EFER.AIBRSE are gated on the feature being exposed.
+
+Hide EFER.AIBRSE from PV guests.  Xen currently has no concept of per-PV-guest
+EFER settings.
+
+Signed-off-by: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 866527b6b749..641e91332b3b 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -928,6 +928,9 @@ const char *hvm_efer_valid(const struct vcpu *v, uint64_t value,
+     if ( (value & EFER_FFXSE) && !p->extd.ffxsr )
+         return "FFXSE without feature";
+ 
++    if ( (value & EFER_AIBRSE) && !p->extd.auto_ibrs )
++        return "AutoIBRS without feature";
++
+     return NULL;
+ }
+ 
+diff --git a/xen/arch/x86/include/asm/msr-index.h b/xen/arch/x86/include/asm/msr-index.h
+index ad22817743e9..c85248f2fd9d 100644
+--- a/xen/arch/x86/include/asm/msr-index.h
++++ b/xen/arch/x86/include/asm/msr-index.h
+@@ -182,7 +182,8 @@
+ #define  EFER_AIBRSE                        (_AC(1, ULL) << 21) /* Automatic IBRS Enable */
+ 
+ #define EFER_KNOWN_MASK \
+-    (EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME | EFER_FFXSE)
++    (EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME | EFER_FFXSE | \
++     EFER_AIBRSE)
+ 
+ #define MSR_STAR                            0xc0000081 /* legacy mode SYSCALL target */
+ #define MSR_LSTAR                           0xc0000082 /* long mode SYSCALL target */
+diff --git a/xen/arch/x86/pv/emul-priv-op.c b/xen/arch/x86/pv/emul-priv-op.c
+index 04416f197951..6cfb442b8eb7 100644
+--- a/xen/arch/x86/pv/emul-priv-op.c
++++ b/xen/arch/x86/pv/emul-priv-op.c
+@@ -867,8 +867,8 @@ static uint64_t guest_efer(const struct domain *d)
+ {
+     uint64_t val;
+ 
+-    /* Hide unknown bits, and unconditionally hide SVME from guests. */
+-    val = read_efer() & EFER_KNOWN_MASK & ~EFER_SVME;
++    /* Hide unknown bits, and unconditionally hide SVME and AIBRSE from guests. */
++    val = read_efer() & EFER_KNOWN_MASK & ~(EFER_SVME | EFER_AIBRSE);
+     /*
+      * Hide the 64-bit features from 32-bit guests.  SCE has
+      * vendor-dependent behaviour.
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index d6c7b5d934b9..3a918a01c270 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -286,7 +286,7 @@ XEN_CPUFEATURE(WRMSRNS,      10*32+19) /*S  WRMSR Non-Serialising */
+ /* AMD-defined CPU features, CPUID level 0x80000021.eax, word 11 */
+ XEN_CPUFEATURE(LFENCE_DISPATCH,    11*32+ 2) /*A  LFENCE always serializing */
+ XEN_CPUFEATURE(NSCB,               11*32+ 6) /*A  Null Selector Clears Base (and limit too) */
+-XEN_CPUFEATURE(AUTO_IBRS,          11*32+ 8) /*   Automatic IBRS */
++XEN_CPUFEATURE(AUTO_IBRS,          11*32+ 8) /*S  Automatic IBRS */
+ XEN_CPUFEATURE(SBPB,               11*32+27) /*A  Selective Branch Predictor Barrier */
+ XEN_CPUFEATURE(IBPB_BRTYPE,        11*32+28) /*A  IBPB flushes Branch Type predictions too */
+ XEN_CPUFEATURE(SRSO_NO,            11*32+29) /*A  Hardware not vulenrable to Speculative Return Stack Overflow */

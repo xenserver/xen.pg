@@ -1,0 +1,59 @@
+From 94039d97e2e3aeee6c7246ad44ab5e0389509d34 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Thu, 21 Dec 2023 11:44:55 +0100
+Subject: amd-vi: set IOMMU page table levels based on guest reported paddr
+ width
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+However take into account the minimum number of levels required by unity maps
+when setting the page table levels.
+
+The previous setting of the page table levels for PV guests based on the
+highest RAM address was bogus, as there can be other non-RAM regions past the
+highest RAM address that need to be mapped, for example device MMIO.
+
+For HVM we also take amd_iommu_min_paging_mode into account, however if unity
+maps require more than 4 levels attempting to add those will currently fail at
+the p2m level, as 4 levels is the maximum supported.
+
+Fixes: 0700c962ac2d ('Add AMD IOMMU support into hypervisor')
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/drivers/passthrough/amd/pci_amd_iommu.c b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+index 8641b84712a0..11d12b693bab 100644
+--- a/xen/drivers/passthrough/amd/pci_amd_iommu.c
++++ b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+@@ -359,21 +359,18 @@ int __read_mostly amd_iommu_min_paging_mode = 1;
+ static int cf_check amd_iommu_domain_init(struct domain *d)
+ {
+     struct domain_iommu *hd = dom_iommu(d);
++    int pglvl = amd_iommu_get_paging_mode(
++                    1UL << (paging_max_paddr_bits(d) - PAGE_SHIFT));
++
++    if ( pglvl < 0 )
++        return pglvl;
++
+ 
+     /*
+-     * Choose the number of levels for the IOMMU page tables.
+-     * - PV needs 3 or 4, depending on whether there is RAM (including hotplug
+-     *   RAM) above the 512G boundary.
+-     * - HVM could in principle use 3 or 4 depending on how much guest
+-     *   physical address space we give it, but this isn't known yet so use 4
+-     *   unilaterally.
+-     * - Unity maps may require an even higher number.
++     * Choose the number of levels for the IOMMU page tables, taking into
++     * account unity maps.
+      */
+-    hd->arch.amd.paging_mode = max(amd_iommu_get_paging_mode(
+-            is_hvm_domain(d)
+-            ? 1ul << (DEFAULT_DOMAIN_ADDRESS_WIDTH - PAGE_SHIFT)
+-            : get_upper_mfn_bound() + 1),
+-        amd_iommu_min_paging_mode);
++    hd->arch.amd.paging_mode = max(pglvl, amd_iommu_min_paging_mode);
+ 
+     return 0;
+ }

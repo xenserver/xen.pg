@@ -772,12 +772,8 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/ocaml/stublibs/dllxenctrl_stubs.so.owner
 %{_libdir}/ocaml/stublibs/dllxeneventchn_stubs.so
 %{_libdir}/ocaml/stublibs/dllxeneventchn_stubs.so.owner
-%{_libdir}/ocaml/stublibs/dllxenlight_stubs.so
-%{_libdir}/ocaml/stublibs/dllxenlight_stubs.so.owner
 %{_libdir}/ocaml/stublibs/dllxenmmap_stubs.so
 %{_libdir}/ocaml/stublibs/dllxenmmap_stubs.so.owner
-%{_libdir}/ocaml/stublibs/dllxentoollog_stubs.so
-%{_libdir}/ocaml/stublibs/dllxentoollog_stubs.so.owner
 %{_libdir}/ocaml/xenbus/META
 %{_libdir}/ocaml/xenbus/xenbus.cma
 %{_libdir}/ocaml/xenbus/xenbus.cmo
@@ -785,15 +781,11 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/ocaml/xenctrl/xenctrl.cma
 %{_libdir}/ocaml/xeneventchn/META
 %{_libdir}/ocaml/xeneventchn/xeneventchn.cma
-%{_libdir}/ocaml/xenlight/META
-%{_libdir}/ocaml/xenlight/xenlight.cma
 %{_libdir}/ocaml/xenmmap/META
 %{_libdir}/ocaml/xenmmap/xenmmap.cma
 %exclude %{_libdir}/ocaml/xenstore/META
 %exclude %{_libdir}/ocaml/xenstore/xenstore.cma
 %exclude %{_libdir}/ocaml/xenstore/xenstore.cmo
-%{_libdir}/ocaml/xentoollog/META
-%{_libdir}/ocaml/xentoollog/xentoollog.cma
 
 %files ocaml-devel
 %{_libdir}/ocaml/xenbus/libxenbus_stubs.a
@@ -811,11 +803,6 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/ocaml/xeneventchn/xeneventchn.cmi
 %{_libdir}/ocaml/xeneventchn/xeneventchn.cmx
 %{_libdir}/ocaml/xeneventchn/xeneventchn.cmxa
-%{_libdir}/ocaml/xenlight/libxenlight_stubs.a
-%{_libdir}/ocaml/xenlight/xenlight.a
-%{_libdir}/ocaml/xenlight/xenlight.cmi
-%{_libdir}/ocaml/xenlight/xenlight.cmx
-%{_libdir}/ocaml/xenlight/xenlight.cmxa
 %{_libdir}/ocaml/xenmmap/libxenmmap_stubs.a
 %{_libdir}/ocaml/xenmmap/xenmmap.a
 %{_libdir}/ocaml/xenmmap/xenmmap.cmi
@@ -825,11 +812,6 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_libdir}/ocaml/xenstore/xenstore.cmi
 %exclude %{_libdir}/ocaml/xenstore/xenstore.cmx
 %exclude %{_libdir}/ocaml/xenstore/xenstore.cmxa
-%{_libdir}/ocaml/xentoollog/libxentoollog_stubs.a
-%{_libdir}/ocaml/xentoollog/xentoollog.a
-%{_libdir}/ocaml/xentoollog/xentoollog.cmi
-%{_libdir}/ocaml/xentoollog/xentoollog.cmx
-%{_libdir}/ocaml/xentoollog/xentoollog.cmxa
 
 %files dom0-tests
 %exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker

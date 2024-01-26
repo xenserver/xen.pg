@@ -1,0 +1,163 @@
+From c04b84ec74a47b13f7e0869f35983dbb026a9b9d Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 14 Dec 2021 16:51:28 +0000
+Subject: x86/prot-key: Split PKRU infrastructure out of asm/processor.h
+
+asm/processor.h is in desperate need of splitting up, and protection key
+functionality in only used in the emulator and pagewalk.  Introduce a new
+asm/prot-key.h and move the relevant content over.
+
+Rename the PKRU_* constants to drop the user part and to use the architectural
+terminology.
+
+Drop the read_pkru_{ad,wd}() helpers entirely.  The pkru infix is about to
+become wrong, and the sole user is shorter and easier to follow without the
+helpers.
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 2404020071e8..ffd3ec973e2c 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -13,6 +13,7 @@
+ #include <asm/io.h>
+ #include <asm/mpspec.h>
+ #include <asm/apic.h>
++#include <asm/prot-key.h>
+ #include <asm/random.h>
+ #include <asm/setup.h>
+ #include <asm/shstk.h>
+diff --git a/xen/arch/x86/include/asm/processor.h b/xen/arch/x86/include/asm/processor.h
+index 8ff96388e8b3..7925e6b911f2 100644
+--- a/xen/arch/x86/include/asm/processor.h
++++ b/xen/arch/x86/include/asm/processor.h
+@@ -367,44 +367,6 @@ static always_inline void set_in_cr4 (unsigned long mask)
+     write_cr4(read_cr4() | mask);
+ }
+ 
+-static inline unsigned int rdpkru(void)
+-{
+-    unsigned int pkru;
+-
+-    asm volatile (".byte 0x0f,0x01,0xee"
+-        : "=a" (pkru) : "c" (0) : "dx");
+-
+-    return pkru;
+-}
+-
+-static inline void wrpkru(unsigned int pkru)
+-{
+-    asm volatile ( ".byte 0x0f, 0x01, 0xef"
+-                   :: "a" (pkru), "d" (0), "c" (0) );
+-}
+-
+-/* Macros for PKRU domain */
+-#define PKRU_READ  (0)
+-#define PKRU_WRITE (1)
+-#define PKRU_ATTRS (2)
+-
+-/*
+- * PKRU defines 32 bits, there are 16 domains and 2 attribute bits per
+- * domain in pkru, pkeys is index to a defined domain, so the value of
+- * pte_pkeys * PKRU_ATTRS + R/W is offset of a defined domain attribute.
+- */
+-static inline bool_t read_pkru_ad(uint32_t pkru, unsigned int pkey)
+-{
+-    ASSERT(pkey < 16);
+-    return (pkru >> (pkey * PKRU_ATTRS + PKRU_READ)) & 1;
+-}
+-
+-static inline bool_t read_pkru_wd(uint32_t pkru, unsigned int pkey)
+-{
+-    ASSERT(pkey < 16);
+-    return (pkru >> (pkey * PKRU_ATTRS + PKRU_WRITE)) & 1;
+-}
+-
+ static always_inline void __monitor(const void *eax, unsigned long ecx,
+                                     unsigned long edx)
+ {
+diff --git a/xen/arch/x86/include/asm/prot-key.h b/xen/arch/x86/include/asm/prot-key.h
+new file mode 100644
+index 000000000000..63a2e22f3fa0
+--- /dev/null
++++ b/xen/arch/x86/include/asm/prot-key.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2021-2022 Citrix Systems Ltd.
++ */
++#ifndef ASM_PROT_KEY_H
++#define ASM_PROT_KEY_H
++
++#include <xen/types.h>
++
++#define PKEY_AD 1 /* Access Disable */
++#define PKEY_WD 2 /* Write Disable */
++
++#define PKEY_WIDTH 2 /* Two bits per protection key */
++
++static inline uint32_t rdpkru(void)
++{
++    uint32_t pkru;
++
++    asm volatile ( ".byte 0x0f,0x01,0xee"
++                   : "=a" (pkru) : "c" (0) : "dx" );
++
++    return pkru;
++}
++
++static inline void wrpkru(uint32_t pkru)
++{
++    asm volatile ( ".byte 0x0f,0x01,0xef"
++                   :: "a" (pkru), "d" (0), "c" (0) );
++}
++
++#endif /* ASM_PROT_KEY_H */
+diff --git a/xen/arch/x86/mm/guest_walk.c b/xen/arch/x86/mm/guest_walk.c
+index 70dacc477f9a..161a61b8f5ca 100644
+--- a/xen/arch/x86/mm/guest_walk.c
++++ b/xen/arch/x86/mm/guest_walk.c
+@@ -26,7 +26,9 @@
+ #include <xen/paging.h>
+ #include <xen/domain_page.h>
+ #include <xen/sched.h>
++
+ #include <asm/page.h>
++#include <asm/prot-key.h>
+ #include <asm/guest_pt.h>
+ #include <asm/hvm/emulate.h>
+ 
+@@ -413,10 +415,11 @@ guest_walk_tables(const struct vcpu *v, struct p2m_domain *p2m,
+          guest_pku_enabled(v) )
+     {
+         unsigned int pkey = guest_l1e_get_pkey(gw->l1e);
+-        unsigned int pkru = rdpkru();
++        unsigned int pkr = rdpkru();
++        unsigned int pk_ar = (pkr >> (pkey * PKEY_WIDTH)) & (PKEY_AD | PKEY_WD);
+ 
+-        if ( read_pkru_ad(pkru, pkey) ||
+-             ((walk & PFEC_write_access) && read_pkru_wd(pkru, pkey) &&
++        if ( (pk_ar & PKEY_AD) ||
++             ((walk & PFEC_write_access) && (pk_ar & PKEY_WD) &&
+               ((walk & PFEC_user_mode) || guest_wp_enabled(v))) )
+         {
+             gw->pfec |= PFEC_prot_key;
+diff --git a/xen/arch/x86/x86_emulate.c b/xen/arch/x86/x86_emulate.c
+index 720740f29b84..8c7d18521807 100644
+--- a/xen/arch/x86/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate.c
+@@ -12,8 +12,10 @@
+ #include <xen/domain_page.h>
+ #include <xen/err.h>
+ #include <xen/event.h>
++
+ #include <asm/x86_emulate.h>
+ #include <asm/processor.h> /* current_cpu_info */
++#include <asm/prot-key.h>
+ #include <asm/xstate.h>
+ #include <asm/amd.h> /* cpu_has_amd_erratum() */
+ #include <asm/debugreg.h>

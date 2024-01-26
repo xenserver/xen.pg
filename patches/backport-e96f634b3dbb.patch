@@ -1,0 +1,74 @@
+From e96f634b3dbbf98eaa261bcb8b33743a03afc20e Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 14 Dec 2021 16:51:28 +0000
+Subject: x86/pagewalk: Support PKS
+
+PKS is very similar to the existing PKU behaviour, operating on pagewalks for
+any supervisor mapping.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/include/asm/guest_pt.h b/xen/arch/x86/include/asm/guest_pt.h
+index 6647ccfb8520..6802db2a415a 100644
+--- a/xen/arch/x86/include/asm/guest_pt.h
++++ b/xen/arch/x86/include/asm/guest_pt.h
+@@ -282,6 +282,11 @@ static always_inline bool guest_pku_enabled(const struct vcpu *v)
+     return !is_pv_vcpu(v) && hvm_pku_enabled(v);
+ }
+ 
++static always_inline bool guest_pks_enabled(const struct vcpu *v)
++{
++    return !is_pv_vcpu(v) && hvm_pks_enabled(v);
++}
++
+ /* Helpers for identifying whether guest entries have reserved bits set. */
+ 
+ /* Bits reserved because of maxphysaddr, and (lack of) EFER.NX */
+diff --git a/xen/arch/x86/include/asm/hvm/hvm.h b/xen/arch/x86/include/asm/hvm/hvm.h
+index 93254651f2f5..65768c797ea7 100644
+--- a/xen/arch/x86/include/asm/hvm/hvm.h
++++ b/xen/arch/x86/include/asm/hvm/hvm.h
+@@ -407,6 +407,8 @@ int hvm_get_param(struct domain *d, uint32_t index, uint64_t *value);
+     ((v)->arch.hvm.guest_efer & EFER_NXE)
+ #define hvm_pku_enabled(v) \
+     (hvm_paging_enabled(v) && ((v)->arch.hvm.guest_cr[4] & X86_CR4_PKE))
++#define hvm_pks_enabled(v) \
++    (hvm_paging_enabled(v) && ((v)->arch.hvm.guest_cr[4] & X86_CR4_PKS))
+ 
+ /* Can we use superpages in the HAP p2m table? */
+ #define hap_has_1gb (!!(hvm_funcs.hap_capabilities & HVM_HAP_SUPERPAGE_1GB))
+@@ -911,6 +913,7 @@ static inline void hvm_set_reg(struct vcpu *v, unsigned int reg, uint64_t val)
+ #define hvm_smap_enabled(v) ((void)(v), false)
+ #define hvm_nx_enabled(v) ((void)(v), false)
+ #define hvm_pku_enabled(v) ((void)(v), false)
++#define hvm_pks_enabled(v) ((void)(v), false)
+ 
+ #define arch_vcpu_block(v) ((void)(v))
+ 
+diff --git a/xen/arch/x86/mm/guest_walk.c b/xen/arch/x86/mm/guest_walk.c
+index 161a61b8f5ca..76b4e0425887 100644
+--- a/xen/arch/x86/mm/guest_walk.c
++++ b/xen/arch/x86/mm/guest_walk.c
+@@ -406,16 +406,17 @@ guest_walk_tables(const struct vcpu *v, struct p2m_domain *p2m,
+ #if GUEST_PAGING_LEVELS >= 4 /* 64-bit only... */
+     /*
+      * If all access checks are thus far ok, check Protection Key for 64bit
+-     * data accesses to user mappings.
++     * data accesses.
+      *
+      * N.B. In the case that the walk ended with a superpage, the fabricated
+      * gw->l1e contains the appropriate leaf pkey.
+      */
+-    if ( (ar & _PAGE_USER) && !(walk & PFEC_insn_fetch) &&
+-         guest_pku_enabled(v) )
++    if ( !(walk & PFEC_insn_fetch) &&
++         ((ar & _PAGE_USER) ? guest_pku_enabled(v)
++                            : guest_pks_enabled(v)) )
+     {
+         unsigned int pkey = guest_l1e_get_pkey(gw->l1e);
+-        unsigned int pkr = rdpkru();
++        unsigned int pkr = (ar & _PAGE_USER) ? rdpkru() : rdpkrs();
+         unsigned int pk_ar = (pkr >> (pkey * PKEY_WIDTH)) & (PKEY_AD | PKEY_WD);
+ 
+         if ( (pk_ar & PKEY_AD) ||

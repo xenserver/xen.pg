@@ -1,0 +1,99 @@
+From df2209f9b7924c312100ccda394eaa3622fd5070 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 22 Jan 2024 13:50:40 +0100
+Subject: common: assembly entry point type/size annotations
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Recent gas versions generate minimalistic Dwarf debug info for items
+annotated as functions and having their sizes specified [1]. Furthermore
+generating live patches wants items properly annotated. "Borrow" Arm's
+END() and (remotely) derive other annotation infrastructure from
+Linux'es, for all architectures to use.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+[1] https://sourceware.org/git?p=binutils-gdb.git;a=commitdiff;h=591cc9fbbfd6d51131c0f1d4a92e7893edcc7a28
+
+diff --git a/xen/include/xen/lib.h b/xen/include/xen/lib.h
+index 05ee1e18af6b..a27e995ec045 100644
+--- a/xen/include/xen/lib.h
++++ b/xen/include/xen/lib.h
+@@ -22,6 +22,15 @@
+ #define __STR(...) #__VA_ARGS__
+ #define STR(...) __STR(__VA_ARGS__)
+ 
++#define ARG1_(x, y...) (x)
++#define ARG2_(x, y...) ARG1_(y)
++#define ARG3_(x, y...) ARG2_(y)
++#define ARG4_(x, y...) ARG3_(y)
++
++#define ARG__(nr) ARG ## nr ## _
++#define ARG_(nr)  ARG__(nr)
++#define LASTARG(x, y...) ARG_(count_args(x, ## y))(x, ## y)
++
+ #ifndef __ASSEMBLY__
+ 
+ #include <xen/inttypes.h>
+diff --git a/xen/include/xen/linkage.h b/xen/include/xen/linkage.h
+new file mode 100644
+index 000000000000..8e3bf6f7d99d
+--- /dev/null
++++ b/xen/include/xen/linkage.h
+@@ -0,0 +1,54 @@
++#ifndef __LINKAGE_H__
++#define __LINKAGE_H__
++
++#ifdef __ASSEMBLY__
++
++#include <xen/lib.h>
++
++/* CODE_ALIGN needs to be specified by every architecture. */
++#ifndef CODE_FILL
++# define CODE_FILL ~0
++#endif
++
++#ifndef DATA_ALIGN
++# define DATA_ALIGN 0
++#endif
++#ifndef DATA_FILL
++# define DATA_FILL ~0
++#endif
++
++#define SYM_ALIGN(align...) .balign align
++
++#define SYM_L_GLOBAL(name) .globl name
++#define SYM_L_WEAK(name)   .weak name
++#define SYM_L_LOCAL(name)  /* nothing */
++
++#define SYM_T_FUNC         STT_FUNC
++#define SYM_T_DATA         STT_OBJECT
++#define SYM_T_NONE         STT_NOTYPE
++
++#define SYM(name, typ, linkage, align...)         \
++        .type name, SYM_T_ ## typ;                \
++        SYM_L_ ## linkage(name);                  \
++        SYM_ALIGN(align);                         \
++        name:
++
++#define END(name) .size name, . - name
++
++#define FUNC(name, align...) \
++        SYM(name, FUNC, GLOBAL, LASTARG(CODE_ALIGN, ## align), CODE_FILL)
++#define LABEL(name, align...) \
++        SYM(name, NONE, GLOBAL, LASTARG(CODE_ALIGN, ## align), CODE_FILL)
++#define DATA(name, align...) \
++        SYM(name, DATA, GLOBAL, LASTARG(DATA_ALIGN, ## align), DATA_FILL)
++
++#define FUNC_LOCAL(name, align...) \
++        SYM(name, FUNC, LOCAL, LASTARG(CODE_ALIGN, ## align), CODE_FILL)
++#define LABEL_LOCAL(name, align...) \
++        SYM(name, NONE, LOCAL, LASTARG(CODE_ALIGN, ## align), CODE_FILL)
++#define DATA_LOCAL(name, align...) \
++        SYM(name, DATA, LOCAL, LASTARG(DATA_ALIGN, ## align), DATA_FILL)
++
++#endif /*  __ASSEMBLY__ */
++
++#endif /* __LINKAGE_H__ */

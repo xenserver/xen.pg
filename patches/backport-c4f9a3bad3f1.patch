@@ -1,0 +1,54 @@
+From c4f9a3bad3f1c6e34c61ad8103a4145f2d6f9c68 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 10 Jan 2023 10:57:21 +0000
+Subject: x86/boot: Sanitise PKRU on boot
+
+While the reset value of the register is 0, it might not be after kexec/etc.
+If PKEY0.{WD,AD} have leaked in from an earlier context, construction of a PV
+dom0 will explode.
+
+Sequencing wise, this must come after setting CR4.PKE, and before we touch any
+user mappings.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 0412dbc915e5..fe92f29c2dc6 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -936,6 +936,9 @@ void cpu_init(void)
+ 	write_debugreg(6, X86_DR6_DEFAULT);
+ 	write_debugreg(7, X86_DR7_DEFAULT);
+ 
++	if (cpu_has_pku)
++		wrpkru(0);
++
+ 	/*
+ 	 * If the platform is performing a Secure Launch via SKINIT, GIF is
+ 	 * clear to prevent external interrupts interfering with Secure
+diff --git a/xen/arch/x86/include/asm/cpufeature.h b/xen/arch/x86/include/asm/cpufeature.h
+index a3ad9ebee4e9..044cfd9f882d 100644
+--- a/xen/arch/x86/include/asm/cpufeature.h
++++ b/xen/arch/x86/include/asm/cpufeature.h
+@@ -109,6 +109,7 @@
+ 
+ /* CPUID level 0x00000007:0.ecx */
+ #define cpu_has_avx512_vbmi     boot_cpu_has(X86_FEATURE_AVX512_VBMI)
++#define cpu_has_pku             boot_cpu_has(X86_FEATURE_PKU)
+ #define cpu_has_avx512_vbmi2    boot_cpu_has(X86_FEATURE_AVX512_VBMI2)
+ #define cpu_has_gfni            boot_cpu_has(X86_FEATURE_GFNI)
+ #define cpu_has_vaes            boot_cpu_has(X86_FEATURE_VAES)
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 566422600d94..6deadcf74763 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -1798,7 +1798,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
+     if ( boot_cpu_has(X86_FEATURE_FSGSBASE) )
+         set_in_cr4(X86_CR4_FSGSBASE);
+ 
+-    if ( boot_cpu_has(X86_FEATURE_PKU) )
++    if ( cpu_has_pku )
+         set_in_cr4(X86_CR4_PKE);
+ 
+     if ( opt_invpcid && cpu_has_invpcid )

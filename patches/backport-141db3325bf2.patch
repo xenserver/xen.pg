@@ -1,0 +1,243 @@
+From 141db3325bf2b4b7efabcd5cd3f90fc8245fc34b Mon Sep 17 00:00:00 2001
+From: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Date: Tue, 8 Aug 2023 14:02:20 +0100
+Subject: xen/pdx: Make CONFIG_PDX_COMPRESSION a common Kconfig option
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a new compile-time flag to allow disabling PDX compression and
+compiles out compression-related code/data. It also shorts the pdx<->pfn
+conversion macros and creates stubs for masking functions.
+
+While at it, removes the old arch-defined CONFIG_HAS_PDX flag.  Despite the
+illusion of choice, it was not optional.
+
+There are ARM and PPC platforms with sparse RAM banks - leave compression
+active by default there.  However, there are no known production x86 systems
+with sparse RAM banks, so disable compression.  RISC-V platforms are unknown
+right now.  These decisions can be revisited if our understanding changes.
+
+Signed-off-by: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Reviewed-by: Julien Grall <jgrall@amazon.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Release-acked-by: Henry Wang <Henry.Wang@arm.com>
+
+diff --git a/xen/arch/arm/Kconfig b/xen/arch/arm/Kconfig
+index 87d541c411cc..62eb68e09dd0 100644
+--- a/xen/arch/arm/Kconfig
++++ b/xen/arch/arm/Kconfig
+@@ -15,7 +15,6 @@ config ARM
+ 	select HAS_ALTERNATIVE
+ 	select HAS_DEVICE_TREE
+ 	select HAS_PASSTHROUGH
+-	select HAS_PDX
+ 	select HAS_PMAP
+ 	select IOMMU_FORCE_PT_SHARE
+ 
+diff --git a/xen/arch/x86/Kconfig b/xen/arch/x86/Kconfig
+index 0432f95ba6ce..0f4add141cb9 100644
+--- a/xen/arch/x86/Kconfig
++++ b/xen/arch/x86/Kconfig
+@@ -23,7 +23,6 @@ config X86
+ 	select HAS_PASSTHROUGH
+ 	select HAS_PCI
+ 	select HAS_PCI_MSI
+-	select HAS_PDX
+ 	select HAS_SCHED_GRANULARITY
+ 	select HAS_UBSAN
+ 	select HAS_VPCI if HVM
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index aca9fa310cc8..4c527c945ac4 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -448,7 +448,7 @@ void domain_cpu_policy_changed(struct domain *d)
+     }
+ }
+ 
+-#ifndef CONFIG_BIGMEM
++#if !defined(CONFIG_BIGMEM) && defined(CONFIG_PDX_COMPRESSION)
+ /*
+  * The hole may be at or above the 44-bit boundary, so we need to determine
+  * the total bit count until reaching 32 significant (not squashed out) bits
+@@ -475,13 +475,20 @@ static unsigned int __init noinline _domain_struct_bits(void)
+ struct domain *alloc_domain_struct(void)
+ {
+     struct domain *d;
+-#ifdef CONFIG_BIGMEM
+-    const unsigned int bits = 0;
+-#else
++
+     /*
+-     * We pack the PDX of the domain structure into a 32-bit field within
+-     * the page_info structure. Hence the MEMF_bits() restriction.
++     * Without CONFIG_BIGMEM, we pack the PDX of the domain structure into
++     * a 32-bit field within the page_info structure. Hence the MEMF_bits()
++     * restriction. With PDX compression in place the number of bits must
++     * be calculated at runtime, but it's fixed otherwise.
++     *
++     * On systems with CONFIG_BIGMEM there's no packing, and so there's no
++     * such restriction.
+      */
++#if defined(CONFIG_BIGMEM) || !defined(CONFIG_PDX_COMPRESSION)
++    const unsigned int bits = IS_ENABLED(CONFIG_BIGMEM) ? 0 :
++                                                          32 + PAGE_SHIFT;
++#else
+     static unsigned int __read_mostly bits;
+ 
+     if ( unlikely(!bits) )
+diff --git a/xen/common/Kconfig b/xen/common/Kconfig
+index 855c843113e3..c36570e6cfac 100644
+--- a/xen/common/Kconfig
++++ b/xen/common/Kconfig
+@@ -23,6 +23,21 @@ config GRANT_TABLE
+ 
+ 	  If unsure, say Y.
+ 
++config PDX_COMPRESSION
++	bool "PDX (Page inDeX) compression" if EXPERT && !X86 && !RISCV
++	default ARM || PPC
++	help
++	  PDX compression is a technique designed to reduce the memory
++	  overhead of physical memory management on platforms with sparse RAM
++	  banks.
++
++	  If your platform does have sparse RAM banks, enabling PDX
++	  compression may reduce the memory overhead of Xen, but does carry a
++	  runtime performance cost.
++
++	  If your platform does not have sparse RAM banks, do not enable PDX
++	  compression.
++
+ config ALTERNATIVE_CALL
+ 	bool
+ 
+@@ -50,9 +65,6 @@ config HAS_IOPORTS
+ config HAS_KEXEC
+ 	bool
+ 
+-config HAS_PDX
+-	bool
+-
+ config HAS_PMAP
+ 	bool
+ 
+diff --git a/xen/common/Makefile b/xen/common/Makefile
+index 3baf83d527d8..9e6ebd28164c 100644
+--- a/xen/common/Makefile
++++ b/xen/common/Makefile
+@@ -27,7 +27,7 @@ obj-y += memory.o
+ obj-y += multicall.o
+ obj-y += notifier.o
+ obj-y += page_alloc.o
+-obj-$(CONFIG_HAS_PDX) += pdx.o
++obj-y += pdx.o
+ obj-$(CONFIG_PERF_COUNTERS) += perfc.o
+ obj-bin-$(CONFIG_HAS_PMAP) += pmap.init.o
+ obj-y += preempt.o
+diff --git a/xen/common/pdx.c b/xen/common/pdx.c
+index d3d38965bde9..d3d63b075032 100644
+--- a/xen/common/pdx.c
++++ b/xen/common/pdx.c
+@@ -31,11 +31,16 @@ unsigned long __read_mostly pdx_group_valid[BITS_TO_LONGS(
+ 
+ bool __mfn_valid(unsigned long mfn)
+ {
+-    if ( unlikely(evaluate_nospec(mfn >= max_page)) )
++    bool invalid = mfn >= max_page;
++
++#ifdef CONFIG_PDX_COMPRESSION
++    invalid |= mfn & pfn_hole_mask;
++#endif
++
++    if ( unlikely(evaluate_nospec(invalid)) )
+         return false;
+-    return likely(!(mfn & pfn_hole_mask)) &&
+-           likely(test_bit(pfn_to_pdx(mfn) / PDX_GROUP_COUNT,
+-                           pdx_group_valid));
++
++    return test_bit(pfn_to_pdx(mfn) / PDX_GROUP_COUNT, pdx_group_valid);
+ }
+ 
+ void set_pdx_range(unsigned long smfn, unsigned long emfn)
+@@ -49,6 +54,8 @@ void set_pdx_range(unsigned long smfn, unsigned long emfn)
+         __set_bit(idx, pdx_group_valid);
+ }
+ 
++#ifdef CONFIG_PDX_COMPRESSION
++
+ /*
+  * Diagram to make sense of the following variables. The masks and shifts
+  * are done on mfn values in order to convert to/from pdx:
+@@ -176,6 +183,7 @@ void __init pfn_pdx_hole_setup(unsigned long mask)
+     ma_top_mask         = pfn_top_mask << PAGE_SHIFT;
+ }
+ 
++#endif /* CONFIG_PDX_COMPRESSION */
+ 
+ /*
+  * Local variables:
+diff --git a/xen/include/xen/pdx.h b/xen/include/xen/pdx.h
+index f3fbc4273aa4..bd535009ea8f 100644
+--- a/xen/include/xen/pdx.h
++++ b/xen/include/xen/pdx.h
+@@ -67,8 +67,6 @@
+  * region involved.
+  */
+ 
+-#ifdef CONFIG_HAS_PDX
+-
+ extern unsigned long max_pdx;
+ 
+ #define PDX_GROUP_COUNT ((1 << PDX_GROUP_SHIFT) / \
+@@ -100,6 +98,8 @@ bool __mfn_valid(unsigned long mfn);
+ #define mfn_to_pdx(mfn) pfn_to_pdx(mfn_x(mfn))
+ #define pdx_to_mfn(pdx) _mfn(pdx_to_pfn(pdx))
+ 
++#ifdef CONFIG_PDX_COMPRESSION
++
+ extern unsigned long pfn_pdx_bottom_mask, ma_va_bottom_mask;
+ extern unsigned int pfn_pdx_hole_shift;
+ extern unsigned long pfn_hole_mask;
+@@ -206,7 +206,39 @@ static inline paddr_t directmapoff_to_maddr(unsigned long offset)
+  */
+ void pfn_pdx_hole_setup(unsigned long mask);
+ 
+-#endif /* HAS_PDX */
++#else /* !CONFIG_PDX_COMPRESSION */
++
++/* Without PDX compression we can skip some computations */
++
++/* pdx<->pfn == identity */
++#define pdx_to_pfn(x) (x)
++#define pfn_to_pdx(x) (x)
++
++/* directmap is indexed by by maddr */
++#define maddr_to_directmapoff(x) (x)
++#define directmapoff_to_maddr(x) (x)
++
++static inline bool pdx_is_region_compressible(paddr_t base,
++                                              unsigned long npages)
++{
++    return true;
++}
++
++static inline uint64_t pdx_init_mask(uint64_t base_addr)
++{
++    return 0;
++}
++
++static inline uint64_t pdx_region_mask(uint64_t base, uint64_t len)
++{
++    return 0;
++}
++
++static inline void pfn_pdx_hole_setup(unsigned long mask)
++{
++}
++
++#endif /* CONFIG_PDX_COMPRESSION */
+ #endif /* __XEN_PDX_H__ */
+ 
+ /*

@@ -1,0 +1,75 @@
+From 07b167d17e84aa7985a1c6d03dd3c23c37a83d23 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 17 Apr 2023 14:03:22 +0200
+Subject: x86emul: support WRMSRNS
+
+This insn differs from WRMSR solely in the lack of serialization. Hence
+the code used there can simply be used here as well, plus a feature
+check of course. As there's no other infrastructure needed beyond
+permitting the insn for PV privileged-op emulation (in particular no
+separate new VMEXIT) we can expose the insn to guests right away.
+
+Don't expose the feature to PV guests, as the involved #UD is
+serializing anyway.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/tools/tests/x86_emulator/x86-emulate.c b/tools/tests/x86_emulator/x86-emulate.c
+index 3a092ea3ec7e..b1e250deee75 100644
+--- a/tools/tests/x86_emulator/x86-emulate.c
++++ b/tools/tests/x86_emulator/x86-emulate.c
+@@ -96,6 +96,7 @@ bool emul_test_init(void)
+     cp.feat.adx = true;
+     cp.feat.avx512pf = cp.feat.avx512f;
+     cp.feat.rdpid = true;
++    cp.feat.wrmsrns = true;
+     cp.extd.clzero = true;
+ 
+     if ( cpu_has_xsave )
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
+index 7a4d3437dd62..d231cdb01a36 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate/x86_emulate.c
+@@ -2012,6 +2012,7 @@ amd_like(const struct x86_emulate_ctxt *ctxt)
+ #define vcpu_has_tsxldtrk()    (ctxt->cpuid->feat.tsxldtrk)
+ #define vcpu_has_avx_vnni()    (ctxt->cpuid->feat.avx_vnni)
+ #define vcpu_has_avx512_bf16() (ctxt->cpuid->feat.avx512_bf16)
++#define vcpu_has_wrmsrns()     (ctxt->cpuid->feat.wrmsrns)
+ 
+ #define vcpu_must_have(feat) \
+     generate_exception_if(!vcpu_has_##feat(), EXC_UD)
+@@ -5713,6 +5714,20 @@ x86_emulate(
+ 
+         switch( modrm )
+         {
++        case 0xc6:
++            switch ( vex.pfx )
++            {
++            case vex_none: /* wrmsrns */
++                vcpu_must_have(wrmsrns);
++                generate_exception_if(!mode_ring0(), X86_EXC_GP, 0);
++                fail_if(!ops->write_msr);
++                rc = ops->write_msr(_regs.ecx,
++                                    ((uint64_t)_regs.r(dx) << 32) | _regs.eax,
++                                    ctxt);
++                goto done;
++            }
++            generate_exception(X86_EXC_UD);
++
+         case 0xca: /* clac */
+         case 0xcb: /* stac */
+             vcpu_must_have(smap);
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index 876415a2244d..d6c7b5d934b9 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -281,7 +281,7 @@ XEN_CPUFEATURE(AVX512_BF16,  10*32+ 5) /*A  AVX512 BFloat16 Instructions */
+ XEN_CPUFEATURE(FZRM,         10*32+10) /*A  Fast Zero-length REP MOVSB */
+ XEN_CPUFEATURE(FSRS,         10*32+11) /*A  Fast Short REP STOSB */
+ XEN_CPUFEATURE(FSRCS,        10*32+12) /*A  Fast Short REP CMPSB/SCASB */
+-XEN_CPUFEATURE(WRMSRNS,      10*32+19) /*   WRMSR Non-Serialising */
++XEN_CPUFEATURE(WRMSRNS,      10*32+19) /*S  WRMSR Non-Serialising */
+ 
+ /* AMD-defined CPU features, CPUID level 0x80000021.eax, word 11 */
+ XEN_CPUFEATURE(LFENCE_DISPATCH,    11*32+ 2) /*A  LFENCE always serializing */
