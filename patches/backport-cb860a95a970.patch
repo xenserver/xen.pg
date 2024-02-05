@@ -1,0 +1,212 @@
+From cb860a95a9700046ac60b3830c8370cb16eccd4b Mon Sep 17 00:00:00 2001
+From: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Date: Tue, 9 May 2023 17:07:10 +0100
+Subject: tools: Modify single-domid callers of xc_domain_getinfolist()
+
+xc_domain_getinfolist() internally relies on a sysctl that performs
+a linear search for the domids. Many callers of xc_domain_getinfolist()
+who require information about a precise domid are much better off calling
+xc_domain_getinfo_single() instead, that will use the getdomaininfo domctl
+instead and ensure the returned domid matches the requested one. The domtctl
+will find the domid faster too, because that uses hashed lists.
+
+Signed-off-by: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@cloud.com>
+Reviewed-by: Anthony PERARD <anthony.perard@citrix.com>
+
+diff --git a/tools/libs/light/libxl_dom.c b/tools/libs/light/libxl_dom.c
+index f6311eea6e3f..7df3a5353818 100644
+--- a/tools/libs/light/libxl_dom.c
++++ b/tools/libs/light/libxl_dom.c
+@@ -32,9 +32,9 @@ libxl_domain_type libxl__domain_type(libxl__gc *gc, uint32_t domid)
+     xc_domaininfo_t info;
+     int ret;
+ 
+-    ret = xc_domain_getinfolist(ctx->xch, domid, 1, &info);
+-    if (ret != 1 || info.domain != domid) {
+-        LOG(ERROR, "unable to get domain type for domid=%"PRIu32, domid);
++    ret = xc_domain_getinfo_single(ctx->xch, domid, &info);
++    if (ret < 0) {
++        LOGED(ERROR, domid, "unable to get dominfo");
+         return LIBXL_DOMAIN_TYPE_INVALID;
+     }
+     if (info.flags & XEN_DOMINF_hvm_guest) {
+@@ -70,15 +70,10 @@ int libxl__domain_cpupool(libxl__gc *gc, uint32_t domid)
+     xc_domaininfo_t info;
+     int ret;
+ 
+-    ret = xc_domain_getinfolist(CTX->xch, domid, 1, &info);
+-    if (ret != 1)
++    ret = xc_domain_getinfo_single(CTX->xch, domid, &info);
++    if (ret < 0)
+     {
+-        LOGE(ERROR, "getinfolist failed %d", ret);
+-        return ERROR_FAIL;
+-    }
+-    if (info.domain != domid)
+-    {
+-        LOGE(ERROR, "got info for dom%d, wanted dom%d\n", info.domain, domid);
++        LOGED(ERROR, domid, "get domaininfo failed");
+         return ERROR_FAIL;
+     }
+     return info.cpupool;
+diff --git a/tools/libs/light/libxl_dom_suspend.c b/tools/libs/light/libxl_dom_suspend.c
+index 4fa22bb73910..6091a5f3f695 100644
+--- a/tools/libs/light/libxl_dom_suspend.c
++++ b/tools/libs/light/libxl_dom_suspend.c
+@@ -332,13 +332,8 @@ static void suspend_common_wait_guest_check(libxl__egc *egc,
+     /* Convenience aliases */
+     const uint32_t domid = dsps->domid;
+ 
+-    ret = xc_domain_getinfolist(CTX->xch, domid, 1, &info);
++    ret = xc_domain_getinfo_single(CTX->xch, domid, &info);
+     if (ret < 0) {
+-        LOGED(ERROR, domid, "unable to check for status of guest");
+-        goto err;
+-    }
+-
+-    if (!(ret == 1 && info.domain == domid)) {
+         LOGED(ERROR, domid, "guest we were suspending has been destroyed");
+         goto err;
+     }
+diff --git a/tools/libs/light/libxl_domain.c b/tools/libs/light/libxl_domain.c
+index 7f0986c18569..5ee1544d9cf3 100644
+--- a/tools/libs/light/libxl_domain.c
++++ b/tools/libs/light/libxl_domain.c
+@@ -349,15 +349,11 @@ int libxl_domain_info(libxl_ctx *ctx, libxl_dominfo *info_r,
+     int ret;
+     GC_INIT(ctx);
+ 
+-    ret = xc_domain_getinfolist(ctx->xch, domid, 1, &xcinfo);
+-    if (ret<0) {
+-        LOGED(ERROR, domid, "Getting domain info list");
+-        GC_FREE;
+-        return ERROR_FAIL;
+-    }
+-    if (ret==0 || xcinfo.domain != domid) {
++    ret = xc_domain_getinfo_single(ctx->xch, domid, &xcinfo);
++    if (ret < 0) {
++        LOGED(ERROR, domid, "Getting domain info");
+         GC_FREE;
+-        return ERROR_DOMAIN_NOTFOUND;
++        return errno == ESRCH ? ERROR_DOMAIN_NOTFOUND : ERROR_FAIL;
+     }
+ 
+     if (info_r)
+@@ -1657,14 +1653,16 @@ int libxl__resolve_domid(libxl__gc *gc, const char *name, uint32_t *domid)
+ libxl_vcpuinfo *libxl_list_vcpu(libxl_ctx *ctx, uint32_t domid,
+                                        int *nr_vcpus_out, int *nr_cpus_out)
+ {
++    int r;
+     GC_INIT(ctx);
+     libxl_vcpuinfo *ptr, *ret;
+     xc_domaininfo_t domaininfo;
+     xc_vcpuinfo_t vcpuinfo;
+     unsigned int nr_vcpus;
+ 
+-    if (xc_domain_getinfolist(ctx->xch, domid, 1, &domaininfo) != 1) {
+-        LOGED(ERROR, domid, "Getting infolist");
++    r = xc_domain_getinfo_single(ctx->xch, domid, &domaininfo);
++    if (r < 0) {
++        LOGED(ERROR, domid, "Getting dominfo");
+         GC_FREE;
+         return NULL;
+     }
+diff --git a/tools/libs/light/libxl_mem.c b/tools/libs/light/libxl_mem.c
+index 92ec09f4cfa9..44e554adbac3 100644
+--- a/tools/libs/light/libxl_mem.c
++++ b/tools/libs/light/libxl_mem.c
+@@ -323,8 +323,8 @@ retry_transaction:
+     libxl__xs_printf(gc, t, GCSPRINTF("%s/memory/target", dompath),
+                      "%"PRIu64, new_target_memkb);
+ 
+-    r = xc_domain_getinfolist(ctx->xch, domid, 1, &info);
+-    if (r != 1 || info.domain != domid) {
++    r = xc_domain_getinfo_single(ctx->xch, domid, &info);
++    if (r < 0) {
+         abort_transaction = 1;
+         rc = ERROR_FAIL;
+         goto out;
+diff --git a/tools/libs/light/libxl_sched.c b/tools/libs/light/libxl_sched.c
+index 7c53dc60e60c..841c05b0ef4e 100644
+--- a/tools/libs/light/libxl_sched.c
++++ b/tools/libs/light/libxl_sched.c
+@@ -219,13 +219,11 @@ static int sched_credit_domain_set(libxl__gc *gc, uint32_t domid,
+     xc_domaininfo_t domaininfo;
+     int rc;
+ 
+-    rc = xc_domain_getinfolist(CTX->xch, domid, 1, &domaininfo);
++    rc = xc_domain_getinfo_single(CTX->xch, domid, &domaininfo);
+     if (rc < 0) {
+-        LOGED(ERROR, domid, "Getting domain info list");
+-        return ERROR_FAIL;
++        LOGED(ERROR, domid, "Getting domain info");
++        return errno == ESRCH ? ERROR_INVAL : ERROR_FAIL;
+     }
+-    if (rc != 1 || domaininfo.domain != domid)
+-        return ERROR_INVAL;
+ 
+     rc = xc_sched_credit_domain_get(CTX->xch, domid, &sdom);
+     if (rc != 0) {
+@@ -426,13 +424,11 @@ static int sched_credit2_domain_set(libxl__gc *gc, uint32_t domid,
+     xc_domaininfo_t info;
+     int rc;
+ 
+-    rc = xc_domain_getinfolist(CTX->xch, domid, 1, &info);
++    rc = xc_domain_getinfo_single(CTX->xch, domid, &info);
+     if (rc < 0) {
+         LOGED(ERROR, domid, "Getting domain info");
+-        return ERROR_FAIL;
++        return errno == ESRCH ? ERROR_INVAL : ERROR_FAIL;
+     }
+-    if (rc != 1 || info.domain != domid)
+-        return ERROR_INVAL;
+ 
+     rc = xc_sched_credit2_domain_get(CTX->xch, domid, &sdom);
+     if (rc != 0) {
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index fb2e51c457b4..be2241487e2e 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -472,10 +472,8 @@ CAMLprim value stub_xc_domain_getinfo(value xch, value domid)
+ 	xc_domaininfo_t info;
+ 	int ret;
+ 
+-	ret = xc_domain_getinfolist(_H(xch), _D(domid), 1, &info);
+-	if (ret != 1)
+-		failwith_xc(_H(xch));
+-	if (info.domain != _D(domid))
++	ret = xc_domain_getinfo_single(_H(xch), _D(domid), &info);
++	if (ret < 0)
+ 		failwith_xc(_H(xch));
+ 
+ 	result = alloc_domaininfo(&info);
+diff --git a/tools/xenpaging/xenpaging.c b/tools/xenpaging/xenpaging.c
+index 6e5490315d01..c7a9a8247766 100644
+--- a/tools/xenpaging/xenpaging.c
++++ b/tools/xenpaging/xenpaging.c
+@@ -169,8 +169,8 @@ static int xenpaging_get_tot_pages(struct xenpaging *paging)
+     xc_domaininfo_t domain_info;
+     int rc;
+ 
+-    rc = xc_domain_getinfolist(xch, paging->vm_event.domain_id, 1, &domain_info);
+-    if ( rc != 1 )
++    rc = xc_domain_getinfo_single(xch, paging->vm_event.domain_id, &domain_info);
++    if ( rc < 0 )
+     {
+         PERROR("Error getting domain info");
+         return -1;
+@@ -424,9 +424,9 @@ static struct xenpaging *xenpaging_init(int argc, char *argv[])
+     /* Get max_pages from guest if not provided via cmdline */
+     if ( !paging->max_pages )
+     {
+-        rc = xc_domain_getinfolist(xch, paging->vm_event.domain_id, 1,
+-                                   &domain_info);
+-        if ( rc != 1 )
++        rc = xc_domain_getinfo_single(xch, paging->vm_event.domain_id,
++                                      &domain_info);
++        if ( rc < 0 )
+         {
+             PERROR("Error getting domain info");
+             goto err;
