@@ -1,0 +1,265 @@
+From f5807d24c8d23654e8175729be83823f0d5aa969 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 22 Jun 2023 23:32:19 +0100
+Subject: x86/spec-ctrl: Mitigation Register File Data Sampling
+
+RFDS affects Atom cores, also branded E-cores, between the Goldmont and
+Gracemont microarchitectures.
+
+Two new bits have been defined; RFDS_CLEAR to indicate VERW has more side
+effets, and RFDS_NO to incidate that the system is unaffected.  Plenty of
+unaffected CPUs won't be getting RFDS_NO retrofitted in microcode, so we
+synthesise it.  Alder Lake and Raptor Lake Xeon-E's are unaffected due to
+their platform configuration, and we must use the Hybrid CPUID bit to
+distinguish them from their non-Xeon counterparts.
+
+Like MD_CLEAR and FB_CLEAR, RFDS_CLEAR needs OR-ing across a resource pool, so
+set it in the max policies and reflect the host setting in default.
+
+This is part of XSA-452 / CVE-2023-28746.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/tools/misc/xen-cpuid.c b/tools/misc/xen-cpuid.c
+index dc7aa38e3b7f..0de5c8fb415c 100644
+--- a/tools/misc/xen-cpuid.c
++++ b/tools/misc/xen-cpuid.c
+@@ -168,6 +168,7 @@ static const char *const str_7d0[32] =
+     /*  8 */                [ 9] = "srbds-ctrl",
+     [10] = "md-clear",      [11] = "rtm-always-abort",
+     /* 12 */                [13] = "tsx-force-abort",
++    /* 14 */                [15] = "hybrid",
+ 
+     [18] = "pconfig",
+     [20] = "cet-ibt",
+@@ -224,7 +225,8 @@ static const char *const str_m10Al[32] =
+     [20] = "bhi-no",              [21] = "xapic-status",
+     /* 22 */                      [23] = "ovrclk-status",
+     [24] = "pbrsb-no",            [25] = "gds-ctrl",
+-    [26] = "gds-no",
++    [26] = "gds-no",              [27] = "rfds-no",
++    [28] = "rfds-clear",
+ };
+ 
+ static const char *const str_m10Ah[32] =
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index 42445a7d2ebb..f6b1c3e0a060 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -432,7 +432,7 @@ static void __init print_details(enum ind_thunk thunk)
+      * Hardware read-only information, stating immunity to certain issues, or
+      * suggestions of which mitigation to use.
+      */
+-    printk("  Hardware hints:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
++    printk("  Hardware hints:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+            (caps & ARCH_CAPS_RDCL_NO)                        ? " RDCL_NO"        : "",
+            (caps & ARCH_CAPS_EIBRS)                          ? " EIBRS"          : "",
+            (caps & ARCH_CAPS_RSBA)                           ? " RSBA"           : "",
+@@ -448,6 +448,7 @@ static void __init print_details(enum ind_thunk thunk)
+            (caps & ARCH_CAPS_FB_CLEAR)                       ? " FB_CLEAR"       : "",
+            (caps & ARCH_CAPS_PBRSB_NO)                       ? " PBRSB_NO"       : "",
+            (caps & ARCH_CAPS_GDS_NO)                         ? " GDS_NO"         : "",
++           (caps & ARCH_CAPS_RFDS_NO)                        ? " RFDS_NO"        : "",
+            (e8b  & cpufeat_mask(X86_FEATURE_IBRS_ALWAYS))    ? " IBRS_ALWAYS"    : "",
+            (e8b  & cpufeat_mask(X86_FEATURE_STIBP_ALWAYS))   ? " STIBP_ALWAYS"   : "",
+            (e8b  & cpufeat_mask(X86_FEATURE_IBRS_FAST))      ? " IBRS_FAST"      : "",
+@@ -458,7 +459,7 @@ static void __init print_details(enum ind_thunk thunk)
+            (e21a & cpufeat_mask(X86_FEATURE_SRSO_NO))        ? " SRSO_NO"        : "");
+ 
+     /* Hardware features which need driving to mitigate issues. */
+-    printk("  Hardware features:%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
++    printk("  Hardware features:%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+            (e8b  & cpufeat_mask(X86_FEATURE_IBPB)) ||
+            (_7d0 & cpufeat_mask(X86_FEATURE_IBRSB))          ? " IBPB"           : "",
+            (e8b  & cpufeat_mask(X86_FEATURE_IBRS)) ||
+@@ -476,6 +477,7 @@ static void __init print_details(enum ind_thunk thunk)
+            (caps & ARCH_CAPS_TSX_CTRL)                       ? " TSX_CTRL"       : "",
+            (caps & ARCH_CAPS_FB_CLEAR_CTRL)                  ? " FB_CLEAR_CTRL"  : "",
+            (caps & ARCH_CAPS_GDS_CTRL)                       ? " GDS_CTRL"       : "",
++           (caps & ARCH_CAPS_RFDS_CLEAR)                     ? " RFDS_CLEAR"     : "",
+            (e21a & cpufeat_mask(X86_FEATURE_SBPB))           ? " SBPB"           : "");
+ 
+     /* Compiled-in support which pertains to mitigations. */
+@@ -1325,6 +1327,83 @@ static __init void mds_calculations(void)
+     }
+ }
+ 
++/*
++ * Register File Data Sampling affects Atom cores from the Goldmont to
++ * Gracemont microarchitectures.  The March 2024 microcode adds RFDS_NO to
++ * some but not all unaffected parts, and RFDS_CLEAR to affected parts still
++ * in support.
++ *
++ * Alder Lake and Raptor Lake client CPUs have a mix of P cores
++ * (Golden/Raptor Cove, not vulnerable) and E cores (Gracemont,
++ * vulnerable), and both enumerate RFDS_CLEAR.
++ *
++ * Both exist in a Xeon SKU, which has the E cores (Gracemont) disabled by
++ * platform configuration, and enumerate RFDS_NO.
++ *
++ * With older parts, or with out-of-date microcode, synthesise RFDS_NO when
++ * safe to do so.
++ *
++ * https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/advisory-guidance/register-file-data-sampling.html
++ */
++static void __init rfds_calculations(void)
++{
++    /* RFDS is only known to affect Intel Family 6 processors at this time. */
++    if ( boot_cpu_data.x86_vendor != X86_VENDOR_INTEL ||
++         boot_cpu_data.x86 != 6 )
++        return;
++
++    /*
++     * If RFDS_NO or RFDS_CLEAR are visible, we've either got suitable
++     * microcode, or an RFDS-aware hypervisor is levelling us in a pool.
++     */
++    if ( cpu_has_rfds_no || cpu_has_rfds_clear )
++        return;
++
++    /* If we're virtualised, don't attempt to synthesise RFDS_NO. */
++    if ( cpu_has_hypervisor )
++        return;
++
++    /*
++     * Not all CPUs are expected to get a microcode update enumerating one of
++     * RFDS_{NO,CLEAR}, or we might have out-of-date microcode.
++     */
++    switch ( boot_cpu_data.x86_model )
++    {
++    case 0x97: /* INTEL_FAM6_ALDERLAKE */
++    case 0xB7: /* INTEL_FAM6_RAPTORLAKE */
++        /*
++         * Alder Lake and Raptor Lake might be a client SKU (with the
++         * Gracemont cores active, and therefore vulnerable) or might be a
++         * server SKU (with the Gracemont cores disabled, and therefore not
++         * vulnerable).
++         *
++         * See if the CPU identifies as hybrid to distinguish the two cases.
++         */
++        if ( !cpu_has_hybrid )
++            break;
++        /* fallthrough */
++    case 0x9A: /* INTEL_FAM6_ALDERLAKE_L */
++    case 0xBA: /* INTEL_FAM6_RAPTORLAKE_P */
++    case 0xBF: /* INTEL_FAM6_RAPTORLAKE_S */
++
++    case 0x5C: /* INTEL_FAM6_ATOM_GOLDMONT */      /* Apollo Lake */
++    case 0x5F: /* INTEL_FAM6_ATOM_GOLDMONT_D */    /* Denverton */
++    case 0x7A: /* INTEL_FAM6_ATOM_GOLDMONT_PLUS */ /* Gemini Lake */
++    case 0x86: /* INTEL_FAM6_ATOM_TREMONT_D */     /* Snow Ridge / Parker Ridge */
++    case 0x96: /* INTEL_FAM6_ATOM_TREMONT */       /* Elkhart Lake */
++    case 0x9C: /* INTEL_FAM6_ATOM_TREMONT_L */     /* Jasper Lake */
++    case 0xBE: /* INTEL_FAM6_ATOM_GRACEMONT */     /* Alder Lake N */
++        return;
++    }
++
++    /*
++     * We appear to be on an unaffected CPU which didn't enumerate RFDS_NO,
++     * perhaps because of it's age or because of out-of-date microcode.
++     * Synthesise it.
++     */
++    setup_force_cpu_cap(X86_FEATURE_RFDS_NO);
++}
++
+ static bool __init cpu_has_gds(void)
+ {
+     /*
+@@ -1839,8 +1918,12 @@ void __init init_speculation_mitigations(void)
+      *
+      *   If FB_CLEAR is enumerated, L1D_FLUSH does not have the same scrubbing
+      *   side effects as VERW and cannot be used in its place.
++     *
++     * - March 2023, for RFDS.  Enumerate RFDS_CLEAR to mean that VERW now
++     *   scrubs non-architectural entries from certain register files.
+      */
+     mds_calculations();
++    rfds_calculations();
+ 
+     /*
+      * Parts which enumerate FB_CLEAR are those with now-updated microcode
+@@ -1864,16 +1947,19 @@ void __init init_speculation_mitigations(void)
+      */
+     if ( opt_verw_pv == -1 )
+         opt_verw_pv = ((cpu_has_bug_mds || cpu_has_bug_msbds_only) &&
+-                       cpu_has_md_clear);
++                       cpu_has_md_clear) || cpu_has_rfds_clear;
+ 
+     if ( opt_verw_hvm == -1 )
+         opt_verw_hvm = ((cpu_has_bug_mds || cpu_has_bug_msbds_only) &&
+-                        cpu_has_md_clear);
++                        cpu_has_md_clear) || cpu_has_rfds_clear;
+ 
+     /*
+      * If SMT is active, and we're protecting against MDS or MMIO stale data,
+      * we need to scrub before going idle too, to avoid secrets moving
+      * sideways into other threads upon pipeline resource repartition.
++     *
++     * We don't need to scrub on idle for RFDS, but there are no RFDS-affected
++     * parts with SMT, so avoid complicating this logic for now.
+      */
+     if ( hw_smt_enabled && (opt_verw_pv || opt_verw_hvm || opt_verw_mmio) )
+         setup_force_cpu_cap(X86_FEATURE_SC_VERW_IDLE);
+@@ -1887,7 +1973,7 @@ void __init init_speculation_mitigations(void)
+      * only *_CLEAR we can see.
+      */
+     if ( opt_verw_hvm && opt_l1d_flush && cpu_has_md_clear &&
+-         !cpu_has_fb_clear )
++         !cpu_has_fb_clear && !cpu_has_rfds_clear )
+         opt_verw_hvm = false;
+ 
+     /*
+diff --git a/xen/include/asm-x86/cpufeature.h b/xen/include/asm-x86/cpufeature.h
+index 4b99206de3b0..251cf87f7e45 100644
+--- a/xen/include/asm-x86/cpufeature.h
++++ b/xen/include/asm-x86/cpufeature.h
+@@ -136,6 +136,7 @@
+ #define cpu_has_md_clear        boot_cpu_has(X86_FEATURE_MD_CLEAR)
+ #define cpu_has_rtm_always_abort boot_cpu_has(X86_FEATURE_RTM_ALWAYS_ABORT)
+ #define cpu_has_tsx_force_abort boot_cpu_has(X86_FEATURE_TSX_FORCE_ABORT)
++#define cpu_has_hybrid          boot_cpu_has(X86_FEATURE_HYBRID)
+ #define cpu_has_arch_caps       boot_cpu_has(X86_FEATURE_ARCH_CAPS)
+ 
+ /* CPUID level 0x00000007:1.eax */
+@@ -155,6 +156,8 @@
+ #define cpu_has_rrsba           boot_cpu_has(X86_FEATURE_RRSBA)
+ #define cpu_has_gds_ctrl        boot_cpu_has(X86_FEATURE_GDS_CTRL)
+ #define cpu_has_gds_no          boot_cpu_has(X86_FEATURE_GDS_NO)
++#define cpu_has_rfds_no         boot_cpu_has(X86_FEATURE_RFDS_NO)
++#define cpu_has_rfds_clear      boot_cpu_has(X86_FEATURE_RFDS_CLEAR)
+ 
+ /* Synthesized. */
+ #define cpu_has_arch_perfmon    boot_cpu_has(X86_FEATURE_ARCH_PERFMON)
+diff --git a/xen/include/asm-x86/msr-index.h b/xen/include/asm-x86/msr-index.h
+index e2f43b24090d..64d822dcb43a 100644
+--- a/xen/include/asm-x86/msr-index.h
++++ b/xen/include/asm-x86/msr-index.h
+@@ -73,6 +73,8 @@
+ #define ARCH_CAPS_PBRSB_NO		(_AC(1, ULL) << 24)
+ #define ARCH_CAPS_GDS_CTRL		(_AC(1, ULL) << 25)
+ #define ARCH_CAPS_GDS_NO		(_AC(1, ULL) << 26)
++#define ARCH_CAPS_RFDS_NO		(_AC(1, ULL) << 27)
++#define ARCH_CAPS_RFDS_CLEAR		(_AC(1, ULL) << 28)
+ 
+ #define MSR_FLUSH_CMD			0x0000010b
+ #define FLUSH_CMD_L1D			(_AC(1, ULL) << 0)
+diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
+index 6a86afdc4577..539b2d837cbf 100644
+--- a/xen/include/public/arch-x86/cpufeatureset.h
++++ b/xen/include/public/arch-x86/cpufeatureset.h
+@@ -268,6 +268,7 @@ XEN_CPUFEATURE(SRBDS_CTRL,    9*32+ 9) /*   MSR_MCU_OPT_CTRL and RNGDS_MITG_DIS.
+ XEN_CPUFEATURE(MD_CLEAR,      9*32+10) /*A  VERW clears microarchitectural buffers */
+ XEN_CPUFEATURE(RTM_ALWAYS_ABORT, 9*32+11) /*! June 2021 TSX defeaturing in microcode. */
+ XEN_CPUFEATURE(TSX_FORCE_ABORT, 9*32+13) /* MSR_TSX_FORCE_ABORT.RTM_ABORT */
++XEN_CPUFEATURE(HYBRID,        9*32+15) /*   Heterogeneous platform */
+ XEN_CPUFEATURE(CET_IBT,       9*32+20) /*   CET - Indirect Branch Tracking */
+ XEN_CPUFEATURE(IBRSB,         9*32+26) /*A  IBRS and IBPB support (used by Intel) */
+ XEN_CPUFEATURE(STIBP,         9*32+27) /*A  STIBP */
+@@ -325,6 +326,8 @@ XEN_CPUFEATURE(OVRCLK_STATUS,      16*32+23) /*   MSR_OVERCLOCKING_STATUS */
+ XEN_CPUFEATURE(PBRSB_NO,           16*32+24) /*A  No Post-Barrier RSB predictions */
+ XEN_CPUFEATURE(GDS_CTRL,           16*32+25) /*   MCU_OPT_CTRL.GDS_MIT_{DIS,LOCK} */
+ XEN_CPUFEATURE(GDS_NO,             16*32+26) /*A  No Gather Data Sampling */
++XEN_CPUFEATURE(RFDS_NO,            16*32+27) /*A  No Register File Data Sampling */
++XEN_CPUFEATURE(RFDS_CLEAR,         16*32+28) /*!A Register File(s) cleared by VERW */
+ 
+ /* Intel-defined CPU features, MSR_ARCH_CAPS 0x10a.edx, word 17 */
+ 
