@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 2
+%global hv_rel 3
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -886,6 +886,11 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Feb 23 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-3
+- Fix for XSA-451 CVE-2023-46841.
+- Fix the migration of VMs which had previously seen the CMP_LEGACY feature.
+- Retire support to customise guest memory at the 1M boundary.
+
 * Tue Feb 13 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-2
 - De-virtualise more function pointers, based on boot time configuration
 - Improve the performance of IOMMU construction for dom0
