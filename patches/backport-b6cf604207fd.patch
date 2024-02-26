@@ -1,0 +1,136 @@
+From b6cf604207fd0a04451a48f2ce6d05fb66c612ab Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edwin.torok@cloud.com>
+Date: Wed, 31 Jan 2024 10:52:55 +0000
+Subject: tools/oxenstored: Use Map instead of Hashtbl for quotas
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On a stress test running 1000 VMs flamegraphs have shown that
+`oxenstored` spends a large amount of time in `Hashtbl.copy` and the GC.
+
+Hashtable complexity:
+ * read/write: O(1) average
+ * copy: O(domains) -- copying the entire table
+
+Map complexity:
+ * read/write: O(log n) worst case
+ * copy: O(1) -- a word copy
+
+We always perform at least one 'copy' when processing each xenstore
+packet (regardless whether it is a readonly operation or inside a
+transaction or not), so the actual complexity per packet is:
+  * Hashtbl: O(domains)
+  * Map: O(log domains)
+
+Maps are the clear winner, and a better fit for the immutable xenstore
+tree.
+
+Signed-off-by: Edwin Török <edwin.torok@cloud.com>
+Acked-by: Christian Lindig <christian.lindig@cloud.com>
+
+diff --git a/tools/ocaml/xenstored/quota.ml b/tools/ocaml/xenstored/quota.ml
+index 6e3d6401ae89..ee8dd2258167 100644
+--- a/tools/ocaml/xenstored/quota.ml
++++ b/tools/ocaml/xenstored/quota.ml
+@@ -23,66 +23,69 @@ let activate = ref true
+ let maxent = ref (1000)
+ let maxsize = ref (2048)
+ 
++module Domid = struct
++	type t = Xenctrl.domid
++	let compare (a:t) (b:t) = compare a b
++end
++
++module DomidMap = Map.Make(Domid)
++
+ type t = {
+ 	maxent: int;               (* max entities per domU *)
+ 	maxsize: int;              (* max size of data store in one node *)
+-	cur: (Xenctrl.domid, int) Hashtbl.t; (* current domains quota *)
++	mutable cur: int DomidMap.t; (* current domains quota *)
+ }
+ 
+ let to_string quota domid =
+-	if Hashtbl.mem quota.cur domid
+-	then Printf.sprintf "dom%i quota: %i/%i" domid (Hashtbl.find quota.cur domid) quota.maxent
+-	else Printf.sprintf "dom%i quota: not set" domid
++	try
++		Printf.sprintf "dom%i quota: %i/%i" domid (DomidMap.find domid quota.cur) quota.maxent
++	with Not_found ->
++		Printf.sprintf "dom%i quota: not set" domid
+ 
+ let create () =
+-	{ maxent = !maxent; maxsize = !maxsize; cur = Hashtbl.create 100; }
++	{ maxent = !maxent; maxsize = !maxsize; cur = DomidMap.empty; }
+ 
+-let copy quota = { quota with cur = (Hashtbl.copy quota.cur) }
++let copy quota = { quota with cur = quota.cur }
+ 
+-let del quota id = Hashtbl.remove quota.cur id
++let del quota id = { quota with cur = DomidMap.remove id quota.cur }
+ 
+ let _check quota id size =
+ 	if size > quota.maxsize then (
+ 		warn "domain %u err create entry: data too big %d" id size;
+ 		raise Data_too_big
+ 	);
+-	if id > 0 && Hashtbl.mem quota.cur id then
+-		let entry = Hashtbl.find quota.cur id in
++	if id > 0 then
++	try
++		let entry = DomidMap.find id quota.cur in
+ 		if entry >= quota.maxent then (
+ 			warn "domain %u cannot create entry: quota reached" id;
+ 			raise Limit_reached
+ 		)
++	with Not_found -> ()
+ 
+ let check quota id size =
+ 	if !activate then
+ 		_check quota id size
+ 
+-let get_entry quota id = Hashtbl.find quota.cur id
++let find_or_zero quota_cur id =
++	try DomidMap.find id quota_cur with Not_found -> 0
+ 
+-let set_entry quota id nb =
+-	if nb = 0
+-	then Hashtbl.remove quota.cur id
+-	else begin
+-	if Hashtbl.mem quota.cur id then
+-		Hashtbl.replace quota.cur id nb
+-	else
+-		Hashtbl.add quota.cur id nb
+-	end
++let update_entry quota_cur id diff =
++	let nb = diff + find_or_zero quota_cur id in
++	if nb = 0 then DomidMap.remove id quota_cur
++	else DomidMap.add id nb quota_cur
+ 
+ let del_entry quota id =
+-	try
+-		let nb = get_entry quota id in
+-		set_entry quota id (nb - 1)
+-	with Not_found -> ()
++	quota.cur <- update_entry quota.cur id (-1)
+ 
+ let add_entry quota id =
+-	let nb = try get_entry quota id with Not_found -> 0 in
+-	set_entry quota id (nb + 1)
+-
+-let add quota diff =
+-	Hashtbl.iter (fun id nb -> set_entry quota id (get_entry quota id + nb)) diff.cur
++	quota.cur <- update_entry quota.cur id (+1)
+ 
+ let merge orig_quota mod_quota dest_quota =
+-	  Hashtbl.iter (fun id nb -> let diff = nb - (try get_entry orig_quota id with Not_found -> 0) in
+-				if diff <> 0 then
+-					set_entry dest_quota id ((try get_entry dest_quota id with Not_found -> 0) + diff)) mod_quota.cur
++	let fold_merge id nb dest =
++		match nb - find_or_zero orig_quota.cur id with
++		| 0 -> dest (* not modified *)
++		| diff -> update_entry dest id diff (* update with [x=x+diff] *)
++	in
++	dest_quota.cur <- DomidMap.fold fold_merge mod_quota.cur dest_quota.cur
++	(* dest_quota = dest_quota + (mod_quota - orig_quota) *)
