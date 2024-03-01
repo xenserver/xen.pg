@@ -1,0 +1,102 @@
+From 0263dc9069ddb66335c72a159e09050b1600e56a Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 29 Feb 2024 20:46:13 +0000
+Subject: tests/resource: Fix HVM guest in !SHADOW builds
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Right now, test-resource always creates HVM Shadow guests.  But if Xen has
+SHADOW compiled out, running the test yields:
+
+  $./test-resource
+  XENMEM_acquire_resource tests
+  Test x86 PV
+    Created d1
+    Test grant table
+  Test x86 PVH
+    Skip: 95 - Operation not supported
+
+and doesn't really test HVM guests, but doesn't fail either.
+
+There's nothing paging-mode-specific about this test, so default to HAP if
+possible and provide a more specific message if neither HAP or Shadow are
+available.
+
+As we've got physinfo to hand, also provide more specific message about the
+absence of PV or HVM support.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/tools/tests/resource/test-resource.c b/tools/tests/resource/test-resource.c
+index 0a950072f99e..e2c4ba3478bc 100644
+--- a/tools/tests/resource/test-resource.c
++++ b/tools/tests/resource/test-resource.c
+@@ -20,6 +20,8 @@ static xc_interface *xch;
+ static xenforeignmemory_handle *fh;
+ static xengnttab_handle *gh;
+ 
++static xc_physinfo_t physinfo;
++
+ static void test_gnttab(uint32_t domid, unsigned int nr_frames,
+                         unsigned long gfn)
+ {
+@@ -172,6 +174,37 @@ static void test_domain_configurations(void)
+ 
+         printf("Test %s\n", t->name);
+ 
++#if defined(__x86_64__) || defined(__i386__)
++        if ( t->create.flags & XEN_DOMCTL_CDF_hvm )
++        {
++            if ( !(physinfo.capabilities & XEN_SYSCTL_PHYSCAP_hvm) )
++            {
++                printf("  Skip: HVM not available\n");
++                continue;
++            }
++
++            /*
++             * On x86, use HAP guests if possible, but skip if neither HAP nor
++             * SHADOW is available.
++             */
++            if ( physinfo.capabilities & XEN_SYSCTL_PHYSCAP_hap )
++                t->create.flags |= XEN_DOMCTL_CDF_hap;
++            else if ( !(physinfo.capabilities & XEN_SYSCTL_PHYSCAP_shadow) )
++            {
++                printf("  Skip: Neither HAP or SHADOW available\n");
++                continue;
++            }
++        }
++        else
++        {
++            if ( !(physinfo.capabilities & XEN_SYSCTL_PHYSCAP_pv) )
++            {
++                printf("  Skip: PV not available\n");
++                continue;
++            }
++        }
++#endif
++
+         rc = xc_domain_create(xch, &domid, &t->create);
+         if ( rc )
+         {
+@@ -214,6 +247,8 @@ static void test_domain_configurations(void)
+ 
+ int main(int argc, char **argv)
+ {
++    int rc;
++
+     printf("XENMEM_acquire_resource tests\n");
+ 
+     xch = xc_interface_open(NULL, NULL, 0);
+@@ -227,6 +262,10 @@ int main(int argc, char **argv)
+     if ( !gh )
+         err(1, "xengnttab_open");
+ 
++    rc = xc_physinfo(xch, &physinfo);
++    if ( rc )
++        err(1, "Failed to obtain physinfo");
++
+     test_domain_configurations();
+ 
+     return !!nr_failures;
