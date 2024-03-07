@@ -1,0 +1,129 @@
+From 989556c6f8ca080f5f202417af97d1188b9ba52a Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 5 Mar 2024 11:28:33 +0000
+Subject: xen/virtual-region: Rename the start/end fields
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+... to text_{start,end}.  We're about to introduce another start/end pair.
+
+Despite it's name, struct virtual_region has always been a module-ish
+description.  Call this out specifically.
+
+As minor cleanup, replace ROUNDUP(x, PAGE_SIZE) with the more concise
+PAGE_ALIGN() ahead of duplicating the example.
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+
+diff --git a/xen/common/livepatch.c b/xen/common/livepatch.c
+index a5068a221786..27af21e0d1cf 100644
+--- a/xen/common/livepatch.c
++++ b/xen/common/livepatch.c
+@@ -785,8 +785,8 @@ static int prepare_payload(struct payload *payload,
+     region = &payload->region;
+ 
+     region->symbols_lookup = livepatch_symbols_lookup;
+-    region->start = payload->text_addr;
+-    region->end = payload->text_addr + payload->text_size;
++    region->text_start = payload->text_addr;
++    region->text_end = payload->text_addr + payload->text_size;
+ 
+     /* Optional sections. */
+     for ( i = 0; i < BUGFRAME_NR; i++ )
+@@ -823,8 +823,8 @@ static int prepare_payload(struct payload *payload,
+             const void *instr = ALT_ORIG_PTR(a);
+             const void *replacement = ALT_REPL_PTR(a);
+ 
+-            if ( (instr < region->start && instr >= region->end) ||
+-                 (replacement < region->start && replacement >= region->end) )
++            if ( (instr < region->text_start && instr >= region->text_end) ||
++                 (replacement < region->text_start && replacement >= region->text_end) )
+             {
+                 printk(XENLOG_ERR LIVEPATCH "%s Alt patching outside payload: %p\n",
+                        elf->name, instr);
+diff --git a/xen/common/virtual_region.c b/xen/common/virtual_region.c
+index 9f12c30efe86..b22ffb75c4ad 100644
+--- a/xen/common/virtual_region.c
++++ b/xen/common/virtual_region.c
+@@ -11,15 +11,15 @@
+ 
+ static struct virtual_region core = {
+     .list = LIST_HEAD_INIT(core.list),
+-    .start = _stext,
+-    .end = _etext,
++    .text_start = _stext,
++    .text_end = _etext,
+ };
+ 
+ /* Becomes irrelevant when __init sections are cleared. */
+ static struct virtual_region core_init __initdata = {
+     .list = LIST_HEAD_INIT(core_init.list),
+-    .start = _sinittext,
+-    .end = _einittext,
++    .text_start = _sinittext,
++    .text_end = _einittext,
+ };
+ 
+ /*
+@@ -39,7 +39,8 @@ const struct virtual_region *find_text_region(unsigned long addr)
+     rcu_read_lock(&rcu_virtual_region_lock);
+     list_for_each_entry_rcu( region, &virtual_region_list, list )
+     {
+-        if ( (void *)addr >= region->start && (void *)addr < region->end )
++        if ( (void *)addr >= region->text_start &&
++             (void *)addr <  region->text_end )
+         {
+             rcu_read_unlock(&rcu_virtual_region_lock);
+             return region;
+@@ -88,8 +89,8 @@ void relax_virtual_region_perms(void)
+ 
+     rcu_read_lock(&rcu_virtual_region_lock);
+     list_for_each_entry_rcu( region, &virtual_region_list, list )
+-        modify_xen_mappings_lite((unsigned long)region->start,
+-                                 ROUNDUP((unsigned long)region->end, PAGE_SIZE),
++        modify_xen_mappings_lite((unsigned long)region->text_start,
++                                 PAGE_ALIGN((unsigned long)region->text_end),
+                                  PAGE_HYPERVISOR_RWX);
+     rcu_read_unlock(&rcu_virtual_region_lock);
+ }
+@@ -100,8 +101,8 @@ void tighten_virtual_region_perms(void)
+ 
+     rcu_read_lock(&rcu_virtual_region_lock);
+     list_for_each_entry_rcu( region, &virtual_region_list, list )
+-        modify_xen_mappings_lite((unsigned long)region->start,
+-                                 ROUNDUP((unsigned long)region->end, PAGE_SIZE),
++        modify_xen_mappings_lite((unsigned long)region->text_start,
++                                 PAGE_ALIGN((unsigned long)region->text_end),
+                                  PAGE_HYPERVISOR_RX);
+     rcu_read_unlock(&rcu_virtual_region_lock);
+ }
+diff --git a/xen/include/xen/virtual_region.h b/xen/include/xen/virtual_region.h
+index d05362071135..442a45bf1f50 100644
+--- a/xen/include/xen/virtual_region.h
++++ b/xen/include/xen/virtual_region.h
+@@ -9,11 +9,18 @@
+ #include <xen/list.h>
+ #include <xen/symbols.h>
+ 
++/*
++ * Despite it's name, this is a module(ish) description.
++ *
++ * There's one region for the runtime .text/etc, one region for .init during
++ * boot only, and one region per livepatch.
++ */
+ struct virtual_region
+ {
+     struct list_head list;
+-    const void *start;                /* Virtual address start. */
+-    const void *end;                  /* Virtual address end. */
++
++    const void *text_start;                /* .text virtual address start. */
++    const void *text_end;                  /* .text virtual address end. */
+ 
+     /* If this is NULL the default lookup mechanism is used. */
+     symbols_lookup_t *symbols_lookup;
