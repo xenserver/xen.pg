@@ -1,0 +1,206 @@
+From cf10a46634bac64a2c02878c1cda4d7e6438a02c Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Mon, 4 Mar 2024 16:24:21 +0100
+Subject: [PATCH 7/7] x86: protect conditional lock taking from speculative
+ execution
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Conditionally taken locks that use the pattern:
+
+if ( lock )
+    spin_lock(...);
+
+Need an else branch in order to issue an speculation barrier in the else case,
+just like it's done in case the lock needs to be acquired.
+
+eval_nospec() could be used on the condition itself, but that would result in a
+double barrier on the branch where the lock is taken.
+
+Introduce a new pair of helpers, {gfn,spin}_lock_if() that can be used to
+conditionally take a lock in a speculation safe way.
+
+This is part of XSA-453 / CVE-2024-2193
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 273b20f9fea6..06a8dc0631e7 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -5023,8 +5023,7 @@ static l3_pgentry_t *virt_to_xen_l3e(unsigned long v)
+         if ( !l3t )
+             return NULL;
+         UNMAP_DOMAIN_PAGE(l3t);
+-        if ( locking )
+-            spin_lock(&map_pgdir_lock);
++        spin_lock_if(locking, &map_pgdir_lock);
+         if ( !(l4e_get_flags(*pl4e) & _PAGE_PRESENT) )
+         {
+             l4_pgentry_t l4e = l4e_from_mfn(l3mfn, __PAGE_HYPERVISOR);
+@@ -5061,8 +5060,7 @@ static l2_pgentry_t *virt_to_xen_l2e(unsigned long v)
+             return NULL;
+         }
+         UNMAP_DOMAIN_PAGE(l2t);
+-        if ( locking )
+-            spin_lock(&map_pgdir_lock);
++        spin_lock_if(locking, &map_pgdir_lock);
+         if ( !(l3e_get_flags(*pl3e) & _PAGE_PRESENT) )
+         {
+             l3e_write(pl3e, l3e_from_mfn(l2mfn, __PAGE_HYPERVISOR));
+@@ -5100,8 +5098,7 @@ l1_pgentry_t *virt_to_xen_l1e(unsigned long v)
+             return NULL;
+         }
+         UNMAP_DOMAIN_PAGE(l1t);
+-        if ( locking )
+-            spin_lock(&map_pgdir_lock);
++        spin_lock_if(locking, &map_pgdir_lock);
+         if ( !(l2e_get_flags(*pl2e) & _PAGE_PRESENT) )
+         {
+             l2e_write(pl2e, l2e_from_mfn(l1mfn, __PAGE_HYPERVISOR));
+@@ -5132,6 +5129,8 @@ l1_pgentry_t *virt_to_xen_l1e(unsigned long v)
+     do {                      \
+         if ( locking )        \
+             l3t_lock(page);   \
++        else                            \
++            block_lock_speculation();   \
+     } while ( false )
+ 
+ #define L3T_UNLOCK(page)                           \
+@@ -5347,8 +5346,7 @@ int map_pages_to_xen(
+             if ( l3e_get_flags(ol3e) & _PAGE_GLOBAL )
+                 flush_flags |= FLUSH_TLB_GLOBAL;
+ 
+-            if ( locking )
+-                spin_lock(&map_pgdir_lock);
++            spin_lock_if(locking, &map_pgdir_lock);
+             if ( (l3e_get_flags(*pl3e) & _PAGE_PRESENT) &&
+                  (l3e_get_flags(*pl3e) & _PAGE_PSE) )
+             {
+@@ -5452,8 +5450,7 @@ int map_pages_to_xen(
+                 if ( l2e_get_flags(*pl2e) & _PAGE_GLOBAL )
+                     flush_flags |= FLUSH_TLB_GLOBAL;
+ 
+-                if ( locking )
+-                    spin_lock(&map_pgdir_lock);
++                spin_lock_if(locking, &map_pgdir_lock);
+                 if ( (l2e_get_flags(*pl2e) & _PAGE_PRESENT) &&
+                      (l2e_get_flags(*pl2e) & _PAGE_PSE) )
+                 {
+@@ -5494,8 +5491,7 @@ int map_pages_to_xen(
+                 unsigned long base_mfn;
+                 const l1_pgentry_t *l1t;
+ 
+-                if ( locking )
+-                    spin_lock(&map_pgdir_lock);
++                spin_lock_if(locking, &map_pgdir_lock);
+ 
+                 ol2e = *pl2e;
+                 /*
+@@ -5549,8 +5545,7 @@ int map_pages_to_xen(
+             unsigned long base_mfn;
+             const l2_pgentry_t *l2t;
+ 
+-            if ( locking )
+-                spin_lock(&map_pgdir_lock);
++            spin_lock_if(locking, &map_pgdir_lock);
+ 
+             ol3e = *pl3e;
+             /*
+@@ -5694,8 +5689,7 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
+                                        l3e_get_flags(*pl3e)));
+             UNMAP_DOMAIN_PAGE(l2t);
+ 
+-            if ( locking )
+-                spin_lock(&map_pgdir_lock);
++            spin_lock_if(locking, &map_pgdir_lock);
+             if ( (l3e_get_flags(*pl3e) & _PAGE_PRESENT) &&
+                  (l3e_get_flags(*pl3e) & _PAGE_PSE) )
+             {
+@@ -5754,8 +5748,7 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
+                                            l2e_get_flags(*pl2e) & ~_PAGE_PSE));
+                 UNMAP_DOMAIN_PAGE(l1t);
+ 
+-                if ( locking )
+-                    spin_lock(&map_pgdir_lock);
++                spin_lock_if(locking, &map_pgdir_lock);
+                 if ( (l2e_get_flags(*pl2e) & _PAGE_PRESENT) &&
+                      (l2e_get_flags(*pl2e) & _PAGE_PSE) )
+                 {
+@@ -5799,8 +5792,7 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
+              */
+             if ( (nf & _PAGE_PRESENT) || ((v != e) && (l1_table_offset(v) != 0)) )
+                 continue;
+-            if ( locking )
+-                spin_lock(&map_pgdir_lock);
++            spin_lock_if(locking, &map_pgdir_lock);
+ 
+             /*
+              * L2E may be already cleared, or set to a superpage, by
+@@ -5847,8 +5839,7 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
+         if ( (nf & _PAGE_PRESENT) ||
+              ((v != e) && (l2_table_offset(v) + l1_table_offset(v) != 0)) )
+             continue;
+-        if ( locking )
+-            spin_lock(&map_pgdir_lock);
++        spin_lock_if(locking, &map_pgdir_lock);
+ 
+         /*
+          * L3E may be already cleared, or set to a superpage, by
+diff --git a/xen/arch/x86/mm/mm-locks.h b/xen/arch/x86/mm/mm-locks.h
+index 4221307e01e4..9ff118e89602 100644
+--- a/xen/arch/x86/mm/mm-locks.h
++++ b/xen/arch/x86/mm/mm-locks.h
+@@ -349,6 +349,15 @@ static inline void p2m_unlock(struct p2m_domain *p)
+ #define p2m_locked_by_me(p)   mm_write_locked_by_me(&(p)->lock)
+ #define gfn_locked_by_me(p,g) p2m_locked_by_me(p)
+ 
++static always_inline void gfn_lock_if(bool condition, struct p2m_domain *p2m,
++                                      gfn_t gfn, unsigned int order)
++{
++    if ( condition )
++        gfn_lock(p2m, gfn, order);
++    else
++        block_lock_speculation();
++}
++
+ /* PoD lock (per-p2m-table)
+  *
+  * Protects private PoD data structs: entry and cache
+diff --git a/xen/arch/x86/mm/p2m.c b/xen/arch/x86/mm/p2m.c
+index b28c899b5ea7..1fa9e01012a2 100644
+--- a/xen/arch/x86/mm/p2m.c
++++ b/xen/arch/x86/mm/p2m.c
+@@ -292,9 +292,8 @@ mfn_t p2m_get_gfn_type_access(struct p2m_domain *p2m, gfn_t gfn,
+     if ( q & P2M_UNSHARE )
+         q |= P2M_ALLOC;
+ 
+-    if ( locked )
+-        /* Grab the lock here, don't release until put_gfn */
+-        gfn_lock(p2m, gfn, 0);
++    /* Grab the lock here, don't release until put_gfn */
++    gfn_lock_if(locked, p2m, gfn, 0);
+ 
+     mfn = p2m->get_entry(p2m, gfn, t, a, q, page_order, NULL);
+ 
+diff --git a/xen/include/xen/spinlock.h b/xen/include/xen/spinlock.h
+index daf48fdea709..7e75d0e2e7fb 100644
+--- a/xen/include/xen/spinlock.h
++++ b/xen/include/xen/spinlock.h
+@@ -216,6 +216,14 @@ static always_inline void spin_lock_irq(spinlock_t *l)
+         block_lock_speculation();                               \
+     })
+ 
++/* Conditionally take a spinlock in a speculation safe way. */
++static always_inline void spin_lock_if(bool condition, spinlock_t *l)
++{
++    if ( condition )
++        _spin_lock(l);
++    block_lock_speculation();
++}
++
+ #define spin_unlock(l)                _spin_unlock(l)
+ #define spin_unlock_irq(l)            _spin_unlock_irq(l)
+ #define spin_unlock_irqrestore(l, f)  _spin_unlock_irqrestore(l, f)

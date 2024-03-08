@@ -1,0 +1,65 @@
+From 769500f0923c8b4f972803492986c1ff06774f7b Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Mon, 4 Mar 2024 18:08:48 +0100
+Subject: [PATCH 6/7] x86/mm: add speculation barriers to open coded locks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a speculation barrier to the clearly identified open-coded lock taking
+functions.
+
+Note that the memory sharing page_lock() replacement (_page_lock()) is left
+as-is, as the code is experimental and not security supported.
+
+This is part of XSA-453 / CVE-2024-2193
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/include/asm/mm.h b/xen/arch/x86/include/asm/mm.h
+index a5d7fdd32ea7..5845b729c3f7 100644
+--- a/xen/arch/x86/include/asm/mm.h
++++ b/xen/arch/x86/include/asm/mm.h
+@@ -393,7 +393,9 @@ const struct platform_bad_page *get_platform_badpages(unsigned int *array_size);
+  * The use of PGT_locked in mem_sharing does not collide, since mem_sharing is
+  * only supported for hvm guests, which do not have PV PTEs updated.
+  */
+-int page_lock(struct page_info *page);
++int page_lock_unsafe(struct page_info *page);
++#define page_lock(pg)   lock_evaluate_nospec(page_lock_unsafe(pg))
++
+ void page_unlock(struct page_info *page);
+ 
+ void put_page_type(struct page_info *page);
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index e884a6fdbd33..273b20f9fea6 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -2033,7 +2033,7 @@ static inline bool current_locked_page_ne_check(struct page_info *page) {
+ #define current_locked_page_ne_check(x) true
+ #endif
+ 
+-int page_lock(struct page_info *page)
++int page_lock_unsafe(struct page_info *page)
+ {
+     unsigned long x, nx;
+ 
+@@ -2094,7 +2094,7 @@ void page_unlock(struct page_info *page)
+  * l3t_lock(), so to avoid deadlock we must avoid grabbing them in
+  * reverse order.
+  */
+-static void l3t_lock(struct page_info *page)
++static always_inline void l3t_lock(struct page_info *page)
+ {
+     unsigned long x, nx;
+ 
+@@ -2103,6 +2103,8 @@ static void l3t_lock(struct page_info *page)
+             cpu_relax();
+         nx = x | PGT_locked;
+     } while ( cmpxchg(&page->u.inuse.type_info, x, nx) != x );
++
++    block_lock_speculation();
+ }
+ 
+ static void l3t_unlock(struct page_info *page)
