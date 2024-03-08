@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 3
+%global hv_rel 4
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -886,6 +886,17 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Mar  8 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-4
+- Fixes for:
+  - XSA-452 CVE-2024-2193, off by default
+  - XSA-453 CVE-2023-28746
+- Fix levelling of MD_CLEAR/FB_CLEAR across a pool
+- Hide x2APIC from PV guests by default
+- Fixes to livepatching, including the ability to patch .rodata
+- Improve oxenstored performance by avoiding Hashtbl.copy when processing
+  packets
+- Print the SPECULATIVE_HARDEN_* options which are enabled at build time
+
 * Fri Feb 23 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-3
 - Fix for XSA-451 CVE-2023-46841.
 - Fix the migration of VMs which had previously seen the CMP_LEGACY feature.
