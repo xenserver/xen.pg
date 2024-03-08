@@ -1,0 +1,149 @@
+From 95a9fdbb1f2decc996853a5f9d2622ebaa5c5db3 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 20 Sep 2023 20:06:53 +0100
+Subject: [PATCH 1/7] x86/paging: Delete update_cr3()'s do_locking parameter
+
+Nicola reports that the XSA-438 fix introduced new MISRA violations because of
+some incidental tidying it tried to do.  The parameter is useless, so resolve
+the MISRA regression by removing it.
+
+hap_update_cr3() discards the parameter entirely, while sh_update_cr3() uses
+it to distinguish internal and external callers and therefore whether the
+paging lock should be taken.
+
+However, we have paging_lock_recursive() for this purpose, which also avoids
+the ability for the shadow internal callers to accidentally not hold the lock.
+
+Fixes: fb0ff49fe9f7 ("x86/shadow: defer releasing of PV's top-level shadow reference")
+Reported-by: Nicola Vetrini <nicola.vetrini@bugseng.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Release-acked-by: Henry Wang <Henry.Wang@arm.com>
+master commit: e71157d1ac2a7fbf413130663cf0a93ff9fbcf7e
+master date: 2023-09-22 15:00:17 +0000
+diff --git a/xen/arch/x86/mm/hap/hap.c b/xen/arch/x86/mm/hap/hap.c
+index 312e341413fd..47c9126555ff 100644
+--- a/xen/arch/x86/mm/hap/hap.c
++++ b/xen/arch/x86/mm/hap/hap.c
+@@ -710,7 +710,7 @@ static bool_t hap_invlpg(struct vcpu *v, unsigned long linear)
+     return 1;
+ }
+ 
+-static pagetable_t hap_update_cr3(struct vcpu *v, bool do_locking, bool noflush)
++static pagetable_t hap_update_cr3(struct vcpu *v, bool noflush)
+ {
+     v->arch.hvm.hw_cr[3] = v->arch.hvm.guest_cr[3];
+     hvm_update_guest_cr3(v, noflush);
+@@ -800,7 +800,7 @@ static void hap_update_paging_modes(struct vcpu *v)
+     }
+ 
+     /* CR3 is effectively updated by a mode change. Flush ASIDs, etc. */
+-    hap_update_cr3(v, 0, false);
++    hap_update_cr3(v, false);
+ 
+  unlock:
+     paging_unlock(d);
+diff --git a/xen/arch/x86/mm/shadow/common.c b/xen/arch/x86/mm/shadow/common.c
+index 88b5d3e235df..d53997ff7cec 100644
+--- a/xen/arch/x86/mm/shadow/common.c
++++ b/xen/arch/x86/mm/shadow/common.c
+@@ -2620,7 +2620,7 @@ static void sh_update_paging_modes(struct vcpu *v)
+     }
+ #endif /* OOS */
+ 
+-    v->arch.paging.mode->update_cr3(v, 0, false);
++    v->arch.paging.mode->update_cr3(v, false);
+ }
+ 
+ void shadow_update_paging_modes(struct vcpu *v)
+diff --git a/xen/arch/x86/mm/shadow/multi.c b/xen/arch/x86/mm/shadow/multi.c
+index b9c02bdbdd68..2ed7cdc96e40 100644
+--- a/xen/arch/x86/mm/shadow/multi.c
++++ b/xen/arch/x86/mm/shadow/multi.c
+@@ -3118,7 +3118,7 @@ static int sh_page_fault(struct vcpu *v,
+          * In any case, in the PAE case, the ASSERT is not true; it can
+          * happen because of actions the guest is taking. */
+ #if GUEST_PAGING_LEVELS == 3
+-        v->arch.paging.mode->update_cr3(v, 0, false);
++        v->arch.paging.mode->update_cr3(v, false);
+ #else
+         ASSERT(d->is_shutting_down);
+ #endif
+@@ -3940,17 +3940,13 @@ sh_set_toplevel_shadow(struct vcpu *v,
+ }
+ 
+ 
+-static pagetable_t
+-sh_update_cr3(struct vcpu *v, bool do_locking, bool noflush)
++static pagetable_t sh_update_cr3(struct vcpu *v, bool noflush)
+ /* Updates vcpu->arch.cr3 after the guest has changed CR3.
+  * Paravirtual guests should set v->arch.guest_table (and guest_table_user,
+  * if appropriate).
+  * HVM guests should also make sure hvm_get_guest_cntl_reg(v, 3) works;
+  * this function will call hvm_update_guest_cr(v, 3) to tell them where the
+  * shadow tables are.
+- * If do_locking != 0, assume we are being called from outside the
+- * shadow code, and must take and release the paging lock; otherwise
+- * that is the caller's responsibility.
+  */
+ {
+     struct domain *d = v->domain;
+@@ -3968,7 +3964,11 @@ sh_update_cr3(struct vcpu *v, bool do_locking, bool noflush)
+         return old_entry;
+     }
+ 
+-    if ( do_locking ) paging_lock(v->domain);
++    /*
++     * This is used externally (with the paging lock not taken) and internally
++     * by the shadow code (with the lock already taken).
++     */
++    paging_lock_recursive(v->domain);
+ 
+ #if (SHADOW_OPTIMIZATIONS & SHOPT_OUT_OF_SYNC)
+     /* Need to resync all the shadow entries on a TLB flush.  Resync
+@@ -4192,8 +4192,7 @@ sh_update_cr3(struct vcpu *v, bool do_locking, bool noflush)
+     shadow_sync_other_vcpus(v);
+ #endif
+ 
+-    /* Release the lock, if we took it (otherwise it's the caller's problem) */
+-    if ( do_locking ) paging_unlock(v->domain);
++    paging_unlock(v->domain);
+ 
+     return old_entry;
+ }
+diff --git a/xen/arch/x86/mm/shadow/none.c b/xen/arch/x86/mm/shadow/none.c
+index 586555bfe8fa..e6ce6d7632af 100644
+--- a/xen/arch/x86/mm/shadow/none.c
++++ b/xen/arch/x86/mm/shadow/none.c
+@@ -50,7 +50,7 @@ static unsigned long _gva_to_gfn(struct vcpu *v, struct p2m_domain *p2m,
+     return gfn_x(INVALID_GFN);
+ }
+ 
+-static pagetable_t _update_cr3(struct vcpu *v, bool do_locking, bool noflush)
++static pagetable_t _update_cr3(struct vcpu *v, bool noflush)
+ {
+     ASSERT_UNREACHABLE();
+     return pagetable_null();
+diff --git a/xen/include/asm-x86/paging.h b/xen/include/asm-x86/paging.h
+index 6ab77330ae62..507977393403 100644
+--- a/xen/include/asm-x86/paging.h
++++ b/xen/include/asm-x86/paging.h
+@@ -133,8 +133,7 @@ struct paging_mode {
+                                             unsigned long cr3,
+                                             paddr_t ga, uint32_t *pfec,
+                                             unsigned int *page_order);
+-    pagetable_t   (*update_cr3            )(struct vcpu *v, bool do_locking,
+-                                            bool noflush);
++    pagetable_t   (*update_cr3            )(struct vcpu *v, bool noflush);
+     void          (*update_paging_modes   )(struct vcpu *v);
+     int           (*write_p2m_entry       )(struct p2m_domain *p2m,
+                                             unsigned long gfn,
+@@ -295,7 +294,7 @@ static inline unsigned long paging_ga_to_gfn_cr3(struct vcpu *v,
+  * as the value to load into the host CR3 to schedule this vcpu */
+ static inline pagetable_t paging_update_cr3(struct vcpu *v, bool noflush)
+ {
+-    return paging_get_hostmode(v)->update_cr3(v, 1, noflush);
++    return paging_get_hostmode(v)->update_cr3(v, noflush);
+ }
+ 
+ /* Update all the things that are derived from the guest's CR0/CR3/CR4.
