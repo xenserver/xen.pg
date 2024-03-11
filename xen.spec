@@ -878,8 +878,8 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 * Fri Mar  8 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.39
 - Fixes for:
   - XSA-449 CVE-2023-46839
-  - XSA-452 CVE-2024-2193, off by default
-  - XSA-453 CVE-2023-28746
+  - XSA-453 CVE-2024-2193, off by default
+  - XSA-452 CVE-2023-28746
 
 * Mon Nov 6 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.38
 - Fixes for
