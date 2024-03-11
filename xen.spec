@@ -888,8 +888,8 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %changelog
 * Fri Mar  8 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-4
 - Fixes for:
-  - XSA-452 CVE-2024-2193, off by default
-  - XSA-453 CVE-2023-28746
+  - XSA-453 CVE-2024-2193, off by default
+  - XSA-452 CVE-2023-28746
 - Fix levelling of MD_CLEAR/FB_CLEAR across a pool
 - Hide x2APIC from PV guests by default
 - Fixes to livepatching, including the ability to patch .rodata
