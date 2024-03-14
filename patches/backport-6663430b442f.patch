@@ -1,22 +1,46 @@
-From 26bf179493fee4011c7398f57da71d66c5e432f0 Mon Sep 17 00:00:00 2001
+From 6663430b442fdf9698bd8e03f701a4547309ad71 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Tue, 5 Mar 2024 19:33:37 +0000
 Subject: x86/spec-ctrl: VERW-handling adjustments
 
 ... before we add yet more complexity to this logic.  Mostly expanded
-comments, but with two minor changes.
+comments, but with three minor changes.
 
- * We only ever need SC_VERW_IDLE when SMT is active.
- * L1D_FLUSH can only be a substitute for VERW when MD_CLEAR is the
-   only *_CLEAR we can see.
+1) Introduce cpu_has_useful_md_clear to simplify later logic in this patch and
+   future ones.
+
+2) We only ever need SC_VERW_IDLE when SMT is active.  If SMT isn't active,
+   then there's no re-partition of pipeline resources based on thread-idleness
+   to worry about.
+
+3) The logic to adjust HVM VERW based on L1D_FLUSH is unmaintainable and, as
+   it turns out, wrong.  SKIP_L1DFL is just a hint bit, whereas opt_l1d_flush
+   is the relevant decision of whether to use L1D_FLUSH based on
+   susceptibility and user preference.
+
+   Rewrite the logic so it can be followed, and incorporate the fact that when
+   FB_CLEAR is visible, L1D_FLUSH isn't a safe substitution.
+
+This is part of XSA-452 / CVE-2023-28746.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 1eb91a8a06230b4b64228c9a380194f8cfe6c5e2)
 
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index e12ec9930cf7..541e3ffc0ad3 100644
+index e12ec9930cf7..adb6bc74e8e6 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
-@@ -1867,24 +1867,62 @@ void __init init_speculation_mitigations(void)
+@@ -1531,7 +1531,7 @@ void __init init_speculation_mitigations(void)
+ {
+     enum ind_thunk thunk = THUNK_DEFAULT;
+     bool has_spec_ctrl, ibrs = false, hw_smt_enabled;
+-    bool cpu_has_bug_taa, retpoline_safe;
++    bool cpu_has_bug_taa, cpu_has_useful_md_clear, retpoline_safe;
+ 
+     hw_smt_enabled = check_smt_enabled();
+ 
+@@ -1867,50 +1867,97 @@ void __init init_speculation_mitigations(void)
              "enabled.  Please assess your configuration and choose an\n"
              "explicit 'smt=<bool>' setting.  See XSA-273.\n");
  
@@ -80,14 +104,28 @@ index e12ec9930cf7..541e3ffc0ad3 100644
 -     * By default, enable PV and HVM mitigations on MDS-vulnerable hardware.
 -     * This will only be a token effort for MLPDS/MFBDS when HT is enabled,
 -     * but it is somewhat better than nothing.
++     * MD_CLEAR is enumerated architecturally forevermore, even after the
++     * scrubbing side effects have been removed.  Create ourselves an version
++     * which expressed whether we think MD_CLEAR is having any useful side
++     * effect.
++     */
++    cpu_has_useful_md_clear = (cpu_has_md_clear &&
++                               (cpu_has_bug_mds || cpu_has_bug_msbds_only));
++
++    /*
 +     * By default, use VERW scrubbing on applicable hardware, if we think it's
 +     * going to have an effect.  This will only be a token effort for
 +     * MLPDS/MFBDS when SMT is enabled.
       */
      if ( opt_verw_pv == -1 )
-         opt_verw_pv = ((cpu_has_bug_mds || cpu_has_bug_msbds_only) &&
-@@ -1895,22 +1933,24 @@ void __init init_speculation_mitigations(void)
-                         cpu_has_md_clear);
+-        opt_verw_pv = ((cpu_has_bug_mds || cpu_has_bug_msbds_only) &&
+-                       cpu_has_md_clear);
++        opt_verw_pv = cpu_has_useful_md_clear;
+ 
+     if ( opt_verw_hvm == -1 )
+-        opt_verw_hvm = ((cpu_has_bug_mds || cpu_has_bug_msbds_only) &&
+-                        cpu_has_md_clear);
++        opt_verw_hvm = cpu_has_useful_md_clear;
  
      /*
 -     * Enable MDS/MMIO defences as applicable.  The Idle blocks need using if
@@ -103,11 +141,12 @@ index e12ec9930cf7..541e3ffc0ad3 100644
 -     * opt_verw_hvm to mean just "should we VERW on the way into HVM
 -     * guests", so spec_ctrl_init_domain() can calculate suitable settings.
 +     * If SMT is active, and we're protecting against MDS or MMIO stale data,
-+     * we need to scrub before going idle too, to avoid secrets moving
-+     * sideways into other threads upon pipeline resource repartition.
++     * we need to scrub before going idle as well as on return to guest.
++     * Various pipeline resources are repartitioned amongst non-idle threads.
       */
 -    if ( opt_verw_pv || opt_verw_hvm || opt_verw_mmio )
-+    if ( hw_smt_enabled && (opt_verw_pv || opt_verw_hvm || opt_verw_mmio) )
++    if ( ((cpu_has_useful_md_clear && (opt_verw_pv || opt_verw_hvm)) ||
++          opt_verw_mmio) && hw_smt_enabled )
          setup_force_cpu_cap(X86_FEATURE_SC_VERW_IDLE);
 -    opt_verw_hvm &= !cpu_has_skip_l1dfl && !opt_l1d_flush;
 +
@@ -119,8 +158,7 @@ index e12ec9930cf7..541e3ffc0ad3 100644
 +     * It is only safe to use L1D_FLUSH in place of VERW when MD_CLEAR is the
 +     * only *_CLEAR we can see.
 +     */
-+    if ( opt_verw_hvm && opt_l1d_flush && cpu_has_md_clear &&
-+         !cpu_has_fb_clear )
++    if ( opt_l1d_flush && cpu_has_md_clear && !cpu_has_fb_clear )
 +        opt_verw_hvm = false;
  
      /*

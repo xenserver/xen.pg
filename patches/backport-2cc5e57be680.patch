@@ -1,8 +1,7 @@
-From 66220bbf216c623f103d3df44d291990d238fc41 Mon Sep 17 00:00:00 2001
-From: Roger Pau Monne <roger.pau@citrix.com>
+From 2cc5e57be680a516aa5cdef4281856d09b9d0ea6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
 Date: Mon, 4 Mar 2024 14:29:36 +0100
-Subject: [PATCH 5/7] locking: attempt to ensure lock wrappers are always
- inline
+Subject: locking: attempt to ensure lock wrappers are always inline
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -22,6 +21,7 @@ This is part of XSA-453 / CVE-2024-2193
 
 Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 197ecd838a2aaf959a469df3696d4559c4f8b762)
 
 diff --git a/xen/arch/x86/hvm/vpt.c b/xen/arch/x86/hvm/vpt.c
 index cb1d81bf9e82..66f10952456b 100644
@@ -65,7 +65,7 @@ index f6a0207a8087..823d627fd001 100644
  void unlock_vector_lock(void);
  
 diff --git a/xen/arch/x86/mm/mm-locks.h b/xen/arch/x86/mm/mm-locks.h
-index c1523aeccf99..4221307e01e4 100644
+index c1523aeccf99..265239c49f39 100644
 --- a/xen/arch/x86/mm/mm-locks.h
 +++ b/xen/arch/x86/mm/mm-locks.h
 @@ -86,8 +86,8 @@ static inline void _set_lock_level(int l)
@@ -110,22 +110,20 @@ index c1523aeccf99..4221307e01e4 100644
  {
      _check_lock_level(d, level);
      percpu_read_lock(p2m_percpu_rwlock, &l->lock);
-@@ -178,15 +180,17 @@ static inline void mm_read_unlock(mm_rwlock_t *l)
+@@ -178,15 +180,15 @@ static inline void mm_read_unlock(mm_rwlock_t *l)
  
  /* This wrapper uses the line number to express the locking order below */
  #define declare_mm_lock(name)                                                 \
 -    static inline void mm_lock_##name(const struct domain *d, mm_lock_t *l,   \
 -                                      const char *func, int rec)              \
-+    static always_inline void mm_lock_##name(const struct domain *d,          \
-+                                             mm_lock_t *l, const char *func,  \
-+                                             int rec)                         \
++    static always_inline void mm_lock_##name(                                 \
++        const struct domain *d, mm_lock_t *l, const char *func, int rec)      \
      { _mm_lock(d, l, func, MM_LOCK_ORDER_##name, rec); }
  #define declare_mm_rwlock(name)                                               \
 -    static inline void mm_write_lock_##name(const struct domain *d,           \
 -                                            mm_rwlock_t *l, const char *func) \
-+    static always_inline void mm_write_lock_##name(const struct domain *d,    \
-+                                                   mm_rwlock_t *l,            \
-+                                                   const char *func)          \
++    static always_inline void mm_write_lock_##name(                           \
++        const struct domain *d, mm_rwlock_t *l, const char *func)             \
      { _mm_write_lock(d, l, func, MM_LOCK_ORDER_##name); }                     \
 -    static inline void mm_read_lock_##name(const struct domain *d,            \
 -                                           mm_rwlock_t *l)                    \
@@ -134,7 +132,7 @@ index c1523aeccf99..4221307e01e4 100644
      { _mm_read_lock(d, l, MM_LOCK_ORDER_##name); }
  /* These capture the name of the calling function */
  #define mm_lock(name, d, l) mm_lock_##name(d, l, __func__, 0)
-@@ -321,7 +325,7 @@ declare_mm_lock(altp2mlist)
+@@ -321,7 +323,7 @@ declare_mm_lock(altp2mlist)
  #define MM_LOCK_ORDER_altp2m                 40
  declare_mm_rwlock(altp2m);
  
@@ -180,7 +178,7 @@ index f5e0b12d1520..dada9f15f574 100644
      ASSERT(lchn != rchn);
  
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index 4cefd78f25b0..8263784afc2f 100644
+index ee7cc496b8cb..62a8685cd514 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
 @@ -410,7 +410,7 @@ static inline void act_set_gfn(struct active_grant_entry *act, gfn_t gfn)
@@ -211,18 +209,17 @@ index 4cefd78f25b0..8263784afc2f 100644
  {
      struct active_grant_entry *act;
 diff --git a/xen/common/sched/core.c b/xen/common/sched/core.c
-index 078beb1adbbd..b4c1daeecc0b 100644
+index 078beb1adbbd..29bbab5ac6fd 100644
 --- a/xen/common/sched/core.c
 +++ b/xen/common/sched/core.c
-@@ -348,23 +348,29 @@ uint64_t get_cpu_idle_time(unsigned int cpu)
+@@ -348,23 +348,28 @@ uint64_t get_cpu_idle_time(unsigned int cpu)
   * This avoids dead- or live-locks when this code is running on both
   * cpus at the same time.
   */
 -static void sched_spin_lock_double(spinlock_t *lock1, spinlock_t *lock2,
 -                                   unsigned long *flags)
-+static always_inline void sched_spin_lock_double(spinlock_t *lock1,
-+                                                 spinlock_t *lock2,
-+                                                 unsigned long *flags)
++static always_inline void sched_spin_lock_double(
++    spinlock_t *lock1, spinlock_t *lock2, unsigned long *flags)
  {
 +    /*
 +     * In order to avoid extra overhead, use the locking primitives without the

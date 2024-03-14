@@ -1,8 +1,8 @@
-From fd8cf38a9dcef770ec27b3d36a1622b642ac6f66 Mon Sep 17 00:00:00 2001
-From: Roger Pau Monne <roger.pau@citrix.com>
+From 9d2f136328aab5537b7180a1b23e171893ebe455 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
 Date: Tue, 13 Feb 2024 13:08:05 +0100
-Subject: [PATCH 2/7] x86/spinlock: introduce support for blocking speculation
- into critical regions
+Subject: x86/spinlock: introduce support for blocking speculation into
+ critical regions
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -30,12 +30,13 @@ This is part of XSA-453 / CVE-2024-2193
 
 Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 7ef0084418e188d05f338c3e028fbbe8b6924afa)
 
 diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
-index 39661712b491..3d6f3a63b7ff 100644
+index d909ec94fe7c..e1d56407dd88 100644
 --- a/docs/misc/xen-command-line.pandoc
 +++ b/docs/misc/xen-command-line.pandoc
-@@ -2337,7 +2337,7 @@ By default SSBD will be mitigated at runtime (i.e `ssbd=runtime`).
+@@ -2327,7 +2327,7 @@ By default SSBD will be mitigated at runtime (i.e `ssbd=runtime`).
  >              {msr-sc,rsb,verw,ibpb-entry}=<bool>|{pv,hvm}=<bool>,
  >              bti-thunk=retpoline|lfence|jmp, {ibrs,ibpb,ssbd,psfd,
  >              eager-fpu,l1d-flush,branch-harden,srb-lock,
@@ -44,7 +45,7 @@ index 39661712b491..3d6f3a63b7ff 100644
  
  Controls for speculative execution sidechannel mitigations.  By default, Xen
  will pick the most appropriate mitigations based on compiled in support,
-@@ -2464,6 +2464,11 @@ On all hardware, the `div-scrub=` option can be used to force or prevent Xen
+@@ -2454,6 +2454,11 @@ On all hardware, the `div-scrub=` option can be used to force or prevent Xen
  from mitigating the DIV-leakage vulnerability.  By default, Xen will mitigate
  DIV-leakage on hardware believed to be vulnerable.
  
@@ -57,7 +58,7 @@ index 39661712b491..3d6f3a63b7ff 100644
  > `= <boolean>`
  
 diff --git a/xen/arch/x86/include/asm/cpufeatures.h b/xen/arch/x86/include/asm/cpufeatures.h
-index c3aad21c3b43..2f9ba502501e 100644
+index c3aad21c3b43..7e8221fd85dd 100644
 --- a/xen/arch/x86/include/asm/cpufeatures.h
 +++ b/xen/arch/x86/include/asm/cpufeatures.h
 @@ -24,7 +24,7 @@ XEN_CPUFEATURE(APERFMPERF,        X86_SYNTH( 8)) /* APERFMPERF */
@@ -65,12 +66,12 @@ index c3aad21c3b43..2f9ba502501e 100644
  XEN_CPUFEATURE(XEN_SMEP,          X86_SYNTH(10)) /* SMEP gets used by Xen itself */
  XEN_CPUFEATURE(XEN_SMAP,          X86_SYNTH(11)) /* SMAP gets used by Xen itself */
 -/* Bit 12 unused. */
-+XEN_CPUFEATURE(SC_LOCK_HARDEN,    X86_SYNTH(12)) /* Lock critical region hardening */
++XEN_CPUFEATURE(SC_NO_LOCK_HARDEN, X86_SYNTH(12)) /* (Disable) Lock critical region hardening */
  XEN_CPUFEATURE(IND_THUNK_LFENCE,  X86_SYNTH(13)) /* Use IND_THUNK_LFENCE */
  XEN_CPUFEATURE(IND_THUNK_JMP,     X86_SYNTH(14)) /* Use IND_THUNK_JMP */
  XEN_CPUFEATURE(SC_NO_BRANCH_HARDEN, X86_SYNTH(15)) /* (Disable) Conditional branch hardening */
 diff --git a/xen/arch/x86/include/asm/nospec.h b/xen/arch/x86/include/asm/nospec.h
-index 7150e76b87fb..cb7d1ab3c5b9 100644
+index 7150e76b87fb..0725839e1982 100644
 --- a/xen/arch/x86/include/asm/nospec.h
 +++ b/xen/arch/x86/include/asm/nospec.h
 @@ -38,6 +38,32 @@ static always_inline void block_speculation(void)
@@ -79,19 +80,19 @@ index 7150e76b87fb..cb7d1ab3c5b9 100644
  
 +static always_inline void arch_block_lock_speculation(void)
 +{
-+    alternative("", "lfence", X86_FEATURE_SC_LOCK_HARDEN);
++    alternative("lfence", "", X86_FEATURE_SC_NO_LOCK_HARDEN);
 +}
 +
 +/* Allow to insert a read memory barrier into conditionals */
 +static always_inline bool barrier_lock_true(void)
 +{
-+    alternative("", "lfence #nospec-true", X86_FEATURE_SC_LOCK_HARDEN);
++    alternative("lfence #nospec-true", "", X86_FEATURE_SC_NO_LOCK_HARDEN);
 +    return true;
 +}
 +
 +static always_inline bool barrier_lock_false(void)
 +{
-+    alternative("", "lfence #nospec-false", X86_FEATURE_SC_LOCK_HARDEN);
++    alternative("lfence #nospec-false", "", X86_FEATURE_SC_NO_LOCK_HARDEN);
 +    return false;
 +}
 +
@@ -107,7 +108,7 @@ index 7150e76b87fb..cb7d1ab3c5b9 100644
  
  /*
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index 35edccd1df44..18829664389f 100644
+index 1ee81e2dfe79..ac21af2c5c0f 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
 @@ -65,6 +65,7 @@ int8_t __read_mostly opt_eager_fpu = -1;
@@ -183,17 +184,17 @@ index 35edccd1df44..18829664389f 100644
      if ( !opt_branch_harden )
          setup_force_cpu_cap(X86_FEATURE_SC_NO_BRANCH_HARDEN);
  
-+    if ( opt_lock_harden )
-+        setup_force_cpu_cap(X86_FEATURE_SC_LOCK_HARDEN);
++    if ( !opt_lock_harden )
++        setup_force_cpu_cap(X86_FEATURE_SC_NO_LOCK_HARDEN);
 +
      /*
       * We do not disable HT by default on affected hardware.
       *
 diff --git a/xen/common/Kconfig b/xen/common/Kconfig
-index 17023195ac71..cd0971877b60 100644
+index e7794cb7f681..cd7385153823 100644
 --- a/xen/common/Kconfig
 +++ b/xen/common/Kconfig
-@@ -185,6 +185,23 @@ config SPECULATIVE_HARDEN_GUEST_ACCESS
+@@ -173,6 +173,23 @@ config SPECULATIVE_HARDEN_GUEST_ACCESS
  
  	  If unsure, say Y.
  
