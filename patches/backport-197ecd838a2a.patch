@@ -1,8 +1,7 @@
 From ca15d91453cf51711a7672761de5fc8a3a8ff380 Mon Sep 17 00:00:00 2001
 From: Roger Pau Monne <roger.pau@citrix.com>
 Date: Mon, 4 Mar 2024 14:29:36 +0100
-Subject: [PATCH 5/7] locking: attempt to ensure lock wrappers are always
- inline
+Subject: locking: attempt to ensure lock wrappers are always inline
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -52,7 +51,7 @@ index 52b342979a96..588f9688ff86 100644
  }
  
 diff --git a/xen/arch/x86/mm/mm-locks.h b/xen/arch/x86/mm/mm-locks.h
-index d6c073dc5cf5..8f5f7705e1c6 100644
+index d6c073dc5cf5..cc635a440571 100644
 --- a/xen/arch/x86/mm/mm-locks.h
 +++ b/xen/arch/x86/mm/mm-locks.h
 @@ -88,8 +88,8 @@ static inline void _set_lock_level(int l)
@@ -97,22 +96,20 @@ index d6c073dc5cf5..8f5f7705e1c6 100644
  {
      _check_lock_level(d, level);
      percpu_read_lock(p2m_percpu_rwlock, &l->lock);
-@@ -180,15 +182,17 @@ static inline void mm_read_unlock(mm_rwlock_t *l)
+@@ -180,15 +182,15 @@ static inline void mm_read_unlock(mm_rwlock_t *l)
  
  /* This wrapper uses the line number to express the locking order below */
  #define declare_mm_lock(name)                                                 \
 -    static inline void mm_lock_##name(const struct domain *d, mm_lock_t *l,   \
 -                                      const char *func, int rec)              \
-+    static always_inline void mm_lock_##name(const struct domain *d,          \
-+                                             mm_lock_t *l, const char *func,  \
-+                                             int rec)                         \
++    static always_inline void mm_lock_##name(                                 \
++        const struct domain *d, mm_lock_t *l, const char *func, int rec)      \
      { _mm_lock(d, l, func, MM_LOCK_ORDER_##name, rec); }
  #define declare_mm_rwlock(name)                                               \
 -    static inline void mm_write_lock_##name(const struct domain *d,           \
 -                                            mm_rwlock_t *l, const char *func) \
-+    static always_inline void mm_write_lock_##name(const struct domain *d,    \
-+                                                   mm_rwlock_t *l,            \
-+                                                   const char *func)          \
++    static always_inline void mm_write_lock_##name(                           \
++        const struct domain *d, mm_rwlock_t *l, const char *func)             \
      { _mm_write_lock(d, l, func, MM_LOCK_ORDER_##name); }                     \
 -    static inline void mm_read_lock_##name(const struct domain *d,            \
 -                                           mm_rwlock_t *l)                    \
@@ -121,7 +118,7 @@ index d6c073dc5cf5..8f5f7705e1c6 100644
      { _mm_read_lock(d, l, MM_LOCK_ORDER_##name); }
  /* These capture the name of the calling function */
  #define mm_lock(name, d, l) mm_lock_##name(d, l, __func__, 0)
-@@ -321,7 +325,7 @@ declare_mm_lock(altp2mlist)
+@@ -321,7 +323,7 @@ declare_mm_lock(altp2mlist)
  #define MM_LOCK_ORDER_altp2m                 40
  declare_mm_rwlock(altp2m);
  
@@ -197,6 +194,42 @@ index d242c0803802..17557d1300a1 100644
  active_entry_acquire(struct grant_table *t, grant_ref_t e)
  {
      struct active_grant_entry *act;
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 062b81117e84..a2579e540fd1 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -345,23 +345,24 @@ uint64_t get_cpu_idle_time(unsigned int cpu)
+  * This avoids dead- or live-locks when this code is running on both
+  * cpus at the same time.
+  */
+-static void sched_spin_lock_double(spinlock_t *lock1, spinlock_t *lock2,
+-                                   unsigned long *flags)
++static always_inline void sched_spin_lock_double(
++    spinlock_t *lock1, spinlock_t *lock2, unsigned long *flags)
+ {
+     if ( lock1 == lock2 )
+     {
+-        spin_lock_irqsave(lock1, *flags);
++        *flags = _spin_lock_irqsave(lock1);
+     }
+     else if ( lock1 < lock2 )
+     {
+-        spin_lock_irqsave(lock1, *flags);
+-        spin_lock(lock2);
++        *flags = _spin_lock_irqsave(lock1);
++        _spin_lock(lock2);
+     }
+     else
+     {
+-        spin_lock_irqsave(lock2, *flags);
+-        spin_lock(lock1);
++        *flags = _spin_lock_irqsave(lock2);
++        _spin_lock(lock1);
+     }
++    block_lock_speculation();
+ }
+ 
+ static void sched_spin_unlock_double(spinlock_t *lock1, spinlock_t *lock2,
 diff --git a/xen/common/timer.c b/xen/common/timer.c
 index 645206a9892b..258295563491 100644
 --- a/xen/common/timer.c
@@ -314,3 +347,51 @@ index 2bc4aaf4530c..201fac7c5a3e 100644
  
  bool_t pci_known_segment(u16 seg);
  bool_t pci_device_detect(u16 seg, u8 bus, u8 dev, u8 func);
+diff --git a/xen/include/xen/sched-if.h b/xen/include/xen/sched-if.h
+index 4712bb3a7546..4cc0b5109661 100644
+--- a/xen/include/xen/sched-if.h
++++ b/xen/include/xen/sched-if.h
+@@ -209,8 +209,24 @@ DECLARE_PER_CPU(cpumask_t, cpumask_scratch);
+ #define cpumask_scratch        (&this_cpu(cpumask_scratch))
+ #define cpumask_scratch_cpu(c) (&per_cpu(cpumask_scratch, c))
+ 
++/*
++ * Deal with _spin_lock_irqsave() returning the flags value instead of storing
++ * it in a passed parameter.
++ */
++#define _sched_spinlock0(lock, irq) _spin_lock##irq(lock)
++#define _sched_spinlock1(lock, irq, arg) ({ \
++    BUILD_BUG_ON(sizeof(arg) != sizeof(unsigned long)); \
++    (arg) = _spin_lock##irq(lock); \
++})
++
++#define _sched_spinlock__(nr) _sched_spinlock ## nr
++#define _sched_spinlock_(nr)  _sched_spinlock__(nr)
++#define _sched_spinlock(lock, irq, args...) \
++    _sched_spinlock_(count_args(args))(lock, irq, ## args)
++
+ #define sched_lock(kind, param, cpu, irq, arg...) \
+-static inline spinlock_t *kind##_schedule_lock##irq(param EXTRA_TYPE(arg)) \
++static always_inline spinlock_t \
++*kind##_schedule_lock##irq(param EXTRA_TYPE(arg)) \
+ { \
+     for ( ; ; ) \
+     { \
+@@ -222,10 +238,16 @@ static inline spinlock_t *kind##_schedule_lock##irq(param EXTRA_TYPE(arg)) \
+          * \
+          * It may also be the case that v->processor may change but the \
+          * lock may be the same; this will succeed in that case. \
++         * \
++         * Use the speculation unsafe locking helper, there's a speculation \
++         * barrier before returning to the caller. \
+          */ \
+-        spin_lock##irq(lock, ## arg); \
++        _sched_spinlock(lock, irq, ## arg); \
+         if ( likely(lock == get_sched_res(cpu)->schedule_lock) ) \
++        { \
++            block_lock_speculation(); \
+             return lock; \
++        } \
+         spin_unlock##irq(lock, ## arg); \
+     } \
+ }
