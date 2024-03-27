@@ -1,6 +1,6 @@
-From 9e18f339830c828798aef465556d4029d83476a0 Mon Sep 17 00:00:00 2001
+From 846fb984b506135917c2862d2e4607005d6afdeb Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
-Date: Fri, 15 Mar 2024 19:32:39 +0000
+Date: Tue, 2 Apr 2024 16:20:09 +0200
 Subject: x86/boot: Improve the boot watchdog determination of stuck cpus
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -26,9 +26,11 @@ into the rather more manageable:
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+master commit: 9e18f339830c828798aef465556d4029d83476a0
+master date: 2024-03-19 18:29:37 +0000
 
 diff --git a/xen/arch/x86/nmi.c b/xen/arch/x86/nmi.c
-index 2a59fbbd4ef4..639f1d248179 100644
+index 7c9591b65e81..dd31034ac8d7 100644
 --- a/xen/arch/x86/nmi.c
 +++ b/xen/arch/x86/nmi.c
 @@ -150,6 +150,8 @@ int nmi_active;
@@ -40,7 +42,7 @@ index 2a59fbbd4ef4..639f1d248179 100644
      unsigned int start_count = this_cpu(nmi_count);
      unsigned long ticks = 10 * 1000 * cpu_khz / nmi_hz;
      unsigned long s, e;
-@@ -158,44 +160,35 @@ static void __init cf_check wait_for_nmis(void *p)
+@@ -158,42 +160,35 @@ static void __init cf_check wait_for_nmis(void *p)
      do {
          cpu_relax();
          if ( this_cpu(nmi_count) >= start_count + 2 )
@@ -58,15 +60,14 @@ index 2a59fbbd4ef4..639f1d248179 100644
  void __init check_nmi_watchdog(void)
  {
 -    static unsigned int __initdata prev_nmi_count[NR_CPUS];
--    unsigned int cpu;
--    char sep = '{';
+-    int cpu;
 -    bool ok = true;
 +    static cpumask_t __initdata stuck_cpus;
  
      if ( nmi_watchdog == NMI_NONE )
          return;
  
-     printk("Testing NMI watchdog on all CPUs: ");
+     printk("Testing NMI watchdog on all CPUs:");
  
 -    for_each_online_cpu ( cpu )
 -        prev_nmi_count[cpu] = per_cpu(nmi_count, cpu);
@@ -77,19 +78,18 @@ index 2a59fbbd4ef4..639f1d248179 100644
       * uses only runs while the core's not halted
       */
 -    on_selected_cpus(&cpu_online_map, wait_for_nmis, NULL, 1);
-+    on_selected_cpus(&cpu_online_map, wait_for_nmis, &stuck_cpus, 1);
- 
+-
 -    for_each_online_cpu ( cpu )
 -    {
 -        if ( per_cpu(nmi_count, cpu) - prev_nmi_count[cpu] < 2 )
 -        {
--            printk("%c%u", sep, cpu);
--            sep = ',';
+-            printk(" %d", cpu);
 -            ok = false;
 -        }
 -    }
--
--    printk("%s\n", ok ? "ok" : "} stuck");
++    on_selected_cpus(&cpu_online_map, wait_for_nmis, &stuck_cpus, 1);
+ 
+-    printk(" %s\n", ok ? "ok" : "stuck");
 +    if ( cpumask_empty(&stuck_cpus) )
 +        printk("ok\n");
 +    else

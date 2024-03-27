@@ -1,0 +1,54 @@
+From bfb69205376d94ff91b09a337c47fb665ee12da3 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Wed, 27 Mar 2024 12:29:33 +0100
+Subject: x86/PoD: tie together P2M update and increment of entry count
+
+When not holding the PoD lock across the entire region covering P2M
+update and stats update, the entry count - if to be incorrect at all -
+should indicate too large a value in preference to a too small one, to
+avoid functions bailing early when they find the count is zero. However,
+instead of moving the increment ahead (and adjust back upon failure),
+extend the PoD-locked region.
+
+Fixes: 99af3cd40b6e ("x86/mm: Rework locking in the PoD layer")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: George Dunlap <george.dunlap@cloud.com>
+master commit: cc950c49ae6a6690f7fc3041a1f43122c250d250
+master date: 2024-03-21 09:48:10 +0100
+
+diff --git a/xen/arch/x86/mm/p2m-pod.c b/xen/arch/x86/mm/p2m-pod.c
+index 99dbcb3101e2..e903db9d9367 100644
+--- a/xen/arch/x86/mm/p2m-pod.c
++++ b/xen/arch/x86/mm/p2m-pod.c
+@@ -1370,19 +1370,28 @@ mark_populate_on_demand(struct domain *d, unsigned long gfn_l,
+         }
+     }
+ 
++    /*
++     * P2M update and stats increment need to collectively be under PoD lock,
++     * to prevent code elsewhere observing PoD entry count being zero despite
++     * there actually still being PoD entries (created by the p2m_set_entry()
++     * invocation below).
++     */
++    pod_lock(p2m);
++
+     /* Now, actually do the two-way mapping */
+     rc = p2m_set_entry(p2m, gfn, INVALID_MFN, order,
+                        p2m_populate_on_demand, p2m->default_access);
+     if ( rc == 0 )
+     {
+-        pod_lock(p2m);
+         p2m->pod.entry_count += 1UL << order;
+         p2m->pod.entry_count -= pod_count;
+         BUG_ON(p2m->pod.entry_count < 0);
+-        pod_unlock(p2m);
++    }
++
++    pod_unlock(p2m);
+ 
++    if ( rc == 0 )
+         ioreq_request_mapcache_invalidate(d);
+-    }
+     else if ( order )
+     {
+         /*
