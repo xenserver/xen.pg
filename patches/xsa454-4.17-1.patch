@@ -1,0 +1,99 @@
+From a9ae41517c6a5bb6b67a6bb939e5b2cb58f27e24 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Wed, 27 Mar 2024 17:31:38 +0000
+Subject: x86/HVM: clear upper halves of GPRs upon entry from 32-bit code
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hypercalls in particular can be the subject of continuations, and logic
+there checks updated state against incoming register values. If the
+guest manufactured a suitable argument register with a non-zero upper
+half before entering compatibility mode and issuing a hypercall from
+there, checks in hypercall_xlat_continuation() might trip.
+
+Since for HVM we want to also be sure to not hit a corner case in the
+emulator, initiate the clipping right from the top of
+{svm,vmx}_vmexit_handler(). Also rename the invoked function, as it no
+longer does only invalidation of fields.
+
+Note that architecturally the upper halves of registers are undefined
+after a switch between compatibility and 64-bit mode (either direction).
+Hence once having entered compatibility mode, the guest can't assume
+the upper half of any register to retain its value.
+
+This is part of XSA-454 / CVE-2023-46842.
+
+Fixes: b8a7efe8528a ("Enable compatibility mode operation for HYPERVISOR_memory_op")
+Reported-by: Manuel Andreas <manuel.andreas@tum.de>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index 3c174645505f..35173502bd50 100644
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -2626,7 +2626,8 @@ void svm_vmexit_handler(struct cpu_user_regs *regs)
+     regs->rsp = vmcb->rsp;
+     regs->rflags = vmcb->rflags;
+ 
+-    hvm_invalidate_regs_fields(regs);
++    hvm_sanitize_regs_fields(
++        regs, !(vmcb_get_efer(vmcb) & EFER_LMA) || !(vmcb->cs.l));
+ 
+     if ( paging_mode_hap(v->domain) )
+         v->arch.hvm.guest_cr[3] = v->arch.hvm.hw_cr[3] = vmcb_get_cr3(vmcb);
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index dc85a471d376..7f4408c2669f 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -4007,6 +4007,7 @@ static void undo_nmis_unblocked_by_iret(void)
+ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+ {
+     unsigned long exit_qualification, exit_reason, idtv_info, intr_info = 0;
++    unsigned long cs_ar_bytes = 0;
+     unsigned int vector = 0;
+     struct vcpu *v = current;
+     struct domain *currd = v->domain;
+@@ -4015,7 +4016,10 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+     __vmread(GUEST_RSP,    &regs->rsp);
+     __vmread(GUEST_RFLAGS, &regs->rflags);
+ 
+-    hvm_invalidate_regs_fields(regs);
++    if ( hvm_long_mode_active(v) )
++        __vmread(GUEST_CS_AR_BYTES, &cs_ar_bytes);
++
++    hvm_sanitize_regs_fields(regs, !(cs_ar_bytes & X86_SEG_AR_CS_LM_ACTIVE));
+ 
+     if ( paging_mode_hap(v->domain) )
+     {
+diff --git a/xen/arch/x86/include/asm/hvm/hvm.h b/xen/arch/x86/include/asm/hvm/hvm.h
+index 65768c797ea7..8285a6ec383b 100644
+--- a/xen/arch/x86/include/asm/hvm/hvm.h
++++ b/xen/arch/x86/include/asm/hvm/hvm.h
+@@ -585,8 +585,24 @@ static inline unsigned int hvm_get_insn_bytes(struct vcpu *v, uint8_t *buf)
+             ? alternative_call(hvm_funcs.get_insn_bytes, v, buf) : 0);
+ }
+ 
+-static inline void hvm_invalidate_regs_fields(struct cpu_user_regs *regs)
++static inline void hvm_sanitize_regs_fields(struct cpu_user_regs *regs,
++                                            bool compat)
+ {
++    if ( compat )
++    {
++        /* Clear GPR upper halves, to counteract guests playing games. */
++        regs->rbp = (uint32_t)regs->ebp;
++        regs->rbx = (uint32_t)regs->ebx;
++        regs->rax = (uint32_t)regs->eax;
++        regs->rcx = (uint32_t)regs->ecx;
++        regs->rdx = (uint32_t)regs->edx;
++        regs->rsi = (uint32_t)regs->esi;
++        regs->rdi = (uint32_t)regs->edi;
++        regs->rip = (uint32_t)regs->eip;
++        regs->rflags = (uint32_t)regs->eflags;
++        regs->rsp = (uint32_t)regs->esp;
++    }
++
+ #ifndef NDEBUG
+     regs->error_code = 0xbeef;
+     regs->entry_vector = 0xbeef;
