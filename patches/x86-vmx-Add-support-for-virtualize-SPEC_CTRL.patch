@@ -1,0 +1,233 @@
+From a38967998ed19dd4b111e10b595568062f968e8a Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Thu, 15 Feb 2024 17:46:53 +0100
+Subject: x86/vmx: Add support for virtualize SPEC_CTRL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The feature is defined in the tertiary exec control, and is available starting
+from Sapphire Rapids and Alder Lake CPUs.
+
+When enabled, two extra VMCS fields are used: SPEC_CTRL mask and shadow.  Bits
+set in mask are not allowed to be toggled by the guest (either set or clear)
+and the value in the shadow field is the value the guest expects to be in the
+SPEC_CTRL register.
+
+By using it the hypervisor can force the value of SPEC_CTRL bits behind the
+guest back without having to trap all accesses to SPEC_CTRL, note that no bits
+are forced into the guest as part of this patch.  It also allows getting rid of
+SPEC_CTRL in the guest MSR load list, since the value in the shadow field will
+be loaded by the hardware on vmentry.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
+index b0d511292e86..0d401c639af3 100644
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -191,6 +191,7 @@ static void __init vmx_display_features(void)
+     P(cpu_has_vmx_tsc_scaling, "TSC Scaling");
+     P(cpu_has_vmx_bus_lock_detection, "Bus Lock Detection");
+     P(cpu_has_vmx_notify_vm_exiting, "Notify VM Exit");
++    P(cpu_has_vmx_virt_spec_ctrl, "Virtualize SPEC_CTRL");
+ #undef P
+ 
+     if ( !printed )
+@@ -341,7 +342,7 @@ static int vmx_init_vmcs_config(void)
+ 
+     if ( _vmx_cpu_based_exec_control & CPU_BASED_ACTIVATE_TERTIARY_CONTROLS )
+     {
+-        uint64_t opt = 0;
++        uint64_t opt = TERTIARY_EXEC_VIRT_SPEC_CTRL;
+ 
+         _vmx_tertiary_exec_control = adjust_vmx_controls2(
+             "Tertiary Exec Control", 0, opt,
+@@ -1358,6 +1359,12 @@ static int construct_vmcs(struct vcpu *v)
+     if ( cpu_has_vmx_tsc_scaling )
+         __vmwrite(TSC_MULTIPLIER, d->arch.hvm.tsc_scaling_ratio);
+ 
++    if ( cpu_has_vmx_virt_spec_ctrl )
++    {
++        __vmwrite(SPEC_CTRL_MASK, 0);
++        __vmwrite(SPEC_CTRL_SHADOW, 0);
++    }
++
+     /* will update HOST & GUEST_CR3 as reqd */
+     paging_update_paging_modes(v);
+ 
+@@ -2066,6 +2073,9 @@ void vmcs_dump_vcpu(struct vcpu *v)
+     if ( v->arch.hvm.vmx.secondary_exec_control &
+          SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY )
+         printk("InterruptStatus = %04x\n", vmr16(GUEST_INTR_STATUS));
++    if ( cpu_has_vmx_virt_spec_ctrl )
++        printk("SPEC_CTRL mask = 0x%016lx  shadow = 0x%016lx\n",
++               vmr(SPEC_CTRL_MASK), vmr(SPEC_CTRL_SHADOW));
+ 
+     printk("*** Host State ***\n");
+     printk("RIP = 0x%016lx (%ps)  RSP = 0x%016lx\n",
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 619c522ab7f1..7537dacb0818 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -709,23 +709,28 @@ static void vmx_cpuid_policy_changed(struct vcpu *v)
+     /*
+      * We can safely pass MSR_SPEC_CTRL through to the guest, even if STIBP
+      * isn't enumerated in hardware, as SPEC_CTRL_STIBP is ignored.
++     *
++     * If VMX_VIRT_SPEC_CTRL is available, it is activated by default and the
++     * guest MSR_SPEC_CTRL value lives in the VMCS.  Otherwise, it lives in
++     * the MSR load/save list.
+      */
+     if ( cp->feat.ibrsb )
+     {
+         vmx_clear_msr_intercept(v, MSR_SPEC_CTRL, VMX_MSR_RW);
+ 
+-        rc = vmx_add_guest_msr(v, MSR_SPEC_CTRL, 0);
+-        if ( rc )
+-            goto out;
++        if ( !cpu_has_vmx_virt_spec_ctrl )
++        {
++            rc = vmx_add_guest_msr(v, MSR_SPEC_CTRL, 0);
++            if ( rc )
++                goto out;
++        }
+     }
+     else
+     {
+         vmx_set_msr_intercept(v, MSR_SPEC_CTRL, VMX_MSR_RW);
+ 
+-        rc = vmx_del_msr(v, MSR_SPEC_CTRL, VMX_MSR_GUEST);
+-        if ( rc && rc != -ESRCH )
+-            goto out;
+-        rc = 0; /* Tolerate -ESRCH */
++        if ( !cpu_has_vmx_virt_spec_ctrl )
++            vmx_del_msr(v, MSR_SPEC_CTRL, VMX_MSR_GUEST);
+     }
+ 
+     /* MSR_PRED_CMD is safe to pass through if the guest knows about it. */
+@@ -2405,9 +2410,14 @@ static uint64_t vmx_get_reg(struct vcpu *v, unsigned int reg)
+     uint64_t val = 0;
+     int rc;
+ 
++    /* Logic which doesn't require remote VMCS acquisition. */
+     switch ( reg )
+     {
+     case MSR_SPEC_CTRL:
++        if ( cpu_has_vmx_virt_spec_ctrl )
++            /* Guest value in VMCS - fetched below. */
++            break;
++
+         rc = vmx_read_guest_msr(v, reg, &val);
+         if ( rc )
+         {
+@@ -2416,13 +2426,26 @@ static uint64_t vmx_get_reg(struct vcpu *v, unsigned int reg)
+             domain_crash(d);
+         }
+         return val;
++    }
++
++    /* Logic which maybe requires remote VMCS acquisition. */
++    vmx_vmcs_enter(v);
++    switch ( reg )
++    {
++    case MSR_SPEC_CTRL:
++        ASSERT(cpu_has_vmx_virt_spec_ctrl);
++        __vmread(SPEC_CTRL_SHADOW, &val);
++        break;
+ 
+     default:
+         printk(XENLOG_G_ERR "%s(%pv, 0x%08x) Bad register\n",
+                __func__, v, reg);
+         domain_crash(d);
+-        return 0;
++        break;
+     }
++    vmx_vmcs_exit(v);
++
++    return val;
+ }
+ 
+ static void vmx_set_reg(struct vcpu *v, unsigned int reg, uint64_t val)
+@@ -2430,9 +2453,14 @@ static void vmx_set_reg(struct vcpu *v, unsigned int reg, uint64_t val)
+     struct domain *d = v->domain;
+     int rc;
+ 
++    /* Logic which doesn't require remote VMCS acquisition. */
+     switch ( reg )
+     {
+     case MSR_SPEC_CTRL:
++        if ( cpu_has_vmx_virt_spec_ctrl )
++            /* Guest value in VMCS - set below. */
++            break;
++
+         rc = vmx_write_guest_msr(v, reg, val);
+         if ( rc )
+         {
+@@ -2440,6 +2468,16 @@ static void vmx_set_reg(struct vcpu *v, unsigned int reg, uint64_t val)
+                    __func__, v, reg, rc);
+             domain_crash(d);
+         }
++        return;
++    }
++
++    /* Logic which maybe requires remote VMCS acquisition. */
++    vmx_vmcs_enter(v);
++    switch ( reg )
++    {
++    case MSR_SPEC_CTRL:
++        ASSERT(cpu_has_vmx_virt_spec_ctrl);
++        __vmwrite(SPEC_CTRL_SHADOW, val);
+         break;
+ 
+     default:
+@@ -2447,6 +2485,7 @@ static void vmx_set_reg(struct vcpu *v, unsigned int reg, uint64_t val)
+                __func__, v, reg, val);
+         domain_crash(d);
+     }
++    vmx_vmcs_exit(v);
+ }
+ 
+ static struct hvm_function_table __initdata vmx_function_table = {
+diff --git a/xen/include/asm-x86/hvm/vmx/vmcs.h b/xen/include/asm-x86/hvm/vmx/vmcs.h
+index e61ab16c17e9..687b9907788d 100644
+--- a/xen/include/asm-x86/hvm/vmx/vmcs.h
++++ b/xen/include/asm-x86/hvm/vmx/vmcs.h
+@@ -280,6 +280,9 @@ extern u32 vmx_secondary_exec_control;
+ #define TERTIARY_EXEC_VIRT_SPEC_CTRL            BIT(7, UL)
+ extern uint64_t vmx_tertiary_exec_control;
+ 
++#define cpu_has_vmx_virt_spec_ctrl \
++     (vmx_tertiary_exec_control & TERTIARY_EXEC_VIRT_SPEC_CTRL)
++
+ #define VMX_EPT_EXEC_ONLY_SUPPORTED                         0x00000001
+ #define VMX_EPT_WALK_LENGTH_4_SUPPORTED                     0x00000040
+ #define VMX_EPT_MEMORY_TYPE_UC                              0x00000100
+@@ -440,6 +443,8 @@ enum vmcs_field {
+     XSS_EXIT_BITMAP                 = 0x0000202c,
+     TSC_MULTIPLIER                  = 0x00002032,
+     TERTIARY_VM_EXEC_CONTROL        = 0x00002034,
++    SPEC_CTRL_MASK                  = 0x0000204a,
++    SPEC_CTRL_SHADOW                = 0x0000204c,
+     GUEST_PHYSICAL_ADDRESS          = 0x00002400,
+     VMCS_LINK_POINTER               = 0x00002800,
+     GUEST_IA32_DEBUGCTL             = 0x00002802,
+diff --git a/xen/include/asm-x86/msr.h b/xen/include/asm-x86/msr.h
+index 4bb4c382ef03..482a2e56f752 100644
+--- a/xen/include/asm-x86/msr.h
++++ b/xen/include/asm-x86/msr.h
+@@ -279,8 +279,11 @@ struct vcpu_msrs
+      * For PV guests, this holds the guest kernel value.  It is accessed on
+      * every entry/exit path.
+      *
+-     * For VT-x guests, the guest value is held in the MSR guest load/save
+-     * list.
++     * For VT-x guests, one of two situations exist:
++     *
++     * - If hardware supports virtualized MSR_SPEC_CTRL, it is active by
++     *   default and the guest value lives in the VMCS.
++     * - Otherwise, the guest value is held in the MSR load/save list.
+      *
+      * For SVM, the guest value lives in the VMCB, and hardware saves/restores
+      * the host value automatically.  However, guests run with the OR of the

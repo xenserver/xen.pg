@@ -1,0 +1,81 @@
+From 1e08abd0de4203e1f807e9cc3d651a8d7ab4d27c Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 22 Dec 2023 17:44:48 +0000
+Subject: x86: Use indirect calls in reset-stack infrastructure
+
+Mixing up JMP and CALL indirect targets leads a very fun form of speculative
+type confusion.  A target which is expecting to be called CALLed needs a
+return address on the stack, and an indirect JMP doesn't place one there.
+
+An indirect JMP which predicts to a target intending to be CALLed can end up
+with a RET speculatively executing with a value from the JMPers stack frame.
+
+There are several ways get indirect JMPs in Xen.
+
+ * From tailcall optimisations.  These are safe because the compiler has
+   arranged the stack to point at the callee's return address.
+
+ * From jump tables.  These are unsafe, but Xen is built with -fno-jump-tables
+   to work around several compiler issues.
+
+ * From reset_stack_and_jump_ind(), which is particularly unsafe.  Because of
+   the additional stack adjustment made, the value picked up off the stack is
+   regs->r15 of the next vCPU to run.
+
+In order to mitigate this type confusion, we want to make all indirect targets
+be CALL targets, and remove the use of indirect JMP except via tailcall
+optimisation.
+
+Luckily due to XSA-348, all C target functions of reset_stack_and_jump_ind()
+are noreturn.  {svm,vmx}_do_resume() exits via reset_stack_and_jump(); a
+direct JMP with entirely different prediction properties.  idle_loop() is an
+infinite loop which eventually exits via reset_stack_and_jump_ind() from a new
+schedule.  i.e. These paths are all fine having one extra return address on
+the stack.
+
+This leaves continue_pv_domain(), which is expecting to be a JMP target.
+Alter it to strip the return address off the stack, which is safe because
+there isn't actually a RET expecting to return to its caller.
+
+This allows us change reset_stack_and_jump_ind() to reset_stack_and_call_ind()
+in order to mitigate the speculative type confusion.
+
+This is part of XSA-456 / CVE-2024-2201.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 3f26be2b3edf..758eb48b30c3 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -1830,12 +1830,12 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
+     /* Ensure that the vcpu has an up-to-date time base. */
+     update_vcpu_system_time(next);
+ 
+-    reset_stack_and_jump_ind(nextd->arch.ctxt_switch->tail);
++    reset_stack_and_call_ind(nextd->arch.ctxt_switch->tail);
+ }
+ 
+ void continue_running(struct vcpu *same)
+ {
+-    reset_stack_and_jump_ind(same->domain->arch.ctxt_switch->tail);
++    reset_stack_and_call_ind(same->domain->arch.ctxt_switch->tail);
+ }
+ 
+ int __sync_local_execstate(void)
+diff --git a/xen/include/asm-x86/current.h b/xen/include/asm-x86/current.h
+index f85d7a38aa16..545a88e95a63 100644
+--- a/xen/include/asm-x86/current.h
++++ b/xen/include/asm-x86/current.h
+@@ -143,8 +143,8 @@ unsigned long get_stack_dump_bottom (unsigned long sp);
+     switch_stack_and_jump(fn, "jmp %c", "i")
+ 
+ /* The constraint may only specify non-call-clobbered registers. */
+-#define reset_stack_and_jump_ind(fn)                                    \
+-    switch_stack_and_jump(fn, "INDIRECT_JMP %", "b")
++#define reset_stack_and_call_ind(fn)                                    \
++    switch_stack_and_jump(fn, "INDIRECT_CALL %", "b")
+ 
+ /*
+  * Which VCPU's state is currently running on each CPU?

@@ -1,0 +1,136 @@
+From a41b0f4eff38454e47a13d724ca1488cbaea31d4 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 26 Mar 2024 19:01:37 +0000
+Subject: x86/spec-ctrl: Support BHI_DIS_S in order to mitigate BHI
+
+Introduce a "bhi-dis-s" boolean to match the other options we have for
+MSR_SPEC_CTRL values.  Also introduce bhi_calculations().
+
+Use BHI_DIS_S whenever possible.
+
+Guests which are levelled to be migration compatible with older CPUs can't see
+BHI_DIS_S, and Xen must fill in the difference to make the guest safe.  Use
+the virt MSR_SPEC_CTRL infrastructure to force BHI_DIS_S behind the guest's
+back.
+
+This is part of XSA-456 / CVE-2024-2201.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 7537dacb0818..57d77ffd2060 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -57,6 +57,7 @@
+ #include <asm/event.h>
+ #include <asm/mce.h>
+ #include <asm/monitor.h>
++#include <asm/spec_ctrl.h>
+ #include <public/arch-x86/cpuid.h>
+ 
+ static bool_t __initdata opt_force_ept;
+@@ -733,6 +734,22 @@ static void vmx_cpuid_policy_changed(struct vcpu *v)
+             vmx_del_msr(v, MSR_SPEC_CTRL, VMX_MSR_GUEST);
+     }
+ 
++    if ( cpu_has_vmx_virt_spec_ctrl )
++    {
++        /*
++         * If we're on BHI_DIS_S capable hardware, the short loop sequence is
++         * not sufficient to mitigate Native-BHI.  If the VM can't see it
++         * (i.e. it's levelled with older hardware), force it behind the
++         * guests back for safey.
++         *
++         * Because there's not a real Host/Guest split of the MSR_SPEC_CTRL
++         * value, this only works as expected when Xen is using BHI_DIS_S too.
++         */
++        bool force_bhi_dis_s = opt_bhi_dis_s && !cp->feat.bhi_ctrl;
++
++        __vmwrite(SPEC_CTRL_MASK, force_bhi_dis_s ? SPEC_CTRL_BHI_DIS_S : 0);
++    }
++
+     /* MSR_PRED_CMD is safe to pass through if the guest knows about it. */
+     if ( cp->feat.ibrsb || cp->extd.ibpb )
+         vmx_clear_msr_intercept(v, MSR_PRED_CMD,  VMX_MSR_RW);
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index b06b39bb6f6a..bdfe9f76b289 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -58,6 +58,7 @@ static int8_t __initdata opt_ibrs = -1;
+ int8_t __initdata opt_stibp = -1;
+ bool __read_mostly opt_ssbd;
+ int8_t __initdata opt_psfd = -1;
++int8_t __read_mostly opt_bhi_dis_s = -1;
+ 
+ int8_t __read_mostly opt_ibpb_ctxt_switch = -1;
+ int8_t __read_mostly opt_eager_fpu = -1;
+@@ -274,6 +275,8 @@ static int __init parse_spec_ctrl(const char *s)
+             opt_ssbd = val;
+         else if ( (val = parse_boolean("psfd", s, ss)) >= 0 )
+             opt_psfd = val;
++        else if ( (val = parse_boolean("bhi-dis-s", s, ss)) >= 0 )
++            opt_bhi_dis_s = val;
+ 
+         /* Misc settings. */
+         else if ( (val = parse_boolean("ibpb", s, ss)) >= 0 )
+@@ -500,7 +503,7 @@ static void __init print_details(enum ind_thunk thunk)
+                "\n");
+ 
+     /* Settings for Xen's protection, irrespective of guests. */
+-    printk("  Xen settings: BTI-Thunk %s, SPEC_CTRL: %s%s%s%s%s, Other:%s%s%s%s%s%s%s\n",
++    printk("  Xen settings: BTI-Thunk %s, SPEC_CTRL: %s%s%s%s%s%s, Other:%s%s%s%s%s%s%s\n",
+            thunk == THUNK_NONE      ? "N/A" :
+            thunk == THUNK_RETPOLINE ? "RETPOLINE" :
+            thunk == THUNK_LFENCE    ? "LFENCE" :
+@@ -516,6 +519,8 @@ static void __init print_details(enum ind_thunk thunk)
+            (default_xen_spec_ctrl & SPEC_CTRL_SSBD)  ? " SSBD+" : " SSBD-",
+            !boot_cpu_has(X86_FEATURE_PSFD) &&
+            (default_xen_spec_ctrl & SPEC_CTRL_PSFD)  ? " PSFD+" : " PSFD-",
++           !boot_cpu_has(X86_FEATURE_BHI_CTRL)       ? "" :
++           (default_xen_spec_ctrl & SPEC_CTRL_BHI_DIS_S) ? " BHI_DIS_S+" : " BHI_DIS_S-",
+            !(caps & ARCH_CAPS_TSX_CTRL)              ? "" :
+            (opt_tsx & 1)                             ? " TSX+" : " TSX-",
+            !cpu_has_srbds_ctrl                       ? "" :
+@@ -1565,6 +1570,21 @@ static void __init gds_calculations(void)
+     }
+ }
+ 
++/*
++ * https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/branch-history-injection.html
++ */
++static void __init bhi_calculations(void)
++{
++    if ( opt_bhi_dis_s == -1 )
++        opt_bhi_dis_s = !boot_cpu_has(X86_FEATURE_BHI_NO);
++
++    if ( !boot_cpu_has(X86_FEATURE_BHI_CTRL) )
++        opt_bhi_dis_s = false;
++
++    if ( opt_bhi_dis_s )
++        default_xen_spec_ctrl |= SPEC_CTRL_BHI_DIS_S;
++}
++
+ void spec_ctrl_init_domain(struct domain *d)
+ {
+     bool pv = is_pv_domain(d);
+@@ -2071,6 +2091,8 @@ void __init init_speculation_mitigations(void)
+ 
+     gds_calculations();
+ 
++    bhi_calculations();
++
+     print_details(thunk);
+ 
+     /*
+diff --git a/xen/include/asm-x86/spec_ctrl.h b/xen/include/asm-x86/spec_ctrl.h
+index 1db95738851d..b25fb55d4bae 100644
+--- a/xen/include/asm-x86/spec_ctrl.h
++++ b/xen/include/asm-x86/spec_ctrl.h
+@@ -89,6 +89,7 @@ static always_inline void spec_ctrl_new_guest_context(void)
+ 
+ extern int8_t opt_ibpb_ctxt_switch;
+ extern bool opt_ssbd;
++extern int8_t opt_bhi_dis_s;
+ extern int8_t opt_eager_fpu;
+ extern int8_t opt_l1d_flush;
+ 

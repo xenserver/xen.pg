@@ -1,0 +1,94 @@
+From dca71a37d44f99fd554cb2a879862ed2811da56c Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 22 Mar 2024 19:29:34 +0000
+Subject: x86/spec-ctrl: Support the "long" BHB loop sequence
+
+Out of an abudnance of caution, implement the long loop too, and allowing for
+it to be opted in to.
+
+This is part of XSA-456 / CVE-2024-2201
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/bhb-thunk.S b/xen/arch/x86/bhb-thunk.S
+index be0794bd7526..6d7440ca43cf 100644
+--- a/xen/arch/x86/bhb-thunk.S
++++ b/xen/arch/x86/bhb-thunk.S
+@@ -56,9 +56,13 @@ ENTRY(clear_bhb_tsx)
+  *
+  * The "short" sequence (5 and 5) is for CPUs prior to Alder Lake / Sapphire
+  * Rapids (i.e. Cores prior to Golden Cove and/or Gracemont).
++ *
++ * The "long" sequence (12 and 7) is for Alder Lake / Sapphire Rapids
++ * (i.e. Golden Cove and/or Gracemont cores).  However, such CPUs are expected
++ * to use BHI_DIS_S in preference.
+  */
+ ENTRY(clear_bhb_loops)
+-        mov     $5, %ecx
++        ALTERNATIVE "mov $5, %ecx", "mov $12, %ecx", X86_SPEC_BHB_LOOPS_LONG
+ 
+         call    1f
+         jmp     5f
+@@ -70,7 +74,7 @@ ENTRY(clear_bhb_loops)
+         int3
+ 
+         .align 64
+-2:      mov     $5, %eax
++2:      ALTERNATIVE "mov $5, %eax", "mov $7, %eax", X86_SPEC_BHB_LOOPS_LONG
+ 
+ 3:      jmp     4f
+         int3
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index 604a029dc034..c47a3ffa656b 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -52,6 +52,7 @@ static enum bhb_thunk {
+     BHB_NONE,
+     BHB_TSX,
+     BHB_SHORT,
++    BHB_LONG,
+ } opt_bhb_seq __initdata;
+ 
+ /* Cmdline controls for Xen's speculative settings. */
+@@ -313,6 +314,8 @@ static int __init parse_spec_ctrl(const char *s)
+                 opt_bhb_seq = BHB_TSX;
+             else if ( !cmdline_strcmp(s, "short") )
+                 opt_bhb_seq = BHB_SHORT;
++            else if ( !cmdline_strcmp(s, "long") )
++                opt_bhb_seq = BHB_LONG;
+             else
+                 rc = -EINVAL;
+         }
+@@ -562,7 +565,8 @@ static void __init print_details(enum ind_thunk thunk)
+            opt_bhb_seq != BHB_NONE    ? "BHB-Seq: " : "",
+            opt_bhb_seq == BHB_NONE    ? "" :
+            opt_bhb_seq == BHB_TSX     ? "TSX, " :
+-           opt_bhb_seq == BHB_SHORT   ? "SHORT, " : "?, ",
++           opt_bhb_seq == BHB_SHORT   ? "SHORT, " :
++           opt_bhb_seq == BHB_LONG    ? "LONG, " : "?, ",
+            (!boot_cpu_has(X86_FEATURE_IBRSB) &&
+             !boot_cpu_has(X86_FEATURE_IBRS))         ? "No" :
+            (default_xen_spec_ctrl & SPEC_CTRL_IBRS)  ? "IBRS+" :  "IBRS-",
+@@ -1700,6 +1704,10 @@ static void __init bhi_calculations(void)
+ 
+     switch ( opt_bhb_seq )
+     {
++    case BHB_LONG:
++        setup_force_cpu_cap(X86_SPEC_BHB_LOOPS_LONG);
++        /* fallthrough */
++
+     case BHB_SHORT:
+         setup_force_cpu_cap(X86_SPEC_BHB_LOOPS);
+         break;
+diff --git a/xen/include/asm-x86/cpufeatures.h b/xen/include/asm-x86/cpufeatures.h
+index 25f03a0ea804..1c7f833c038a 100644
+--- a/xen/include/asm-x86/cpufeatures.h
++++ b/xen/include/asm-x86/cpufeatures.h
+@@ -55,6 +55,7 @@ XEN_CPUFEATURE(IBPB_ENTRY_HVM,    X86_SYNTH(27)) /* MSR_PRED_CMD used by Xen for
+ 
+ #define X86_SPEC_BHB_TSX          X86_BUG(19) /* Use clear_bhb_tsx for BHI mitigation. */
+ #define X86_SPEC_BHB_LOOPS        X86_BUG(20) /* Use clear_bhb_loops for BHI mitigation.*/
++#define X86_SPEC_BHB_LOOPS_LONG   X86_BUG(21) /* Upgrade clear_bhb_loops to the "long" sequence. */
+ 
+ /* Total number of capability words, inc synth and bug words. */
+ #define NCAPINTS (FSCAPINTS + X86_NR_SYNTH + X86_NR_BUG) /* N 32-bit words worth of info */
