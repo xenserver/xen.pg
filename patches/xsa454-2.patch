@@ -1,0 +1,81 @@
+From: Bjoern Doebel <doebel@amazon.de>
+Subject: hypercall_xlat_continuation: Replace BUG_ON with domain_crash
+
+Instead of crashing the host in case of unexpected hypercall parameters,
+resort to only crashing the calling domain.
+
+This is part of XSA-454 / CVE-2023-46842.
+
+Fixes: b8a7efe8528a ("Enable compatibility mode operation for HYPERVISOR_memory_op")
+Signed-off-by: Bjoern Doebel <doebel@amazon.de>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/arch/x86/hypercall.c b/xen/arch/x86/hypercall.c
+index 3b749c61f9d5..ad5a1ffbdee4 100644
+--- a/xen/arch/x86/hypercall.c
++++ b/xen/arch/x86/hypercall.c
+@@ -193,8 +193,13 @@ int hypercall_xlat_continuation(unsigned int *id, unsigned int nr,
+                 cval = va_arg(args, unsigned int);
+                 if ( cval == nval )
+                     mask &= ~1U;
+-                else
+-                    BUG_ON(nval == (unsigned int)nval);
++                else if ( nval == (unsigned int)nval )
++                {
++                    printk(XENLOG_G_ERR
++                           "multicall (op %lu) bogus continuation arg%u (%#lx)\n",
++                           mcs->call.op, i, nval);
++                    domain_crash(current->domain);
++                }
+             }
+             else if ( id && *id == i )
+             {
+@@ -206,8 +211,13 @@ int hypercall_xlat_continuation(unsigned int *id, unsigned int nr,
+                 mcs->call.args[i] = cval;
+                 ++rc;
+             }
+-            else
+-                BUG_ON(mcs->call.args[i] != (unsigned int)mcs->call.args[i]);
++            else if ( mcs->call.args[i] != (unsigned int)mcs->call.args[i] )
++            {
++                printk(XENLOG_G_ERR
++                       "multicall (op %lu) bad continuation arg%u (%#lx)\n",
++                       mcs->call.op, i, mcs->call.args[i]);
++                domain_crash(current->domain);
++            }
+         }
+     }
+     else
+@@ -233,8 +243,13 @@ int hypercall_xlat_continuation(unsigned int *id, unsigned int nr,
+                 cval = va_arg(args, unsigned int);
+                 if ( cval == nval )
+                     mask &= ~1U;
+-                else
+-                    BUG_ON(nval == (unsigned int)nval);
++                else if ( nval == (unsigned int)nval )
++                {
++                    printk(XENLOG_G_ERR
++                           "hypercall (op %u) bogus continuation arg%u (%#lx)\n",
++                           regs->eax, i, nval);
++                    domain_crash(current->domain);
++                }
+             }
+             else if ( id && *id == i )
+             {
+@@ -246,8 +261,13 @@ int hypercall_xlat_continuation(unsigned int *id, unsigned int nr,
+                 *reg = cval;
+                 ++rc;
+             }
+-            else
+-                BUG_ON(*reg != (unsigned int)*reg);
++            else if ( *reg != (unsigned int)*reg )
++            {
++                printk(XENLOG_G_ERR
++                       "hypercall (op %u) bad continuation arg%u (%#lx)\n",
++                       regs->eax, i, *reg);
++                domain_crash(current->domain);
++            }
+         }
+     }
+ 
