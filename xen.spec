@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.39
+%global hv_rel 9.40
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -875,6 +875,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Apr  8 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.40
+- Fixes for:
+  - XSA-454 CVE-2023-46842
+  - XSA-455 CVE-2024-31142
+  - XSA-456 CVE-2024-2201
+
 * Fri Mar  8 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.39
 - Fixes for:
   - XSA-449 CVE-2023-46839
