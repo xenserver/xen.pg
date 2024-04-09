@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 5
+%global hv_rel 6
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -886,6 +886,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Tue Apr  9 2024 Alex Brett <alex.brett@cloud.com> - 4.17.3-6
+- CA-391273: Rebuild to resolve xen-dom0-tools dependency issue
+
 * Wed Apr  3 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-5
 - Fixes for:
   - XSA-454 CVE-2023-46842
