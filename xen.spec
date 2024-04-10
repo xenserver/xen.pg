@@ -316,6 +316,7 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 
 # Install artefacts for livepatches
 %{__install} -p -D -m 644 xen/build-xen-release/xen-syms %{buildroot}%{lp_devel_dir}/xen-syms
+%{__install} -p -D -m 644 xen/build-xen-debug/xen-syms %{buildroot}%{lp_devel_dir}/xen-syms-d
 cp -a ../livepatch-src/. %{buildroot}%{lp_devel_dir}
 
 # Install release & debug Xen
