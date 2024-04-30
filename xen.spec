@@ -887,6 +887,14 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Tue Apr 30 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-1
+- Update to Xen 4.17.4
+- Fix a bug in RTC emulation for HVM guests which occasionally causes OVMF to
+  fail an assertion
+- Fix a bug in livepatch application when CET-IBT is active, leading to a full
+  host crash
+- Include the debug xen debug symbols in in the lp-devel subpackage
+
 * Tue Apr  9 2024 Alex Brett <alex.brett@cloud.com> - 4.17.3-6
 - CA-391273: Rebuild to resolve xen-dom0-tools dependency issue
 
