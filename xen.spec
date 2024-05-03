@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 4
+%global hv_rel 5
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -902,6 +902,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri May 31 2024 Pau Ruiz Safont <pau.ruizsafont@cloud.com> - 4.17.4-5
+- Rebuild with OCaml 4.14.2 compiler.
+
 * Thu May 30 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-4
 - Don't link oxenstored against libsystemd, and remove systemd-devel as a
   build dependency
