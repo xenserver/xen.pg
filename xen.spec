@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 2
+%global hv_rel 3
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -891,6 +891,13 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed May 15 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-3
+- Pass all MSI-X vector control writes to the device model
+- Distinguish "ucode already up to date" and treat it as success
+- Optimise HVMLoader AP bringup
+- Fix xentop cpu% sort order
+- Fix possible watchdog timeouts or NULL pointer deference with CPU hotplug
+
 * Tue May  7 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-2
 - Fix a heterogeneous CPU levelling bug between ICX and CLX
 
