@@ -1,0 +1,51 @@
+From abd00b037da5ffa4e8c4508a5df0cd6eabb805a4 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Mon, 13 May 2024 10:59:25 +0200
+Subject: x86/mtrr: avoid system wide rendezvous when setting AP MTRRs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There's no point in forcing a system wide update of the MTRRs on all processors
+when there are no changes to be propagated.  On AP startup it's only the AP
+that needs to write the system wide MTRR values in order to match the rest of
+the already online CPUs.
+
+We have occasionally seen the watchdog trigger during `xen-hptool cpu-online`
+in one Intel Cascade Lake box with 448 CPUs due to the re-setting of the MTRRs
+on all the CPUs in the system.
+
+While there adjust the comment to clarify why the system-wide resetting of the
+MTRR registers is not needed for the purposes of mtrr_ap_init().
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Release-acked-by: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/cpu/mtrr/main.c b/xen/arch/x86/cpu/mtrr/main.c
+index 990f12286ae5..099e9f2cf7ad 100644
+--- a/xen/arch/x86/cpu/mtrr/main.c
++++ b/xen/arch/x86/cpu/mtrr/main.c
+@@ -573,14 +573,15 @@ void mtrr_ap_init(void)
+ 	if (!mtrr_if || hold_mtrr_updates_on_aps)
+ 		return;
+ 	/*
+-	 * Ideally we should hold mtrr_mutex here to avoid mtrr entries changed,
+-	 * but this routine will be called in cpu boot time, holding the lock
+-	 * breaks it. This routine is called in two cases: 1.very earily time
+-	 * of software resume, when there absolutely isn't mtrr entry changes;
+-	 * 2.cpu hotadd time. We let mtrr_add/del_page hold cpuhotplug lock to
+-	 * prevent mtrr entry changes
++	 * hold_mtrr_updates_on_aps takes care of preventing unnecessary MTRR
++	 * updates when batch starting the CPUs (see
++	 * mtrr_aps_sync_{begin,end}()).
++	 *
++	 * Otherwise just apply the current system wide MTRR values to this AP.
++	 * Note this doesn't require synchronization with the other CPUs, as
++	 * there are strictly no modifications of the current MTRR values.
+ 	 */
+-	set_mtrr(~0U, 0, 0, 0);
++	mtrr_set_all();
+ }
+ 
+ /**
