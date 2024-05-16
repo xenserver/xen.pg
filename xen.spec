@@ -27,6 +27,10 @@
 %global __requires_exclude_from ^%{lp_devel_dir}/.*$
 %global __brp_mangle_shebangs_exclude_from ^%{lp_devel_dir}/.*$
 
+%if 0%{?xenserver} < 9
+%global __patch /usr/bin/patch --fuzz=0
+%endif
+
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.17.4
