@@ -1,0 +1,57 @@
+From fdeacd43848e4ad9b2d33913351fb814567a714a Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 21 May 2024 11:58:17 +0200
+Subject: VT-d: correct ATS checking for root complex integrated devices
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Spec version 4.1 says
+
+"The ATSR structures identifies PCI Express Root-Ports supporting
+ Address Translation Services (ATS) transactions. Software must enable
+ ATS on endpoint devices behind a Root Port only if the Root Port is
+ reported as supporting ATS transactions."
+
+Clearly root complex integrated devices aren't "behind root ports",
+matching my observation on a SapphireRapids system having an ATS-
+capable root complex integrated device. Hence for such devices we
+shouldn't try to locate a corresponding ATSR.
+
+Since both pci_find_ext_capability() and pci_find_cap_offset() return
+"unsigned int", change "pos" to that type at the same time.
+
+Fixes: 903b93211f56 ("[VTD] laying the ground work for ATS")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Roger Pau Monné <roger.pau@citrix.com>
+master commit: 04e31583bab97e5042a44a1d00fce2760272635f
+master date: 2024-05-06 09:22:45 +0200
+
+diff --git a/xen/drivers/passthrough/vtd/x86/ats.c b/xen/drivers/passthrough/vtd/x86/ats.c
+index 04d702b1d6b1..9d65b4896a77 100644
+--- a/xen/drivers/passthrough/vtd/x86/ats.c
++++ b/xen/drivers/passthrough/vtd/x86/ats.c
+@@ -44,7 +44,7 @@ struct acpi_drhd_unit *find_ats_dev_drhd(struct vtd_iommu *iommu)
+ int ats_device(const struct pci_dev *pdev, const struct acpi_drhd_unit *drhd)
+ {
+     struct acpi_drhd_unit *ats_drhd;
+-    int pos;
++    unsigned int pos, expfl = 0;
+ 
+     if ( !ats_enabled || !iommu_qinval )
+         return 0;
+@@ -53,7 +53,13 @@ int ats_device(const struct pci_dev *pdev, const struct acpi_drhd_unit *drhd)
+          !ecap_dev_iotlb(drhd->iommu->ecap) )
+         return 0;
+ 
+-    if ( !acpi_find_matched_atsr_unit(pdev) )
++    pos = pci_find_cap_offset(pdev->seg, pdev->bus, PCI_SLOT(pdev->devfn),
++                              PCI_FUNC(pdev->devfn), PCI_CAP_ID_EXP);
++    if ( pos )
++        expfl = pci_conf_read16(pdev->sbdf, pos + PCI_EXP_FLAGS);
++
++    if ( MASK_EXTR(expfl, PCI_EXP_FLAGS_TYPE) != PCI_EXP_TYPE_RC_END &&
++         !acpi_find_matched_atsr_unit(pdev) )
+         return 0;
+ 
+     ats_drhd = find_ats_dev_drhd(drhd->iommu);
