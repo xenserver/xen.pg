@@ -92,7 +92,6 @@ BuildRequires: dev86 iasl
 
 # For the domain builder (decompression and hashing)
 BuildRequires: zlib-devel bzip2-devel xz-devel libzstd-devel
-BuildRequires: openssl-devel
 
 # For libxl
 BuildRequires: yajl-devel libuuid-devel perl
