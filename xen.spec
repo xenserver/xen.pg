@@ -129,7 +129,11 @@ BuildRequires: json-c-devel
 BuildRequires: libempserver-devel
 
 %if %with_systemd
-BuildRequires: systemd-devel
+%if 0%{?xenserver} < 9
+BuildRequires: systemd
+%else
+BuildRequires: systemd-rpm-macros
+%endif
 %endif
 
 # Need cov-analysis if coverity is enabled
