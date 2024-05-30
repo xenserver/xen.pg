@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 3
+%global hv_rel 4
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -902,6 +902,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Thu May 30 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-4
+- Don't link oxenstored against libsystemd, and remove systemd-devel as a
+  build dependency
+- Fix population of the online vCPU bitmap for PVH guests
+- Drop unused openssl-devel build dependency
+
 * Wed May 15 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-3
 - Pass all MSI-X vector control writes to the device model
 - Distinguish "ucode already up to date" and treat it as success
