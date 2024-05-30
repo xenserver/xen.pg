@@ -72,6 +72,9 @@ BuildRequires: python2-rpm-macros
         }
     end
 
+    -- For the banner
+    table.insert(deps, 'figlet')
+
     -- For Kconfig
     table.insert(deps, 'bison')
     table.insert(deps, 'flex')
@@ -87,39 +90,44 @@ BuildRequires: python2-rpm-macros
 
 %{core_builddeps BuildRequires}
 
-# For HVMLoader and 16/32bit firmware
-BuildRequires: dev86 iasl
+BuildRequires: libtool
 
-# For the domain builder (decompression and hashing)
-BuildRequires: zlib-devel bzip2-devel xz-devel libzstd-devel
+# For libxenguest (domain builder)
+BuildRequires: bzip2-devel
+BuildRequires: libzstd-devel
+BuildRequires: lzo-devel
+BuildRequires: xz-devel
+BuildRequires: zlib-devel
 
 # For libxl
-BuildRequires: yajl-devel libuuid-devel perl
+BuildRequires: yajl-devel
+BuildRequires: libuuid-devel
+BuildRequires: perl
 
-# For ocaml stubs
-BuildRequires: ocaml >= 4.13.1-3
-BuildRequires: ocaml-findlib
+# For libacpi
+BuildRequires: iasl
 
+# For libxenfsimage
+BuildRequires: e2fsprogs-devel
 BuildRequires: libblkid-devel
 
 # For xentop
 BuildRequires: ncurses-devel
 
-# For the banner
-BuildRequires: figlet
+# For RomBIOS
+BuildRequires: dev86
 
-# For libxenfsimage
-BuildRequires: e2fsprogs-devel
-BuildRequires: lzo-devel
-
-# For xenguest
-BuildRequires: json-c-devel libempserver-devel
+# For ocaml components
+BuildRequires: ocaml >= 4.13.1-3
+BuildRequires: ocaml-findlib
 
 # For manpages
 BuildRequires: perl-podlators
 
-# Misc
-BuildRequires: libtool
+# For xenguest
+BuildRequires: json-c-devel
+BuildRequires: libempserver-devel
+
 %if %with_systemd
 BuildRequires: systemd-devel
 %endif
