@@ -1,0 +1,78 @@
+From 6f39608e1f2cebb55a2265d426c16f1f4132f63e Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Wed, 26 Jun 2024 14:10:15 +0200
+Subject: x86/EPT: avoid marking non-present entries for re-configuring
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For non-present entries EMT, like most other fields, is meaningless to
+hardware. Make the logic in ept_set_entry() setting the field (and iPAT)
+conditional upon dealing with a present entry, leaving the value at 0
+otherwise. This has two effects for epte_get_entry_emt() which we'll
+want to leverage subsequently:
+1) The call moved here now won't be issued with INVALID_MFN anymore (a
+   respective BUG_ON() is being added).
+2) Neither of the other two calls could now be issued with a truncated
+   form of INVALID_MFN anymore (as long as there's no bug anywhere
+   marking an entry present when that was populated using INVALID_MFN).
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+master commit: 777c71d31325bc55ba1cc3f317d4155fe519ab0b
+master date: 2024-06-13 16:54:17 +0200
+
+diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
+index 54fa13fa7e43..b7d7a5b68c81 100644
+--- a/xen/arch/x86/mm/p2m-ept.c
++++ b/xen/arch/x86/mm/p2m-ept.c
+@@ -662,6 +662,8 @@ static int cf_check resolve_misconfig(struct p2m_domain *p2m, unsigned long gfn)
+             if ( e.emt != MTRR_NUM_TYPES )
+                 break;
+ 
++            ASSERT(is_epte_present(&e));
++
+             if ( level == 0 )
+             {
+                 for ( gfn -= i, i = 0; i < EPT_PAGETABLE_ENTRIES; ++i )
+@@ -927,17 +929,6 @@ ept_set_entry(struct p2m_domain *p2m, gfn_t gfn_, mfn_t mfn,
+ 
+     if ( mfn_valid(mfn) || p2m_allows_invalid_mfn(p2mt) )
+     {
+-        bool ipat;
+-        int emt = epte_get_entry_emt(p2m->domain, _gfn(gfn), mfn,
+-                                     i * EPT_TABLE_ORDER, &ipat,
+-                                     p2mt);
+-
+-        if ( emt >= 0 )
+-            new_entry.emt = emt;
+-        else /* ept_handle_misconfig() will need to take care of this. */
+-            new_entry.emt = MTRR_NUM_TYPES;
+-
+-        new_entry.ipat = ipat;
+         new_entry.sp = !!i;
+         new_entry.sa_p2mt = p2mt;
+         new_entry.access = p2ma;
+@@ -953,6 +944,22 @@ ept_set_entry(struct p2m_domain *p2m, gfn_t gfn_, mfn_t mfn,
+             need_modify_vtd_table = 0;
+ 
+         ept_p2m_type_to_flags(p2m, &new_entry);
++
++        if ( is_epte_present(&new_entry) )
++        {
++            bool ipat;
++            int emt = epte_get_entry_emt(p2m->domain, _gfn(gfn), mfn,
++                                         i * EPT_TABLE_ORDER, &ipat,
++                                         p2mt);
++
++            BUG_ON(mfn_eq(mfn, INVALID_MFN));
++
++            if ( emt >= 0 )
++                new_entry.emt = emt;
++            else /* ept_handle_misconfig() will need to take care of this. */
++                new_entry.emt = MTRR_NUM_TYPES;
++            new_entry.ipat = ipat;
++        }
+     }
+ 
+     if ( sve != -1 )
