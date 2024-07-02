@@ -782,17 +782,17 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/pkgconfig/xenstat.pc
 
 %files ocaml-libs
-%{_libdir}/ocaml/stublibs/dllxenbus_stubs.so
-%{_libdir}/ocaml/stublibs/dllxenbus_stubs.so.owner
+%exclude %{_libdir}/ocaml/stublibs/dllxenbus_stubs.so
+%exclude %{_libdir}/ocaml/stublibs/dllxenbus_stubs.so.owner
 %{_libdir}/ocaml/stublibs/dllxenctrl_stubs.so
 %{_libdir}/ocaml/stublibs/dllxenctrl_stubs.so.owner
 %{_libdir}/ocaml/stublibs/dllxeneventchn_stubs.so
 %{_libdir}/ocaml/stublibs/dllxeneventchn_stubs.so.owner
 %{_libdir}/ocaml/stublibs/dllxenmmap_stubs.so
 %{_libdir}/ocaml/stublibs/dllxenmmap_stubs.so.owner
-%{_libdir}/ocaml/xenbus/META
-%{_libdir}/ocaml/xenbus/xenbus.cma
-%{_libdir}/ocaml/xenbus/xenbus.cmo
+%exclude %{_libdir}/ocaml/xenbus/META
+%exclude %{_libdir}/ocaml/xenbus/xenbus.cma
+%exclude %{_libdir}/ocaml/xenbus/xenbus.cmo
 %{_libdir}/ocaml/xenctrl/META
 %{_libdir}/ocaml/xenctrl/xenctrl.cma
 %{_libdir}/ocaml/xeneventchn/META
@@ -804,11 +804,11 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_libdir}/ocaml/xenstore/xenstore.cmo
 
 %files ocaml-devel
-%{_libdir}/ocaml/xenbus/libxenbus_stubs.a
-%{_libdir}/ocaml/xenbus/xenbus.a
-%{_libdir}/ocaml/xenbus/xenbus.cmi
-%{_libdir}/ocaml/xenbus/xenbus.cmx
-%{_libdir}/ocaml/xenbus/xenbus.cmxa
+%exclude %{_libdir}/ocaml/xenbus/libxenbus_stubs.a
+%exclude %{_libdir}/ocaml/xenbus/xenbus.a
+%exclude %{_libdir}/ocaml/xenbus/xenbus.cmi
+%exclude %{_libdir}/ocaml/xenbus/xenbus.cmx
+%exclude %{_libdir}/ocaml/xenbus/xenbus.cmxa
 %{_libdir}/ocaml/xenctrl/libxenctrl_stubs.a
 %{_libdir}/ocaml/xenctrl/xenctrl.a
 %{_libdir}/ocaml/xenctrl/xenctrl.cmi
