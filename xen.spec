@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 5
+%global hv_rel 6
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -902,6 +902,16 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Wed Jul  3 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-6
+- Fix for XSA-458 CVE-2024-31143
+- Fix early detection of CPU features on hardware with the CPUID Limit active
+  in firmware
+- Fix a bug whereby dynamic XSTATE CPUID information was provided to all
+  guests, even those with XSAVE disabled
+- Fix a bug on Intel where HVM guests may have MMIO mappings forced to UC even
+  if the guest kernel wanted a different cacheability
+- Fix multiple bugs with interrupt affinity handling around CPU hotplug
+
 * Fri May 31 2024 Pau Ruiz Safont <pau.ruizsafont@cloud.com> - 4.17.4-5
 - Rebuild with OCaml 4.14.2 compiler.
 
