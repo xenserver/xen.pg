@@ -1,0 +1,89 @@
+From 4baf3a31a53ae14a3ed8e57092e97f584359079f Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 4 Jul 2024 14:21:55 +0200
+Subject: tools/libxs: Fix CLOEXEC handling in get_dev()
+
+Move the O_CLOEXEC compatibility outside of an #ifdef USE_PTHREAD block.
+
+Introduce set_cloexec() to wrap fcntl() setting FD_CLOEXEC.  It will be reused
+for other CLOEXEC fixes too.
+
+Use set_cloexec() when O_CLOEXEC isn't available as a best-effort fallback.
+
+Fixes: f4f2f3402b2f ("tools/libxs: Open /dev/xen/xenbus fds as O_CLOEXEC")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+Acked-by: Anthony PERARD <anthony.perard@vates.tech>
+master commit: bf7c1464706adfa903f1e7d59383d042c3a88e39
+master date: 2024-07-02 10:51:06 +0100
+
+diff --git a/tools/libs/store/xs.c b/tools/libs/store/xs.c
+index b5933fb1080f..0abbcb13b424 100644
+--- a/tools/libs/store/xs.c
++++ b/tools/libs/store/xs.c
+@@ -40,6 +40,10 @@
+ 
+ #include <xentoolcore_internal.h>
+ 
++#ifndef O_CLOEXEC
++#define O_CLOEXEC 0
++#endif
++
+ struct xs_stored_msg {
+ 	struct list_head list;
+ 	struct xsd_sockmsg hdr;
+@@ -54,10 +58,6 @@ struct xs_stored_msg {
+ #include <dlfcn.h>
+ #endif
+ 
+-#ifndef O_CLOEXEC
+-#define O_CLOEXEC 0
+-#endif
+-
+ struct xs_handle {
+ 	/* Communications channel to xenstore daemon. */
+ 	int fd;
+@@ -176,6 +176,16 @@ static bool setnonblock(int fd, int nonblock) {
+ 	return true;
+ }
+ 
++static bool set_cloexec(int fd)
++{
++	int flags = fcntl(fd, F_GETFL);
++
++	if (flags < 0)
++		return false;
++
++	return fcntl(fd, flags | FD_CLOEXEC) >= 0;
++}
++
+ int xs_fileno(struct xs_handle *h)
+ {
+ 	char c = 0;
+@@ -230,8 +240,24 @@ error:
+ 
+ static int get_dev(const char *connect_to)
+ {
+-	/* We cannot open read-only because requests are writes */
+-	return open(connect_to, O_RDWR | O_CLOEXEC);
++	int fd, saved_errno;
++
++	fd = open(connect_to, O_RDWR | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++
++	/* Compat for non-O_CLOEXEC environments.  Racy. */
++	if (!O_CLOEXEC && !set_cloexec(fd))
++		goto error;
++
++	return fd;
++
++error:
++	saved_errno = errno;
++	close(fd);
++	errno = saved_errno;
++
++	return -1;
+ }
+ 
+ static int all_restrict_cb(Xentoolcore__Active_Handle *ah, domid_t domid) {

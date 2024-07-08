@@ -1,0 +1,50 @@
+From 37810b52d003f8a04af41d7b1f85eff24af9f804 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 8 Jul 2024 15:56:14 +0100
+Subject: tools/libxs: Fix fcntl() invocation in set_cloexec()
+
+set_cloexec() had a bit too much copy&pate from setnonblock(), and
+insufficient testing on ancient versions of Linux...
+
+As written (emulating ancient linux by undef'ing O_CLOEXEC), strace shows:
+
+  open("/dev/xen/xenbus", O_RDWR)         = 3
+  fcntl(3, F_GETFL)                       = 0x8002 (flags O_RDWR|O_LARGEFILE)
+  fcntl(3, 0x8003 /* F_??? */, 0x7ffe4a771d90) = -1 EINVAL (Invalid argument)
+  close(3)                                = 0
+
+which is obviously nonsense.
+
+Switch F_GETFL -> F_GETFD, and fix the second invocation to use F_SETFD.  With
+this, strace is rather happer:
+
+  open("/dev/xen/xenbus", O_RDWR)         = 3
+  fcntl(3, F_GETFD)                       = 0
+  fcntl(3, F_SETFD, FD_CLOEXEC)           = 0
+
+Fixes: bf7c1464706a ("tools/libxs: Fix CLOEXEC handling in get_dev()")
+Reported-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+Release-Acked-by: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+
+diff --git a/tools/libs/store/xs.c b/tools/libs/store/xs.c
+index 3f723bff5ac4..03f06e614eec 100644
+--- a/tools/libs/store/xs.c
++++ b/tools/libs/store/xs.c
+@@ -182,12 +182,12 @@ static bool setnonblock(int fd, int nonblock) {
+ 
+ static bool set_cloexec(int fd)
+ {
+-	int flags = fcntl(fd, F_GETFL);
++	int flags = fcntl(fd, F_GETFD);
+ 
+ 	if (flags < 0)
+ 		return false;
+ 
+-	return fcntl(fd, flags | FD_CLOEXEC) >= 0;
++	return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) >= 0;
+ }
+ 
+ static int pipe_cloexec(int fds[2])

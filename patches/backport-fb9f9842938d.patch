@@ -1,0 +1,76 @@
+From fb9f9842938dbc095de8f6bdebd4bc2e3ef0f1e7 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 4 Jul 2024 14:20:50 +0200
+Subject: pirq_cleanup_check() leaks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Its original introduction had two issues: For one the "common" part of
+the checks (carried out in the macro) was inverted. And then after
+removal from the radix tree the structure wasn't scheduled for freeing.
+(All structures still left in the radix tree would be freed upon domain
+destruction, though.)
+
+For the freeing to be safe even if it didn't use RCU (i.e. to avoid use-
+after-free), re-arrange checks/operations in evtchn_close(), such that
+the pointer wouldn't be used anymore after calling pirq_cleanup_check()
+(noting that unmap_domain_pirq_emuirq() itself calls the function in the
+success case).
+
+Fixes: c24536b636f2 ("replace d->nr_pirqs sized arrays with radix tree")
+Fixes: 79858fee307c ("xen: fix hvm_domain_use_pirq's behavior")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+master commit: daa90dfea9175c07f13d1a2d901857b2dd14d080
+master date: 2024-07-02 08:35:56 +0200
+
+diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
+index 11b2a213aa44..827ed556d348 100644
+--- a/xen/arch/x86/irq.c
++++ b/xen/arch/x86/irq.c
+@@ -1413,6 +1413,7 @@ void (pirq_cleanup_check)(struct pirq *pirq, struct domain *d)
+ 
+     if ( radix_tree_delete(&d->pirq_tree, pirq->pirq) != pirq )
+         BUG();
++    free_pirq_struct(pirq);
+ }
+ 
+ /* Flush all ready EOIs from the top of this CPU's pending-EOI stack. */
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index dada9f15f574..7eb719f0deb1 100644
+--- a/xen/common/event_channel.c
++++ b/xen/common/event_channel.c
+@@ -680,11 +680,16 @@ int evtchn_close(struct domain *d1, int port1, bool guest)
+             if ( !is_hvm_domain(d1) )
+                 pirq_guest_unbind(d1, pirq);
+             pirq->evtchn = 0;
+-            pirq_cleanup_check(pirq, d1);
+ #ifdef CONFIG_X86
+-            if ( is_hvm_domain(d1) && domain_pirq_to_irq(d1, pirq->pirq) > 0 )
+-                unmap_domain_pirq_emuirq(d1, pirq->pirq);
++            if ( !is_hvm_domain(d1) ||
++                 domain_pirq_to_irq(d1, pirq->pirq) <= 0 ||
++                 unmap_domain_pirq_emuirq(d1, pirq->pirq) < 0 )
++                /*
++                 * The successful path of unmap_domain_pirq_emuirq() will have
++                 * called pirq_cleanup_check() already.
++                 */
+ #endif
++                pirq_cleanup_check(pirq, d1);
+         }
+         unlink_pirq_port(chn1, d1->vcpu[chn1->notify_vcpu_id]);
+         break;
+diff --git a/xen/include/xen/irq.h b/xen/include/xen/irq.h
+index c93ef31a9c3d..f69c9ec760ea 100644
+--- a/xen/include/xen/irq.h
++++ b/xen/include/xen/irq.h
+@@ -179,7 +179,7 @@ extern struct pirq *pirq_get_info(struct domain *, int pirq);
+ void pirq_cleanup_check(struct pirq *, struct domain *);
+ 
+ #define pirq_cleanup_check(pirq, d) \
+-    ((pirq)->evtchn ? pirq_cleanup_check(pirq, d) : (void)0)
++    (!(pirq)->evtchn ? pirq_cleanup_check(pirq, d) : (void)0)
+ 
+ extern void pirq_guest_eoi(struct pirq *);
+ extern void desc_guest_eoi(struct irq_desc *, struct pirq *);
