@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.40
+%global hv_rel 9.41
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -875,6 +875,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Thu Jul 11 2024 Roger Pau Monné <roger.pau@citrix.com> - 4.13.5-9.41
+- Fixes for XSA-458 CVE-2024-31143.
+- Fix early detection of CPU features on hardware with the CPUID Limit active
+  in firmware.
+- Fix RTC emulation.
+
 * Mon Apr  8 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.40
 - Fixes for:
   - XSA-454 CVE-2023-46842
