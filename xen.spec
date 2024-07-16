@@ -15,9 +15,6 @@
 # `git describe` when not building an from a tagged changeset.
 %{!?xsrel: %global xsrel %{hv_rel}}
 
-%define with_sysv 0
-%define with_systemd 1
-
 %define base_dir  %{name}-%{version}
 
 %define lp_devel_dir %{_usrsrc}/xen-%{version}-%{release}
@@ -128,12 +125,10 @@ BuildRequires: perl-podlators
 BuildRequires: json-c-devel
 BuildRequires: libempserver-devel
 
-%if %with_systemd
 %if 0%{?xenserver} < 9
 BuildRequires: systemd
 %else
 BuildRequires: systemd-rpm-macros
-%endif
 %endif
 
 # Need cov-analysis if coverity is enabled
@@ -190,11 +185,9 @@ Requires: xen-tools = %{version}
 Obsoletes: xen-installer-files <= 4.13.5-10.42
 Requires: edk2
 Requires: ipxe
-%if %with_systemd
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
-%endif
 %description dom0-tools
 This package contains the Xen Hypervisor control domain tools.
 
@@ -536,11 +529,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_sysconfdir}/rc.d/init.d/xendomains
 %exclude %{_sysconfdir}/rc.d/init.d/xendriverdomain
 %exclude %{_sysconfdir}/sysconfig/xendomains
-%if %with_systemd
 %exclude %{_sysconfdir}/rc.d/init.d/xen-watchdog
-%else
-%{_sysconfdir}/rc.d/init.d/xen-watchdog
-%endif
 %config %{_sysconfdir}/logrotate.d/xen-tools
 %config %{_sysconfdir}/sysconfig/xencommons
 %config %{_sysconfdir}/xen/oxenstored.conf
@@ -682,7 +671,6 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_mandir}/man8/xentrace.8.gz
 %dir /var/lib/xen
 %dir /var/log/xen
-%if %with_systemd
 %{_unitdir}/proc-xen.mount
 %{_unitdir}/xen-init-dom0.service
 %{_unitdir}/xen-watchdog.service
@@ -692,7 +680,6 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_unitdir}/xen-qemu-dom0-disk-backend.service
 %exclude %{_unitdir}/xendomains.service
 %exclude %{_unitdir}/xendriverdomain.service
-%endif
 
 %files dom0-libs
 %{_libdir}/libxencall.so.1
@@ -873,7 +860,6 @@ fi
 mkdir -p %{_rundir}/reboot-required.d/%{name}
 touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 
-%if %with_systemd
 %post dom0-tools
 %systemd_post proc-xen.mount
 %systemd_post var-lib-xenstored.mount
@@ -897,7 +883,6 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %systemd_postun xen-watchdog.service
 %systemd_postun xenconsoled.service
 %systemd_postun xenstored.service
-%endif
 
 %{?_cov_results_package}
 
