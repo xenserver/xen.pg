@@ -1,0 +1,172 @@
+From e42e4d8c3e2c391e8ce990e0a2c76d6e9a17aad6 Mon Sep 17 00:00:00 2001
+Message-Id: <e42e4d8c3e2c391e8ce990e0a2c76d6e9a17aad6.1721646831.git.matthew.barnes@cloud.com>
+From: Matthew Barnes <matthew.barnes@cloud.com>
+Date: Fri, 5 Jul 2024 16:05:07 +0100
+Subject: tools/misc: xen-hvmcrash: Inject #DF instead of overwriting RIP
+
+xen-hvmcrash would previously save records, overwrite the instruction
+pointer with a bogus value, and then restore them to crash a domain
+just enough to cause the guest OS to memdump.
+
+This approach is found to be unreliable when tested on a guest running
+Windows 10 x64, with some executions doing nothing at all.
+
+Another approach would be to trigger NMIs. This approach is found to be
+unreliable when tested on Linux (Ubuntu 22.04), as Linux will ignore
+NMIs if it is not configured to handle such.
+
+Injecting a double fault abort to all vCPUs is found to be more
+reliable at crashing and invoking memdumps from Windows and Linux
+domains.
+
+This patch modifies the xen-hvmcrash tool to inject #DF to all vCPUs
+belonging to the specified domain, instead of overwriting RIP.
+
+Signed-off-by: Matthew Barnes <matthew.barnes@cloud.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/tools/misc/Makefile b/tools/misc/Makefile
+index 66d0d6b09029..c26e544e8393 100644
+--- a/tools/misc/Makefile
++++ b/tools/misc/Makefile
+@@ -81,7 +81,7 @@ xen-hvmctx: xen-hvmctx.o
+ 	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS_libxenctrl) $(APPEND_LDFLAGS)
+ 
+ xen-hvmcrash: xen-hvmcrash.o
+-	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS_libxenctrl) $(APPEND_LDFLAGS)
++	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS_libxenctrl) $(LDLIBS_libxendevicemodel) $(APPEND_LDFLAGS)
+ 
+ xen-memshare: xen-memshare.o
+ 	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS_libxenctrl) $(APPEND_LDFLAGS)
+diff --git a/tools/misc/xen-hvmcrash.c b/tools/misc/xen-hvmcrash.c
+index 1d058fa40a47..5ae5bedb2bc8 100644
+--- a/tools/misc/xen-hvmcrash.c
++++ b/tools/misc/xen-hvmcrash.c
+@@ -1,7 +1,7 @@
+ /* 
+  * xen-hvmcrash.c
+  *
+- * Attempt to crash an HVM guest by overwriting RIP/EIP with a bogus value
++ * Attempt to crash an HVM guest by injecting #DF to every vcpu
+  * 
+  * Copyright (c) 2010 Citrix Systems, Inc.
+  *
+@@ -24,36 +24,25 @@
+  * DEALINGS IN THE SOFTWARE.
+  */
+ 
+-#include <inttypes.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+-#include <stddef.h>
+-#include <stdint.h>
+-#include <unistd.h>
+ #include <string.h>
+ #include <errno.h>
+-#include <limits.h>
+-
+-#include <sys/types.h>
+-#include <sys/stat.h>
+-#include <arpa/inet.h>
+ 
+ #include <xenctrl.h>
+-#include <xen/xen.h>
+-#include <xen/domctl.h>
+-#include <xen/hvm/save.h>
++#include <xendevicemodel.h>
++
++#include <xen/asm/x86-defns.h>
+ 
+ int
+ main(int argc, char **argv)
+ {
+     int domid;
+     xc_interface *xch;
++    xendevicemodel_handle *dmod;
+     xc_domaininfo_t dominfo;
+-    int ret;
+-    uint32_t len;
+-    uint8_t *buf;
+-    uint32_t off;
+-    struct hvm_save_descriptor *descriptor;
++    int vcpu_id, ret;
++    bool injected = false;
+ 
+     if (argc != 2 || !argv[1] || (domid = atoi(argv[1])) < 0) {
+         fprintf(stderr, "usage: %s <domid>\n", argv[0]);
+@@ -83,59 +72,29 @@ main(int argc, char **argv)
+         exit(-1);
+     }
+ 
+-    /*
+-     * Calling with zero buffer length should return the buffer length
+-     * required.
+-     */
+-    ret = xc_domain_hvm_getcontext(xch, domid, 0, 0);
+-    if (ret < 0) {
+-        perror("xc_domain_hvm_getcontext");
+-        exit(1);
+-    }
+-    
+-    len = ret;
+-    buf = malloc(len);
+-    if (buf == NULL) {
+-        perror("malloc");
+-        exit(1);
+-    }
+-
+-    ret = xc_domain_hvm_getcontext(xch, domid, buf, len);
+-    if (ret < 0) {
+-        perror("xc_domain_hvm_getcontext");
+-        exit(1);
+-    }
+-
+-    off = 0;
+-
+-    while (off < len) {
+-        descriptor = (struct hvm_save_descriptor *)(buf + off);
+-
+-        off += sizeof (struct hvm_save_descriptor);
+-
+-        if (descriptor->typecode == HVM_SAVE_CODE(CPU)) {
+-            HVM_SAVE_TYPE(CPU) *cpu;
+-
+-            /* Overwrite EIP/RIP with some recognisable but bogus value */
+-            cpu = (HVM_SAVE_TYPE(CPU) *)(buf + off);
+-            printf("CPU[%d]: RIP = %" PRIx64 "\n", descriptor->instance, cpu->rip);
+-            cpu->rip = 0xf001;
+-        } else if (descriptor->typecode == HVM_SAVE_CODE(END)) {
+-            break;
++    dmod = xc_interface_dmod_handle(xch);
++
++    for (vcpu_id = 0; vcpu_id <= dominfo.max_vcpu_id; vcpu_id++) {
++        printf("Injecting #DF to vcpu ID #%d...\n", vcpu_id);
++        ret = xendevicemodel_inject_event(dmod, domid, vcpu_id,
++                                X86_EXC_DF,
++                                XEN_DMOP_EVENT_hw_exc, 0, 0, 0);
++        if (ret < 0) {
++            fprintf(stderr, "Could not inject #DF to vcpu ID #%d: %s\n",
++                    vcpu_id, strerror(errno));
++            continue;
+         }
+-
+-        off += descriptor->length;
++        injected = true;
+     }
+ 
+-    ret = xc_domain_hvm_setcontext(xch, domid, buf, len);
++    ret = xc_domain_unpause(xch, domid);
+     if (ret < 0) {
+-        perror("xc_domain_hvm_setcontext");
++        perror("xc_domain_unpause");
+         exit(1);
+     }
+ 
+-    ret = xc_domain_unpause(xch, domid);
+-    if (ret < 0) {
+-        perror("xc_domain_unpause");
++    if (!injected) {
++        fprintf(stderr, "Could not inject #DF to any vcpu!\n");
+         exit(1);
+     }
+ 
