@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 6
+%global hv_rel 7
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -887,6 +887,11 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Mon Jul 22 2024 Matthew Barnes <matthew.barnes@cloud.com> - 4.17.4-7
+- Fix CLOEXEC handling in libxenstore
+- Don't package Ocaml Xenbus library
+- Inject #DF instead of overwriting RIP in xen-hvmcrash
+
 * Wed Jul  3 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-6
 - Fix for XSA-458 CVE-2024-31143
 - Fix early detection of CPU features on hardware with the CPUID Limit active
