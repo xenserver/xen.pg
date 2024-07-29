@@ -1,0 +1,51 @@
+From 42db2deb5e7617f0459b68cd73ab503938356186 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 18 Jul 2024 10:23:00 +0100
+Subject: tools/libxs: Fix length check in xs_talkv()
+
+If the sum of iov element lengths overflows, the XENSTORE_PAYLOAD_MAX can
+pass, after which we'll write 4G of data with a good-looking length field, and
+the remainder of the payload will be interpreted as subsequent commands.
+
+Check each iov element length for XENSTORE_PAYLOAD_MAX before accmulating it.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jason Andryuk <jason.andryuk@amd.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/tools/libs/store/xs.c b/tools/libs/store/xs.c
+index 03f06e614eec..27533e8e2422 100644
+--- a/tools/libs/store/xs.c
++++ b/tools/libs/store/xs.c
+@@ -538,21 +538,24 @@ static void *xs_talkv(struct xs_handle *h, xs_transaction_t t,
+ 	struct xsd_sockmsg msg;
+ 	void *ret = NULL;
+ 	int saved_errno;
+-	unsigned int i;
++	unsigned int i, msg_len;
+ 	struct sigaction ignorepipe, oldact;
+ 
+ 	msg.tx_id = t;
+ 	msg.req_id = 0;
+ 	msg.type = type;
+-	msg.len = 0;
+-	for (i = 0; i < num_vecs; i++)
+-		msg.len += iovec[i].iov_len;
+ 
+-	if (msg.len > XENSTORE_PAYLOAD_MAX) {
+-		errno = E2BIG;
+-		return 0;
++	/* Calculate the payload length by summing iovec elements */
++	for (i = 0, msg_len = 0; i < num_vecs; i++) {
++		if ((iovec[i].iov_len > XENSTORE_PAYLOAD_MAX) ||
++		    ((msg_len += iovec[i].iov_len) > XENSTORE_PAYLOAD_MAX)) {
++			errno = E2BIG;
++			return NULL;
++		}
+ 	}
+ 
++	msg.len = msg_len;
++
+ 	ignorepipe.sa_handler = SIG_IGN;
+ 	sigemptyset(&ignorepipe.sa_mask);
+ 	ignorepipe.sa_flags = 0;
