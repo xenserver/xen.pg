@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 7
+%global hv_rel 8
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -887,6 +887,13 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Fri Aug  2 2024 Roger Pau Monné <roger.pau@citrix.com> - 4.17.4-8
+- Fix for XSA-460 CVE-2024-31145
+- Fix IO breakpoint recognition in PV guests
+- Fix libxenstore.so to not modify SIGBUS behind the back of the application
+- Fix a integer overflow in Xen's bunzip2(), leading to a rare decompression
+  faliure
+
 * Mon Jul 22 2024 Matthew Barnes <matthew.barnes@cloud.com> - 4.17.4-7
 - Fix CLOEXEC handling in libxenstore
 - Don't package Ocaml Xenbus library
