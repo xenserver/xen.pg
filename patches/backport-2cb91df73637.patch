@@ -1,0 +1,68 @@
+From 2cb91df736374f3a09cbff1d61fe8e7d6dbc636c Mon Sep 17 00:00:00 2001
+From: Matthew Barnes <matthew.barnes@cloud.com>
+Date: Thu, 8 Aug 2024 13:57:28 +0200
+Subject: tools/lsevtchn: Use errno macro to handle hypercall error cases
+
+Currently, lsevtchn aborts its event channel enumeration when it hits
+an event channel that is owned by Xen.
+
+lsevtchn does not distinguish between different hypercall errors, which
+results in lsevtchn missing potential relevant event channels with
+higher port numbers.
+
+Use the errno macro to distinguish between hypercall errors, and
+continue event channel enumeration if the hypercall error is not
+critical to enumeration.
+
+Signed-off-by: Matthew Barnes <matthew.barnes@cloud.com>
+Reviewed-by: Anthony PERARD <anthony.perard@vates.tech>
+master commit: e92a453c8db8bba62d6be3006079e2b9990c3978
+master date: 2024-08-02 08:43:57 +0200
+
+diff --git a/tools/xcutils/lsevtchn.c b/tools/xcutils/lsevtchn.c
+index d1710613ddc5..30c8d847b814 100644
+--- a/tools/xcutils/lsevtchn.c
++++ b/tools/xcutils/lsevtchn.c
+@@ -3,6 +3,7 @@
+ #include <stdint.h>
+ #include <string.h>
+ #include <stdio.h>
++#include <errno.h>
+ 
+ #include <xenctrl.h>
+ 
+@@ -24,7 +25,23 @@ int main(int argc, char **argv)
+         status.port = port;
+         rc = xc_evtchn_status(xch, &status);
+         if ( rc < 0 )
+-            break;
++        {
++            switch ( errno )
++            {
++            case EACCES: /* Xen-owned evtchn */
++                continue;
++
++            case EINVAL: /* Port enumeration has ended */
++                rc = 0;
++                break;
++
++            default:
++                perror("xc_evtchn_status");
++                rc = 1;
++                break;
++            }
++            goto out;
++        }
+ 
+         if ( status.status == EVTCHNSTAT_closed )
+             continue;
+@@ -58,7 +75,8 @@ int main(int argc, char **argv)
+         printf("\n");
+     }
+ 
++ out:
+     xc_interface_close(xch);
+ 
+-    return 0;
++    return rc;
+ }

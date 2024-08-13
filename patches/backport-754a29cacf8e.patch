@@ -1,0 +1,301 @@
+From 754a29cacf8eb3bbfeeff00a46b2b9dec512936f Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 24 Aug 2022 11:08:28 +0100
+Subject: tools/hvmloader: Move various helpers to being static inlines
+
+The IO port, MSR, IO-APIC and LAPIC accessors compile typically to single or
+pairs of instructions, which is less overhead than even the stack manipulation
+to call the helpers.
+
+Move the implementations from util.c to being static inlines in util.h
+
+In addition, turn ioapic_base_address into a constant as it is never modified
+from 0xfec00000 (substantially shrinks the IO-APIC logic), and make use of the
+"A" constraint for WRMSR/RDMSR like we already do for RDTSC.
+
+Bloat-o-meter reports a net:
+  add/remove: 0/13 grow/shrink: 0/18 up/down: 0/-790 (-790)
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/tools/firmware/hvmloader/config.h b/tools/firmware/hvmloader/config.h
+index c82adf6dc508..cd716bf39245 100644
+--- a/tools/firmware/hvmloader/config.h
++++ b/tools/firmware/hvmloader/config.h
+@@ -44,7 +44,6 @@ extern struct bios_config ovmf_config;
+ #define PAGE_SHIFT 12
+ #define PAGE_SIZE  (1ul << PAGE_SHIFT)
+ 
+-extern uint32_t ioapic_base_address;
+ extern uint8_t ioapic_version;
+ 
+ #define IOAPIC_ID           0x01
+diff --git a/tools/firmware/hvmloader/hvmloader.c b/tools/firmware/hvmloader/hvmloader.c
+index c58841e5b556..f8af88fabf24 100644
+--- a/tools/firmware/hvmloader/hvmloader.c
++++ b/tools/firmware/hvmloader/hvmloader.c
+@@ -113,7 +113,6 @@ asm (
+ 
+ unsigned long scratch_start = SCRATCH_PHYSICAL_ADDRESS;
+ 
+-uint32_t ioapic_base_address = 0xfec00000;
+ uint8_t ioapic_version;
+ 
+ bool acpi_enabled;
+diff --git a/tools/firmware/hvmloader/mp_tables.c b/tools/firmware/hvmloader/mp_tables.c
+index d207ecbf00c9..77d3010406d0 100644
+--- a/tools/firmware/hvmloader/mp_tables.c
++++ b/tools/firmware/hvmloader/mp_tables.c
+@@ -229,7 +229,7 @@ static void fill_mp_ioapic_entry(struct mp_ioapic_entry *mpie)
+     mpie->ioapic_id = IOAPIC_ID;
+     mpie->ioapic_version = ioapic_version;
+     mpie->ioapic_flags = 1; /* enabled */
+-    mpie->ioapic_addr = ioapic_base_address;
++    mpie->ioapic_addr = IOAPIC_BASE_ADDRESS;
+ }
+ 
+ 
+diff --git a/tools/firmware/hvmloader/util.c b/tools/firmware/hvmloader/util.c
+index e82047d99324..c34f077b38e3 100644
+--- a/tools/firmware/hvmloader/util.c
++++ b/tools/firmware/hvmloader/util.c
+@@ -42,60 +42,6 @@ bool check_overlap(uint64_t start, uint64_t size,
+             (start < reserved_start + reserved_size);
+ }
+ 
+-void wrmsr(uint32_t idx, uint64_t v)
+-{
+-    asm volatile (
+-        "wrmsr"
+-        : : "c" (idx), "a" ((uint32_t)v), "d" ((uint32_t)(v>>32)) );
+-}
+-
+-uint64_t rdmsr(uint32_t idx)
+-{
+-    uint32_t lo, hi;
+-
+-    asm volatile (
+-        "rdmsr"
+-        : "=a" (lo), "=d" (hi) : "c" (idx) );
+-
+-    return (lo | ((uint64_t)hi << 32));
+-}
+-
+-void outb(uint16_t addr, uint8_t val)
+-{
+-    asm volatile ( "outb %%al, %%dx" : : "d" (addr), "a" (val) );
+-}
+-
+-void outw(uint16_t addr, uint16_t val)
+-{
+-    asm volatile ( "outw %%ax, %%dx" : : "d" (addr), "a" (val) );
+-}
+-
+-void outl(uint16_t addr, uint32_t val)
+-{
+-    asm volatile ( "outl %%eax, %%dx" : : "d" (addr), "a" (val) );
+-}
+-
+-uint8_t inb(uint16_t addr)
+-{
+-    uint8_t val;
+-    asm volatile ( "inb %%dx,%%al" : "=a" (val) : "d" (addr) );
+-    return val;
+-}
+-
+-uint16_t inw(uint16_t addr)
+-{
+-    uint16_t val;
+-    asm volatile ( "inw %%dx,%%ax" : "=a" (val) : "d" (addr) );
+-    return val;
+-}
+-
+-uint32_t inl(uint16_t addr)
+-{
+-    uint32_t val;
+-    asm volatile ( "inl %%dx,%%eax" : "=a" (val) : "d" (addr) );
+-    return val;
+-}
+-
+ uint8_t cmos_inb(uint8_t idx)
+ {
+     outb(0x70, idx);
+@@ -493,28 +439,6 @@ void *scratch_alloc(uint32_t size, uint32_t align)
+     return (void *)(unsigned long)s;
+ }
+ 
+-uint32_t ioapic_read(uint32_t reg)
+-{
+-    *(volatile uint32_t *)(ioapic_base_address + 0x00) = reg;
+-    return *(volatile uint32_t *)(ioapic_base_address + 0x10);
+-}
+-
+-void ioapic_write(uint32_t reg, uint32_t val)
+-{
+-    *(volatile uint32_t *)(ioapic_base_address + 0x00) = reg;
+-    *(volatile uint32_t *)(ioapic_base_address + 0x10) = val;
+-}
+-
+-uint32_t lapic_read(uint32_t reg)
+-{
+-    return *(volatile uint32_t *)(LAPIC_BASE_ADDRESS + reg);
+-}
+-
+-void lapic_write(uint32_t reg, uint32_t val)
+-{
+-    *(volatile uint32_t *)(LAPIC_BASE_ADDRESS + reg) = val;
+-}
+-
+ #define PCI_CONF1_ADDRESS(bus, devfn, reg) \
+     (0x80000000 | (bus << 16) | (devfn << 8) | (reg & ~3))
+ 
+@@ -945,7 +869,7 @@ void hvmloader_acpi_build_tables(struct acpi_config *config,
+ 
+     config->lapic_base_address = LAPIC_BASE_ADDRESS;
+     config->lapic_id = acpi_lapic_id;
+-    config->ioapic_base_address = ioapic_base_address;
++    config->ioapic_base_address = IOAPIC_BASE_ADDRESS;
+     config->ioapic_id = IOAPIC_ID;
+     config->pci_isa_irq_mask = PCI_ISA_IRQ_MASK; 
+ 
+diff --git a/tools/firmware/hvmloader/util.h b/tools/firmware/hvmloader/util.h
+index 8d95eab28a65..cde0951c27c7 100644
+--- a/tools/firmware/hvmloader/util.h
++++ b/tools/firmware/hvmloader/util.h
+@@ -7,6 +7,7 @@
+ #include <stdbool.h>
+ #include <xen/xen.h>
+ #include <xen/hvm/hvm_info_table.h>
++#include "config.h"
+ #include "e820.h"
+ 
+ /* Request un-prefixed values from errno.h. */
+@@ -67,28 +68,113 @@ static inline int test_and_clear_bit(int nr, volatile void *addr)
+ }
+ 
+ /* MSR access */
+-void wrmsr(uint32_t idx, uint64_t v);
+-uint64_t rdmsr(uint32_t idx);
++static inline void wrmsr(uint32_t idx, uint64_t v)
++{
++    asm volatile ( "wrmsr" :: "c" (idx), "A" (v) );
++}
++
++static inline uint64_t rdmsr(uint32_t idx)
++{
++    uint64_t res;
++
++    asm volatile ( "rdmsr" : "=A" (res) : "c" (idx) );
++
++    return res;
++}
+ 
+ /* I/O output */
+-void outb(uint16_t addr, uint8_t  val);
+-void outw(uint16_t addr, uint16_t val);
+-void outl(uint16_t addr, uint32_t val);
++static inline void outb(uint16_t port, uint8_t val)
++{
++    asm volatile ( "outb %[val], %[port]"
++                   :
++                   : [port] "Nd" (port),
++                     [val] "a" (val)
++                   : "memory" );
++}
++
++static inline void outw(uint16_t port, uint16_t val)
++{
++    asm volatile ( "outw %[val], %[port]"
++                   :
++                   : [port] "Nd" (port),
++                     [val] "a" (val)
++                   : "memory" );
++}
++
++static inline void outl(uint16_t port, uint32_t val)
++{
++    asm volatile ( "outl %[val], %[port]"
++                   :
++                   : [port] "Nd" (port),
++                     [val] "a" (val)
++                   : "memory" );
++}
+ 
+ /* I/O input */
+-uint8_t  inb(uint16_t addr);
+-uint16_t inw(uint16_t addr);
+-uint32_t inl(uint16_t addr);
++static inline uint8_t inb(uint16_t port)
++{
++    uint8_t val;
++
++    asm volatile ( "inb %[port], %[val]"
++                   : [val] "=a" (val)
++                   : [port] "Nd" (port)
++                   : "memory" );
++
++    return val;
++}
++
++static inline uint16_t inw(uint16_t port)
++{
++    uint16_t val;
++
++    asm volatile ( "inw %[port], %[val]"
++                   : [val] "=a" (val)
++                   : [port] "Nd" (port)
++                   : "memory" );
++
++    return val;
++}
++
++static inline uint32_t inl(uint16_t port)
++{
++    uint32_t val;
++
++    asm volatile ( "inl %[port], %[val]"
++                   : [val] "=a" (val)
++                   : [port] "Nd" (port)
++                   : "memory" );
++
++    return val;
++}
+ 
+ /* CMOS access */
+ uint8_t cmos_inb(uint8_t idx);
+ void cmos_outb(uint8_t idx, uint8_t val);
+ 
+ /* APIC access */
+-uint32_t ioapic_read(uint32_t reg);
+-void ioapic_write(uint32_t reg, uint32_t val);
+-uint32_t lapic_read(uint32_t reg);
+-void lapic_write(uint32_t reg, uint32_t val);
++#define IOAPIC_BASE_ADDRESS 0xfec00000
++static inline uint32_t ioapic_read(uint32_t reg)
++{
++    *(volatile uint32_t *)(IOAPIC_BASE_ADDRESS + 0x00) = reg;
++    return *(volatile uint32_t *)(IOAPIC_BASE_ADDRESS + 0x10);
++}
++
++static inline void ioapic_write(uint32_t reg, uint32_t val)
++{
++    *(volatile uint32_t *)(IOAPIC_BASE_ADDRESS + 0x00) = reg;
++    *(volatile uint32_t *)(IOAPIC_BASE_ADDRESS + 0x10) = val;
++}
++
++#define LAPIC_BASE_ADDRESS  0xfee00000
++static inline uint32_t lapic_read(uint32_t reg)
++{
++    return *(volatile uint32_t *)(LAPIC_BASE_ADDRESS + reg);
++}
++
++static inline void lapic_write(uint32_t reg, uint32_t val)
++{
++    *(volatile uint32_t *)(LAPIC_BASE_ADDRESS + reg) = val;
++}
+ 
+ /* PCI access */
+ uint32_t pci_read(uint32_t devfn, uint32_t reg, uint32_t len);
