@@ -1,0 +1,108 @@
+From d81dd31303513a1626973778d557a6493d86511a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Mon, 5 Aug 2024 10:16:54 +0200
+Subject: x86/shutdown: change default reboot method preference
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The current logic to chose the preferred reboot method is based on the mode Xen
+has been booted into, so if the box is booted from UEFI, the preferred reboot
+method will be to use the ResetSystem() run time service call.
+
+However, that method seems to be widely untested, and quite often leads to a
+result similar to:
+
+Hardware Dom0 shutdown: rebooting machine
+----[ Xen-4.18-unstable  x86_64  debug=y  Tainted:   C    ]----
+CPU:    0
+RIP:    e008:[<0000000000000017>] 0000000000000017
+RFLAGS: 0000000000010202   CONTEXT: hypervisor
+[...]
+Xen call trace:
+   [<0000000000000017>] R 0000000000000017
+   [<ffff83207eff7b50>] S ffff83207eff7b50
+   [<ffff82d0403525aa>] F machine_restart+0x1da/0x261
+   [<ffff82d04035263c>] F apic_wait_icr_idle+0/0x37
+   [<ffff82d040233689>] F smp_call_function_interrupt+0xc7/0xcb
+   [<ffff82d040352f05>] F call_function_interrupt+0x20/0x34
+   [<ffff82d04033b0d5>] F do_IRQ+0x150/0x6f3
+   [<ffff82d0402018c2>] F common_interrupt+0x132/0x140
+   [<ffff82d040283d33>] F arch/x86/acpi/cpu_idle.c#acpi_idle_do_entry+0x113/0x129
+   [<ffff82d04028436c>] F arch/x86/acpi/cpu_idle.c#acpi_processor_idle+0x3eb/0x5f7
+   [<ffff82d04032a549>] F arch/x86/domain.c#idle_loop+0xec/0xee
+
+****************************************
+Panic on CPU 0:
+FATAL TRAP: vector = 6 (invalid opcode)
+****************************************
+
+Which in most cases does lead to a reboot, however that's unreliable.
+
+Change the default reboot preference to prefer ACPI over UEFI if available and
+not in reduced hardware mode.
+
+This is in line to what Linux does, so it's unlikely to cause issues on current
+and future hardware, since there's a much higher chance of vendors testing
+hardware with Linux rather than Xen.
+
+Add a special case for one Acer model that does require being rebooted using
+ResetSystem().  See Linux commit 0082517fa4bce for rationale.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Marek Marczykowski-Górecki <marmarek@invisiblethingslab.com>
+Acked-By: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+
+diff --git a/xen/arch/x86/shutdown.c b/xen/arch/x86/shutdown.c
+index 7619544d14da..3816ede1afe5 100644
+--- a/xen/arch/x86/shutdown.c
++++ b/xen/arch/x86/shutdown.c
+@@ -150,19 +150,20 @@ static void default_reboot_type(void)
+ 
+     if ( xen_guest )
+         reboot_type = BOOT_XEN;
++    else if ( !acpi_disabled && !acpi_gbl_reduced_hardware )
++        reboot_type = BOOT_ACPI;
+     else if ( efi_enabled(EFI_RS) )
+         reboot_type = BOOT_EFI;
+-    else if ( acpi_disabled )
+-        reboot_type = BOOT_KBD;
+     else
+-        reboot_type = BOOT_ACPI;
++        reboot_type = BOOT_KBD;
+ }
+ 
+ static int __init cf_check override_reboot(const struct dmi_system_id *d)
+ {
+     enum reboot_type type = (long)d->driver_data;
+ 
+-    if ( type == BOOT_ACPI && acpi_disabled )
++    if ( (type == BOOT_ACPI && acpi_disabled) ||
++         (type == BOOT_EFI && !efi_enabled(EFI_RS)) )
+         type = BOOT_KBD;
+ 
+     if ( reboot_type != type )
+@@ -172,6 +173,7 @@ static int __init cf_check override_reboot(const struct dmi_system_id *d)
+             [BOOT_KBD]  = "keyboard controller",
+             [BOOT_ACPI] = "ACPI",
+             [BOOT_CF9]  = "PCI",
++            [BOOT_EFI]  = "UEFI",
+         };
+ 
+         reboot_type = type;
+@@ -530,6 +532,15 @@ static const struct dmi_system_id __initconstrel reboot_dmi_table[] = {
+             DMI_MATCH(DMI_PRODUCT_NAME, "PowerEdge R740"),
+         },
+     },
++    {    /* Handle problems with rebooting on Acer TravelMate X514-51T. */
++        .callback = override_reboot,
++        .driver_data = (void *)(long)BOOT_EFI,
++        .ident = "Acer TravelMate X514-51T",
++        .matches = {
++            DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++            DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate X514-51T"),
++        },
++    },
+     { }
+ };
+ 
