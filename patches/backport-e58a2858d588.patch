@@ -1,0 +1,110 @@
+From e58a2858d588ed57ca13200f3d3148d78ad0e491 Mon Sep 17 00:00:00 2001
+From: Frediano Ziglio <frediano.ziglio@cloud.com>
+Date: Thu, 22 Aug 2024 15:00:43 +0100
+Subject: x86/boot: Preserve the value clobbered by the load-base calculation
+
+Right now, Xen clobbers the value at 0xffc when performing it's load-base
+calculation.  We've got plenty of free registers at this point, so the value
+can be preserved easily.
+
+This fixes a real bug booting under Coreboot+SeaBIOS, where 0xffc happens to
+be the cbmem pointer (e.g. Coreboot's dmesg ring, among other things).
+
+However, there's also a better choice of memory location to use than 0xffc, as
+all our supported boot protocols have a pointer to an info structure in %ebx.
+
+Update the documentation to match.
+
+Fixes: 1695e53851e5 ("x86/boot: Fix the boot time relocation calculations")
+Fixes: d96bb172e8c9 ("x86/entry: Early PVH boot code")
+Signed-off-by: Frediano Ziglio <frediano.ziglio@cloud.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jason Andryuk <jason.andryuk@amd.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/docs/hypervisor-guide/x86/how-xen-boots.rst b/docs/hypervisor-guide/x86/how-xen-boots.rst
+index ca77d7c8a333..8b3229005cca 100644
+--- a/docs/hypervisor-guide/x86/how-xen-boots.rst
++++ b/docs/hypervisor-guide/x86/how-xen-boots.rst
+@@ -96,6 +96,12 @@ Xen, once loaded into memory, identifies its position in order to relocate
+ system structures.  For 32bit entrypoints, this necessarily requires a call
+ instruction, and therefore a stack, but none of the ABIs provide one.
+ 
+-Overall, given that on a BIOS-based system, the IVT and BDA occupy the first
+-5/16ths of the first page of RAM, with the rest free to use, Xen assumes the
+-top of the page is safe to use.
++In each supported 32bit entry protocol, ``%ebx`` is a pointer to an info
++structure, and it is highly likely that this structure does not overlap with
++Xen.  Therefore we use this as a temporary stack, preserving the prior value,
++in order to calculate Xen's position in memory.
++
++If this heuristic happens to be wrong (most likely because we were booted by
++some other protocol), the calculation stills works as long as ``%ebx`` points
++at RAM and does not alias the currently-executing instructions.  This is
++reasonably likely, and the best we can manage given no other information.
+diff --git a/xen/arch/x86/boot/head.S b/xen/arch/x86/boot/head.S
+index a6ce23ea1098..3678f615bc60 100644
+--- a/xen/arch/x86/boot/head.S
++++ b/xen/arch/x86/boot/head.S
+@@ -405,17 +405,23 @@ __pvh_start:
+         cli
+ 
+         /*
+-         * We need one push/pop to determine load address.  Use the same
+-         * absolute stack address as the native path, for lack of a better
+-         * alternative.
++         * We need one call (i.e. push) to determine the load address.  See
++         * __start for a discussion on how to do this safely using the PVH
++         * info structure.
+          */
+-        mov     $0x1000, %esp
++
++        /* Preserve the field we're about to clobber. */
++        mov     (%ebx), %edx
++        lea     4(%ebx), %esp
+ 
+         /* Calculate the load base address. */
+         call    1f
+ 1:      pop     %esi
+         sub     $sym_offs(1b), %esi
+ 
++        /* Restore the clobbered field. */
++        mov     %edx, (%ebx)
++
+         /* Set up stack. */
+         lea     STACK_SIZE - CPUINFO_sizeof + sym_esi(cpu0_stack), %esp
+ 
+@@ -451,21 +457,26 @@ __start:
+         /*
+          * Multiboot (both 1 and 2) specify the stack pointer as undefined
+          * when entering in BIOS circumstances.  This is unhelpful for
+-         * relocatable images, where one push/pop is required to calculate
+-         * images load address.
++         * relocatable images, where one call (i.e. push) is required to
++         * calculate the image's load address.
+          *
+-         * On a BIOS-based system, the IVT and BDA occupy the first 5/16ths of
+-         * the first page of RAM, with the rest free for use.  Use the top of
+-         * this page for a temporary stack, being one of the safest locations
+-         * to clobber.
++         * This early in boot, there is one area of memory we know about with
++         * reasonable confidence that it isn't overlapped by Xen, and that's
++         * the Multiboot info structure in %ebx.  Use it as a temporary stack.
+          */
+-        mov     $0x1000, %esp
++
++        /* Preserve the field we're about to clobber. */
++        mov     (%ebx), %edx
++        lea     4(%ebx), %esp
+ 
+         /* Calculate the load base address. */
+         call    1f
+ 1:      pop     %esi
+         sub     $sym_offs(1b), %esi
+ 
++        /* Restore the clobbered field. */
++        mov     %edx, (%ebx)
++
+         /* Set up stack. */
+         lea     STACK_SIZE - CPUINFO_sizeof + sym_esi(cpu0_stack), %esp
+ 

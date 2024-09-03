@@ -1,0 +1,90 @@
+From 8d336fcb6ea6b486ceccef2e36d003db032131fe Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 30 Jan 2023 22:14:20 +0000
+Subject: tools/ocaml: Factor out compatiblity handling
+
+... rather than having each library implement its own subset.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Christian Lindig <christian.lindig@cloud.com>
+
+diff --git a/tools/ocaml/libs/xc/Makefile b/tools/ocaml/libs/xc/Makefile
+index 1d9fecb06ef2..cdf4d01dac52 100644
+--- a/tools/ocaml/libs/xc/Makefile
++++ b/tools/ocaml/libs/xc/Makefile
+@@ -2,7 +2,7 @@ OCAML_TOPLEVEL=$(CURDIR)/../..
+ XEN_ROOT=$(OCAML_TOPLEVEL)/../..
+ include $(OCAML_TOPLEVEL)/common.make
+ 
+-CFLAGS += -I../mmap $(CFLAGS_libxenctrl) $(CFLAGS_libxenguest)
++CFLAGS += -I../ -I../mmap $(CFLAGS_libxenctrl) $(CFLAGS_libxenguest)
+ CFLAGS += $(APPEND_CFLAGS)
+ OCAMLINCLUDE += -I ../mmap -I ../eventchn
+ 
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index be2241487e2e..958c3ffac3a0 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -25,6 +25,8 @@
+ #include <caml/fail.h>
+ #include <caml/callback.h>
+ 
++#include "xen-caml-compat.h"
++
+ #include <sys/mman.h>
+ #include <stdint.h>
+ #include <string.h>
+@@ -40,14 +42,6 @@
+ #define _H(__h) ((xc_interface *)(__h))
+ #define _D(__d) ((uint32_t)Int_val(__d))
+ 
+-#ifndef Val_none
+-#define Val_none (Val_int(0))
+-#endif
+-
+-#ifndef Tag_some
+-#define Tag_some 0
+-#endif
+-
+ #define string_of_option_array(array, index) \
+ 	((Field(array, index) == Val_none) ? NULL : String_val(Field(Field(array, index), 0)))
+ 
+@@ -699,8 +693,7 @@ CAMLprim value stub_xc_evtchn_status(value xch, value domid, value port)
+ 	Store_field(result_status, 0, Val_int(status.vcpu));
+ 	Store_field(result_status, 1, stat);
+ 
+-	result = caml_alloc_small(1, Tag_some);
+-	Store_field(result, 0, result_status);
++	result = caml_alloc_some(result_status);
+ 
+ 	CAMLreturn(result);
+ }
+diff --git a/tools/ocaml/libs/xen-caml-compat.h b/tools/ocaml/libs/xen-caml-compat.h
+new file mode 100644
+index 000000000000..14aede21284d
+--- /dev/null
++++ b/tools/ocaml/libs/xen-caml-compat.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: LGPL-2.1-only WITH OCaml-LGPL-linking-exception */
++#ifndef XEN_CAML_COMPAT_H
++#define XEN_CAML_COMPAT_H
++
++#ifndef Val_none /* Option handling.  Compat for Ocaml < 4.12 */
++
++#define Val_none Val_int(0)
++#define Tag_some 0
++#define Some_val(v) Field(v, 0)
++
++static inline value caml_alloc_some(value v)
++{
++    CAMLparam1(v);
++
++    value some = caml_alloc_small(1, Tag_some);
++    Field(some, 0) = v;
++
++    CAMLreturn(some);
++}
++
++#endif /* !Val_none */
++
++#endif /* XEN_CAML_COMPAT_H */
