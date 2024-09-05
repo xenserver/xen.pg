@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.41
+%global hv_rel 9.42
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -875,6 +875,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Thu Sep 05 2024 Alejandro Vallejo <alejandro.vallejo@cloud.com> - 4.13.5-9.42
+- Fix for XSA-460 / CVE-2024-31145.
+
 * Thu Jul 11 2024 Roger Pau Monné <roger.pau@citrix.com> - 4.13.5-9.41
 - Fixes for XSA-458 CVE-2024-31143.
 - Fix early detection of CPU features on hardware with the CPUID Limit active
