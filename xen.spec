@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.43
+%global hv_rel 9.44
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -844,7 +844,7 @@ if [ -e %{_sysconfdir}/sysconfig/kernel ] && ! grep -q '^HYPERVISOR' %{_sysconfd
 fi
 
 mkdir -p %{_rundir}/reboot-required.d/%{name}
-touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
+touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
 
 %if %with_systemd
 %post dom0-tools
@@ -875,6 +875,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{hv_rel}
 %{?_cov_results_package}
 
 %changelog
+* Thu Sep 19 2024 Alex Brett <alex.brett@cloud.com> - 4.13.5-9.44
+- Fix a packaging issue affecting livepatching
+
 * Thu Sep 12 2024 Roger Pau Monné <roger.pau@citrix.com> - 4.13.5-9.43
 - Fix for XSA-462 / CVE-2024-45817.
 
