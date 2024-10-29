@@ -189,8 +189,9 @@ License: GPLv2 and LGPLv2 and MIT
 Requires: xen-dom0-libs = %{version}
 Requires: xen-tools = %{version}
 Obsoletes: xen-installer-files <= 4.13.5-10.42
-Requires: edk2
-Requires: ipxe
+Requires: %{_libdir}/xen/bin/qemu-system-i386
+Requires: %{_datadir}/edk2/OVMF-release.fd
+Requires: %{_datadir}/ipxe/ipxe.bin
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
@@ -267,8 +268,8 @@ export PYTHON="%{__python}"
            --enable-systemd \
            --with-xenstored=oxenstored \
            --with-system-qemu=%{_libdir}/xen/bin/qemu-system-i386 \
-           --with-system-ipxe=/usr/share/ipxe/ipxe.bin \
-           --with-system-ovmf=/usr/share/edk2/OVMF-release.fd
+           --with-system-ipxe=%{_datadir}/ipxe/ipxe.bin \
+           --with-system-ovmf=%{_datadir}/edk2/OVMF-release.fd
 
 
 %fetchcert -c XEN_LP_SIGN_KEY_XS9 -o livepatch.cer
