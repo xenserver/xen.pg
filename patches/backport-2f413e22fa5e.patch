@@ -1,0 +1,73 @@
+From 2f413e22fa5eb1c6b8ec04ef1529807a2fbf6c79 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Wed, 9 Oct 2024 09:55:38 +0200
+Subject: x86/msr: add log messages to MSR state load error paths
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some error paths in the MSR state loading logic don't contain error messages,
+which makes debugging them quite hard without adding extra patches to print the
+information.
+
+Add two new log messages to the MSR state load path that print information
+about the entry that failed to load, for both PV and HVM.
+
+While there also adjust XEN_DOMCTL_set_vcpu_msrs to return -ENXIO in case the
+MSR is unhandled or can't be loaded, so it matches the error code used by HVM
+MSR loading (and it's less ambiguous than -EINVAL).
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index 27d5b3f3d64d..37ebcb3abbc7 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -1162,6 +1162,7 @@ long arch_do_domctl(
+                 if ( msr.reserved )
+                     break;
+ 
++                ret = -ENXIO;
+                 switch ( msr.index )
+                 {
+                 case MSR_SPEC_CTRL:
+@@ -1170,9 +1171,16 @@ long arch_do_domctl(
+                 case MSR_AMD64_DR0_ADDRESS_MASK:
+                 case MSR_AMD64_DR1_ADDRESS_MASK ... MSR_AMD64_DR3_ADDRESS_MASK:
+                     if ( guest_wrmsr(v, msr.index, msr.value) != X86EMUL_OKAY )
++                    {
++                        printk(XENLOG_G_ERR
++                               "%pv load MSR %#x with value %#lx failed\n",
++                               v, msr.index, msr.value);
+                         break;
++                    }
+                     continue;
+                 }
++                printk(XENLOG_G_ERR "%pv attempted load of unhandled MSR %#x\n",
++                       v, msr.index);
+                 break;
+             }
+ 
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 7b2e1c9813d6..3b803e15e065 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -1535,10 +1535,17 @@ static int cf_check hvm_load_cpu_msrs(struct domain *d, hvm_domain_context_t *h)
+             rc = guest_wrmsr(v, ctxt->msr[i].index, ctxt->msr[i].val);
+ 
+             if ( rc != X86EMUL_OKAY )
++            {
++                printk(XENLOG_G_ERR
++                       "HVM %pv load MSR %#x with value %#lx failed\n",
++                       v, ctxt->msr[i].index, ctxt->msr[i].val);
+                 return -ENXIO;
++            }
+             break;
+ 
+         default:
++            printk(XENLOG_G_ERR "HVM %pv attempted load of unhandled MSR %#x\n",
++                   v, ctxt->msr[i].index);
+             return -ENXIO;
+         }
+     }

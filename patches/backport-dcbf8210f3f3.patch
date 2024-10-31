@@ -1,0 +1,115 @@
+From dcbf8210f3f3a49626341355308010eb92194b85 Mon Sep 17 00:00:00 2001
+From: Matthew Barnes <matthew.barnes@cloud.com>
+Date: Wed, 9 Oct 2024 09:54:48 +0200
+Subject: x86/APIC: Switch flat driver to use phys dst for ext ints
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+External interrupts via logical delivery mode in xAPIC do not benefit
+from targeting multiple CPUs and instead simply bloat up the vector
+space.
+
+However the xAPIC flat driver currently uses logical delivery for
+external interrupts.
+
+This patch switches the xAPIC flat driver to use physical destination
+mode for external interrupts, instead of logical destination mode.
+
+This patch also applies the following non-functional changes:
+- Remove now unused logical flat functions
+- Expand GENAPIC_FLAT and GENAPIC_PHYS macros, and delete them.
+
+Resolves: https://gitlab.com/xen-project/xen/-/issues/194
+Signed-off-by: Matthew Barnes <matthew.barnes@cloud.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/arch/x86/genapic/bigsmp.c b/xen/arch/x86/genapic/bigsmp.c
+index 7219ec53b027..f680989100a6 100644
+--- a/xen/arch/x86/genapic/bigsmp.c
++++ b/xen/arch/x86/genapic/bigsmp.c
+@@ -43,5 +43,11 @@ static int __init cf_check probe_bigsmp(void)
+ 
+ const struct genapic __initconst_cf_clobber apic_bigsmp = {
+ 	APIC_INIT("bigsmp", probe_bigsmp),
+-	GENAPIC_PHYS
++	.int_delivery_mode = dest_Fixed,
++	.int_dest_mode = 0, /* physical delivery */
++	.init_apic_ldr = init_apic_ldr_phys,
++	.vector_allocation_cpumask = vector_allocation_cpumask_phys,
++	.cpu_mask_to_apicid = cpu_mask_to_apicid_phys,
++	.send_IPI_mask = send_IPI_mask_phys,
++	.send_IPI_self = send_IPI_self_legacy
+ };
+diff --git a/xen/arch/x86/genapic/default.c b/xen/arch/x86/genapic/default.c
+index a968836a1878..59c79afdb8fa 100644
+--- a/xen/arch/x86/genapic/default.c
++++ b/xen/arch/x86/genapic/default.c
+@@ -16,5 +16,11 @@
+ /* should be called last. */
+ const struct genapic __initconst_cf_clobber apic_default = {
+ 	APIC_INIT("default", NULL),
+-	GENAPIC_FLAT
++	.int_delivery_mode = dest_Fixed,
++	.int_dest_mode = 0, /* physical delivery */
++	.init_apic_ldr = init_apic_ldr_flat,
++	.vector_allocation_cpumask = vector_allocation_cpumask_phys,
++	.cpu_mask_to_apicid = cpu_mask_to_apicid_phys,
++	.send_IPI_mask = send_IPI_mask_flat,
++	.send_IPI_self = send_IPI_self_legacy
+ };
+diff --git a/xen/arch/x86/genapic/delivery.c b/xen/arch/x86/genapic/delivery.c
+index d1f99bf6834a..3def78f380d3 100644
+--- a/xen/arch/x86/genapic/delivery.c
++++ b/xen/arch/x86/genapic/delivery.c
+@@ -19,16 +19,6 @@ void cf_check init_apic_ldr_flat(void)
+ 	apic_write(APIC_LDR, val);
+ }
+ 
+-const cpumask_t *cf_check vector_allocation_cpumask_flat(int cpu)
+-{
+-	return &cpu_online_map;
+-} 
+-
+-unsigned int cf_check cpu_mask_to_apicid_flat(const cpumask_t *cpumask)
+-{
+-	return cpumask_bits(cpumask)[0]&0xFF;
+-}
+-
+ /*
+  * PHYSICAL DELIVERY MODE (unicast to physical APIC IDs).
+  */
+diff --git a/xen/arch/x86/include/asm/genapic.h b/xen/arch/x86/include/asm/genapic.h
+index beeaddf19daa..f5b79ba06562 100644
+--- a/xen/arch/x86/include/asm/genapic.h
++++ b/xen/arch/x86/include/asm/genapic.h
+@@ -42,29 +42,11 @@ extern const struct genapic apic_bigsmp;
+ void cf_check send_IPI_self_legacy(uint8_t vector);
+ 
+ void cf_check init_apic_ldr_flat(void);
+-unsigned int cf_check cpu_mask_to_apicid_flat(const cpumask_t *cpumask);
+ void cf_check send_IPI_mask_flat(const cpumask_t *mask, int vector);
+-const cpumask_t *cf_check vector_allocation_cpumask_flat(int cpu);
+-#define GENAPIC_FLAT \
+-	.int_delivery_mode = dest_LowestPrio, \
+-	.int_dest_mode = 1 /* logical delivery */, \
+-	.init_apic_ldr = init_apic_ldr_flat, \
+-	.vector_allocation_cpumask = vector_allocation_cpumask_flat, \
+-	.cpu_mask_to_apicid = cpu_mask_to_apicid_flat, \
+-	.send_IPI_mask = send_IPI_mask_flat, \
+-	.send_IPI_self = send_IPI_self_legacy
+ 
+ void cf_check init_apic_ldr_phys(void);
+ unsigned int cf_check cpu_mask_to_apicid_phys(const cpumask_t *cpumask);
+ void cf_check send_IPI_mask_phys(const cpumask_t *mask, int vector);
+ const cpumask_t *cf_check vector_allocation_cpumask_phys(int cpu);
+-#define GENAPIC_PHYS \
+-	.int_delivery_mode = dest_Fixed, \
+-	.int_dest_mode = 0 /* physical delivery */, \
+-	.init_apic_ldr = init_apic_ldr_phys, \
+-	.vector_allocation_cpumask = vector_allocation_cpumask_phys, \
+-	.cpu_mask_to_apicid = cpu_mask_to_apicid_phys, \
+-	.send_IPI_mask = send_IPI_mask_phys, \
+-	.send_IPI_self = send_IPI_self_legacy
+ 
+ #endif
