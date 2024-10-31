@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.44
+%global hv_rel 9.45
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -875,6 +875,12 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
 %{?_cov_results_package}
 
 %changelog
+* Tue Nov 05 2024 Javi Merino <javi.merino@cloud.com> - 4.13.5-9.45
+- Fixes for XSA-463 CVE-2024-45818
+- Fixes for XSA-464 CVE-2024-45819
+- Fix IO-APIC directed EOIs when using AMD-Vi interrupt remapping
+- Remove an overly strict check when parsing AMD IVRS ACPI tables
+
 * Thu Sep 19 2024 Alex Brett <alex.brett@cloud.com> - 4.13.5-9.44
 - Fix a packaging issue affecting livepatching
 
