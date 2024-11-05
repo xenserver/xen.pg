@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 3
+%global hv_rel 4
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,17 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Tue Nov  5 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-4
+- Fixes for
+  - XSA-463 CVE-2024-45818
+  - XSA-464 CVE-2024-45819
+- Fix IO-APIC directed EOIs when using AMD-Vi interrupt remapping
+- Fix a crash during livepatch loading caused by an incorrect order of checks
+- Switch xAPIC flat driver to use physical destination mode for external
+  interrupts
+- Remove an overly strict check when parsing AMD IVRS ACPI tables
+- Fix a leak of pending interrupts during CPU offline
+
 * Wed Sep 11 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-3
 - Fix for XSA-462 CA-399169
 
