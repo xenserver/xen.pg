@@ -3,12 +3,12 @@ Permit overly large xenbus packets
 This reverts XSA-420
 
 diff --git a/tools/ocaml/libs/xb/partial.ml b/tools/ocaml/libs/xb/partial.ml
-index 3aa8927eb7f0..efeeb20aae0a 100644
+index 0e6532807d19..84517bfe0d75 100644
 --- a/tools/ocaml/libs/xb/partial.ml
 +++ b/tools/ocaml/libs/xb/partial.ml
 @@ -27,6 +27,8 @@ external header_size: unit -> int = "stub_header_size"
  external header_of_string_internal: string -> int * int * int * int
-          = "stub_header_of_string"
+   = "stub_header_of_string"
  
 +let allow_oversize_packets = ref true
 +
@@ -16,25 +16,25 @@ index 3aa8927eb7f0..efeeb20aae0a 100644
  let xenstore_rel_path_max = 2048 (* xen/include/public/io/xs_wire.h *)
  
 @@ -36,7 +38,7 @@ let of_string s =
- 	   This will leave the guest connection is a bad state and will
- 	   be hard to recover from without restarting the connection
- 	   (ie rebooting the guest) *)
--	let dlen = max 0 (min xenstore_payload_max dlen) in
-+	let dlen = max 0 (if !allow_oversize_packets then dlen else min xenstore_payload_max dlen) in
- 	{
- 		tid = tid;
- 		rid = rid;
+      	   This will leave the guest connection is a bad state and will
+      	   be hard to recover from without restarting the connection
+      	   (ie rebooting the guest) *)
+-  let dlen = max 0 (min xenstore_payload_max dlen) in
++  let dlen = max 0 (if !allow_oversize_packets then dlen else min xenstore_payload_max dlen) in
+   {
+     tid = tid;
+     rid = rid;
 @@ -46,8 +48,8 @@ let of_string s =
- 	}
+   }
  
  let append pkt s sz =
--	if Buffer.length pkt.buf + sz > xenstore_payload_max then failwith "Buffer.add: cannot grow buffer";
--	Buffer.add_substring pkt.buf s 0 sz
-+	if not !allow_oversize_packets && Buffer.length pkt.buf + sz > xenstore_payload_max then failwith "Buffer.add: cannot grow buffer";
-+	Buffer.add_string pkt.buf (String.sub s 0 sz)
+-  if Buffer.length pkt.buf + sz > xenstore_payload_max then failwith "Buffer.add: cannot grow buffer";
+-  Buffer.add_substring pkt.buf s 0 sz
++  if not !allow_oversize_packets && Buffer.length pkt.buf + sz > xenstore_payload_max then failwith "Buffer.add: cannot grow buffer";
++  Buffer.add_string pkt.buf (String.sub s 0 sz)
  
  let to_complete pkt =
- 	pkt.len - (Buffer.length pkt.buf)
+   pkt.len - (Buffer.length pkt.buf)
 diff --git a/tools/ocaml/libs/xb/partial.mli b/tools/ocaml/libs/xb/partial.mli
 index b9216018f517..26f7cc3cb18e 100644
 --- a/tools/ocaml/libs/xb/partial.mli
@@ -48,16 +48,16 @@ index b9216018f517..26f7cc3cb18e 100644
  val xenstore_rel_path_max : int
  val of_string : string -> pkt
 diff --git a/tools/ocaml/xenstored/xenstored.ml b/tools/ocaml/xenstored/xenstored.ml
-index e2638a5af2bf..a90d5f29a089 100644
+index 1aaa3e995e1f..e43e74661059 100644
 --- a/tools/ocaml/xenstored/xenstored.ml
 +++ b/tools/ocaml/xenstored/xenstored.ml
 @@ -358,6 +358,9 @@ let tweak_gc () =
  
  let () =
- 	Printexc.set_uncaught_exception_handler Logging.fallback_exception_handler;
+   Printexc.set_uncaught_exception_handler Logging.fallback_exception_handler;
 +
-+	Xenbus.Partial.allow_oversize_packets := false;
++  Xenbus.Partial.allow_oversize_packets := false;
 +
- 	let cf = do_argv in
- 	if cf.config_test then begin
- 		let path = config_filename cf in
+   let cf = do_argv in
+   if cf.config_test then begin
+     let path = config_filename cf in
