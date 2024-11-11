@@ -1,11 +1,11 @@
 # -*- rpm-spec -*-
 
 # Commitish for Source0, required by tooling.
-%global package_srccommit RELEASE-4.17.5
+%global package_srccommit RELEASE-4.19.1
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 7
+%global hv_rel 1
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -30,7 +30,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.17.5
+Version: 4.19.1
 Release: %{?xsrel}%{?dist}
 License: GPLv2 and LGPLv2 and MIT and Public Domain
 URL:     https://www.xenproject.org
@@ -382,6 +382,8 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_includedir}/%{name}/arch-arm.h
 %{_includedir}/%{name}/arch-arm/hvm/save.h
 %{_includedir}/%{name}/arch-arm/smccc.h
+%{_includedir}/%{name}/arch-ppc.h
+%{_includedir}/%{name}/arch-riscv.h
 %{_includedir}/%{name}/arch-x86/cpuid.h
 %{_includedir}/%{name}/arch-x86/cpufeatureset.h
 %{_includedir}/%{name}/arch-x86/guest-acpi.h
@@ -475,8 +477,8 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/libxentoolcore.so.1.0
 %{_libdir}/libxentoollog.so.1
 %{_libdir}/libxentoollog.so.1.0
-%{_libdir}/libxenvchan.so.4.17
-%{_libdir}/libxenvchan.so.4.17.0
+%{_libdir}/libxenvchan.so.4.19
+%{_libdir}/libxenvchan.so.4.19.0
 
 %files libs-devel
 
@@ -563,14 +565,11 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_sysconfdir}/%{name}/xlexample.pvhlinux
 %exclude %{_sysconfdir}/%{name}/xlexample.pvlinux
 %config %{_sysconfdir}/xen/xl.conf
-%{_bindir}/pygrub
 %{_bindir}/vchan-socket-proxy
 %{_bindir}/xen-cpuid
 %{_bindir}/xen-detect
 %{_bindir}/xenalyze
-%exclude %{_bindir}/xencons
 %{_bindir}/xencov_split
-%{_bindir}/xentrace_format
 
 # Pygrub python libs
 %{py_sitearch}/grub/
@@ -599,13 +598,13 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libexecdir}/%{name}/bin/pygrub
 %{_libexecdir}/%{name}/bin/readnotes
 %{_libexecdir}/%{name}/bin/verify-stream-v2
+%{_libexecdir}/%{name}/bin/xen-9pfsd
 %{_libexecdir}/%{name}/bin/xen-init-dom0
 %{_libexecdir}/%{name}/bin/xenconsole
 %{_libexecdir}/%{name}/bin/xenctx
 %{_libexecdir}/%{name}/bin/xendomains
 %{_libexecdir}/%{name}/bin/xenguest
 %{_libexecdir}/%{name}/bin/xenpaging
-%exclude %{_libexecdir}/%{name}/bin/xenpvnetboot
 %{_libexecdir}/%{name}/boot/hvmloader
 %{_libexecdir}/%{name}/boot/xen-shim
 %{_sbindir}/flask-get-bool
@@ -649,7 +648,6 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_sbindir}/xenlockprof
 %{_mandir}/man1/xenhypfs.1.gz
 %{_mandir}/man1/xentop.1.gz
-%{_mandir}/man1/xentrace_format.1.gz
 %{_mandir}/man1/xenstore-chmod.1.gz
 %{_mandir}/man1/xenstore-ls.1.gz
 %{_mandir}/man1/xenstore-read.1.gz
@@ -669,6 +667,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_mandir}/man7/xen-vtpm.7.gz
 %exclude %{_mandir}/man7/xen-vtpmmgr.7.gz
 %{_mandir}/man8/xentrace.8.gz
+%{_mandir}/man8/xenwatchdogd.8.gz
 %dir /var/lib/xen
 %dir /var/log/xen
 %{_unitdir}/proc-xen.mount
@@ -684,24 +683,24 @@ install_xen -%{hv_rel}-d build-xen-debug
 %files dom0-libs
 %{_libdir}/libxencall.so.1
 %{_libdir}/libxencall.so.1.3
-%{_libdir}/libxenctrl.so.4.17
-%{_libdir}/libxenctrl.so.4.17.0
+%{_libdir}/libxenctrl.so.4.19
+%{_libdir}/libxenctrl.so.4.19.0
 %{_libdir}/libxendevicemodel.so.1
 %{_libdir}/libxendevicemodel.so.1.4
 %{_libdir}/libxenforeignmemory.so.1
 %{_libdir}/libxenforeignmemory.so.1.4
-%{_libdir}/libxenfsimage.so.4.17
-%{_libdir}/libxenfsimage.so.4.17.0
-%{_libdir}/libxenguest.so.4.17
-%{_libdir}/libxenguest.so.4.17.0
+%{_libdir}/libxenfsimage.so.4.19
+%{_libdir}/libxenfsimage.so.4.19.0
+%{_libdir}/libxenguest.so.4.19
+%{_libdir}/libxenguest.so.4.19.0
 %{_libdir}/libxenhypfs.so.1
 %{_libdir}/libxenhypfs.so.1.0
-%{_libdir}/libxenlight.so.4.17
-%{_libdir}/libxenlight.so.4.17.0
-%{_libdir}/libxenstat.so.4.17
-%{_libdir}/libxenstat.so.4.17.0
-%{_libdir}/libxlutil.so.4.17
-%{_libdir}/libxlutil.so.4.17.0
+%{_libdir}/libxenlight.so.4.19
+%{_libdir}/libxenlight.so.4.19.0
+%{_libdir}/libxenstat.so.4.19
+%{_libdir}/libxenstat.so.4.19.0
+%{_libdir}/libxlutil.so.4.19
+%{_libdir}/libxlutil.so.4.19.0
 %{_libdir}/xenfsimage/btrfs/fsimage.so
 %{_libdir}/xenfsimage/ext2fs-lib/fsimage.so
 %{_libdir}/xenfsimage/fat/fsimage.so
