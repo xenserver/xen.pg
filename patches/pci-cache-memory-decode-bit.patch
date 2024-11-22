@@ -1,0 +1,98 @@
+xen/pci: Cache the state of the PCI memory decoded bit
+
+When PIRQs are bound to vCPUs, Xen will check the state of the PCI
+memory decoded bit every time the vCPU is migrated. On a busy system,
+this happens frequently. The PCI config cycle load causes some buggy PCI
+devices to crash (e.g. Cisco VIC UCSX-ML-V5D200GV2).
+
+Fix this by tracking the state of the memory decoded bit and using the
+cached state instead of generating a config read.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/arch/x86/msi.c b/xen/arch/x86/msi.c
+index 3d36fc420403..e45c95137284 100644
+--- a/xen/arch/x86/msi.c
++++ b/xen/arch/x86/msi.c
+@@ -133,9 +133,11 @@ static bool memory_decoded(const struct pci_dev *dev)
+     {
+         sbdf.bus = dev->info.physfn.bus;
+         sbdf.devfn = dev->info.physfn.devfn;
++
++        return pci_conf_read16(sbdf, PCI_COMMAND) & PCI_COMMAND_MEMORY;
+     }
+ 
+-    return pci_conf_read16(sbdf, PCI_COMMAND) & PCI_COMMAND_MEMORY;
++    return dev->memory_enabled;
+ }
+ 
+ static bool msix_memory_decoded(const struct pci_dev *dev, unsigned int pos)
+diff --git a/xen/arch/x86/pci.c b/xen/arch/x86/pci.c
+index 97b792e578f1..b7006fa960ad 100644
+--- a/xen/arch/x86/pci.c
++++ b/xen/arch/x86/pci.c
+@@ -85,14 +85,22 @@ int pci_conf_write_intercept(unsigned int seg, unsigned int bdf,
+      * Avoid expensive operations when no hook is going to do anything
+      * for the access anyway.
+      */
+-    if ( reg < 64 || reg >= 256 )
++    if ( reg != PCI_COMMAND && (reg < 64 || reg >= 256) )
+         return 0;
+ 
+     pcidevs_lock();
+ 
+     pdev = pci_get_pdev(NULL, PCI_SBDF(seg, bdf));
+     if ( pdev )
+-        rc = pci_msi_conf_write_intercept(pdev, reg, size, data);
++    {
++        if ( reg == PCI_COMMAND )
++        {
++            pdev->memory_enabled = !!(*data & PCI_COMMAND_MEMORY);
++            rc = 1;
++        }
++        else
++            rc = pci_msi_conf_write_intercept(pdev, reg, size, data);
++    }
+ 
+     pcidevs_unlock();
+ 
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index b886bcd57b48..1db78bae0a6e 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -339,6 +339,8 @@ static struct pci_dev *alloc_pdev(struct pci_seg *pseg, u8 bus, u8 devfn)
+         return NULL;
+     }
+ 
++    pdev->memory_enabled = !!(pci_conf_read16(pdev->sbdf, PCI_COMMAND) & PCI_COMMAND_MEMORY);
++
+     list_add(&pdev->alldevs_list, &pseg->alldevs_list);
+ 
+     /* update bus2bridge */
+diff --git a/xen/drivers/vpci/header.c b/xen/drivers/vpci/header.c
+index 766fd98b2196..8d3f6373e6a4 100644
+--- a/xen/drivers/vpci/header.c
++++ b/xen/drivers/vpci/header.c
+@@ -378,7 +378,10 @@ static void cf_check cmd_write(
+          */
+         modify_bars(pdev, cmd, false);
+     else
++    {
+         pci_conf_write16(pdev->sbdf, reg, cmd);
++        pdev->memory_enabled = !!(cmd & PCI_COMMAND_MEMORY);
++    }
+ }
+ 
+ static void cf_check bar_write(
+diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
+index b373f139d136..1faeb147b94c 100644
+--- a/xen/include/xen/pci.h
++++ b/xen/include/xen/pci.h
+@@ -141,6 +141,8 @@ struct pci_dev {
+     } fault;
+     u64 vf_rlen[6];
+ 
++    bool memory_enabled;
++
+     /* Data for vPCI. */
+     struct vpci *vpci;
+ };
