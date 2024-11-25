@@ -1,0 +1,78 @@
+From 8eed56995dc6210c132a447c79dc5bd85c99dbb4 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 25 Nov 2024 12:17:49 +0100
+Subject: x86emul: ignore VEX.W for BMI{1,2} insns in 32-bit mode
+
+While result values and other status flags are unaffected as long as we
+can ignore the case of registers having their upper 32 bits non-zero
+outside of 64-bit mode, EFLAGS.SF may obtain a wrong value when we
+mistakenly re-execute the original insn with VEX.W set.
+
+Note that guest the memory access, if any, is correctly carried out as
+32-bit regardless of VEX.W. The emulator-local memory operand will be
+accessed as a 64-bit quantity, but it is pre-initialised to zero so no
+internal state can leak.
+
+Fixes: 771daacd197a ("x86emul: support BMI1 insns")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 1179d51dcb7d93111bfb35172c75eb5a73fe6a43
+master date: 2024-11-14 13:00:57 +0100
+
+diff --git a/tools/tests/x86_emulator/test_x86_emulator.c b/tools/tests/x86_emulator/test_x86_emulator.c
+index 7b7fbaaf45ec..14ffcd3e9336 100644
+--- a/tools/tests/x86_emulator/test_x86_emulator.c
++++ b/tools/tests/x86_emulator/test_x86_emulator.c
+@@ -1933,6 +1933,30 @@ int main(int argc, char **argv)
+         if ( (rc != X86EMUL_OKAY) || regs.ecx != 0xfedcba90 ||
+              (regs.eflags & 0xf6b) != 0x202 || !check_eip(blsr) )
+             goto fail;
++
++#ifdef __x86_64__
++        /* Re-test with VEX.W set while emulating 32-bit mode. */
++        ctxt.lma       = 0;
++        ctxt.addr_size = 32;
++        ctxt.sp_size   = 32;
++
++        memcpy(instr, blsr, blsr_end - blsr);
++        instr[2] |= 0x80;
++        regs.rip = (unsigned long)&instr[0];
++        regs.eflags = EFLAGS_ALWAYS_SET | X86_EFLAGS_OF | X86_EFLAGS_ZF | \
++                      X86_EFLAGS_CF;
++        rc = x86_emulate(&ctxt, &emulops);
++        if ( (rc != X86EMUL_OKAY) || regs.ecx != 0xfedcba90 ||
++             (regs.eflags & (EFLAGS_MASK & ~(X86_EFLAGS_AF | X86_EFLAGS_PF))) !=
++              (EFLAGS_ALWAYS_SET | X86_EFLAGS_SF) ||
++             (regs.rip != (unsigned long)&instr[blsr_end - blsr]) )
++            goto fail;
++
++        ctxt.lma       = 1;
++        ctxt.addr_size = 64;
++        ctxt.sp_size   = 64;
++#endif
++
+         printf("okay\n");
+     }
+     else
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
+index ce50018bbdcb..be96f972fafb 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate/x86_emulate.c
+@@ -10416,6 +10416,8 @@ x86_emulate(
+         *pvex = vex;
+         pvex->b = 1;
+         pvex->r = 1;
++        if ( !mode_64bit() )
++            pvex->w = 0;
+         pvex->reg = 0xf; /* rAX */
+         buf[3] = b;
+         buf[4] = 0x09; /* reg=rCX r/m=(%rCX) */
+@@ -10450,6 +10452,8 @@ x86_emulate(
+         *pvex = vex;
+         pvex->b = 1;
+         pvex->r = 1;
++        if ( !mode_64bit() )
++            pvex->w = 0;
+         pvex->reg = 0xf; /* rAX */
+         buf[3] = b;
+         buf[4] = (modrm & 0x38) | 0x01; /* r/m=(%rCX) */

@@ -1,0 +1,48 @@
+From 8974056f1f7a8194f60f8eaa1d21c3f39d71722c Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 25 Nov 2024 12:18:09 +0100
+Subject: x86emul: avoid double memory read for RORX
+
+Originally only twobyte_table[0x3a] determined what part of generic
+operand fetching (near the top of x86_emulate()) comes into play. When
+ext0f3a_table[] was added, ->desc was updated to properly describe the
+ModR/M byte's function. With that generic source operand fetching came
+into play for RORX, rendering the explicit fetching in the respective
+case block redundant (and wrong at the very least when MMIO with side
+effects is accessed).
+
+While there also make a purely cosmetic / documentary adjustment to
+ext0f3a_table[]: RORX really is a 2-operand insn, MOV-like in that it
+only writes its destination register.
+
+Fixes: 9f7f5f6bc95b ("x86emul: add tables for 0f38 and 0f3a extension space")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 939a9e800c4156677c10c6cf08fde071e9b86eaf
+master date: 2024-11-14 13:03:18 +0100
+
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
+index be96f972fafb..5e2ecd0691b0 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate/x86_emulate.c
+@@ -626,7 +626,7 @@ static const struct ext0f3a_table {
+     [0xcc] = { .simd_size = simd_other },
+     [0xce ... 0xcf] = { .simd_size = simd_packed_int, .d8s = d8s_vl },
+     [0xdf] = { .simd_size = simd_packed_int, .two_op = 1 },
+-    [0xf0] = {},
++    [0xf0] = { .two_op = 1 /* Mov */ },
+ };
+ 
+ static const opcode_desc_t xop_table[] = {
+@@ -11164,11 +11164,6 @@ x86_emulate(
+     case X86EMUL_OPC_VEX_F2(0x0f3a, 0xf0): /* rorx imm,r/m,r */
+         vcpu_must_have(bmi2);
+         generate_exception_if(vex.l || vex.reg != 0xf, EXC_UD);
+-        if ( ea.type == OP_REG )
+-            src.val = *ea.reg;
+-        else if ( (rc = read_ulong(ea.mem.seg, ea.mem.off, &src.val, op_bytes,
+-                                   ctxt, ops)) != X86EMUL_OKAY )
+-            goto done;
+         if ( mode_64bit() && vex.w )
+             asm ( "rorq %b1,%0" : "=g" (dst.val) : "c" (imm1), "0" (src.val) );
+         else
