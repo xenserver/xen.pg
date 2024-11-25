@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 4
+%global hv_rel 5
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,11 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Nov 25 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-5
+- Initial AMD Turin support
+- Fix dom0 pIRQ limit calculation
+- Fix emulation of BMI1/2 instructions
+
 * Tue Nov  5 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-4
 - Fixes for
   - XSA-463 CVE-2024-45818
