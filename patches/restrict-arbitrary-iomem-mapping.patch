@@ -1,0 +1,209 @@
+Prevent arbitrary iomem mapping
+
+When Xen is locked down, check whether the iomem being mapped belongs to a
+device assigned to the target domain. This prevents a malicious dom0 userspace
+mapping iomem into a domain and then using it to control a device to attack
+dom0 kernel space.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 54f510394fbb..da4f941c005b 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -694,7 +694,8 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+ 
+         if ( !iomem_access_permitted(current->domain,
+                                      mfn, mfn + nr_mfns - 1) ||
+-             xsm_iomem_permission(XSM_HOOK, d, mfn, mfn + nr_mfns - 1, allow) )
++             xsm_iomem_permission(XSM_HOOK, d, mfn, mfn + nr_mfns - 1, allow) ||
++             check_iomem_access(d, mfn, mfn + nr_mfns - 1) )
+             ret = -EPERM;
+         else if ( allow )
+             ret = iomem_permit_access(d, mfn, mfn + nr_mfns - 1);
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index bb935ac126a5..0ba8ed5d339f 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -640,6 +640,168 @@ out:
+     return rc;
+ }
+ 
++int check_iomem_access(const struct domain *d, xen_pfn_t mfn_start,
++                       xen_pfn_t mfn_end)
++{
++    struct pci_dev *pdev;
++    int rc = 0;
++
++    if ( !is_locked_down() )
++        return 0;
++
++    pcidevs_lock();
++    list_for_each_entry ( pdev, &d->pdev_list, domain_list )
++    {
++        unsigned int i;
++
++        if ( pdev->info.is_virtfn )
++        {
++            unsigned int pos;
++            int vf;
++            uint32_t base;
++            uint16_t ctrl, num_vf, offset, stride;
++            uint64_t addr, size;
++            pci_sbdf_t sbdf = pdev->sbdf;
++
++            vf = pdev->sbdf.bdf;
++            sbdf.bus = pdev->info.physfn.bus;
++            sbdf.devfn = pdev->info.physfn.devfn;
++
++            pos = pci_find_ext_capability(sbdf, PCI_EXT_CAP_ID_SRIOV);
++            if ( !pos )
++                continue;
++
++            ctrl = pci_conf_read16(sbdf, pos + PCI_SRIOV_CTRL);
++            num_vf = pci_conf_read16(sbdf, pos + PCI_SRIOV_NUM_VF);
++            offset = pci_conf_read16(sbdf, pos + PCI_SRIOV_VF_OFFSET);
++            stride = pci_conf_read16(sbdf, pos + PCI_SRIOV_VF_STRIDE);
++
++            if ( !(ctrl & PCI_SRIOV_CTRL_VFE) ||
++                 !(ctrl & PCI_SRIOV_CTRL_MSE) ||
++                 !num_vf || !offset || (num_vf > 1 && !stride) )
++                continue;
++
++            base = pos + PCI_SRIOV_BAR;
++            vf -= sbdf.bdf + offset;
++            if ( vf < 0 )
++                continue;
++            if ( stride )
++            {
++                if ( vf % stride )
++                    continue;
++                vf /= stride;
++            }
++            if ( vf >= num_vf )
++                continue;
++
++            for ( i = 0; i < PCI_SRIOV_NUM_BARS; i++ )
++            {
++                size = pdev->pf_pdev->physfn.vf_rlen[i];
++                if ( !size )
++                    continue;
++
++                addr = pci_conf_read32(sbdf, base + i * 4);
++                if ( (addr & PCI_BASE_ADDRESS_SPACE) != PCI_BASE_ADDRESS_SPACE_MEMORY )
++                    continue;
++
++                if ( (addr & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
++                        PCI_BASE_ADDRESS_MEM_TYPE_64 )
++                {
++                    if ( ++i == PCI_SRIOV_NUM_BARS )
++                        continue;
++
++                    addr &= PCI_BASE_ADDRESS_MEM_MASK;
++
++                    addr += vf * size +
++                        ((uint64_t)pci_conf_read32(sbdf,
++                                                   base + i * 4) << 32);
++                }
++                else
++                    addr = (addr & PCI_BASE_ADDRESS_MEM_MASK) + vf * size;
++
++                if ( !addr )
++                    continue;
++
++                if ( mfn_start >= (addr >> PAGE_SHIFT) &&
++                     mfn_end <= ((addr + size - 1) >> PAGE_SHIFT) )
++                {
++                    rc = 0;
++                    goto out;
++                }
++            }
++        }
++        else
++        {
++            uint64_t addr, size;
++            uint32_t bar;
++
++            if ( (pci_conf_read8(pdev->sbdf, PCI_HEADER_TYPE) & 0x7f) !=
++                    PCI_HEADER_TYPE_NORMAL )
++                continue;
++
++            for ( i = 0; i < PCI_HEADER_NORMAL_NR_BARS; )
++            {
++                unsigned int idx = PCI_BASE_ADDRESS_0 + i * 4;
++
++                bar = pci_conf_read32(pdev->sbdf, idx);
++
++                if ( (bar & PCI_BASE_ADDRESS_SPACE) !=
++                        PCI_BASE_ADDRESS_SPACE_MEMORY )
++                {
++                    i++;
++                    continue;
++                }
++
++                addr = 0;
++                size = 0;
++                rc = pci_size_mem_bar(pdev->sbdf, idx, &addr, &size,
++                                      (i == PCI_HEADER_NORMAL_NR_BARS - 1) ?
++                                          PCI_BAR_LAST : 0);
++                i += rc;
++
++                if ( !addr || !size )
++                    continue;
++
++                if ( mfn_start >= (addr >> PAGE_SHIFT) &&
++                     mfn_end <= ((addr + size - 1) >> PAGE_SHIFT) )
++                {
++                    rc = 0;
++                    goto out;
++                }
++            }
++
++            /* Handle the ROM BAR */
++            addr = 0;
++            size = 0;
++
++            bar = pci_conf_read32(pdev->sbdf, PCI_ROM_ADDRESS);
++            addr = bar & PCI_ROM_ADDRESS_MASK;
++
++            pci_conf_write32(pdev->sbdf,
++                             PCI_ROM_ADDRESS, bar | (uint32_t)PCI_ROM_ADDRESS_MASK);
++            size = pci_conf_read32(pdev->sbdf, PCI_ROM_ADDRESS);
++            pci_conf_write32(pdev->sbdf, PCI_ROM_ADDRESS, bar);
++            size &= ~(size - 1);
++
++            if ( !addr || !size )
++                continue;
++
++            if ( mfn_start >= (addr >> PAGE_SHIFT) &&
++                 mfn_end <= ((addr + size - 1) >> PAGE_SHIFT) )
++            {
++                rc = 0;
++                goto out;
++            }
++        }
++    }
++
++    rc = -ENOENT;
++
++out:
++    pcidevs_unlock();
++    return rc;
++}
++
+ /**
+  * pci_enable_acs - enable ACS if hardware support it
+  * @dev: the PCI device
+diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
+index 23bcc846b35c..09a6bf958f7f 100644
+--- a/xen/include/xen/pci.h
++++ b/xen/include/xen/pci.h
+@@ -270,6 +270,9 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
+ int check_ioport_access(const struct domain *d, unsigned int port_start,
+                         unsigned int port_end);
+ 
++int check_iomem_access(const struct domain *d, xen_pfn_t mfn_start,
++                       xen_pfn_t mfn_end);
++
+ #define PCI_BAR_VF      (1u << 0)
+ #define PCI_BAR_LAST    (1u << 1)
+ #define PCI_BAR_ROM     (1u << 2)
