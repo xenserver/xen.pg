@@ -1,0 +1,57 @@
+From 28301682f492c1df2ff9c3e01a0aab6262bd925a Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 2 Dec 2024 17:27:05 +0000
+Subject: libs/guest: Fix migration compatibility with a security-patched Xen
+ 4.13
+
+xc_cpuid_apply_policy() provides compatibility for migration of a pre-4.14 VM
+where no CPUID data was provided in the stream.
+
+It guesses the various max-leaf limits, based on what was true at the time of
+writing, but this was not correctly adapted when speculative security issues
+forced the advertisement of new feature bits.  Of note are:
+
+ * LFENCE-DISPATCH, in leaf 0x80000021.eax
+ * BHI-CTRL, in leaf 0x7[2].edx
+
+In both cases, a VM booted on a security-patched Xen 4.13, and then migrated
+on to any newer version of Xen on the same or compatible hardware would have
+these features stripped back because Xen is still editing the cpu-policy for
+sanity behind the back of the toolstack.
+
+For VMs using BHI_DIS_S to mitigate Native-BHI, this resulted in a failure to
+restore the guests MSR_SPEC_CTRL setting:
+
+  (XEN) HVM d7v0 load MSR 0x48 with value 0x401 failed
+  (XEN) HVM7 restore: failed to load entry 20/0 rc -6
+
+Fixes: e9b4fe263649 ("x86/cpuid: support LFENCE always serialising CPUID bit")
+Fixes: f3709b15fc86 ("x86/cpuid: Infrastructure for cpuid word 7:2.edx")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/tools/libs/guest/xg_cpuid_x86.c b/tools/libs/guest/xg_cpuid_x86.c
+index ac1ce388aeed..c58887241fd7 100644
+--- a/tools/libs/guest/xg_cpuid_x86.c
++++ b/tools/libs/guest/xg_cpuid_x86.c
+@@ -657,7 +657,8 @@ int xc_cpuid_apply_policy(xc_interface *xch, uint32_t domid, bool restore,
+          *
+          * This restore path is used for incoming VMs with no CPUID data
+          * i.e. originated on Xen 4.13 or earlier.  We must invent a policy
+-         * compatible with what Xen 4.13 would have done on the same hardware.
++         * compatible with what a security-patched Xen 4.13 would have done on
++         * the same hardware.
+          *
+          * Specifically:
+          * - Clamp max leaves.
+@@ -674,8 +675,8 @@ int xc_cpuid_apply_policy(xc_interface *xch, uint32_t domid, bool restore,
+         }
+ 
+         p->basic.max_leaf = min(p->basic.max_leaf, 0xdu);
+-        p->feat.max_subleaf = 0;
+-        p->extd.max_leaf = min(p->extd.max_leaf, 0x8000001c);
++        p->feat.max_subleaf = min(p->feat.max_subleaf, 0x2u);
++        p->extd.max_leaf = min(p->extd.max_leaf, 0x80000021);
+     }
+ 
+     if ( featureset )
