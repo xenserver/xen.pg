@@ -1,0 +1,44 @@
+From e5865e7804635a6cf863968a9eee395cd39bc6f3 Mon Sep 17 00:00:00 2001
+From: Andrii Sultanov <andrii.sultanov@cloud.com>
+Date: Mon, 16 Dec 2024 13:35:10 +0100
+Subject: tools/ocaml: Specify rpath correctly for ocamlmklib
+
+ocamlmklib has special handling for C-like '-Wl,-rpath' option, but does
+not know how to handle '-Wl,-rpath-link', as evidenced by warnings like:
+"Unknown option
+-Wl,-rpath-link=$HOME/xen/tools/ocaml/libs/eventchn/../../../../tools/libs/toollog"
+Pass this option directly to the compiler with -ccopt instead.
+
+Also pass -L directly to the linker with -ldopt. This prevents embedding absolute
+paths from buildtime into binary's RPATH.
+
+Fixes: f7b4e4558b42 ("tools/ocaml: Fix OCaml libs rules")
+Reported-by: Fernando Rodrigues <alpha@sigmasquadron.net>
+Tested-by: Fernando Rodrigues <alpha@sigmasquadron.net>
+Signed-off-by: Andrii Sultanov <andrii.sultanov@cloud.com>
+Acked-by: Christian Lindig <christian.lindig@cloud.com>
+master commit: bf8a209915804088c09ac6575bcca554450fa7e8
+master date: 2024-12-11 10:45:08 +0000
+
+diff --git a/tools/ocaml/Makefile.rules b/tools/ocaml/Makefile.rules
+index 5638193edf8a..678bbc046ff6 100644
+--- a/tools/ocaml/Makefile.rules
++++ b/tools/ocaml/Makefile.rules
+@@ -61,7 +61,7 @@ mk-caml-lib-bytecode = $(call quiet-command, $(OCAMLC) $(OCAMLCFLAGS) -a -o $1 $
+ 
+ mk-caml-stubs = $(call quiet-command, $(OCAMLMKLIB) -o `basename $1 .a` $2,MKLIB,$1)
+ mk-caml-lib-stubs = \
+-	$(call quiet-command, $(OCAMLMKLIB) -o `basename $1 .a | sed -e 's/^lib//'` $2 $3,MKLIB,$1)
++	$(call quiet-command, $(OCAMLMKLIB) -o `basename $1 .a | sed -e 's/^lib//'` $2 `echo $3 | sed -e 's/-ccopt -l/-l/g' | sed -e 's/-ccopt -L/-ldopt -L/g'`,MKLIB,$1)
+ 
+ # define a library target <name>.cmxa and <name>.cma
+ define OCAML_LIBRARY_template
+@@ -72,7 +72,7 @@ define OCAML_LIBRARY_template
+  $(1)_stubs.a: $(foreach obj,$$($(1)_C_OBJS),$(obj).o)
+ 	$(call mk-caml-stubs,$$@, $$+)
+  lib$(1)_stubs.a: $(foreach obj,$($(1)_C_OBJS),$(obj).o)
+-	$(call mk-caml-lib-stubs,$$@, $$+, $(foreach lib,$(LIBS_$(1)),$(lib)))
++	$(call mk-caml-lib-stubs,$$@, $$+, $(foreach lib,$(LIBS_$(1)),-ccopt $(lib)))
+ endef
+ 
+ define OCAML_NOC_LIBRARY_template
