@@ -1,40 +1,54 @@
-From b027e3426229d6102f2092e2790f82caad3356f5 Mon Sep 17 00:00:00 2001
+From a1746cd4434dd27ca2da8430dfb10edc76264bb3 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Mon, 25 Mar 2024 15:14:46 +0000
-Subject: x86/spec-ctrl: Support for SRSO_US_NO and SRSO_MSR_FIX
+Subject: x86/spec-ctrl: Support for SRSO_U/S_NO and SRSO_MSR_FIX
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-AMD have updated the SRSO whitepaper[1] with further information.
+AMD have updated the SRSO whitepaper[1] with further information.  These
+features exist on AMD Zen5 CPUs and are necessary for Xen to use.
 
-There's a new SRSO_U/S_NO enumeration saying that SRSO attacks can't cross the
-user/supervisor boundary.  i.e. Xen don't need to use IBPB-on-entry for PV.
+The two features are in principle unrelated:
 
-There's also a new SRSO_MSR_FIX identifying that the BP_SPEC_REDUCE bit is
-available in MSR_BP_CFG.  When set, SRSO attacks can't cross the host/guest
-boundary.  i.e. Xen don't need to use IBPB-on-entry for HVM.
+ * SRSO_U/S_NO is an enumeration saying that SRSO attacks can't cross the
+   User(CPL3) / Supervisor(CPL<3) boundary.  i.e. Xen don't need to use
+   IBPB-on-entry for PV64.  PV32 guests are explicitly unsupported for
+   speculative issues, and excluded from consideration for simplicity.
+
+ * SRSO_MSR_FIX is an enumeration identifying that the BP_SPEC_REDUCE bit is
+   available in MSR_BP_CFG.  When set, SRSO attacks can't cross the host/guest
+   boundary.  i.e. Xen don't need to use IBPB-on-entry for HVM.
 
 Extend ibpb_calculations() to account for these when calculating
-opt_ibpb_entry_{pv,hvm} defaults.  Add a bp-spec-reduce option to control the
-use of BP_SPEC_REDUCE, but activate it by default.
+opt_ibpb_entry_{pv,hvm} defaults.  Add a `bp-spec-reduce=<bool>` option to
+control the use of BP_SPEC_REDUCE, with it active by default.
 
 Because MSR_BP_CFG is core-scoped with a race condition updating it, repurpose
 amd_check_erratum_1485() into amd_check_bp_cfg() and calculate all updates at
 once.
 
-Advertise SRSO_U/S_NO to guests whenever possible, as it allows the guest
-kernel to skip SRSO protections too.  This is easy for HVM guests, but hard
-for PV guests, as both the guest userspace and kernel operate in CPL3.  After
-discussing with AMD, it is believed to be safe to advertise SRSO_U/S_NO to PV
-guests when BP_SPEC_REDUCE is active.
+Xen also needs to to advertise SRSO_U/S_NO to guests to allow the guest kernel
+to skip SRSO mitigations too:
 
-Fix a typo in the SRSO_NO's comment.
+ * This is trivial for HVM guests.  It is also is accurate for PV32 guests
+   too, but we have already excluded them from consideration, and do so again
+   here to simplify the policy logic.
+
+ * As written, SRSO_U/S_NO does not help for the PV64 user->kernel boundary.
+   However, after discussing with AMD, an implementation detail of having
+   BP_SPEC_REDUCE active causes the PV64 user->kernel boundary to have the
+   property described by SRSO_U/S_NO, so we can advertise SRSO_U/S_NO to
+   guests when the BP_SPEC_REDUCE precondition is met.
+
+Finally, fix a typo in the SRSO_NO's comment.
 
 [1] https://www.amd.com/content/dam/amd/en/documents/corporate/cr/speculative-return-stack-overflow-whitepaper.pdf
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
 diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
-index 39c10b302ede..8e15b41e8d4b 100644
+index 39c10b302ede..c8e73d627263 100644
 --- a/docs/misc/xen-command-line.pandoc
 +++ b/docs/misc/xen-command-line.pandoc
 @@ -2340,7 +2340,7 @@ By default SSBD will be mitigated at runtime (i.e `ssbd=runtime`).
@@ -54,14 +68,14 @@ index 39c10b302ede..8e15b41e8d4b 100644
 +to force or prevent Xen from using MSR_BP_CFG.BP_SPEC_REDUCE to mitigate the
 +SRSO (Speculative Return Stack Overflow) vulnerability.  Xen will use
 +bp-spec-reduce when available, as it is preferable to using `ibpb-entry=hvm`
-+to mitigate SRSO for HVM guests, and because it is a necessary prerequisite in
-+order to advertise SRSO_U/S_NO to PV guests.
++to mitigate SRSO for HVM guests, and because it is a prerequisite to advertise
++SRSO_U/S_NO to PV guests.
 +
  ### sync_console
  > `= <boolean>`
  
 diff --git a/xen/arch/x86/cpu-policy.c b/xen/arch/x86/cpu-policy.c
-index 9d1f8c2706ce..7186b0bf8323 100644
+index 9d1f8c2706ce..5dde9d5bad0c 100644
 --- a/xen/arch/x86/cpu-policy.c
 +++ b/xen/arch/x86/cpu-policy.c
 @@ -14,6 +14,7 @@
@@ -72,21 +86,23 @@ index 9d1f8c2706ce..7186b0bf8323 100644
  #include <asm/xstate.h>
  
  struct cpu_policy __read_mostly       raw_cpu_policy;
-@@ -650,6 +651,24 @@ static void __init calculate_pv_max_policy(void)
+@@ -650,6 +651,26 @@ static void __init calculate_pv_max_policy(void)
          __clear_bit(X86_FEATURE_IBRS, fs);
      }
  
 +    /*
 +     * SRSO_U/S_NO means that the CPU is not vulnerable to SRSO attacks across
-+     * the User (CPL3)/Supervisor (CPL<3) boundary.  However the PV64
-+     * user/kernel boundary is CPL3 on both sides, so it won't convey the
-+     * meaning that a PV kernel expects.
++     * the User (CPL3) / Supervisor (CPL<3) boundary.
 +     *
-+     * PV32 guests are explicitly unsupported WRT speculative safety, so are
-+     * ignored to avoid complicating the logic.
++     * PV32 guests are unsupported for speculative issues, and excluded from
++     * consideration for simplicity.
 +     *
-+     * After discussions with AMD, it is believed to be safe to offer
-+     * SRSO_US_NO to PV guests when BP_SPEC_REDUCE is active.
++     * The PV64 user/kernel boundary is CPL3 on both sides, so SRSO_U/S_NO
++     * won't convey the meaning that a PV kernel expects.
++     *
++     * After discussions with AMD, an implementation detail of having
++     * BP_SPEC_REDUCE active causes the PV64 user/kernel boundary to have a
++     * property compatible with the meaning of SRSO_U/S_NO.
 +     *
 +     * If BP_SPEC_REDUCE isn't active, remove SRSO_U/S_NO from the PV max
 +     * policy, which will cause it to filter out of PV default too.
@@ -98,7 +114,7 @@ index 9d1f8c2706ce..7186b0bf8323 100644
      guest_common_feature_adjustments(fs);
  
 diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
-index 2838725bab98..823a268a14bd 100644
+index 2838725bab98..31f785a446da 100644
 --- a/xen/arch/x86/cpu/amd.c
 +++ b/xen/arch/x86/cpu/amd.c
 @@ -982,16 +982,33 @@ static void cf_check fam17_disable_c6(void *arg)
@@ -123,7 +139,7 @@ index 2838725bab98..823a268a14bd 100644
 +	 * default.  This lets us do two things:
 +	 *
 +	 * 1) Avoid IBPB-on-entry to mitigate SRSO attacks from HVM guests.
-+	 * 2) Lets us advertise SRSO_US_NO to PV guests.
++	 * 2) Advertise SRSO_US_NO to PV guests.
 +	 */
 +	if (boot_cpu_has(X86_FEATURE_SRSO_MSR_FIX) && opt_bp_spec_reduce)
 +		new |= BP_CFG_SPEC_REDUCE;
@@ -182,7 +198,7 @@ index 4439a1b24346..4557ae2271b8 100644
  /*
   * The L1D address mask, which might be wider than reported in CPUID, and the
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index b1e47a849e87..bedc86ad5600 100644
+index b1e47a849e87..fcfa95482e56 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
 @@ -95,6 +95,7 @@ static bool __initdata opt_unpriv_mmio;
@@ -252,7 +268,7 @@ index b1e47a849e87..bedc86ad5600 100644
  
      /* Check we have hardware IBPB support before using it... */
      if ( !boot_cpu_has(X86_FEATURE_IBRSB) && !boot_cpu_has(X86_FEATURE_IBPB) )
-@@ -1157,22 +1163,41 @@ static void __init ibpb_calculations(void)
+@@ -1157,22 +1163,43 @@ static void __init ibpb_calculations(void)
           * Confusion.  Mitigate with IBPB-on-entry.
           */
          if ( !boot_cpu_has(X86_FEATURE_BTC_NO) )
@@ -263,10 +279,10 @@ index b1e47a849e87..bedc86ad5600 100644
 -         * Further to BTC, Zen3/4 CPUs suffer from Speculative Return Stack
 -         * Overflow in most configurations.  Mitigate with IBPB-on-entry if we
 -         * have the microcode that makes this an effective option.
-+         * Further to BTC, Zen3 and later CPUs suffer from Speculative Return
-+         * Stack Overflow in most configurations.  Mitigate with IBPB-on-entry
-+         * if we have the microcode that makes this an effective option,
-+         * except where there are other mitigating factors available.
++         * In addition to BTC, Zen3 and later CPUs suffer from Speculative
++         * Return Stack Overflow in most configurations.  If we have microcode
++         * that makes IBPB-on-entry an effective mitigation, see about using
++         * it.
           */
          if ( !boot_cpu_has(X86_FEATURE_SRSO_NO) &&
               boot_cpu_has(X86_FEATURE_IBPB_BRTYPE) )
@@ -274,9 +290,11 @@ index b1e47a849e87..bedc86ad5600 100644
 +        {
 +            /*
 +             * SRSO_U/S_NO is a subset of SRSO_NO, identifying that SRSO isn't
-+             * possible across the user/supervisor boundary.  We only need to
-+             * use IBPB-on-entry for PV guests on hardware which doesn't
-+             * enumerate SRSO_US_NO.
++             * possible across the User (CPL3) / Supervisor (CPL<3) boundary.
++             *
++             * Ignoring PV32 (not security supported for speculative issues),
++             * this means we only need to use IBPB-on-entry for PV guests on
++             * hardware which doesn't enumerate SRSO_US_NO.
 +             */
 +            if ( !boot_cpu_has(X86_FEATURE_SRSO_US_NO) )
 +                def_ibpb_entry_pv = true;
