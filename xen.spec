@@ -883,6 +883,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Jan 13 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.1-1
+- Update to Xen 4.19.1
+
 * Wed Dec 18 2024 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-7
 - Fix IO-APIC initialization with ExtINT mode pins
 - Fix emulation of MOVBE instruction
