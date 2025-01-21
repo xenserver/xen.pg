@@ -1,0 +1,60 @@
+From 0a14438052e65507041cf205c517ab0b4c786813 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Marczykowski-G=C3=B3recki?=
+ <marmarek@invisiblethingslab.com>
+Date: Tue, 21 Jan 2025 09:17:44 +0100
+Subject: tools/xg: increase LZMA_BLOCK_SIZE for uncompressing the kernel
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Linux 6.12-rc2 fails to decompress with the current 128MiB, contrary to
+the code comment. It results in a failure like this:
+
+    domainbuilder: detail: xc_dom_kernel_file: filename="/var/lib/qubes/vm-kernels/6.12-rc2-1.1.fc37/vmlinuz"
+    domainbuilder: detail: xc_dom_malloc_filemap    : 12104 kB
+    domainbuilder: detail: xc_dom_module_file: filename="/var/lib/qubes/vm-kernels/6.12-rc2-1.1.fc37/initramfs"
+    domainbuilder: detail: xc_dom_malloc_filemap    : 7711 kB
+    domainbuilder: detail: xc_dom_boot_xen_init: ver 4.19, caps xen-3.0-x86_64 hvm-3.0-x86_32 hvm-3.0-x86_32p hvm-3.0-x86_64
+    domainbuilder: detail: xc_dom_parse_image: called
+    domainbuilder: detail: xc_dom_find_loader: trying multiboot-binary loader ...
+    domainbuilder: detail: loader probe failed
+    domainbuilder: detail: xc_dom_find_loader: trying HVM-generic loader ...
+    domainbuilder: detail: loader probe failed
+    domainbuilder: detail: xc_dom_find_loader: trying Linux bzImage loader ...
+    domainbuilder: detail: _xc_try_lzma_decode: XZ decompression error: Memory usage limit reached
+    xc: error: panic: xg_dom_bzimageloader.c:761: xc_dom_probe_bzimage_kernel unable to XZ decompress kernel: Invalid kernel
+    domainbuilder: detail: loader probe failed
+    domainbuilder: detail: xc_dom_find_loader: trying ELF-generic loader ...
+    domainbuilder: detail: loader probe failed
+    xc: error: panic: xg_dom_core.c:689: xc_dom_find_loader: no loader found: Invalid kernel
+    libxl: error: libxl_dom.c:566:libxl__build_dom: xc_dom_parse_image failed
+
+The important part: XZ decompression error: Memory usage limit reached
+
+This looks to be related to the following change in Linux:
+8653c909922743bceb4800e5cc26087208c9e0e6 ("xz: use 128 MiB dictionary and force single-threaded mode")
+
+Fix this by increasing the block size to 256MiB. And remove the
+misleading comment (from lack of better ideas).
+
+Signed-off-by: Marek Marczykowski-Górecki <marmarek@invisiblethingslab.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Anthony PERARD <anthony.perard@vates.tech>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: e6472d46680ccd2b804ad73c19042a5811d036f0
+master date: 2024-12-19 17:33:54 +0000
+
+diff --git a/tools/libs/guest/xg_dom_bzimageloader.c b/tools/libs/guest/xg_dom_bzimageloader.c
+index c6ee6d83e7c6..1fb4e5a1f728 100644
+--- a/tools/libs/guest/xg_dom_bzimageloader.c
++++ b/tools/libs/guest/xg_dom_bzimageloader.c
+@@ -272,8 +272,7 @@ static int _xc_try_lzma_decode(
+     return retval;
+ }
+ 
+-/* 128 Mb is the minimum size (half-way) documented to work for all inputs. */
+-#define LZMA_BLOCK_SIZE (128*1024*1024)
++#define LZMA_BLOCK_SIZE (256*1024*1024)
+ 
+ static int xc_try_xz_decode(
+     struct xc_dom_image *dom, void **blob, size_t *size)

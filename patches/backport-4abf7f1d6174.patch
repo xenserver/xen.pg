@@ -1,0 +1,61 @@
+From 4abf7f1d6174b74640c219e1cc7cb768e8d7ea32 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 21 Jan 2025 09:19:39 +0100
+Subject: x86emul: VCVT{,U}DQ2PD ignores embedded rounding
+
+IOW we shouldn't raise #UD in that case. Be on the safe side though and
+only encode fully legitimate forms into the stub to be executed.
+
+Things weren't quite right for VCVT{,U}SI2SD either, in the attempt to
+be on the safe side: Clearing EVEX.L'L isn't useful; it's EVEX.b which
+primarily needs clearing. Also reflect the somewhat improved doc
+situation in the comment there.
+
+Fixes: ed806f373730 ("x86emul: support AVX512F legacy-equivalent packed int/FP conversion insns")
+Fixes: baf4a376f550 ("x86emul: support AVX512F legacy-equivalent scalar int/FP conversion insns")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: d3709d1324aa140f064b9c68da37547f459f8e8d
+master date: 2025-01-08 11:01:17 +0100
+
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
+index 09ab75d035f7..4ef868de3d7d 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate/x86_emulate.c
+@@ -3592,12 +3592,15 @@ x86_emulate(
+         if ( !mode_64bit() )
+             evex.w = 0;
+         /*
+-         * SDM version 067 claims that exception type E10NF implies #UD when
+-         * EVEX.L'L is non-zero for 32-bit VCVT{,U}SI2SD. Experimentally this
+-         * cannot be confirmed, but be on the safe side for the stub.
++         * While SDM version 085 has explicit wording towards embedded rounding
++         * being ignored, it's still not entirely unambiguous with the exception
++         * type referred to. Be on the safe side for the stub.
+          */
+         if ( !evex.w && evex.pfx == vex_f2 )
++        {
++            evex.brs = 0;
+             evex.lr = 0;
++        }
+         opc[1] = (modrm & 0x38) | 0xc0;
+         insn_bytes = EVEX_PFX_BYTES + 2;
+         opc[2] = 0xc3;
+@@ -4815,7 +4818,16 @@ x86_emulate(
+         else
+         {
+             host_and_vcpu_must_have(avx512f);
+-            generate_exception_if(ea.type != OP_MEM && evex.brs, X86_EXC_UD);
++            /*
++             * While SDM version 085 has explicit wording towards embedded
++             * rounding being ignored, it's still not entirely unambiguous with
++             * the exception type referred to. Be on the safe side for the stub.
++             */
++            if ( ea.type != OP_MEM && evex.brs )
++            {
++                evex.brs = 0;
++                evex.lr = 2;
++            }
+         }
+         if ( ea.type != OP_REG || !evex.brs )
+             avx512_vlen_check(false);

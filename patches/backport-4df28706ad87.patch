@@ -1,0 +1,109 @@
+From 4df28706ad8756b36de23b5173e8f4ce4c086c57 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 21 Jan 2025 09:19:56 +0100
+Subject: x86emul: correct put_fpu()'s segment selector handling
+
+All selector fields under ctxt->regs are (normally) poisoned in the HVM
+case, and the four ones besides CS and SS are potentially stale for PV.
+Avoid using them in the hypervisor incarnation of the emulator, when
+trying to cover for a missing ->read_segment() hook.
+
+To make sure there's always a valid ->read_segment() handler for all HVM
+cases, add a respective function to shadow code, even if it is not
+expected for FPU insns to be used to update page tables.
+
+Fixes: 0711b59b858a ("x86emul: correct FPU code/data pointers and opcode handling")
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 645b8d48c78f5b6ffd6230873f9e3ced4e840acd
+master date: 2025-01-08 11:02:16 +0100
+
+diff --git a/xen/arch/x86/mm/shadow/hvm.c b/xen/arch/x86/mm/shadow/hvm.c
+index c16f3b3adf32..114957a3e1ec 100644
+--- a/xen/arch/x86/mm/shadow/hvm.c
++++ b/xen/arch/x86/mm/shadow/hvm.c
+@@ -287,11 +287,29 @@ hvm_emulate_cmpxchg(enum x86_segment seg,
+     return rc;
+ }
+ 
++static int cf_check
++hvm_emulate_read_segment(enum x86_segment seg,
++                         struct segment_register *reg,
++                         struct x86_emulate_ctxt *ctxt)
++{
++    struct sh_emulate_ctxt *sh_ctxt =
++        container_of(ctxt, struct sh_emulate_ctxt, ctxt);
++    const struct segment_register *sreg = hvm_get_seg_reg(seg, sh_ctxt);
++
++    if ( IS_ERR(sreg) )
++        return -PTR_ERR(sreg);
++
++    *reg = *sreg;
++
++    return X86EMUL_OKAY;
++}
++
+ static const struct x86_emulate_ops hvm_shadow_emulator_ops = {
+     .read       = hvm_emulate_read,
+     .insn_fetch = hvm_emulate_insn_fetch,
+     .write      = hvm_emulate_write,
+     .cmpxchg    = hvm_emulate_cmpxchg,
++    .read_segment = hvm_emulate_read_segment,
+ };
+ 
+ const struct x86_emulate_ops *shadow_init_emulation(
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
+index 4ef868de3d7d..31475208d1d4 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate/x86_emulate.c
+@@ -447,14 +447,37 @@ static void put_fpu(
+         if ( state->ea.type == OP_MEM )
+         {
+             aux.dp = state->ea.mem.off;
+-            if ( ops->read_segment &&
+-                 ops->read_segment(state->ea.mem.seg, &sreg,
+-                                   ctxt) == X86EMUL_OKAY )
++            if ( state->ea.mem.seg == x86_seg_cs )
++                aux.ds = aux.cs;
++            else if ( ops->read_segment &&
++                      ops->read_segment(state->ea.mem.seg, &sreg,
++                                        ctxt) == X86EMUL_OKAY )
+                 aux.ds = sreg.sel;
++#ifdef __XEN__
++            /*
++             * While generally the expectation is that input structures are
++             * fully populated, the selector fields under ctxt->regs normally
++             * aren't set, with the exception of CS and SS for PV domains.
++             * Read the real selector registers for PV, and assert that HVM
++             * invocations always set a properly functioning ->read_segment()
++             * hook.
++             */
++            else if ( is_pv_vcpu(current) )
++                switch ( state->ea.mem.seg )
++                {
++                case x86_seg_ds: aux.ds = read_sreg(ds);  break;
++                case x86_seg_es: aux.ds = read_sreg(es);  break;
++                case x86_seg_fs: aux.ds = read_sreg(fs);  break;
++                case x86_seg_gs: aux.ds = read_sreg(gs);  break;
++                case x86_seg_ss: aux.ds = ctxt->regs->ss; break;
++                default:         ASSERT_UNREACHABLE();    break;
++                }
++            else
++                ASSERT_UNREACHABLE();
++#else
+             else
+                 switch ( state->ea.mem.seg )
+                 {
+-                case x86_seg_cs: aux.ds = ctxt->regs->cs; break;
+                 case x86_seg_ds: aux.ds = ctxt->regs->ds; break;
+                 case x86_seg_es: aux.ds = ctxt->regs->es; break;
+                 case x86_seg_fs: aux.ds = ctxt->regs->fs; break;
+@@ -462,6 +485,7 @@ static void put_fpu(
+                 case x86_seg_ss: aux.ds = ctxt->regs->ss; break;
+                 default:         ASSERT_UNREACHABLE();    break;
+                 }
++#endif
+             aux.dval = true;
+         }
+         ops->put_fpu(ctxt, X86EMUL_FPU_none, &aux);
