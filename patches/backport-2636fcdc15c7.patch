@@ -1,0 +1,116 @@
+From 2636fcdc15c707d5e097770133f0afb69e8d70c9 Mon Sep 17 00:00:00 2001
+From: Teddy Astie <teddy.astie@vates.tech>
+Date: Fri, 24 Jan 2025 12:31:15 +0100
+Subject: x86/iommu: check for CMPXCHG16B when enabling IOMMU
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+All hardware with VT-d/AMD-Vi has CMPXCHG16B support. Check this at
+initialisation time, and otherwise refuse to use the IOMMU.
+
+If the local APICs support x2APIC mode the IOMMU support for interrupt
+remapping will be checked earlier using a specific helper.  If no support
+for CX16 is detected by that earlier hook disable the IOMMU at that point
+and prevent further poking for CX16 later in the boot process, which would
+also fail.
+
+There's a possible corner case when running virtualized, and the underlying
+hypervisor exposing an IOMMU but no CMPXCHG16B support.  In which case
+ignoring the IOMMU is fine, albeit the most natural would be for the
+underlying hypervisor to also expose CMPXCHG16B support if an IOMMU is
+available to the VM.
+
+Note this change only introduces the checks, but doesn't remove the now
+stale checks for CX16 support sprinkled in the IOMMU code.  Further changes
+will take care of that.
+
+Suggested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Teddy Astie <teddy.astie@vates.tech>
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-Acked-by: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+
+diff --git a/xen/drivers/passthrough/amd/iommu_intr.c b/xen/drivers/passthrough/amd/iommu_intr.c
+index 7fc796dec25b..f07fd9e3d970 100644
+--- a/xen/drivers/passthrough/amd/iommu_intr.c
++++ b/xen/drivers/passthrough/amd/iommu_intr.c
+@@ -649,6 +649,19 @@ bool __init cf_check iov_supports_xt(void)
+     if ( !iommu_enable || !iommu_intremap )
+         return false;
+ 
++    if ( unlikely(!cpu_has_cx16) )
++    {
++        AMD_IOMMU_ERROR("no CMPXCHG16B support, disabling IOMMU\n");
++        /*
++         * Disable IOMMU support at once: there's no reason to check for CX16
++         * yet again when attempting to initialize IOMMU DMA remapping
++         * functionality or interrupt remapping without x2APIC support.
++         */
++        iommu_enable = false;
++        iommu_intremap = iommu_intremap_off;
++        return false;
++    }
++
+     if ( amd_iommu_prepare(true) )
+         return false;
+ 
+diff --git a/xen/drivers/passthrough/amd/pci_amd_iommu.c b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+index 73dcc4a2dd0c..f96f59440bcc 100644
+--- a/xen/drivers/passthrough/amd/pci_amd_iommu.c
++++ b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+@@ -309,6 +309,12 @@ static int __init cf_check iov_detect(void)
+     if ( !iommu_enable && !iommu_intremap )
+         return 0;
+ 
++    if ( unlikely(!cpu_has_cx16) )
++    {
++        AMD_IOMMU_ERROR("no CMPXCHG16B support, disabling IOMMU\n");
++        return -ENODEV;
++    }
++
+     if ( (init_done ? amd_iommu_init_late()
+                     : amd_iommu_init(false)) != 0 )
+     {
+diff --git a/xen/drivers/passthrough/vtd/intremap.c b/xen/drivers/passthrough/vtd/intremap.c
+index c504852eb818..233db5cb64de 100644
+--- a/xen/drivers/passthrough/vtd/intremap.c
++++ b/xen/drivers/passthrough/vtd/intremap.c
+@@ -150,6 +150,19 @@ bool __init cf_check intel_iommu_supports_eim(void)
+     if ( !iommu_qinval || !iommu_intremap || list_empty(&acpi_drhd_units) )
+         return false;
+ 
++    if ( unlikely(!cpu_has_cx16) )
++    {
++        printk(XENLOG_ERR VTDPREFIX "no CMPXCHG16B support, disabling IOMMU\n");
++        /*
++         * Disable IOMMU support at once: there's no reason to check for CX16
++         * yet again when attempting to initialize IOMMU DMA remapping
++         * functionality or interrupt remapping without x2APIC support.
++         */
++        iommu_enable = false;
++        iommu_intremap = iommu_intremap_off;
++        return false;
++    }
++
+     /* We MUST have a DRHD unit for each IOAPIC. */
+     for ( apic = 0; apic < nr_ioapics; apic++ )
+         if ( !ioapic_to_drhd(IO_APIC_ID(apic)) )
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index 27a4d1640189..3daedc4f5593 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -2633,6 +2633,13 @@ static int __init cf_check vtd_setup(void)
+     int ret;
+     bool reg_inval_supported = true;
+ 
++    if ( unlikely(!cpu_has_cx16) )
++    {
++        printk(XENLOG_ERR VTDPREFIX "no CMPXCHG16B support, disabling IOMMU\n");
++        ret = -ENODEV;
++        goto error;
++    }
++
+     if ( list_empty(&acpi_drhd_units) )
+     {
+         ret = -ENODEV;
