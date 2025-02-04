@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.46
+%global hv_rel 9.47
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -875,6 +875,11 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
 %{?_cov_results_package}
 
 %changelog
+* Tue Feb 04 2025 Javi Merino <javi.merino@cloud.com> - 4.13.5-9.47
+- Reduce PCI config reads
+- Prevent early exit from i8259 loop detection on systems with
+  multiple IO-APICs
+
 * Tue Nov 12 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-9.46
 - Fix watchdog setup on Intel Sapphire Rapids and Emerald Rapids platforms.
 
