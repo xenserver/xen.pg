@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 7
+%global hv_rel 8
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Tue Feb  4 2025 Javi Merino <javi.merino@cloud.com> - 4.17.5-8
+- Fix IO_PAGE_FAULT reported by AMD
+- Reduce PCI config reads
+
 * Wed Dec 18 2024 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-7
 - Fix IO-APIC initialization with ExtINT mode pins
 - Fix emulation of MOVBE instruction
