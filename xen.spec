@@ -99,7 +99,7 @@ BuildRequires: zlib-devel
 # For libxl
 BuildRequires: yajl-devel
 BuildRequires: libuuid-devel
-BuildRequires: perl
+BuildRequires: perl-interpreter
 
 # For libacpi
 BuildRequires: iasl
