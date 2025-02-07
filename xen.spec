@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9.47
+%global hv_rel 9.48
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -875,6 +875,9 @@ touch %{_rundir}/reboot-required.d/%{name}/%{version}-%{release}
 %{?_cov_results_package}
 
 %changelog
+* Fri Feb 07 2025 Javi Merino <javi.merino@cloud.com> - 4.13.5-9.48
+- Fix incomplete reduction of PCI config reads
+
 * Tue Feb 04 2025 Javi Merino <javi.merino@cloud.com> - 4.13.5-9.47
 - Reduce PCI config reads
 - Prevent early exit from i8259 loop detection on systems with
