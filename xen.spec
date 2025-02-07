@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 8
+%global hv_rel 9
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Fri Feb 07 2025 Javi Merino <javi.merino@cloud.com> - 4.17.5-9
+- Fix PCI config reads patch
+
 * Tue Feb  4 2025 Javi Merino <javi.merino@cloud.com> - 4.17.5-8
 - Fix IO_PAGE_FAULT reported by AMD
 - Reduce PCI config reads
