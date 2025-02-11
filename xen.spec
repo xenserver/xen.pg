@@ -183,12 +183,20 @@ Requires: xen-devel = %{version}
 %description libs-devel
 This package contains the Xen Hypervisor general development for all domains.
 
+%package oxenstored
+Summary: OCaml xenstore daemon
+License: LGPLv2.1
+Provides: %{_sbindir}/oxenstored
+%description oxenstored
+This package contains the OCaml xenstore daemon.
+
 %package dom0-tools
 Summary: Xen Hypervisor Domain 0 tools
 License: GPLv2 and LGPLv2 and MIT
 Requires: xen-dom0-libs = %{version}
 Requires: xen-tools = %{version}
 Obsoletes: xen-installer-files <= 4.13.5-10.42
+Requires: %{_sbindir}/oxenstored
 Requires: %{_libdir}/xen/bin/qemu-system-i386
 Requires: %{_datadir}/edk2/OVMF-release.fd
 Requires: %{_datadir}/ipxe/ipxe.bin
@@ -545,6 +553,9 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/libxenvchan.so
 %{_libdir}/pkgconfig/xenvchan.pc
 
+%files oxenstored
+%{_sbindir}/oxenstored
+
 %files dom0-tools
 %{_sysconfdir}/bash_completion.d/xl
 %exclude %{_sysconfdir}/rc.d/init.d/xencommons
@@ -624,7 +635,6 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_sbindir}/flask-set-bool
 %{_sbindir}/flask-setenforce
 %{_sbindir}/gdbsx
-%{_sbindir}/oxenstored
 %{_sbindir}/xen-access
 %{_sbindir}/xen-diag
 %{_sbindir}/xen-hptool
