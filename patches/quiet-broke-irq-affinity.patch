@@ -1,99 +1,24 @@
-Quiet "Broke affinity for irq" messages during shutdown
+Quiet "Broke affinity for irq" messages during suspend
 
-Quiet the "Broke affinity for irq" messages during a shutdown or
-suspend, as it is already done during a reboot. Do this by conditionally
-printing the messages depending on the system state, as originally
-suggested by Jan when discussing commit e509b8e09c00 ("x86: fixup IRQs
-when CPUs go down during shutdown").
+Quiet the "Broke affinity for irq" messages during suspend. Do this
+by conditionally printing the messages depending on the system state,
+as originally suggested by Jan when discussing commit e509b8e09c00
+("x86: fixup IRQs when CPUs go down during shutdown").
 
 Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
 Suggested-by: Jan Beulich <jbeulich@suse.com>
 
-diff --git a/xen/arch/x86/include/asm/irq.h b/xen/arch/x86/include/asm/irq.h
-index 207c9fede253..f10068334903 100644
---- a/xen/arch/x86/include/asm/irq.h
-+++ b/xen/arch/x86/include/asm/irq.h
-@@ -137,7 +137,7 @@ int map_domain_emuirq_pirq(struct domain *d, int pirq, int irq);
- int unmap_domain_pirq_emuirq(struct domain *d, int pirq);
- 
- /* Evacuate interrupts assigned to CPUs not present in the input CPU mask. */
--void fixup_irqs(const cpumask_t *mask, bool verbose);
-+void fixup_irqs(const cpumask_t *mask);
- void fixup_eoi(void);
- 
- int  init_irq_data(void);
 diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
-index 11b2a213aa44..5ded724850aa 100644
+index ff3ac832f4b9..e44e0b394dbb 100644
 --- a/xen/arch/x86/irq.c
 +++ b/xen/arch/x86/irq.c
-@@ -2596,7 +2596,7 @@ static int __init cf_check setup_dump_irqs(void)
- __initcall(setup_dump_irqs);
- 
- /* Evacuate interrupts assigned to CPUs not present in the input CPU mask. */
--void fixup_irqs(const cpumask_t *mask, bool verbose)
-+void fixup_irqs(const cpumask_t *mask)
- {
-     unsigned int irq;
-     static int warned;
-@@ -2748,7 +2748,8 @@ void fixup_irqs(const cpumask_t *mask, bool verbose)
+@@ -2742,6 +2742,9 @@ void fixup_irqs(void)
  
          spin_unlock(&desc->lock);
  
--        if ( !verbose )
-+        if ( system_state == SYS_STATE_reboot ||
-+             system_state == SYS_STATE_suspend )
-             continue;
- 
++	if ( system_state == SYS_STATE_suspend )
++            continue;
++
          if ( !set_affinity )
-diff --git a/xen/arch/x86/shutdown.c b/xen/arch/x86/shutdown.c
-index 7619544d14da..dcc89b5ea55e 100644
---- a/xen/arch/x86/shutdown.c
-+++ b/xen/arch/x86/shutdown.c
-@@ -572,6 +572,7 @@ void machine_restart(unsigned int delay_millisecs)
- 
-     if ( system_state >= SYS_STATE_smp_boot )
-     {
-+        system_state = SYS_STATE_reboot;
-         local_irq_enable();
- 
-         /* Ensure we are the boot CPU. */
-diff --git a/xen/arch/x86/smp.c b/xen/arch/x86/smp.c
-index 1f27b20286da..c4d13f088b89 100644
---- a/xen/arch/x86/smp.c
-+++ b/xen/arch/x86/smp.c
-@@ -362,7 +362,7 @@ void smp_send_stop(void)
-         int timeout = 10;
- 
-         local_irq_disable();
--        fixup_irqs(cpumask_of(cpu), 0);
-+        fixup_irqs(cpumask_of(cpu));
-         local_irq_enable();
- 
-         smp_call_function(stop_this_cpu, NULL, 0);
-diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
-index 1889fa2a3159..3d64c254cf53 100644
---- a/xen/arch/x86/smpboot.c
-+++ b/xen/arch/x86/smpboot.c
-@@ -1291,7 +1291,7 @@ void __cpu_disable(void)
- 
-     /* It's now safe to remove this processor from the online map */
-     cpumask_clear_cpu(cpu, &cpu_online_map);
--    fixup_irqs(&cpu_online_map, 1);
-+    fixup_irqs(&cpu_online_map);
-     fixup_eoi();
- }
- 
-diff --git a/xen/include/xen/kernel.h b/xen/include/xen/kernel.h
-index 8cd142032d3b..4f47a4eb3fa0 100644
---- a/xen/include/xen/kernel.h
-+++ b/xen/include/xen/kernel.h
-@@ -95,7 +95,8 @@ extern enum system_state {
-     SYS_STATE_smp_boot,
-     SYS_STATE_active,
-     SYS_STATE_suspend,
--    SYS_STATE_resume
-+    SYS_STATE_resume,
-+    SYS_STATE_reboot,
- } system_state;
- 
- bool_t is_active_kernel_text(unsigned long addr);
+             printk("Cannot set affinity for IRQ%u\n", irq);
+         else if ( break_affinity )

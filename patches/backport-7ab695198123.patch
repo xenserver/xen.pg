@@ -1,0 +1,189 @@
+From 7ab6951981231b4c576a3588248c303001272588 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Wed, 5 Feb 2025 15:05:47 +0100
+Subject: x86/pci: disable MSI(-X) on all devices at shutdown
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Attempt to disable MSI(-X) capabilities on all PCI devices know by Xen at
+shutdown.  Doing such disabling should facilitate kexec chained kernel from
+booting more reliably, as device MSI(-X) interrupt generation should be
+quiesced.
+
+Only attempt to disable MSI(-X) on all devices in the crash context if the
+PCI lock is not taken, otherwise the PCI device list could be in an
+inconsistent state.  This requires introducing a new pcidevs_trylock()
+helper to check whether the lock is currently taken.
+
+Disabling MSI(-X) should prevent "Receive accept error" being raised as a
+result of non-disabled interrupts targeting offline CPUs.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Release-Acked-by: Oleksii Kurochko<oleksii.kurochko@gmail.com>
+
+diff --git a/xen/arch/x86/crash.c b/xen/arch/x86/crash.c
+index 99089f77a7eb..145cba70acf4 100644
+--- a/xen/arch/x86/crash.c
++++ b/xen/arch/x86/crash.c
+@@ -176,6 +176,16 @@ static void nmi_shootdown_cpus(void)
+          */
+         x2apic_enabled = (current_local_apic_mode() == APIC_MODE_X2APIC);
+ 
++        if ( pcidevs_trylock() )
++        {
++            /*
++             * Assume the PCI device list to be in a consistent state if the
++             * lock is not held when the crash happened.
++             */
++            pci_disable_msi_all();
++            pcidevs_unlock();
++        }
++
+         disable_IO_APIC();
+         hpet_disable();
+     }
+diff --git a/xen/arch/x86/include/asm/msi.h b/xen/arch/x86/include/asm/msi.h
+index fe670895eed2..82f64a6dc79e 100644
+--- a/xen/arch/x86/include/asm/msi.h
++++ b/xen/arch/x86/include/asm/msi.h
+@@ -85,6 +85,7 @@ extern int pci_enable_msi(struct msi_info *msi, struct msi_desc **desc);
+ extern void pci_disable_msi(struct msi_desc *desc);
+ extern int pci_prepare_msix(u16 seg, u8 bus, u8 devfn, bool off);
+ extern void pci_cleanup_msi(struct pci_dev *pdev);
++extern void pci_disable_msi_all(void);
+ extern int setup_msi_irq(struct irq_desc *, struct msi_desc *);
+ extern int __setup_msi_irq(struct irq_desc *, struct msi_desc *,
+                            const struct hw_interrupt_type *);
+diff --git a/xen/arch/x86/msi.c b/xen/arch/x86/msi.c
+index 3d36fc420403..4e3893041ab8 100644
+--- a/xen/arch/x86/msi.c
++++ b/xen/arch/x86/msi.c
+@@ -1210,6 +1210,24 @@ void pci_cleanup_msi(struct pci_dev *pdev)
+     msi_free_irqs(pdev);
+ }
+ 
++static int cf_check disable_msi(struct pci_dev *pdev, void *arg)
++{
++    msi_set_enable(pdev, 0);
++    msix_set_enable(pdev, 0);
++
++    return 0;
++}
++
++/* Disable MSI and/or MSI-X on all devices known by Xen. */
++void pci_disable_msi_all(void)
++{
++    int rc = pci_iterate_devices(disable_msi, NULL);
++
++    if ( rc )
++        printk(XENLOG_ERR
++               "Failed to disable MSI(-X) on some devices: %d\n", rc);
++}
++
+ int pci_reset_msix_state(struct pci_dev *pdev)
+ {
+     unsigned int pos = pci_find_cap_offset(pdev->seg, pdev->bus, pdev->sbdf.dev,
+diff --git a/xen/arch/x86/smp.c b/xen/arch/x86/smp.c
+index 144be9732823..5d2026ab6b42 100644
+--- a/xen/arch/x86/smp.c
++++ b/xen/arch/x86/smp.c
+@@ -373,6 +373,7 @@ void smp_send_stop(void)
+         smp_call_function(stop_this_cpu, &stop_aps, 0);
+ 
+     local_irq_disable();
++    pci_disable_msi_all();
+     disable_IO_APIC();
+     hpet_disable();
+ 
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index 1b3d28516643..47856a6d7fc3 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -68,6 +68,11 @@ bool_t pcidevs_locked(void)
+     return !!spin_is_locked(&_pcidevs_lock);
+ }
+ 
++bool pcidevs_trylock_unsafe(void)
++{
++    return _spin_trylock_recursive(&_pcidevs_lock);
++}
++
+ static struct radix_tree_root pci_segments;
+ 
+ static inline struct pci_seg *get_pseg(u16 seg)
+@@ -1697,6 +1702,43 @@ int iommu_do_pci_domctl(
+     return ret;
+ }
+ 
++struct segment_iter {
++    int (*handler)(struct pci_dev *pdev, void *arg);
++    void *arg;
++    int rc;
++};
++
++static int cf_check iterate_all(struct pci_seg *pseg, void *arg)
++{
++    struct segment_iter *iter = arg;
++    struct pci_dev *pdev;
++
++    list_for_each_entry ( pdev, &pseg->alldevs_list, alldevs_list )
++    {
++        int rc = iter->handler(pdev, iter->arg);
++
++        if ( !iter->rc )
++            iter->rc = rc;
++    }
++
++    return 0;
++}
++
++/*
++ * Iterate without locking or preemption over all PCI devices known by Xen.
++ * Can be called with interrupts disabled.
++ */
++int pci_iterate_devices(int (*handler)(struct pci_dev *pdev, void *arg),
++                        void *arg)
++{
++    struct segment_iter iter = {
++        .handler = handler,
++        .arg = arg,
++    };
++
++    return pci_segments_iterate(iterate_all, &iter) ?: iter.rc;
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
+index b373f139d136..6b6536f3841e 100644
+--- a/xen/include/xen/pci.h
++++ b/xen/include/xen/pci.h
+@@ -163,6 +163,11 @@ static always_inline void pcidevs_lock(void)
+ }
+ void pcidevs_unlock(void);
+ bool_t __must_check pcidevs_locked(void);
++bool pcidevs_trylock_unsafe(void);
++static always_inline bool pcidevs_trylock(void)
++{
++    return lock_evaluate_nospec(pcidevs_trylock_unsafe());
++}
+ 
+ bool_t pci_known_segment(u16 seg);
+ bool_t pci_device_detect(u16 seg, u8 bus, u8 dev, u8 func);
+@@ -185,6 +190,13 @@ struct pci_dev *pci_get_pdev(const struct domain *d, pci_sbdf_t sbdf);
+ struct pci_dev *pci_get_real_pdev(pci_sbdf_t sbdf);
+ void pci_check_disable_device(u16 seg, u8 bus, u8 devfn);
+ 
++/*
++ * Iterate without locking or preemption over all PCI devices known by Xen.
++ * Can be called with interrupts disabled.
++ */
++int pci_iterate_devices(int (*handler)(struct pci_dev *pdev, void *arg),
++                        void *arg);
++
+ uint8_t pci_conf_read8(pci_sbdf_t sbdf, unsigned int reg);
+ uint16_t pci_conf_read16(pci_sbdf_t sbdf, unsigned int reg);
+ uint32_t pci_conf_read32(pci_sbdf_t sbdf, unsigned int reg);

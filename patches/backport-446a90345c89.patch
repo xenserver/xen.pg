@@ -1,0 +1,134 @@
+From 446a90345c89d61550ca75f449f2c7ce8b924a6a Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Tue, 28 Jan 2025 16:06:07 +0100
+Subject: x86/irq: drop fixup_irqs() parameters
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The solely remaining caller always passes the same globally available
+parameters.  Drop the parameters and modify fixup_irqs() to use
+cpu_online_map in place of the input mask parameter, and always be verbose
+in its output printing.
+
+While there remove some of the checks given the single context where
+fixup_irqs() is now called, which should always be in the CPU offline path,
+after the CPU going offline has been removed from cpu_online_map.
+
+No functional change intended.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Release-Acked-by: Oleksii Kurochko<oleksii.kurochko@gmail.com>
+
+diff --git a/xen/arch/x86/include/asm/irq.h b/xen/arch/x86/include/asm/irq.h
+index 207c9fede253..959270df40fb 100644
+--- a/xen/arch/x86/include/asm/irq.h
++++ b/xen/arch/x86/include/asm/irq.h
+@@ -136,8 +136,8 @@ void free_domain_pirqs(struct domain *d);
+ int map_domain_emuirq_pirq(struct domain *d, int pirq, int irq);
+ int unmap_domain_pirq_emuirq(struct domain *d, int pirq);
+ 
+-/* Evacuate interrupts assigned to CPUs not present in the input CPU mask. */
+-void fixup_irqs(const cpumask_t *mask, bool verbose);
++/* Evacuate interrupts assigned to CPUs not present in the CPU online map. */
++void fixup_irqs(void);
+ void fixup_eoi(void);
+ 
+ int  init_irq_data(void);
+diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
+index 0ef3a2ca375b..3e57b916db51 100644
+--- a/xen/arch/x86/irq.c
++++ b/xen/arch/x86/irq.c
+@@ -2599,17 +2599,21 @@ static int __init cf_check setup_dump_irqs(void)
+ }
+ __initcall(setup_dump_irqs);
+ 
+-/* Evacuate interrupts assigned to CPUs not present in the input CPU mask. */
+-void fixup_irqs(const cpumask_t *mask, bool verbose)
++/* Evacuate interrupts assigned to CPUs not present in the CPU online map. */
++void fixup_irqs(void)
+ {
++    const unsigned int cpu = smp_processor_id();
+     unsigned int irq;
+     static int warned;
+     struct irq_desc *desc;
+ 
++    /* Only to be called from the context of a CPU going offline. */
++    ASSERT(!cpu_online(cpu));
++
+     for ( irq = 0; irq < nr_irqs; irq++ )
+     {
+         bool break_affinity = false, set_affinity = true, check_irr = false;
+-        unsigned int vector, cpu = smp_processor_id();
++        unsigned int vector;
+         cpumask_t *affinity = this_cpu(scratch_cpumask);
+ 
+         if ( irq == 2 )
+@@ -2653,12 +2657,6 @@ void fixup_irqs(const cpumask_t *mask, bool verbose)
+         }
+ 
+         if ( desc->arch.move_in_progress &&
+-             /*
+-              * Only attempt to adjust the mask if the current CPU is going
+-              * offline, otherwise the whole system is going down and leaving
+-              * stale data in the masks is fine.
+-              */
+-             !cpu_online(cpu) &&
+              cpumask_test_cpu(cpu, desc->arch.old_cpu_mask) )
+         {
+             /*
+@@ -2700,16 +2698,17 @@ void fixup_irqs(const cpumask_t *mask, bool verbose)
+ 
+         /*
+          * Avoid shuffling the interrupt around as long as current target CPUs
+-         * are a subset of the input mask.  What fixup_irqs() cares about is
+-         * evacuating interrupts from CPUs not in the input mask.
++         * are a subset of the online mask.  What fixup_irqs() cares about is
++         * evacuating interrupts from CPUs not in the online mask.
+          */
+-        if ( !desc->action || cpumask_subset(desc->arch.cpu_mask, mask) )
++        if ( !desc->action || cpumask_subset(desc->arch.cpu_mask,
++                                             &cpu_online_map) )
+         {
+             spin_unlock(&desc->lock);
+             continue;
+         }
+ 
+-        if ( !cpumask_intersects(mask, desc->affinity) )
++        if ( !cpumask_intersects(&cpu_online_map, desc->affinity) )
+         {
+             break_affinity = true;
+             cpumask_setall(affinity);
+@@ -2725,7 +2724,7 @@ void fixup_irqs(const cpumask_t *mask, bool verbose)
+          * the interrupt, signal to check whether there are any pending vectors
+          * to be handled in the local APIC after the interrupt has been moved.
+          */
+-        if ( !cpu_online(cpu) && cpumask_test_cpu(cpu, desc->arch.cpu_mask) )
++        if ( cpumask_test_cpu(cpu, desc->arch.cpu_mask) )
+             check_irr = true;
+ 
+         if ( desc->handler->set_affinity )
+@@ -2752,9 +2751,6 @@ void fixup_irqs(const cpumask_t *mask, bool verbose)
+ 
+         spin_unlock(&desc->lock);
+ 
+-        if ( !verbose )
+-            continue;
+-
+         if ( !set_affinity )
+             printk("Cannot set affinity for IRQ%u\n", irq);
+         else if ( break_affinity )
+diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
+index 1889fa2a3159..66e7564ef1d8 100644
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -1291,7 +1291,7 @@ void __cpu_disable(void)
+ 
+     /* It's now safe to remove this processor from the online map */
+     cpumask_clear_cpu(cpu, &cpu_online_map);
+-    fixup_irqs(&cpu_online_map, 1);
++    fixup_irqs();
+     fixup_eoi();
+ }
+ 

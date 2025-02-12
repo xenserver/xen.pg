@@ -1,0 +1,179 @@
+From 819c3cb186a86ef3e04fb5af4d9f9f6de032c3ee Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Tue, 4 Feb 2025 11:46:14 +0100
+Subject: x86/iommu: disable interrupts at shutdown
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a new hook to inhibit interrupt generation by the IOMMU(s).  Note the
+hook is currently only implemented for x86 IOMMUs.  The purpose is to
+disable interrupt generation at shutdown so any kexec chained image finds
+the IOMMU(s) in a quiesced state.
+
+It would also prevent "Receive accept error" being raised as a result of
+non-disabled interrupts targeting offline CPUs.
+
+Note that the iommu_quiesce() call in nmi_shootdown_cpus() is still
+required even when there's a preceding iommu_crash_shutdown() call; the
+later can become a no-op depending on the setting of the "crash-disable"
+command line option.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Release-Acked-by: Oleksii Kurochko<oleksii.kurochko@gmail.com>
+
+diff --git a/xen/arch/x86/crash.c b/xen/arch/x86/crash.c
+index 145cba70acf4..d67803fee4f8 100644
+--- a/xen/arch/x86/crash.c
++++ b/xen/arch/x86/crash.c
+@@ -188,6 +188,7 @@ static void nmi_shootdown_cpus(void)
+ 
+         disable_IO_APIC();
+         hpet_disable();
++        iommu_quiesce();
+     }
+ }
+ 
+diff --git a/xen/arch/x86/smp.c b/xen/arch/x86/smp.c
+index 5d2026ab6b42..9467dcda5c74 100644
+--- a/xen/arch/x86/smp.c
++++ b/xen/arch/x86/smp.c
+@@ -376,6 +376,7 @@ void smp_send_stop(void)
+     pci_disable_msi_all();
+     disable_IO_APIC();
+     hpet_disable();
++    iommu_quiesce();
+ 
+     if ( num_online_cpus() > 1 )
+     {
+diff --git a/xen/drivers/passthrough/amd/iommu.h b/xen/drivers/passthrough/amd/iommu.h
+index a58be28bf96d..fbcbf84bfa11 100644
+--- a/xen/drivers/passthrough/amd/iommu.h
++++ b/xen/drivers/passthrough/amd/iommu.h
+@@ -340,6 +340,7 @@ extern unsigned long *shared_intremap_inuse;
+ void cf_check amd_iommu_resume(void);
+ int __must_check cf_check amd_iommu_suspend(void);
+ void cf_check amd_iommu_crash_shutdown(void);
++void cf_check amd_iommu_quiesce(void);
+ 
+ /* guest iommu support */
+ #ifdef CONFIG_HVM
+diff --git a/xen/drivers/passthrough/amd/iommu_init.c b/xen/drivers/passthrough/amd/iommu_init.c
+index 101a60ce1794..f00e2f49f3ce 100644
+--- a/xen/drivers/passthrough/amd/iommu_init.c
++++ b/xen/drivers/passthrough/amd/iommu_init.c
+@@ -1603,3 +1603,20 @@ void cf_check amd_iommu_resume(void)
+         invalidate_all_domain_pages();
+     }
+ }
++
++void cf_check amd_iommu_quiesce(void)
++{
++    struct amd_iommu *iommu;
++
++    for_each_amd_iommu ( iommu )
++    {
++        if ( iommu->ctrl.int_cap_xt_en )
++        {
++            iommu->ctrl.int_cap_xt_en = false;
++            writeq(iommu->ctrl.raw,
++                   iommu->mmio_base + IOMMU_CONTROL_MMIO_OFFSET);
++        }
++        else
++            amd_iommu_msi_enable(iommu, IOMMU_CONTROL_DISABLED);
++    }
++}
+diff --git a/xen/drivers/passthrough/amd/pci_amd_iommu.c b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+index cac903f48ad2..98a810fd8fa2 100644
+--- a/xen/drivers/passthrough/amd/pci_amd_iommu.c
++++ b/xen/drivers/passthrough/amd/pci_amd_iommu.c
+@@ -781,6 +781,7 @@ static const struct iommu_ops __initconst_cf_clobber _iommu_ops = {
+     .crash_shutdown = amd_iommu_crash_shutdown,
+     .get_reserved_device_memory = amd_iommu_get_reserved_device_memory,
+     .dump_page_tables = amd_dump_page_tables,
++    .quiesce = amd_iommu_quiesce,
+ };
+ 
+ static const struct iommu_init_ops __initconstrel _iommu_init_ops = {
+diff --git a/xen/drivers/passthrough/iommu.c b/xen/drivers/passthrough/iommu.c
+index df803afb799c..355fe42dce02 100644
+--- a/xen/drivers/passthrough/iommu.c
++++ b/xen/drivers/passthrough/iommu.c
+@@ -650,6 +650,18 @@ void iommu_crash_shutdown(void)
+ #endif
+ }
+ 
++void iommu_quiesce(void)
++{
++    const struct iommu_ops *ops;
++
++    if ( !iommu_enabled )
++        return;
++
++    ops = iommu_get_ops();
++    if ( ops->quiesce )
++        iommu_vcall(ops, quiesce);
++}
++
+ int iommu_get_reserved_device_memory(iommu_grdm_t *func, void *ctxt)
+ {
+     const struct iommu_ops *ops;
+diff --git a/xen/drivers/passthrough/vtd/iommu.c b/xen/drivers/passthrough/vtd/iommu.c
+index 692ad41b5bb7..a29908df4778 100644
+--- a/xen/drivers/passthrough/vtd/iommu.c
++++ b/xen/drivers/passthrough/vtd/iommu.c
+@@ -3202,6 +3202,24 @@ static int cf_check intel_iommu_quarantine_init(struct pci_dev *pdev,
+     return rc;
+ }
+ 
++static void cf_check vtd_quiesce(void)
++{
++    const struct acpi_drhd_unit *drhd;
++
++    for_each_drhd_unit ( drhd )
++    {
++        const struct vtd_iommu *iommu = drhd->iommu;
++        uint32_t sts = dmar_readl(iommu->reg, DMAR_FECTL_REG);
++
++        /*
++         * Open code dma_msi_mask() to avoid taking the spinlock which could
++         * deadlock if called from crash context.
++         */
++        sts |= DMA_FECTL_IM;
++        dmar_writel(iommu->reg, DMAR_FECTL_REG, sts);
++    }
++}
++
+ static const struct iommu_ops __initconst_cf_clobber vtd_ops = {
+     .page_sizes = PAGE_SIZE_4K,
+     .init = intel_iommu_domain_init,
+@@ -3231,6 +3249,7 @@ static const struct iommu_ops __initconst_cf_clobber vtd_ops = {
+     .iotlb_flush = iommu_flush_iotlb,
+     .get_reserved_device_memory = intel_iommu_get_reserved_device_memory,
+     .dump_page_tables = vtd_dump_page_tables,
++    .quiesce = vtd_quiesce,
+ };
+ 
+ const struct iommu_init_ops __initconstrel intel_iommu_init_ops = {
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index f8a52627f7c3..57fa1f061ad9 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -303,6 +303,8 @@ struct iommu_ops {
+      */
+     int (*dt_xlate)(device_t *dev, const struct dt_phandle_args *args);
+ #endif
++    /* Inhibit all interrupt generation, to be used at shutdown. */
++    void (*quiesce)(void);
+ };
+ 
+ /*
+@@ -383,6 +385,7 @@ static inline int iommu_do_domctl(struct xen_domctl *domctl, struct domain *d,
+ int __must_check iommu_suspend(void);
+ void iommu_resume(void);
+ void iommu_crash_shutdown(void);
++void iommu_quiesce(void);
+ int iommu_get_reserved_device_memory(iommu_grdm_t *, void *);
+ int iommu_quarantine_dev_init(device_t *dev);
+ 
