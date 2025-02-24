@@ -1,0 +1,90 @@
+From 46e3e9d7398303a12714cacf1e56c6da505cffec Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 17 Feb 2025 13:23:00 +0100
+Subject: radix-tree: introduce RADIX_TREE{,_INIT}()
+
+... now that static initialization is possible. Use RADIX_TREE() for
+pci_segments and ivrs_maps.
+
+This then fixes an ordering issue on x86: With the call to
+radix_tree_init(), acpi_mmcfg_init()'s invocation of pci_segments_init()
+will zap the possible earlier introduction of segment 0 by
+amd_iommu_detect_one_acpi()'s call to pci_ro_device(), and thus the
+write-protection of the PCI devices representing AMD IOMMUs.
+
+Fixes: 3950f2485bbc ("x86/x2APIC: defer probe until after IOMMU ACPI table parsing")
+Requested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 26fe09e34566d701ecaea76b4563bb9934e85861
+master date: 2025-02-07 10:00:04 +0100
+
+diff --git a/xen/common/radix-tree.c b/xen/common/radix-tree.c
+index 994a5a3b3da7..ac4bfbd3f408 100644
+--- a/xen/common/radix-tree.c
++++ b/xen/common/radix-tree.c
+@@ -704,7 +704,7 @@ void radix_tree_destroy(
+ 
+ void radix_tree_init(struct radix_tree_root *root)
+ {
+-	memset(root, 0, sizeof(*root));
++	*root = (struct radix_tree_root)RADIX_TREE_INIT();
+ }
+ 
+ static __init unsigned long __maxindex(unsigned int height)
+diff --git a/xen/drivers/passthrough/amd/iommu_init.c b/xen/drivers/passthrough/amd/iommu_init.c
+index 6c0dc2d5cb69..b546c28667f9 100644
+--- a/xen/drivers/passthrough/amd/iommu_init.c
++++ b/xen/drivers/passthrough/amd/iommu_init.c
+@@ -31,7 +31,7 @@ static struct tasklet amd_iommu_irq_tasklet;
+ unsigned int __read_mostly amd_iommu_acpi_info;
+ unsigned int __read_mostly ivrs_bdf_entries;
+ u8 __read_mostly ivhd_type;
+-static struct radix_tree_root ivrs_maps;
++static RADIX_TREE(ivrs_maps);
+ LIST_HEAD_READ_MOSTLY(amd_iommu_head);
+ bool iommuv2_enabled;
+ 
+@@ -1410,7 +1410,6 @@ int __init amd_iommu_prepare(bool xt)
+         goto error_out;
+     ivrs_bdf_entries = rc;
+ 
+-    radix_tree_init(&ivrs_maps);
+     for_each_amd_iommu ( iommu )
+     {
+         rc = amd_iommu_prepare_one(iommu);
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index ae620b300726..c7ee835b8a69 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -68,7 +68,7 @@ bool pcidevs_locked(void)
+     return rspin_is_locked(&_pcidevs_lock);
+ }
+ 
+-static struct radix_tree_root pci_segments;
++static RADIX_TREE(pci_segments);
+ 
+ static inline struct pci_seg *get_pseg(u16 seg)
+ {
+@@ -124,7 +124,6 @@ static int pci_segments_iterate(
+ 
+ void __init pci_segments_init(void)
+ {
+-    radix_tree_init(&pci_segments);
+     if ( !alloc_pseg(0) )
+         panic("Could not initialize PCI segment 0\n");
+ }
+diff --git a/xen/include/xen/radix-tree.h b/xen/include/xen/radix-tree.h
+index 9d5ffae3eb86..40773659727b 100644
+--- a/xen/include/xen/radix-tree.h
++++ b/xen/include/xen/radix-tree.h
+@@ -72,6 +72,9 @@ struct radix_tree_root {
+  *** radix-tree API starts here **
+  */
+ 
++#define RADIX_TREE_INIT() {}
++#define RADIX_TREE(name) struct radix_tree_root name = RADIX_TREE_INIT()
++
+ void radix_tree_init(struct radix_tree_root *root);
+ 
+ void radix_tree_destroy(

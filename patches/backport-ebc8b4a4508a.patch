@@ -1,0 +1,118 @@
+From ebc8b4a4508a0b84c3f3b31324f688dabb210093 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 17 Feb 2025 13:22:24 +0100
+Subject: radix-tree: purge node allocation override hooks
+
+These were needed by TMEM only, which is long gone. The Linux original
+doesn't have such either. This effectively reverts one of the "Other
+changes" from 8dc6738dbb3c ("Update radix-tree.[ch] from upstream Linux
+to gain RCU awareness").
+
+Positive side effect: Two cf_check go away.
+
+While there also convert xmalloc()+memset() to xzalloc().
+
+Requested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 1275093a96fed45057db241b3aa6e191d9dcf596
+master date: 2025-02-07 09:59:11 +0100
+
+diff --git a/xen/common/radix-tree.c b/xen/common/radix-tree.c
+index adc3034222dc..994a5a3b3da7 100644
+--- a/xen/common/radix-tree.c
++++ b/xen/common/radix-tree.c
+@@ -52,12 +52,6 @@ struct rcu_node {
+ 	struct rcu_head rcu_head;
+ };
+ 
+-static struct radix_tree_node *cf_check rcu_node_alloc(void *arg)
+-{
+-	struct rcu_node *rcu_node = xmalloc(struct rcu_node);
+-	return rcu_node ? &rcu_node->node : NULL;
+-}
+-
+ static void cf_check _rcu_node_free(struct rcu_head *head)
+ {
+ 	struct rcu_node *rcu_node =
+@@ -65,26 +59,20 @@ static void cf_check _rcu_node_free(struct rcu_head *head)
+ 	xfree(rcu_node);
+ }
+ 
+-static void cf_check rcu_node_free(struct radix_tree_node *node, void *arg)
+-{
+-	struct rcu_node *rcu_node = container_of(node, struct rcu_node, node);
+-	call_rcu(&rcu_node->rcu_head, _rcu_node_free);
+-}
+-
+ static struct radix_tree_node *radix_tree_node_alloc(
+ 	struct radix_tree_root *root)
+ {
+-	struct radix_tree_node *ret;
+-	ret = root->node_alloc(root->node_alloc_free_arg);
+-	if (ret)
+-		memset(ret, 0, sizeof(*ret));
+-	return ret;
++	struct rcu_node *rcu_node = xzalloc(struct rcu_node);
++
++	return rcu_node ? &rcu_node->node : NULL;
+ }
+ 
+ static void radix_tree_node_free(
+ 	struct radix_tree_root *root, struct radix_tree_node *node)
+ {
+-	root->node_free(node, root->node_alloc_free_arg);
++	struct rcu_node *rcu_node = container_of(node, struct rcu_node, node);
++
++	call_rcu(&rcu_node->rcu_head, _rcu_node_free);
+ }
+ 
+ /*
+@@ -717,19 +705,6 @@ void radix_tree_destroy(
+ void radix_tree_init(struct radix_tree_root *root)
+ {
+ 	memset(root, 0, sizeof(*root));
+-	root->node_alloc = rcu_node_alloc;
+-	root->node_free = rcu_node_free;
+-}
+-
+-void radix_tree_set_alloc_callbacks(
+-	struct radix_tree_root *root,
+-	radix_tree_alloc_fn_t *node_alloc,
+-	radix_tree_free_fn_t *node_free,
+-	void *node_alloc_free_arg)
+-{
+-	root->node_alloc = node_alloc;
+-	root->node_free = node_free;
+-	root->node_alloc_free_arg = node_alloc_free_arg;
+ }
+ 
+ static __init unsigned long __maxindex(unsigned int height)
+diff --git a/xen/include/xen/radix-tree.h b/xen/include/xen/radix-tree.h
+index 58c40312e619..9d5ffae3eb86 100644
+--- a/xen/include/xen/radix-tree.h
++++ b/xen/include/xen/radix-tree.h
+@@ -66,11 +66,6 @@ typedef void radix_tree_free_fn_t(struct radix_tree_node *, void *);
+ struct radix_tree_root {
+ 	unsigned int		height;
+ 	struct radix_tree_node	__rcu *rnode;
+-
+-	/* Allow to specify custom node alloc/dealloc routines. */
+-	radix_tree_alloc_fn_t *node_alloc;
+-	radix_tree_free_fn_t *node_free;
+-	void *node_alloc_free_arg;
+ };
+ 
+ /*
+@@ -78,11 +73,6 @@ struct radix_tree_root {
+  */
+ 
+ void radix_tree_init(struct radix_tree_root *root);
+-void radix_tree_set_alloc_callbacks(
+-	struct radix_tree_root *root,
+-	radix_tree_alloc_fn_t *node_alloc,
+-	radix_tree_free_fn_t *node_free,
+-	void *node_alloc_free_arg);
+ 
+ void radix_tree_destroy(
+ 	struct radix_tree_root *root,
