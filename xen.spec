@@ -883,6 +883,12 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Feb 24 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.19.1-2
+- Fix (experimental) nested virt enabling
+- Fix IO_PAGE_FAULT on AMD machines due to interrupt migration
+- Reduce PCI config space accesses
+- Fix reboot/shutdown issues on AMD due to local APIC ESR interrupts
+
 * Mon Jan 13 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.1-1
 - Update to Xen 4.19.1
 
