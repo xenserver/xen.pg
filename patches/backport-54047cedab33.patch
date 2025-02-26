@@ -1,0 +1,59 @@
+From 54047cedab338b6688db9ffe9d24399ddde818ba Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 25 Oct 2024 17:39:06 +0100
+Subject: x86/ucode: Break early_microcode_load() out of early_microcode_init()
+
+microcode_grab_module() and early_microcode_update_cpu() are logically one
+task that passes state via static variables.
+
+We intend to delete said static variables; start by breaking these functions
+out of early_microcode_init().
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Daniel P. Smith <dpsmith@apertussolutions.com>
+
+diff --git a/xen/arch/x86/cpu/microcode/core.c b/xen/arch/x86/cpu/microcode/core.c
+index 655bc41e076d..3607a223647c 100644
+--- a/xen/arch/x86/cpu/microcode/core.c
++++ b/xen/arch/x86/cpu/microcode/core.c
+@@ -856,6 +856,25 @@ static int __init early_microcode_update_cpu(void)
+     return microcode_update_cpu(patch);
+ }
+ 
++/*
++ * There are several tasks:
++ * - Locate the ucode blob in the boot modules.
++ * - Parse and attempt in-place load.
++ * - Inform microcode_init_cache() of how to find the blob again.
++ */
++static int __init early_microcode_load(
++    unsigned long *module_map,
++    const multiboot_info_t *mbi,
++    const module_t mod[])
++{
++    microcode_grab_module(module_map, mbi, mods);
++
++    if ( !ucode_mod.mod_end && !ucode_blob.size )
++        return 0;
++
++    return early_microcode_update_cpu();
++}
++
+ int __init early_microcode_init(unsigned long *module_map,
+                                 const struct multiboot_info *mbi,
+                                 const module_t mods[])
+@@ -901,10 +920,7 @@ int __init early_microcode_init(unsigned long *module_map,
+         return -ENODEV;
+     }
+ 
+-    microcode_grab_module(module_map, mbi, mods);
+-
+-    if ( ucode_mod.mod_end || ucode_blob.size )
+-        rc = early_microcode_update_cpu();
++    rc = early_microcode_load(module_map, mbi, mods);
+ 
+     /*
+      * Some CPUID leaves and MSRs are only present after microcode updates

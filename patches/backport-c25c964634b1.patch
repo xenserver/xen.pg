@@ -1,0 +1,175 @@
+From c25c964634b1f201163725c85fa5b27561dfc880 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 25 Oct 2024 18:08:34 +0100
+Subject: x86/ucode: Enforce invariant about module selection
+
+The work to add the `ucode=nmi` cmdline option left a subtle corner case.
+Both scan and an explicit index could be chosen, and we could really find both
+a CPIO archive and a microcode file.
+
+Worse, because the if/else chains for processing ucode_{blob,mod} are opposite
+ways around in early_microcode_load() and microcode_init_cache(), we can
+genuinely perform early microcode loading from the CPIO archive, then cache
+from the explicit file.
+
+Therefore, enforce that only one selection method can be active.
+
+Rename ucode_{scan,mod_idx} to have an opt_ prefix.  This is both for
+consistency with the rest of Xen, and to guarantee that we've got all
+instances of the variables covered in this change.  Explain how they're use.
+During cmdline/config parsing, always update both variables in pairs.
+
+In early_microcode_load(), ASSERT() the invariant just in case.  Use a local
+variable for idx rather than operating on the static; we're the only consume
+of the value.
+
+Expand the index selection logic with comments and warnings to the user when
+something went wrong.
+
+Fixes: 5ed12565aa32 ("microcode: rendezvous CPUs in NMI handler and load ucode")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Daniel P. Smith <dpsmith@apertussolutions.com>
+
+diff --git a/xen/arch/x86/cpu/microcode/core.c b/xen/arch/x86/cpu/microcode/core.c
+index 23a3389b6b26..3fd19cfab2af 100644
+--- a/xen/arch/x86/cpu/microcode/core.c
++++ b/xen/arch/x86/cpu/microcode/core.c
+@@ -57,7 +57,6 @@
+ #define MICROCODE_UPDATE_TIMEOUT_US 1000000
+ 
+ static module_t __initdata ucode_mod;
+-static signed int __initdata ucode_mod_idx;
+ static bool __initdata ucode_mod_forced;
+ static unsigned int nr_cores;
+ 
+@@ -89,11 +88,6 @@ struct ucode_mod_blob {
+ };
+ 
+ static struct ucode_mod_blob __initdata ucode_blob;
+-/*
+- * By default we will NOT parse the multiboot modules to see if there is
+- * cpio image with the microcode images.
+- */
+-static bool __initdata ucode_scan;
+ 
+ /* By default, ucode loading is done in NMI handler */
+ static bool ucode_in_nmi = true;
+@@ -103,9 +97,24 @@ bool __read_mostly opt_ucode_allow_same;
+ /* Protected by microcode_mutex */
+ static struct microcode_patch *microcode_cache;
+ 
++/*
++ * opt_mod_idx and opt_scan have subtle semantics.
++ *
++ * The cmdline can either identify a module by number (inc -ve back-reference)
++ * containing a raw microcode container, or select scan which instructs Xen to
++ * search all modules for an uncompressed CPIO archive containing a file with
++ * a vendor-dependent name.
++ *
++ * These options do not make sense when combined, so for the benefit of module
++ * location we require that they are not both active together.
++ */
++static int __initdata opt_mod_idx;
++static bool __initdata opt_scan;
++
+ void __init microcode_set_module(unsigned int idx)
+ {
+-    ucode_mod_idx = idx;
++    opt_mod_idx = idx;
++    opt_scan = false;
+     ucode_mod_forced = 1;
+ }
+ 
+@@ -131,14 +140,22 @@ static int __init cf_check parse_ucode(const char *s)
+         else if ( !ucode_mod_forced ) /* Not forced by EFI */
+         {
+             if ( (val = parse_boolean("scan", s, ss)) >= 0 )
+-                ucode_scan = val;
++            {
++                opt_scan = val;
++                opt_mod_idx = 0;
++            }
+             else
+             {
+                 const char *q;
+ 
+-                ucode_mod_idx = simple_strtol(s, &q, 0);
++                opt_mod_idx = simple_strtol(s, &q, 0);
+                 if ( q != ss )
++                {
++                    opt_mod_idx = 0;
+                     rc = -EINVAL;
++                }
++                else
++                    opt_scan = false;
+             }
+         }
+ 
+@@ -162,7 +179,7 @@ static void __init microcode_scan_module(
+     int i;
+ 
+     ucode_blob.size = 0;
+-    if ( !ucode_scan )
++    if ( !opt_scan )
+         return;
+ 
+     if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
+@@ -792,7 +809,7 @@ int __init microcode_init_cache(unsigned long *module_map,
+     if ( !ucode_ops.apply_microcode )
+         return -ENODEV;
+ 
+-    if ( ucode_scan )
++    if ( opt_scan )
+         /* Need to rescan the modules because they might have been relocated */
+         microcode_scan_module(module_map, mbi, mods);
+ 
+@@ -851,16 +868,41 @@ static int __init early_microcode_load(
+     const multiboot_info_t *mbi,
+     const module_t mod[])
+ {
+-    if ( ucode_mod_idx < 0 )
+-        ucode_mod_idx += mbi->mods_count;
+-    if ( ucode_mod_idx <= 0 || ucode_mod_idx >= mbi->mods_count ||
+-         !__test_and_clear_bit(ucode_mod_idx, module_map) )
+-        goto scan;
+-    ucode_mod = mod[ucode_mod_idx];
+-scan:
+-    if ( ucode_scan )
++    int idx = opt_mod_idx;
++
++    /*
++     * Cmdline parsing ensures this invariant holds, so that we don't end up
++     * trying to mix multiple ways of finding the microcode.
++     */
++    ASSERT(idx == 0 || !opt_scan);
++    if ( opt_scan ) /* Scan for a CPIO archive */
+         microcode_scan_module(module_map, mbi, mod);
+ 
++    if ( idx ) /* Specific module nominated */
++    {
++        /*
++         * Negative indicies can be used to reference from the end of the
++         * modules.  e.g. ucode=-1 refers to the last module.
++         */
++        if ( idx < 0 )
++            idx += mbi->mods_count;
++
++        if ( idx <= 0 || idx >= mbi->mods_count )
++        {
++            printk(XENLOG_WARNING "Microcode: Chosen module %d out of range [1, %u)\n",
++                   idx, mbi->mods_count);
++            return -ENODEV;
++        }
++
++        if ( !__test_and_clear_bit(idx, module_map) )
++        {
++            printk(XENLOG_WARNING "Microcode: Chosen module %d already used\n", idx);
++            return -ENODEV;
++        }
++
++        ucode_mod = mod[idx];
++    }
++
+     if ( !ucode_mod.mod_end && !ucode_blob.size )
+         return 0;
+ 
