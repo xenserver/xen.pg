@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 1
+%global hv_rel 3
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -883,6 +883,12 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Mar  3 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.1-3
+- Fix for XSA-467 CVE-2025-1713
+- Scan for microcode by default
+- Fix build warning in oxenstored
+- Drop workaround for HP Gen8 systems
+
 * Mon Feb 24 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.19.1-2
 - Fix (experimental) nested virt enabling
 - Fix IO_PAGE_FAULT on AMD machines due to interrupt migration
