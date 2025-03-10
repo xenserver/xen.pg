@@ -1,0 +1,68 @@
+From 9a474fcceccf0add2ff7f6c7d4ebd24159edf544 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 7 Mar 2025 14:24:42 +0000
+Subject: xen/watchdog: Identify which domain watchdog fired
+
+When a watchdog fires, the domain is crashed and can't dump any state.
+
+Xen allows a domain to have two separate watchdogs.  Therefore, for a
+domain running multiple watchdogs (e.g. one based around network, one
+for disk), it is important for diagnostics to know which watchdog
+fired.
+
+As the printk() is in a timer callback, this is a bit awkward to
+arrange, but there are 12 spare bits in the bottom of the domain
+pointer owing to its alignment.
+
+Reuse these bits to encode the watchdog id too, so the one which fired
+is identified when the domain is crashed.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/xen/common/sched/core.c b/xen/common/sched/core.c
+index 8c6c26b562f6..78c5917788fe 100644
+--- a/xen/common/sched/core.c
++++ b/xen/common/sched/core.c
+@@ -1536,12 +1536,19 @@ long vcpu_yield(void)
+ 
+ static void cf_check domain_watchdog_timeout(void *data)
+ {
+-    struct domain *d = data;
++    /*
++     * The data parameter encodes the watchdog id in the low bits of
++     * the domain pointer.
++     */
++    struct domain *d = _p((unsigned long)data & PAGE_MASK);
++    unsigned int id = (unsigned long)data & ~PAGE_MASK;
++
++    BUILD_BUG_ON(alignof(*d) < PAGE_SIZE);
+ 
+     if ( d->is_shutting_down || d->is_dying )
+         return;
+ 
+-    printk("Watchdog timer fired for domain %u\n", d->domain_id);
++    printk("Watchdog timer %u fired for %pd\n", id, d);
+     domain_shutdown(d, SHUTDOWN_watchdog);
+ }
+ 
+@@ -1595,7 +1602,17 @@ void watchdog_domain_init(struct domain *d)
+     d->watchdog_inuse_map = 0;
+ 
+     for ( i = 0; i < NR_DOMAIN_WATCHDOG_TIMERS; i++ )
+-        init_timer(&d->watchdog_timer[i], domain_watchdog_timeout, d, 0);
++    {
++        void *data = d;
++
++        BUILD_BUG_ON(NR_DOMAIN_WATCHDOG_TIMERS > alignof(*d));
++
++        /*
++         * For the timer callback parameter, encode the watchdog id in
++         * the low bits of the domain pointer.
++         */
++        init_timer(&d->watchdog_timer[i], domain_watchdog_timeout, data + i, 0);
++    }
+ }
+ 
+ void watchdog_domain_destroy(struct domain *d)
