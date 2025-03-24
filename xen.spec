@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 3
+%global hv_rel 4
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -883,6 +883,11 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Mar 24 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.1-4
+- Identify which domain watchdog fired
+- Add xenguest support for the platform:mmio_hole_size attribute
+- Fix crash on boot when operating on the dom0 or initrd binaries
+
 * Mon Mar  3 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.1-3
 - Fix for XSA-467 CVE-2025-1713
 - Scan for microcode by default
