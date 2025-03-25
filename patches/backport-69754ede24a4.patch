@@ -1,0 +1,82 @@
+From 69754ede24a44c3c3aafdb77d4a203810f00ba9e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Thu, 20 Mar 2025 13:20:51 +0100
+Subject: x86/ioremap: prevent additions against the NULL pointer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This was reported by clang UBSAN as:
+
+UBSAN: Undefined behaviour in arch/x86/mm.c:6297:40
+applying zero offset to null pointer
+[...]
+Xen call trace:
+    [<ffff82d040303662>] R common/ubsan/ubsan.c#ubsan_epilogue+0xa/0xc0
+    [<ffff82d040304aa3>] F __ubsan_handle_pointer_overflow+0xcb/0x100
+    [<ffff82d0406ebbc0>] F ioremap_wc+0xc8/0xe0
+    [<ffff82d0406c3728>] F video_init+0xd0/0x180
+    [<ffff82d0406ab6f5>] F console_init_preirq+0x3d/0x220
+    [<ffff82d0406f1876>] F __start_xen+0x68e/0x5530
+    [<ffff82d04020482e>] F __high_start+0x8e/0x90
+
+Fix bt_ioremap() and ioremap{,_wc}() to not add the offset if the returned
+pointer from __vmap() is NULL.
+
+Fixes: d0d4635d034f ('implement vmap()')
+Fixes: f390941a92f1 ('x86/DMI: fix table mapping when one lives above 1Mb')
+Fixes: 81d195c6c0e2 ('x86: introduce ioremap_wc()')
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 9a6f2c52f75781acda39fab5cc96d1bcc54bf534
+master date: 2025-03-17 13:33:29 +0100
+
+diff --git a/xen/arch/x86/dmi_scan.c b/xen/arch/x86/dmi_scan.c
+index 81f80c053a7a..b517c068b853 100644
+--- a/xen/arch/x86/dmi_scan.c
++++ b/xen/arch/x86/dmi_scan.c
+@@ -113,6 +113,7 @@ static const void *__init bt_ioremap(paddr_t addr, unsigned int len)
+ {
+     mfn_t mfn = _mfn(PFN_DOWN(addr));
+     unsigned int offs = PAGE_OFFSET(addr);
++    void *va;
+ 
+     if ( addr + len <= MB(1) )
+         return __va(addr);
+@@ -120,8 +121,10 @@ static const void *__init bt_ioremap(paddr_t addr, unsigned int len)
+     if ( system_state < SYS_STATE_boot )
+         return __acpi_map_table(addr, len);
+ 
+-    return __vmap(&mfn, PFN_UP(offs + len), 1, 1, PAGE_HYPERVISOR_RO,
+-                  VMAP_DEFAULT) + offs;
++    va = __vmap(&mfn, PFN_UP(offs + len), 1, 1, PAGE_HYPERVISOR_RO,
++                VMAP_DEFAULT);
++
++    return va ? va + offs : NULL;
+ }
+ 
+ static void __init bt_iounmap(const void *ptr, unsigned int len)
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index d65cf9fa714d..2d9c7a5316cf 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -6015,7 +6015,9 @@ void __iomem *ioremap(paddr_t pa, size_t len)
+         unsigned int offs = pa & (PAGE_SIZE - 1);
+         unsigned int nr = PFN_UP(offs + len);
+ 
+-        va = __vmap(&mfn, nr, 1, 1, PAGE_HYPERVISOR_UCMINUS, VMAP_DEFAULT) + offs;
++        va = __vmap(&mfn, nr, 1, 1, PAGE_HYPERVISOR_UCMINUS, VMAP_DEFAULT);
++        if ( va )
++            va += offs;
+     }
+ 
+     return (void __force __iomem *)va;
+@@ -6032,7 +6034,7 @@ void __iomem *__init ioremap_wc(paddr_t pa, size_t len)
+ 
+     va = __vmap(&mfn, nr, 1, 1, PAGE_HYPERVISOR_WC, VMAP_DEFAULT);
+ 
+-    return (void __force __iomem *)(va + offs);
++    return (void __force __iomem *)(va ? va + offs : NULL);
+ }
+ 
+ int create_perdomain_mapping(struct domain *d, unsigned long va,
