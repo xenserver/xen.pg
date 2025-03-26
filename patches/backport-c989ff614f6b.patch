@@ -1,0 +1,47 @@
+From c989ff614f6bad48b3bd4b32694f711b31c7b2d6 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 17 Feb 2025 15:51:51 +0000
+Subject: x86/svm: Separate STI and VMRUN instructions in svm_asm_do_resume()
+
+There is a corner case in the VMRUN instruction where its INTR_SHADOW state
+leaks into guest state if a VMExit occurs before the VMRUN is complete.  An
+example of this could be taking #NPF due to event injection.
+
+Xen can safely execute STI anywhere between CLGI and VMRUN, as CLGI blocks
+external interrupts too.  However, an exception (while fatal) will appear to
+be in an irqs-on region (as GIF isn't considered), so position the STI after
+the speculation actions but prior to the GPR pops.
+
+Link: https://lore.kernel.org/all/CADH9ctBs1YPmE4aCfGPNBwA10cA8RuAk2gO7542DjMZgs4uzJQ@mail.gmail.com/
+Fixes: 66b245d9eaeb ("SVM: limit GIF=0 region")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Release-Acked-by: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+
+diff --git a/xen/arch/x86/hvm/svm/entry.S b/xen/arch/x86/hvm/svm/entry.S
+index 6fd9652c04a1..91edb3345938 100644
+--- a/xen/arch/x86/hvm/svm/entry.S
++++ b/xen/arch/x86/hvm/svm/entry.S
+@@ -74,6 +74,14 @@ __UNLIKELY_END(nsvm_hap)
+         ALTERNATIVE "", svm_vmentry_spec_ctrl, X86_FEATURE_SC_MSR_HVM
+         ALTERNATIVE "", DO_SPEC_CTRL_DIV, X86_FEATURE_SC_DIV
+ 
++        /*
++         * Set EFLAGS.IF after CLGI covers us from real interrupts, but not
++         * immediately prior to VMRUN.  The VMRUN instruction leaks it's
++         * INTR_SHADOW into guest state if a VMExit occurs before VMRUN
++         * completes (e.g. taking #NPF during event injecting.)
++         */
++        sti
++
+         pop  %r15
+         pop  %r14
+         pop  %r13
+@@ -91,7 +99,6 @@ __UNLIKELY_END(nsvm_hap)
+         pop  %rsi
+         pop  %rdi
+ 
+-        sti
+         vmrun
+ 
+         SAVE_ALL
