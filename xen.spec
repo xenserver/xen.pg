@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10
+%global hv_rel 11
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Wed Mar 26 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-11
+- Add xenguest support for the platform:mmio_hole_size attribute
+- Identify which domain watchdog fired
+
 * Thu Feb 27 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-10
 - Fix for XSA-467 CVE-2025-1713
 - Fix reboot/shutdown issues on AMD due to local APIC ESR interrupts
