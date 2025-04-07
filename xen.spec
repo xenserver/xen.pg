@@ -883,6 +883,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Apr  7 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.19.2-1
+- Update to Xen 4.19.2.
+
 * Mon Mar 24 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.1-4
 - Identify which domain watchdog fired
 - Add xenguest support for the platform:mmio_hole_size attribute
