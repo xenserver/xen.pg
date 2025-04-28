@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 11
+%global hv_rel 12
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Apr 28 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-12
+- Work around Ice Lake erratum ICX143, which manifests as a hang on boot
+- Fix crash on boot when perf counters are unavailable
+
 * Wed Mar 26 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-11
 - Add xenguest support for the platform:mmio_hole_size attribute
 - Identify which domain watchdog fired
