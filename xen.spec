@@ -333,9 +333,9 @@ mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
 %{make_build} DESTDIR=%{buildroot} install-tools
 %{make_build} DESTDIR=%{buildroot} -C docs install-man-pages
 
-# Install artefacts for livepatches
-%{__install} -p -D -m 644 xen/build-xen-release/xen-syms %{buildroot}%{lp_devel_dir}/xen-syms
-%{__install} -p -D -m 644 xen/build-xen-debug/xen-syms %{buildroot}%{lp_devel_dir}/xen-syms-d
+# Install artifacts for livepatches
+%{__install} -p -D -m 644 xen/build-xen-release/xen.efi.elf %{buildroot}%{lp_devel_dir}/xen-syms
+%{__install} -p -D -m 644 xen/build-xen-debug/xen.efi.elf %{buildroot}%{lp_devel_dir}/xen-syms-d
 cp -a ../livepatch-src/. %{buildroot}%{lp_devel_dir}
 
 # Install release & debug Xen
@@ -343,7 +343,7 @@ install_xen () { # $1=vendorversion $2=outdir
     %{__install} -p -D -m 644 xen/$2/xen.gz     %{buildroot}/boot/xen-%{version}$1.gz
     %{__install} -p -D -m 644 xen/$2/System.efi.map %{buildroot}/boot/xen-%{version}$1.map
     %{__install} -p -D -m 644 xen/$2/.config    %{buildroot}/boot/xen-%{version}$1.config
-    %{__install} -p -D -m 644 xen/$2/xen-syms   %{buildroot}/boot/xen-syms-%{version}$1
+    %{__install} -p -D -m 644 xen/$2/xen.efi.elf   %{buildroot}/boot/xen-syms-%{version}$1
     %{__install} -p -D -m 644 xen/$2/xen.efi    %{buildroot}/boot/xen-%{version}$1.efi
 }
 install_xen -%{hv_rel}   build-xen-release
