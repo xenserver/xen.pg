@@ -1,0 +1,350 @@
+From ac050f6517f9fe101bd08b8e0cf7a602076296b7 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 7 Apr 2025 17:15:17 +0200
+Subject: x86/thunk: Build Xen with Return Thunks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Indirect Target Selection speculative vulnerability means that indirect
+branches (including RETs) are unsafe when in the first half of a cacheline.
+
+In order to mitigate this, build with return thunks and arrange for
+__x86_return_thunk to be (mis)aligned in the same manner as
+__x86_indirect_thunk_* so the RET instruction is placed in a safe location.
+
+place_ret() needs to conditionally emit JMP __x86_return_thunk instead of RET.
+
+This is part of XSA-469 / CVE-2024-28956
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index 24f74c538d86..87aa389070e6 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -40,6 +40,7 @@ obj-$(CONFIG_LIVEPATCH) += livepatch.o
+ obj-y += msi.o
+ obj-y += msr.o
+ obj-$(CONFIG_INDIRECT_THUNK) += indirect-thunk.o
++obj-$(CONFIG_RETURN_THUNK) += indirect-thunk.o
+ obj-y += ioport_emulate.o
+ obj-y += irq.o
+ obj-$(CONFIG_KEXEC) += machine_kexec.o
+diff --git a/xen/arch/x86/Rules.mk b/xen/arch/x86/Rules.mk
+index 812a652eecdc..c15e7d0a17b3 100644
+--- a/xen/arch/x86/Rules.mk
++++ b/xen/arch/x86/Rules.mk
+@@ -54,6 +54,13 @@ CFLAGS += -fno-jump-tables
+ export CONFIG_INDIRECT_THUNK=y
+ endif
+ 
++# Compile with return thunk support if available.
++ifneq ($(call cc-option,$(CC),-mfunction-return=thunk-extern,n),n)
++CFLAGS += -mfunction-return=thunk-extern
++CFLAGS += -DCONFIG_RETURN_THUNK
++export CONFIG_RETURN_THUNK=y
++endif
++
+ # If supported by the compiler, reduce stack alignment to 8 bytes. But allow
+ # this to be overridden elsewhere.
+ $(call cc-option-add,CFLAGS-stack-boundary,CC,-mpreferred-stack-boundary=3)
+diff --git a/xen/arch/x86/acpi/wakeup_prot.S b/xen/arch/x86/acpi/wakeup_prot.S
+index 15c22e597e25..f2f64c238b41 100644
+--- a/xen/arch/x86/acpi/wakeup_prot.S
++++ b/xen/arch/x86/acpi/wakeup_prot.S
+@@ -1,4 +1,7 @@
+         .file __FILE__
++
++#include <asm/asm_defns.h>
++
+         .text
+         .code64
+ 
+@@ -98,7 +101,7 @@ ENTRY(__ret_point)
+         LOAD_GREG(13)
+         LOAD_GREG(14)
+         LOAD_GREG(15)
+-        ret 
++        RET
+ 
+ .data
+         .align 16
+diff --git a/xen/arch/x86/alternative.c b/xen/arch/x86/alternative.c
+index 9ae12b8e6f5e..8dd4b83b69a1 100644
+--- a/xen/arch/x86/alternative.c
++++ b/xen/arch/x86/alternative.c
+@@ -147,16 +147,45 @@ void init_or_livepatch add_nops(void *insns, unsigned int len)
+     }
+ }
+ 
++void __x86_return_thunk(void);
++
+ /*
+  * Place a return at @ptr.  @ptr must be in the writable alias of a stub.
+  *
++ * When CONFIG_RETURN_THUNK is active, this may be a JMP __x86_return_thunk
++ * instead, depending on the safety of @ptr with respect to Indirect Target
++ * Selection.
++ *
+  * Returns the next position to write into the stub.
+  */
+ void *place_ret(void *ptr)
+ {
++    unsigned long addr = (unsigned long)ptr;
+     uint8_t *p = ptr;
+ 
+-    *p++ = 0xc3;
++    /*
++     * When Return Thunks are used, if a RET would be unsafe at this location
++     * with respect to Indirect Target Selection (i.e. if addr is in the first
++     * half of a cacheline), insert a JMP __x86_return_thunk instead.
++     *
++     * The displacement needs to be relative to the executable alias of the
++     * stub, not to @ptr which is the writeable alias.
++     */
++    if ( IS_ENABLED(CONFIG_RETURN_THUNK) && !(addr & 0x20) )
++    {
++        long stub_va = (this_cpu(stubs.addr) & PAGE_MASK) + (addr & ~PAGE_MASK);
++        long disp = (long)__x86_return_thunk - (stub_va + 5);
++
++        BUG_ON((int32_t)disp != disp);
++
++        *p++ = 0xe9;
++        *(int32_t *)p = disp;
++        p += 4;
++    }
++    else
++    {
++        *p++ = 0xc3;
++    }
+ 
+     return p;
+ }
+diff --git a/xen/arch/x86/bhb-thunk.S b/xen/arch/x86/bhb-thunk.S
+index ab3a6cd7afef..f63de151a270 100644
+--- a/xen/arch/x86/bhb-thunk.S
++++ b/xen/arch/x86/bhb-thunk.S
+@@ -23,7 +23,7 @@ ENTRY(clear_bhb_tsx)
+ 0:      .byte 0xc6, 0xf8, 0             /* xabort $0 */
+         int3
+ 1:
+-        ret
++        RET
+ 
+         .type clear_bhb_tsx, @function
+         .size clear_bhb_tsx, . - clear_bhb_tsx
+diff --git a/xen/arch/x86/clear_page.S b/xen/arch/x86/clear_page.S
+index d9d524c79ecd..ea70bd91676e 100644
+--- a/xen/arch/x86/clear_page.S
++++ b/xen/arch/x86/clear_page.S
+@@ -1,5 +1,6 @@
+         .file __FILE__
+ 
++#include <asm/asm_defns.h>
+ #include <asm/page.h>
+ 
+ ENTRY(clear_page_sse2)
+@@ -15,4 +16,4 @@ ENTRY(clear_page_sse2)
+         jnz     0b
+ 
+         sfence
+-        ret
++        RET
+diff --git a/xen/arch/x86/copy_page.S b/xen/arch/x86/copy_page.S
+index 2da81126c5fa..bb79c5fc79db 100644
+--- a/xen/arch/x86/copy_page.S
++++ b/xen/arch/x86/copy_page.S
+@@ -1,5 +1,6 @@
+         .file __FILE__
+ 
++#include <asm/asm_defns.h>
+ #include <asm/page.h>
+ 
+ #define src_reg %rsi
+@@ -40,4 +41,4 @@ ENTRY(copy_page_sse2)
+         movnti  tmp4_reg, 3*WORD_SIZE(dst_reg)
+ 
+         sfence
+-        ret
++        RET
+diff --git a/xen/arch/x86/efi/check.c b/xen/arch/x86/efi/check.c
+index 7fedd5a6105b..052a9c8ec88d 100644
+--- a/xen/arch/x86/efi/check.c
++++ b/xen/arch/x86/efi/check.c
+@@ -2,3 +2,6 @@ int __attribute__((__ms_abi__)) test(int i)
+ {
+     return i;
+ }
++
++/* In case -mfunction-return is in use. */
++void __x86_return_thunk(void) {};
+diff --git a/xen/arch/x86/indirect-thunk.S b/xen/arch/x86/indirect-thunk.S
+index 7882142793d7..480be6a91e84 100644
+--- a/xen/arch/x86/indirect-thunk.S
++++ b/xen/arch/x86/indirect-thunk.S
+@@ -11,6 +11,8 @@
+ 
+ #include <asm/asm_defns.h>
+ 
++#ifdef CONFIG_INDIRECT_THUNK
++
+ .macro IND_THUNK_RETPOLINE reg:req
+         call 2f
+ 1:
+@@ -62,3 +64,27 @@ ENTRY(__x86_indirect_thunk_\reg)
+ .irp reg, ax, cx, dx, bx, bp, si, di, 8, 9, 10, 11, 12, 13, 14, 15
+         GEN_INDIRECT_THUNK reg=r\reg
+ .endr
++
++#endif /* CONFIG_INDIRECT_THUNK */
++
++#ifdef CONFIG_RETURN_THUNK
++        .section .text.entry.__x86_return_thunk, "ax", @progbits
++
++        /*
++         * The Indirect Target Selection speculative vulnerability means that
++         * indirect branches (including RETs) are unsafe when in the first
++         * half of a cacheline.  Arrange for them to be in the second half.
++         *
++         * Align to 64, then skip 32.
++         */
++        .balign 64
++        .fill 32, 1, 0xcc
++
++ENTRY(__x86_return_thunk)
++        ret
++        int3 /* Halt straight-line speculation */
++
++        .size __x86_return_thunk, . - __x86_return_thunk
++        .type __x86_return_thunk, @function
++
++#endif /* CONFIG_RETURN_THUNK */
+diff --git a/xen/arch/x86/pv/gpr_switch.S b/xen/arch/x86/pv/gpr_switch.S
+index 6d26192c2cb0..3e066fbad8d3 100644
+--- a/xen/arch/x86/pv/gpr_switch.S
++++ b/xen/arch/x86/pv/gpr_switch.S
+@@ -37,7 +37,7 @@ ENTRY(host_to_guest_gpr_switch)
+         movq  %rcx,8(%rsp)
+         movq  UREGS_rcx(%rdi), %rcx
+         movq  UREGS_rdi(%rdi), %rdi
+-        ret
++        RET
+ 
+ ENTRY(guest_to_host_gpr_switch)
+         pushq %rdi
+@@ -64,4 +64,4 @@ ENTRY(guest_to_host_gpr_switch)
+         popq  %rbx
+         movq  %rcx, UREGS_rcx(%rdi)
+         popq  %rcx
+-        ret
++        RET
+diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
+index c47a3ffa656b..c32dcfa834ec 100644
+--- a/xen/arch/x86/spec_ctrl.c
++++ b/xen/arch/x86/spec_ctrl.c
+@@ -548,6 +548,9 @@ static void __init print_details(enum ind_thunk thunk)
+ #ifdef CONFIG_INDIRECT_THUNK
+                " INDIRECT_THUNK"
+ #endif
++#ifdef CONFIG_RETURN_THUNK
++               " RETURN_THUNK"
++#endif
+ #ifdef CONFIG_SHADOW_PAGING
+                " SHADOW_PAGING"
+ #endif
+diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
+index 2de04c0216ae..3278879e4d3f 100644
+--- a/xen/arch/x86/x86_64/compat/entry.S
++++ b/xen/arch/x86/x86_64/compat/entry.S
+@@ -182,7 +182,7 @@ ENTRY(cr4_pv32_restore)
+         mov   %rax, %cr4
+         mov   %rax, (%rdx)
+         pop   %rdx
+-        ret
++        RET
+ 0:
+ #ifndef NDEBUG
+         /* Check that _all_ of the bits intended to be set actually are. */
+@@ -201,7 +201,7 @@ ENTRY(cr4_pv32_restore)
+ #endif
+         pop   %rdx
+         xor   %eax, %eax
+-        ret
++        RET
+ 
+         .section .text.entry, "ax", @progbits
+ 
+@@ -364,7 +364,7 @@ __UNLIKELY_END(compat_bounce_null_selector)
+         xor   %eax, %eax
+         mov   %ax,  TRAPBOUNCE_cs(%rdx)
+         mov   %al,  TRAPBOUNCE_flags(%rdx)
+-        ret
++        RET
+ 
+ .section .fixup,"ax"
+ .Lfx13:
+diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
+index 9cf816297bd0..3229754a34c8 100644
+--- a/xen/arch/x86/x86_64/entry.S
++++ b/xen/arch/x86/x86_64/entry.S
+@@ -504,7 +504,7 @@ __UNLIKELY_END(create_bounce_frame_bad_bounce_ip)
+         xor   %eax, %eax
+         mov   %rax, TRAPBOUNCE_eip(%rdx)
+         mov   %al,  TRAPBOUNCE_flags(%rdx)
+-        ret
++        RET
+ 
+         .pushsection .fixup, "ax", @progbits
+         # Numeric tags below represent the intended overall %rsi adjustment.
+diff --git a/xen/arch/x86/xen.lds.S b/xen/arch/x86/xen.lds.S
+index 8fda0dd0a6ca..d6ce90d6c99c 100644
+--- a/xen/arch/x86/xen.lds.S
++++ b/xen/arch/x86/xen.lds.S
+@@ -74,6 +74,7 @@ SECTIONS
+        . = ALIGN(PAGE_SIZE);
+        _stextentry = .;
+        *(.text.entry)
++       *(.text.entry.*)
+        . = ALIGN(PAGE_SIZE);
+        _etextentry = .;
+ 
+diff --git a/xen/common/Kconfig b/xen/common/Kconfig
+index 24620d331c69..0ca059d6a1d4 100644
+--- a/xen/common/Kconfig
++++ b/xen/common/Kconfig
+@@ -88,6 +88,17 @@ config HAS_CHECKPOLICY
+ 
+ menu "Speculative hardening"
+ 
++config RETURN_THUNK
++	bool "Out-of-line Returns"
++	depends on CC_HAS_RETURN_THUNK
++	default INDIRECT_THUNK
++	help
++	  Compile Xen with out-of-line returns.
++
++	  This allows Xen to mitigate a variety of speculative vulnerabilities
++	  by choosing a hardware-dependent instruction sequence to implement
++	  function returns safely.
++
+ config SPECULATIVE_HARDEN_ARRAY
+ 	bool "Speculative Array Hardening"
+ 	default y
+diff --git a/xen/include/asm-x86/indirect_thunk_asm.h b/xen/include/asm-x86/indirect_thunk_asm.h
+index ecc0ccc6e775..4d026f669305 100644
+--- a/xen/include/asm-x86/indirect_thunk_asm.h
++++ b/xen/include/asm-x86/indirect_thunk_asm.h
+@@ -40,4 +40,10 @@ asm ( "\t.include \"asm/indirect_thunk_asm.h\"" );
+     .endif
+ .endm
+ 
++#ifdef CONFIG_RETURN_THUNK
++# define RET jmp __x86_return_thunk
++#else
++# define RET ret
++#endif
++
+ #endif
