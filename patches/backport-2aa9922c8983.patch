@@ -1,4 +1,4 @@
-From 4e61b34b902ca06a43c4a092313a3800ca7c0f1b Mon Sep 17 00:00:00 2001
+From 2aa9922c89839e8e28051db472cd02e91e0a6795 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Mon, 21 Apr 2025 15:52:56 +0100
 Subject: x86/alternative: Support replacements when a feature is not present
@@ -11,35 +11,27 @@ more clearly in _apply_alternatives().
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 328ed39c59e0af06d594f5e64a52b57aa0b02340)
 
 diff --git a/xen/arch/x86/alternative.c b/xen/arch/x86/alternative.c
-index 5738e03613ed..abcbc5d939c1 100644
+index 8356414be701..6eee6e501ad9 100644
 --- a/xen/arch/x86/alternative.c
 +++ b/xen/arch/x86/alternative.c
-@@ -209,6 +209,8 @@ static int init_or_livepatch _apply_alternatives(struct alt_instr *start,
+@@ -209,10 +209,12 @@ static void init_or_livepatch _apply_alternatives(struct alt_instr *start,
          uint8_t *repl = ALT_REPL_PTR(a);
          uint8_t buf[MAX_PATCH_LEN];
          unsigned int total_len = a->orig_len + a->pad_len;
 +        unsigned int feat = a->cpuid & ~ALT_FLAG_NOT;
 +        bool inv = a->cpuid & ALT_FLAG_NOT, replace;
  
-         if ( a->repl_len > total_len )
-         {
-@@ -226,11 +228,11 @@ static int init_or_livepatch _apply_alternatives(struct alt_instr *start,
-             return -ENOSPC;
-         }
+         BUG_ON(a->repl_len > total_len);
+         BUG_ON(total_len > sizeof(buf));
+-        BUG_ON(a->cpuid >= NCAPINTS * 32);
++        BUG_ON(feat >= NCAPINTS * 32);
  
--        if ( a->cpuid >= NCAPINTS * 32 )
-+        if ( feat >= NCAPINTS * 32 )
-         {
-              printk(XENLOG_ERR
-                    "Alt for %ps, feature %#x outside of featureset range %#x\n",
--                   ALT_ORIG_PTR(a), a->cpuid, NCAPINTS * 32);
-+                   ALT_ORIG_PTR(a), feat, NCAPINTS * 32);
-             return -ERANGE;
-         }
- 
-@@ -255,8 +257,14 @@ static int init_or_livepatch _apply_alternatives(struct alt_instr *start,
+         /*
+          * Detect sequences of alt_instr's patching the same origin site, and
+@@ -235,8 +237,14 @@ static void init_or_livepatch _apply_alternatives(struct alt_instr *start,
              continue;
          }
  
@@ -55,21 +47,8 @@ index 5738e03613ed..abcbc5d939c1 100644
          {
              /* Origin site site already touched?  Don't nop anything. */
              if ( base->priv )
-diff --git a/xen/arch/x86/include/asm/alternative-asm.h b/xen/arch/x86/include/asm/alternative-asm.h
-index 57c9c1ebb65e..9935ba907177 100644
---- a/xen/arch/x86/include/asm/alternative-asm.h
-+++ b/xen/arch/x86/include/asm/alternative-asm.h
-@@ -12,7 +12,7 @@
-  * instruction. See apply_alternatives().
-  */
- .macro altinstruction_entry orig repl feature orig_len repl_len pad_len
--    .if \feature >= NCAPINTS * 32
-+    .if ((\feature) & ~ALT_FLAG_NOT) >= NCAPINTS * 32
-         .error "alternative feature outside of featureset range"
-     .endif
-     .long \orig - .
 diff --git a/xen/arch/x86/include/asm/alternative.h b/xen/arch/x86/include/asm/alternative.h
-index 3d8e7ba9b9e7..4d0032a88a7a 100644
+index ee4cbe92cc2b..388e595786e0 100644
 --- a/xen/arch/x86/include/asm/alternative.h
 +++ b/xen/arch/x86/include/asm/alternative.h
 @@ -1,6 +1,13 @@
@@ -86,7 +65,7 @@ index 3d8e7ba9b9e7..4d0032a88a7a 100644
  #ifdef __ASSEMBLY__
  #include <asm/alternative-asm.h>
  #else
-@@ -12,7 +19,7 @@
+@@ -11,7 +18,7 @@
  struct __packed alt_instr {
      int32_t  orig_offset;   /* original instruction */
      int32_t  repl_offset;   /* offset to replacement instruction */
@@ -95,12 +74,3 @@ index 3d8e7ba9b9e7..4d0032a88a7a 100644
      uint8_t  orig_len;      /* length of original instruction */
      uint8_t  repl_len;      /* length of new instruction */
      uint8_t  pad_len;       /* length of build-time padding */
-@@ -60,7 +67,7 @@ extern void alternative_branches(void);
-                     alt_repl_len(n2)) "-" alt_orig_len)
- 
- #define ALTINSTR_ENTRY(feature, num)                                    \
--        " .if " STR(feature) " >= " STR(NCAPINTS * 32) "\n"             \
-+        " .if (" STR(feature & ~ALT_FLAG_NOT) ") >= " STR(NCAPINTS * 32) "\n" \
-         " .error \"alternative feature outside of featureset range\"\n" \
-         " .endif\n"                                                     \
-         " .long .LXEN%=_orig_s - .\n"             /* label           */ \

@@ -1,4 +1,4 @@
-From 0ad35e00881a28edafbc7fcad4f46ab8db5ba371 Mon Sep 17 00:00:00 2001
+From ddc5c1e0aafb9b21faa6da94d74be89bc0158ed8 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Sun, 4 May 2025 22:44:42 +0100
 Subject: x86/stubs: Introduce place_ret() to abstract away raw 0xc3's
@@ -22,12 +22,13 @@ This is part of XSA-469 / CVE-2024-28956
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+(cherry picked from commit 2eb1132f796386e4524fb25dd0ed349e14ca35dd)
 
 diff --git a/tools/tests/x86_emulator/x86-emulate.h b/tools/tests/x86_emulator/x86-emulate.h
-index 9112e684edea..94664f97197b 100644
+index 58760f096d3e..65ae95e624e6 100644
 --- a/tools/tests/x86_emulator/x86-emulate.h
 +++ b/tools/tests/x86_emulator/x86-emulate.h
-@@ -64,6 +64,12 @@
+@@ -67,6 +67,12 @@
  
  #define is_canonical_address(x) (((int64_t)(x) >> 47) == ((int64_t)(x) >> 63))
  
@@ -41,7 +42,7 @@ index 9112e684edea..94664f97197b 100644
  extern struct cpu_policy cp;
  
 diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
-index d68946f72a42..fd73b6d06bcc 100644
+index 6a070a8cf8da..882408ccaf9a 100644
 --- a/xen/arch/x86/Makefile
 +++ b/xen/arch/x86/Makefile
 @@ -10,9 +10,7 @@ obj-$(CONFIG_XENOPROF) += oprofile/
@@ -65,7 +66,7 @@ index d68946f72a42..fd73b6d06bcc 100644
  obj-y += msr.o
  obj-$(CONFIG_INDIRECT_THUNK) += indirect-thunk.o
 diff --git a/xen/arch/x86/alternative.c b/xen/arch/x86/alternative.c
-index abcbc5d939c1..8e5f3e63f84c 100644
+index 6eee6e501ad9..88082f68a982 100644
 --- a/xen/arch/x86/alternative.c
 +++ b/xen/arch/x86/alternative.c
 @@ -149,6 +149,20 @@ void init_or_livepatch add_nops(void *insns, unsigned int len)
@@ -128,20 +129,20 @@ index f05c16def68b..adfd439d3a50 100644
  
          asm volatile ( "INDIRECT_CALL %[stb]\n"
 diff --git a/xen/arch/x86/include/asm/alternative.h b/xen/arch/x86/include/asm/alternative.h
-index 4d0032a88a7a..4855bbc9cb48 100644
+index 388e595786e0..28e69e988ac0 100644
 --- a/xen/arch/x86/include/asm/alternative.h
 +++ b/xen/arch/x86/include/asm/alternative.h
-@@ -31,6 +31,8 @@ struct __packed alt_instr {
+@@ -30,6 +30,8 @@ struct __packed alt_instr {
  #define ALT_REPL_PTR(a)     __ALT_PTR(a, repl_offset)
  
  extern void add_nops(void *insns, unsigned int len);
 +void *place_ret(void *ptr);
 +
  /* Similar to alternative_instructions except it can be run with IRQs enabled. */
- extern int apply_alternatives(struct alt_instr *start, struct alt_instr *end);
+ extern void apply_alternatives(struct alt_instr *start, struct alt_instr *end);
  extern void alternative_instructions(void);
 diff --git a/xen/arch/x86/pv/emul-priv-op.c b/xen/arch/x86/pv/emul-priv-op.c
-index 0f0273b27a1c..949cec4e16ae 100644
+index f216c2641205..28ea7cc580a9 100644
 --- a/xen/arch/x86/pv/emul-priv-op.c
 +++ b/xen/arch/x86/pv/emul-priv-op.c
 @@ -88,7 +88,6 @@ static io_emul_stub_t *io_emul_stub_setup(struct priv_op_ctxt *ctxt, u8 opcode,
@@ -168,7 +169,7 @@ index 0f0273b27a1c..949cec4e16ae 100644
      BUG_ON(STUB_BUF_SIZE / 2 < (p - ctxt->io_emul_stub));
  
 diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
-index 466d758c9b85..a2506b71597a 100644
+index 995670cbc8e9..b5eca13410cd 100644
 --- a/xen/arch/x86/x86_emulate/x86_emulate.c
 +++ b/xen/arch/x86/x86_emulate/x86_emulate.c
 @@ -1533,36 +1533,42 @@ static inline bool fpu_check_write(void)
@@ -220,7 +221,7 @@ index 466d758c9b85..a2506b71597a 100644
      invoke_stub(_PRE_EFLAGS("[eflags]", "[mask]", "[tmp]"),             \
                  _POST_EFLAGS("[eflags]", "[mask]", "[tmp]"),            \
                  [eflags] "+g" (_regs.eflags), [tmp] "=&r" (tmp_)        \
-@@ -3853,7 +3859,7 @@ x86_emulate(
+@@ -3852,7 +3858,7 @@ x86_emulate(
          stb[3] = 0x91;
          stb[4] = evex.opmsk << 3;
          insn_bytes = 5;
@@ -229,7 +230,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "+m" (op_mask) : "a" (&op_mask));
  
-@@ -6766,7 +6772,7 @@ x86_emulate(
+@@ -6751,7 +6757,7 @@ x86_emulate(
              evex.lr = 0;
          opc[1] = (modrm & 0x38) | 0xc0;
          insn_bytes = EVEX_PFX_BYTES + 2;
@@ -238,7 +239,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          copy_EVEX(opc, evex);
          invoke_stub("", "", "=g" (dummy) : "a" (src.val));
-@@ -6831,7 +6837,7 @@ x86_emulate(
+@@ -6816,7 +6822,7 @@ x86_emulate(
              insn_bytes = PFX_BYTES + 2;
              copy_REX_VEX(opc, rex_prefix, vex);
          }
@@ -247,7 +248,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          ea.reg = decode_gpr(&_regs, modrm_reg);
          invoke_stub("", "", "=a" (*ea.reg) : "c" (mmvalp), "m" (*mmvalp));
-@@ -6899,7 +6905,7 @@ x86_emulate(
+@@ -6884,7 +6890,7 @@ x86_emulate(
              insn_bytes = PFX_BYTES + 2;
              copy_REX_VEX(opc, rex_prefix, vex);
          }
@@ -256,7 +257,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          _regs.eflags &= ~EFLAGS_MASK;
          invoke_stub("",
-@@ -7128,7 +7134,7 @@ x86_emulate(
+@@ -7113,7 +7119,7 @@ x86_emulate(
          opc[1] = modrm & 0xc7;
          insn_bytes = PFX_BYTES + 2;
      simd_0f_to_gpr:
@@ -265,7 +266,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          generate_exception_if(ea.type != OP_REG, EXC_UD);
  
-@@ -7525,7 +7531,7 @@ x86_emulate(
+@@ -7510,7 +7516,7 @@ x86_emulate(
              vex.w = 0;
          opc[1] = modrm & 0x38;
          insn_bytes = PFX_BYTES + 2;
@@ -274,7 +275,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          copy_REX_VEX(opc, rex_prefix, vex);
          invoke_stub("", "", "+m" (src.val) : "a" (&src.val));
-@@ -7553,7 +7559,7 @@ x86_emulate(
+@@ -7538,7 +7544,7 @@ x86_emulate(
              evex.w = 0;
          opc[1] = modrm & 0x38;
          insn_bytes = EVEX_PFX_BYTES + 2;
@@ -283,7 +284,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          copy_EVEX(opc, evex);
          invoke_stub("", "", "+m" (src.val) : "a" (&src.val));
-@@ -7748,7 +7754,7 @@ x86_emulate(
+@@ -7733,7 +7739,7 @@ x86_emulate(
  #endif /* X86EMUL_NO_SIMD */
  
      simd_0f_reg_only:
@@ -292,7 +293,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          copy_REX_VEX(opc, rex_prefix, vex);
          invoke_stub("", "", [dummy_out] "=g" (dummy) : [dummy_in] "i" (0) );
-@@ -8073,7 +8079,7 @@ x86_emulate(
+@@ -8058,7 +8064,7 @@ x86_emulate(
          if ( !mode_64bit() )
              vex.w = 0;
          opc[1] = modrm & 0xf8;
@@ -301,7 +302,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          copy_VEX(opc, vex);
          ea.reg = decode_gpr(&_regs, modrm_rm);
-@@ -8116,7 +8122,7 @@ x86_emulate(
+@@ -8101,7 +8107,7 @@ x86_emulate(
          if ( !mode_64bit() )
              vex.w = 0;
          opc[1] = modrm & 0xc7;
@@ -310,7 +311,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          copy_VEX(opc, vex);
          invoke_stub("", "", "=a" (dst.val) : [dummy] "i" (0));
-@@ -8146,7 +8152,7 @@ x86_emulate(
+@@ -8131,7 +8137,7 @@ x86_emulate(
          opc = init_prefixes(stub);
          opc[0] = b;
          opc[1] = modrm;
@@ -319,7 +320,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          copy_VEX(opc, vex);
          _regs.eflags &= ~EFLAGS_MASK;
-@@ -9042,7 +9048,7 @@ x86_emulate(
+@@ -9027,7 +9033,7 @@ x86_emulate(
          if ( !mode_64bit() )
              vex.w = 0;
          opc[1] = modrm & 0xc7;
@@ -328,7 +329,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          copy_REX_VEX(opc, rex_prefix, vex);
          invoke_stub("", "", "=a" (ea.val) : [dummy] "i" (0));
-@@ -9160,7 +9166,7 @@ x86_emulate(
+@@ -9145,7 +9151,7 @@ x86_emulate(
              opc[1] &= 0x38;
          }
          insn_bytes = PFX_BYTES + 2;
@@ -337,7 +338,7 @@ index 466d758c9b85..a2506b71597a 100644
          if ( vex.opcx == vex_none )
          {
              /* Cover for extra prefix byte. */
-@@ -9439,7 +9445,7 @@ x86_emulate(
+@@ -9424,7 +9430,7 @@ x86_emulate(
          pvex->b = !mode_64bit() || (vex.reg >> 3);
          opc[1] = 0xc0 | (~vex.reg & 7);
          pvex->reg = 0xf;
@@ -346,7 +347,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "=a" (ea.val) : [dummy] "i" (0));
          put_stub(stub);
-@@ -9699,7 +9705,7 @@ x86_emulate(
+@@ -9684,7 +9690,7 @@ x86_emulate(
              evex.w = 0;
          opc[1] = modrm & 0xf8;
          insn_bytes = EVEX_PFX_BYTES + 2;
@@ -355,7 +356,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          copy_EVEX(opc, evex);
          invoke_stub("", "", "=g" (dummy) : "a" (src.val));
-@@ -9798,7 +9804,7 @@ x86_emulate(
+@@ -9783,7 +9789,7 @@ x86_emulate(
          pvex->b = 1;
          opc[1] = (modrm_reg & 7) << 3;
          pvex->reg = 0xf;
@@ -364,7 +365,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "=m" (*mmvalp) : "a" (mmvalp));
  
-@@ -9868,7 +9874,7 @@ x86_emulate(
+@@ -9853,7 +9859,7 @@ x86_emulate(
          pvex->b = 1;
          opc[1] = (modrm_reg & 7) << 3;
          pvex->reg = 0xf;
@@ -373,7 +374,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "+m" (*mmvalp) : "a" (mmvalp));
  
-@@ -9924,7 +9930,7 @@ x86_emulate(
+@@ -9909,7 +9915,7 @@ x86_emulate(
          pevex->b = 1;
          opc[1] = (modrm_reg & 7) << 3;
          pevex->RX = 1;
@@ -382,7 +383,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "=m" (*mmvalp) : "a" (mmvalp));
  
-@@ -9989,7 +9995,7 @@ x86_emulate(
+@@ -9974,7 +9980,7 @@ x86_emulate(
          pevex->b = 1;
          opc[1] = (modrm_reg & 7) << 3;
          pevex->RX = 1;
@@ -391,7 +392,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "+m" (*mmvalp) : "a" (mmvalp));
  
-@@ -10003,7 +10009,7 @@ x86_emulate(
+@@ -9988,7 +9994,7 @@ x86_emulate(
          opc[2] = 0x90;
          /* Use (%rax) as source. */
          opc[3] = evex.opmsk << 3;
@@ -400,7 +401,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "+m" (op_mask) : "a" (&op_mask));
          put_stub(stub);
-@@ -10097,7 +10103,7 @@ x86_emulate(
+@@ -10082,7 +10088,7 @@ x86_emulate(
          pevex->b = 1;
          opc[1] = (modrm_reg & 7) << 3;
          pevex->RX = 1;
@@ -409,7 +410,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "=m" (*mmvalp) : "a" (mmvalp));
  
-@@ -10175,7 +10181,7 @@ x86_emulate(
+@@ -10160,7 +10166,7 @@ x86_emulate(
          opc[2] = 0x90;
          /* Use (%rax) as source. */
          opc[3] = evex.opmsk << 3;
@@ -418,7 +419,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "+m" (op_mask) : "a" (&op_mask));
          put_stub(stub);
-@@ -10244,7 +10250,7 @@ x86_emulate(
+@@ -10229,7 +10235,7 @@ x86_emulate(
          pevex->r = !mode_64bit() || !(state->sib_index & 0x08);
          pevex->R = !mode_64bit() || !(state->sib_index & 0x10);
          pevex->RX = 1;
@@ -427,7 +428,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          invoke_stub("", "", "=m" (index) : "a" (&index));
          put_stub(stub);
-@@ -10422,7 +10428,7 @@ x86_emulate(
+@@ -10404,7 +10410,7 @@ x86_emulate(
          pvex->reg = 0xf; /* rAX */
          buf[3] = b;
          buf[4] = 0x09; /* reg=rCX r/m=(%rCX) */
@@ -436,7 +437,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          src.reg = decode_vex_gpr(vex.reg, &_regs, ctxt);
          emulate_stub([dst] "=&c" (dst.val), "[dst]" (&src.val), "a" (*src.reg));
-@@ -10458,7 +10464,7 @@ x86_emulate(
+@@ -10438,7 +10444,7 @@ x86_emulate(
          pvex->reg = 0xf; /* rAX */
          buf[3] = b;
          buf[4] = (modrm & 0x38) | 0x01; /* r/m=(%rCX) */
@@ -445,7 +446,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          dst.reg = decode_vex_gpr(vex.reg, &_regs, ctxt);
          emulate_stub("=&a" (dst.val), "c" (&src.val));
-@@ -10690,7 +10696,7 @@ x86_emulate(
+@@ -10670,7 +10676,7 @@ x86_emulate(
              evex.w = vex.w = 0;
          opc[1] = modrm & 0x38;
          opc[2] = imm1;
@@ -454,7 +455,7 @@ index 466d758c9b85..a2506b71597a 100644
          if ( vex.opcx == vex_none )
          {
              /* Cover for extra prefix byte. */
-@@ -10857,7 +10863,7 @@ x86_emulate(
+@@ -10837,7 +10843,7 @@ x86_emulate(
              insn_bytes = PFX_BYTES + 3;
              copy_VEX(opc, vex);
          }
@@ -463,7 +464,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          /* Latch MXCSR - we may need to restore it below. */
          invoke_stub("stmxcsr %[mxcsr]", "",
-@@ -11085,7 +11091,7 @@ x86_emulate(
+@@ -11065,7 +11071,7 @@ x86_emulate(
          }
          opc[2] = imm1;
          insn_bytes = PFX_BYTES + 3;
@@ -472,7 +473,7 @@ index 466d758c9b85..a2506b71597a 100644
          if ( vex.opcx == vex_none )
          {
              /* Cover for extra prefix byte. */
-@@ -11240,7 +11246,7 @@ x86_emulate(
+@@ -11225,7 +11231,7 @@ x86_emulate(
          pxop->reg = 0xf; /* rAX */
          buf[3] = b;
          buf[4] = (modrm & 0x38) | 0x01; /* r/m=(%rCX) */
@@ -481,7 +482,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          dst.reg = decode_vex_gpr(vex.reg, &_regs, ctxt);
          emulate_stub([dst] "=&a" (dst.val), "c" (&src.val));
-@@ -11349,7 +11355,7 @@ x86_emulate(
+@@ -11334,7 +11340,7 @@ x86_emulate(
          buf[3] = b;
          buf[4] = 0x09; /* reg=rCX r/m=(%rCX) */
          *(uint32_t *)(buf + 5) = imm1;
@@ -490,7 +491,7 @@ index 466d758c9b85..a2506b71597a 100644
  
          emulate_stub([dst] "=&c" (dst.val), "[dst]" (&src.val));
  
-@@ -11416,12 +11422,12 @@ x86_emulate(
+@@ -11401,12 +11407,12 @@ x86_emulate(
              BUG();
          if ( evex_encoded() )
          {

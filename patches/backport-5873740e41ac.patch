@@ -1,10 +1,42 @@
-From 99a6ea40e09f76727e16c1972127bb5005ed1cb2 Mon Sep 17 00:00:00 2001
+From 5873740e41acb8593f92623ddd03caebda2718f6 Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 24 Apr 2025 16:51:00 +0100
-Subject: x86/spec-ctrl: Intel PB-OPT
+Subject: x86/spec-ctrl: Support Intel's new PB-OPT
 
+In IPU 2025.2 (May 2025), Intel have released an alternative mitigation for a
+prior security issue (SA-00982) on Sapphire and Emerald Rapids CPUs.
+
+Intel suggest that certain workloads will benefit from using the alternative
+mode.  This can be selected by booting with `spec-ctrl=ibpb-alt`.
+
+https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/cpuid-enumeration-and-architectural-msrs.html
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
 
+diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
+index c8e73d627263..5df13621502d 100644
+--- a/docs/misc/xen-command-line.pandoc
++++ b/docs/misc/xen-command-line.pandoc
+@@ -2340,7 +2340,7 @@ By default SSBD will be mitigated at runtime (i.e `ssbd=runtime`).
+ >              {ibrs,ibpb,ssbd,psfd,
+ >              eager-fpu,l1d-flush,branch-harden,srb-lock,
+ >              unpriv-mmio,gds-mit,div-scrub,lock-harden,
+->              bhi-dis-s,bp-spec-reduce}=<bool> ]`
++>              bhi-dis-s,bp-spec-reduce,ibpb-alt}=<bool> ]`
+ 
+ Controls for speculative execution sidechannel mitigations.  By default, Xen
+ will pick the most appropriate mitigations based on compiled in support,
+@@ -2496,6 +2496,10 @@ bp-spec-reduce when available, as it is preferable to using `ibpb-entry=hvm`
+ to mitigate SRSO for HVM guests, and because it is a prerequisite to advertise
+ SRSO_U/S_NO to PV guests.
+ 
++On Sappire and Emerald Rapids CPUs with May 2025 microcode or later, the
++`ibpb-alt=` option can be used to switch to the alternative mitigation for
++Intel SA-00982.  Intel suggest that some workloads will benefit from this.
++
+ ### sync_console
+ > `= <boolean>`
+ 
 diff --git a/xen/arch/x86/acpi/power.c b/xen/arch/x86/acpi/power.c
 index e43b26612335..bbe06752109b 100644
 --- a/xen/arch/x86/acpi/power.c
@@ -56,6 +88,18 @@ index 2494d4c64ec7..72e11db197a2 100644
  /*
   * Processors which have self-snooping capability can handle conflicting
   * memory type across CPUs by snooping its own cache. However, there exists
+diff --git a/xen/arch/x86/include/asm/cpufeature.h b/xen/arch/x86/include/asm/cpufeature.h
+index df2ffb660005..d42d2bb57111 100644
+--- a/xen/arch/x86/include/asm/cpufeature.h
++++ b/xen/arch/x86/include/asm/cpufeature.h
+@@ -167,6 +167,7 @@
+ #define cpu_has_gds_no          boot_cpu_has(X86_FEATURE_GDS_NO)
+ #define cpu_has_rfds_no         boot_cpu_has(X86_FEATURE_RFDS_NO)
+ #define cpu_has_rfds_clear      boot_cpu_has(X86_FEATURE_RFDS_CLEAR)
++#define cpu_has_pb_opt_ctrl     boot_cpu_has(X86_FEATURE_PB_OPT_CTRL)
+ #define cpu_has_its_no          boot_cpu_has(X86_FEATURE_ITS_NO)
+ 
+ /* Synthesized. */
 diff --git a/xen/arch/x86/include/asm/msr-index.h b/xen/arch/x86/include/asm/msr-index.h
 index 340716188e0f..db602fdbfeeb 100644
 --- a/xen/arch/x86/include/asm/msr-index.h
@@ -97,14 +141,14 @@ index 66e7564ef1d8..0b1c1c51c2a1 100644
      tsx_init(); /* Needs microcode.  May change HLE/RTM feature bits. */
  
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index 288b80a0bf12..a8419c0560a0 100644
+index c8903d6359c8..b8d2366e8297 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
 @@ -97,6 +97,8 @@ static int8_t __initdata opt_gds_mit = -1;
  static int8_t __initdata opt_div_scrub = -1;
  bool __ro_after_init opt_bp_spec_reduce = true;
  
-+static __initdata bool opt_ibpb_alt;
++static bool __initdata opt_ibpb_alt;
 +
  static int __init cf_check parse_spec_ctrl(const char *s)
  {
@@ -123,7 +167,7 @@ index 288b80a0bf12..a8419c0560a0 100644
          info->last_spec_ctrl = val;
      }
 +
-+    if ( boot_cpu_has(X86_FEATURE_PB_OPT_CTRL) )
++    if ( cpu_has_pb_opt_ctrl )
 +        set_in_pb_opt_ctrl(PB_OPT_IBPB_ALT, opt_ibpb_alt);
  }
  
