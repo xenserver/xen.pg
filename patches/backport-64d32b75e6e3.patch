@@ -1,0 +1,63 @@
+From 64d32b75e6e3b093828623d5ce30b4826bb6b1df Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 19 Dec 2023 13:47:38 +0100
+Subject: x86: allow non-BIGMEM configs to boot on >= 16Tb systems
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+While frame table setup, directmap init, and boot allocator population
+respect all intended bounds, the logic passing memory to the heap
+allocator which wasn't passed to the boot allocator fails to respect
+max_{pdx,pfn}. This then typically triggers the BUG() in
+free_heap_pages() after checking page state, because of hitting a struct
+page_info instance which was set to all ~0.
+
+Of course all the memory above the 16Tb boundary is still going to
+remain unused; using it requires BIGMEM=y. And of course this fix
+similarly ought to help BIGMEM=y configurations on >= 123Tb systems
+(where all the memory beyond that boundary continues to be unused).
+
+Fixes: bac2000063ba ("x86-64: reduce range spanned by 1:1 mapping and frame table indexes")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 3cba2be0af6c..62f4686cae1d 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -1731,15 +1731,15 @@ void asmlinkage __init noreturn __start_xen(unsigned long mbi_p)
+ 
+     if ( max_page - 1 > virt_to_mfn(HYPERVISOR_VIRT_END - 1) )
+     {
+-        unsigned long limit = virt_to_mfn(HYPERVISOR_VIRT_END - 1);
++        unsigned long lo = virt_to_mfn(HYPERVISOR_VIRT_END - 1);
+         uint64_t mask = PAGE_SIZE - 1;
+ 
+         if ( !highmem_start )
+-            xenheap_max_mfn(limit);
++            xenheap_max_mfn(lo);
+ 
+         end_boot_allocator();
+ 
+-        /* Pass the remaining memory to the allocator. */
++        /* Pass the remaining memory in (lo, max_page) to the allocator. */
+         for ( i = 0; i < boot_e820.nr_map; i++ )
+         {
+             uint64_t s, e;
+@@ -1748,10 +1748,12 @@ void asmlinkage __init noreturn __start_xen(unsigned long mbi_p)
+                 continue;
+             s = (boot_e820.map[i].addr + mask) & ~mask;
+             e = (boot_e820.map[i].addr + boot_e820.map[i].size) & ~mask;
+-            if ( PFN_DOWN(e) <= limit )
++            if ( PFN_DOWN(e) <= lo || PFN_DOWN(s) >= max_page )
+                 continue;
+-            if ( PFN_DOWN(s) <= limit )
+-                s = pfn_to_paddr(limit + 1);
++            if ( PFN_DOWN(s) <= lo )
++                s = pfn_to_paddr(lo + 1);
++            if ( PFN_DOWN(e) > max_page )
++                e = pfn_to_paddr(max_page);
+             init_domheap_pages(s, e);
+         }
+     }
