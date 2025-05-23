@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 4
+%global hv_rel 5
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -365,7 +365,7 @@ cp -a ../livepatch-src/. %{buildroot}%{lp_devel_dir}
 # Install release & debug Xen
 install_xen () { # $1=vendorversion $2=outdir
     %{__install} -p -D -m 644 xen/$2/xen.gz     %{buildroot}/boot/xen-%{version}$1.gz
-    %{__install} -p -D -m 644 xen/$2/System.map %{buildroot}/boot/xen-%{version}$1.map
+    %{__install} -p -D -m 644 xen/$2/System.efi.map %{buildroot}/boot/xen-%{version}$1.map
     %{__install} -p -D -m 644 xen/$2/.config    %{buildroot}/boot/xen-%{version}$1.config
     %{__install} -p -D -m 644 xen/$2/xen-syms   %{buildroot}/boot/xen-syms-%{version}$1
     %{__install} -p -D -m 644 xen/$2/xen.efi    %{buildroot}/boot/xen-%{version}$1.efi
@@ -923,6 +923,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Fri May 23 2025 Ross Lagerwall <ross.lagerwall@citrix.com> - 4.19.2-5
+- CA-411441: Use symbol map from EFI file
+
 * Wed May 21 2025 Frediano Ziglio <frediano.ziglio@cloud.com> - 4.19.2-4
 - CP-308117: Rebuild due to signature issue
 
