@@ -9,7 +9,7 @@ this restriction in Xen to support this use case.
 
 Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
 diff --git a/xen/common/kexec.c b/xen/common/kexec.c
-index 0e4fd43a040a..b5974f48865c 100644
+index 8c2d1da19f83..fe06c391c722 100644
 --- a/xen/common/kexec.c
 +++ b/xen/common/kexec.c
 @@ -911,7 +911,7 @@ static uint16_t kexec_load_v1_arch(void)
@@ -84,7 +84,7 @@ index 0e4fd43a040a..b5974f48865c 100644
  
      ret = kimage_alloc(&kimage, load.type, load.arch, load.entry_maddr,
 diff --git a/xen/common/kimage.c b/xen/common/kimage.c
-index eaec5fafd0ab..6782f4663f29 100644
+index cc33ce653289..6782f4663f29 100644
 --- a/xen/common/kimage.c
 +++ b/xen/common/kimage.c
 @@ -89,7 +89,7 @@ static struct page_info *kimage_alloc_zeroed_page(unsigned memflags)
@@ -304,6 +304,78 @@ index eaec5fafd0ab..6782f4663f29 100644
  
      switch( type )
      {
+@@ -1313,14 +1318,16 @@ static int kimage_load_purgatory_image(struct kexec_image *image)
+  * Update the loaded purgatory with the digest and locations of the segments.
+  */
+ static int kimage_purgatory_calc_one_digest(sha256_context *ctx,
+-                                            xen_kexec_segment_t *segment)
++                                            struct kimage_segment *segment)
+ {
+     paddr_t dest;
+     unsigned long sbytes;
++    unsigned int dest_offset;
+     int ret = 0;
+ 
+     sbytes = segment->buf_size;
+-    dest = segment->dest_maddr;
++    dest = segment->dest_maddr + segment->dest_offset;
++    dest_offset = segment->dest_offset;
+ 
+     while ( sbytes )
+     {
+@@ -1330,14 +1337,14 @@ static int kimage_purgatory_calc_one_digest(sha256_context *ctx,
+ 
+         dest_mfn = dest >> PAGE_SHIFT;
+ 
+-        dchunk = PAGE_SIZE;
++        dchunk = PAGE_SIZE - dest_offset;
+         schunk = min(dchunk, sbytes);
+ 
+         dest_va = map_domain_page(_mfn(dest_mfn));
+         if ( !dest_va )
+             return -EINVAL;
+ 
+-        sha256_update(ctx, dest_va, schunk);
++        sha256_update(ctx, dest_va + dest_offset, schunk);
+ 
+         unmap_domain_page(dest_va);
+         if ( ret )
+@@ -1345,6 +1352,7 @@ static int kimage_purgatory_calc_one_digest(sha256_context *ctx,
+ 
+         sbytes -= schunk;
+         dest += dchunk;
++        dest_offset = 0;
+     }
+     return 0;
+ }
+@@ -1371,7 +1379,8 @@ static int kimage_purgatory_calc_digest(struct kexec_image *image)
+         if ( ret )
+             return ret;
+ 
+-        regions[s].start = image->segments[s].dest_maddr;
++        regions[s].start = image->segments[s].dest_maddr +
++                           image->segments[s].dest_offset;
+         regions[s].len = image->segments[s].buf_size;
+     }
+ 
+@@ -1403,6 +1412,7 @@ static uint64_t kimage_find_kernel_entry_maddr(struct kexec_image *image)
+     void *dest_va;
+ 
+     alignment_addr = image->segments[KERNEL_SEGMENT_IDX].dest_maddr +
++                         image->segments[KERNEL_SEGMENT_IDX].dest_offset +
+                          offsetof(struct setup_header, kernel_alignment);
+ 
+     dest_mfn = alignment_addr >> PAGE_SHIFT;
+@@ -1425,7 +1435,8 @@ static uint64_t kimage_find_kernel_entry_maddr(struct kexec_image *image)
+          alignment > 0x1000000 )
+         return -EINVAL;
+ 
+-    return ROUNDUP(image->segments[KERNEL_SEGMENT_IDX].dest_maddr,
++    return ROUNDUP(image->segments[KERNEL_SEGMENT_IDX].dest_maddr +
++                       image->segments[KERNEL_SEGMENT_IDX].dest_offset,
+                    alignment) +
+                    0x200;
+ }
 diff --git a/xen/include/xen/kimage.h b/xen/include/xen/kimage.h
 index 92efd637f122..fb07130b635b 100644
 --- a/xen/include/xen/kimage.h
