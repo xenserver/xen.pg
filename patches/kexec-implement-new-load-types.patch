@@ -58,7 +58,7 @@ index 000000000000..b04c6d84de64
 + * End:
 + */
 diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
-index 435f433e55fd..f0780b907be1 100644
+index cb062d712fca..4d39d34c7c03 100644
 --- a/xen/arch/x86/Makefile
 +++ b/xen/arch/x86/Makefile
 @@ -40,6 +40,7 @@ obj-y += hypercall.o
@@ -258,18 +258,6 @@ index 000000000000..dfa1bb8a5071
 + * indent-tabs-mode: nil
 + * End:
 + */
-diff --git a/xen/common/Kconfig b/xen/common/Kconfig
-index 95b3ac0de39a..a012bb650a6f 100644
---- a/xen/common/Kconfig
-+++ b/xen/common/Kconfig
-@@ -272,6 +272,7 @@ config KEXEC
- 	bool "kexec support"
- 	default y
- 	depends on HAS_KEXEC
-+	select CRYPTO
- 	help
- 	  Allows a running Xen hypervisor to be replaced with another OS
- 	  without rebooting. This is primarily used to execute a crash
 diff --git a/xen/common/kexec.c b/xen/common/kexec.c
 index 790839657d79..73f56fd36ac0 100644
 --- a/xen/common/kexec.c
@@ -292,27 +280,34 @@ index 790839657d79..73f56fd36ac0 100644
      if ( ret < 0 )
          goto error;
 diff --git a/xen/common/kimage.c b/xen/common/kimage.c
-index 9961eac187e9..cc33ce653289 100644
+index 9961eac187e9..11e2749b384e 100644
 --- a/xen/common/kimage.c
 +++ b/xen/common/kimage.c
-@@ -19,10 +19,16 @@
+@@ -19,10 +19,23 @@
  #include <xen/guest_access.h>
  #include <xen/mm.h>
  #include <xen/kexec.h>
 +#include <xen/x86-linux.h>
  #include <xen/kimage.h>
 +#include <xen/elfstructs.h>
-+#include <xen/sha256.h>
++#include <xen/sha2.h>
 +#include <xen/lib.h>
  
  #include <asm/page.h>
  
 +#define KIMAGE_SHA256_REGIONS 16
 +
++typedef struct
++{
++    uint64_t start;
++    uint64_t len;
++}
++sha256_region_t;
++
  /*
   * When kexec transitions to the new kernel there is a one-to-one
   * mapping between physical and virtual addresses.  On processors
-@@ -214,17 +220,12 @@ static int kimage_normal_alloc(struct kexec_image **rimage, paddr_t entry,
+@@ -214,17 +227,12 @@ static int kimage_normal_alloc(struct kexec_image **rimage, paddr_t entry,
                             KEXEC_TYPE_DEFAULT);
  }
  
@@ -333,7 +328,7 @@ index 9961eac187e9..cc33ce653289 100644
      /*
       * Verify we have good destination addresses.  Normally
       * the caller is responsible for making certain we don't
-@@ -254,6 +255,25 @@ static int kimage_crash_alloc(struct kexec_image **rimage, paddr_t entry,
+@@ -254,6 +262,25 @@ static int kimage_crash_alloc(struct kexec_image **rimage, paddr_t entry,
                             KEXEC_TYPE_CRASH);
  }
  
@@ -359,7 +354,7 @@ index 9961eac187e9..cc33ce653289 100644
  static int kimage_is_destination_range(struct kexec_image *image,
                                         paddr_t start,
                                         paddr_t end)
-@@ -476,7 +496,7 @@ static void kimage_free_extra_pages(struct kexec_image *image)
+@@ -476,7 +503,7 @@ static void kimage_free_extra_pages(struct kexec_image *image)
      kimage_free_page_list(&image->unusable_pages);
  }
  
@@ -368,7 +363,7 @@ index 9961eac187e9..cc33ce653289 100644
  {
      kimage_entry_t *entries;
  
-@@ -542,6 +562,8 @@ void kimage_free(struct kexec_image *image)
+@@ -542,6 +569,8 @@ void kimage_free(struct kexec_image *image)
      kimage_free_all_entries(image);
      kimage_free_page_list(&image->control_pages);
      xfree(image->segments);
@@ -377,7 +372,7 @@ index 9961eac187e9..cc33ce653289 100644
      xfree(image);
  }
  
-@@ -748,7 +770,8 @@ static int kimage_load_crash_segment(struct kexec_image *image,
+@@ -748,7 +777,8 @@ static int kimage_load_crash_segment(struct kexec_image *image,
          if ( !dest_va )
              return -EINVAL;
  
@@ -387,7 +382,7 @@ index 9961eac187e9..cc33ce653289 100644
          memset(dest_va + schunk, 0, dchunk - schunk);
  
          unmap_domain_page(dest_va);
-@@ -764,7 +787,8 @@ static int kimage_load_crash_segment(struct kexec_image *image,
+@@ -764,7 +794,8 @@ static int kimage_load_crash_segment(struct kexec_image *image,
      return 0;
  }
  
@@ -397,7 +392,7 @@ index 9961eac187e9..cc33ce653289 100644
  {
      int result = -ENOMEM;
      paddr_t addr;
-@@ -802,11 +826,16 @@ int kimage_alloc(struct kexec_image **rimage, uint8_t type, uint16_t arch,
+@@ -802,11 +833,16 @@ int kimage_alloc(struct kexec_image **rimage, uint8_t type, uint16_t arch,
      switch( type )
      {
      case KEXEC_TYPE_DEFAULT:
@@ -414,7 +409,7 @@ index 9961eac187e9..cc33ce653289 100644
      default:
          result = -EINVAL;
          break;
-@@ -829,7 +858,6 @@ int kimage_load_segments(struct kexec_image *image)
+@@ -829,7 +865,6 @@ int kimage_load_segments(struct kexec_image *image)
          if ( result < 0 )
              return result;
      }
@@ -422,7 +417,7 @@ index 9961eac187e9..cc33ce653289 100644
      return 0;
  }
  
-@@ -938,6 +966,573 @@ done:
+@@ -938,6 +973,573 @@ done:
      return ret;
  }
  
@@ -772,7 +767,7 @@ index 9961eac187e9..cc33ce653289 100644
 +/*
 + * Update the loaded purgatory with the digest and locations of the segments.
 + */
-+static int kimage_purgatory_calc_one_digest(sha256_context *ctx,
++static int kimage_purgatory_calc_one_digest(struct sha2_256_state *ctx,
 +                                            xen_kexec_segment_t *segment)
 +{
 +    paddr_t dest;
@@ -797,7 +792,7 @@ index 9961eac187e9..cc33ce653289 100644
 +        if ( !dest_va )
 +            return -EINVAL;
 +
-+        sha256_update(ctx, dest_va, schunk);
++        sha2_256_update(ctx, dest_va, schunk);
 +
 +        unmap_domain_page(dest_va);
 +        if ( ret )
@@ -813,8 +808,8 @@ index 9961eac187e9..cc33ce653289 100644
 +{
 +    int ret;
 +    sha256_region_t regions[KIMAGE_SHA256_REGIONS] = {{0}};
-+    sha256_context ctx;
-+    sha256_digest_t digest;
++    struct sha2_256_state ctx;
++    uint8_t digest[SHA2_256_DIGEST_SIZE];
 +    unsigned int s;
 +
 +    if ( image->nr_segments > KIMAGE_SHA256_REGIONS )
@@ -824,7 +819,7 @@ index 9961eac187e9..cc33ce653289 100644
 +    }
 +
 +
-+    sha256_starts(&ctx);
++    sha2_256_init(&ctx);
 +
 +    for ( s = 0; s < image->nr_segments; s++ ) {
 +        ret = kimage_purgatory_calc_one_digest(&ctx, &image->segments[s]);
@@ -835,7 +830,7 @@ index 9961eac187e9..cc33ce653289 100644
 +        regions[s].len = image->segments[s].buf_size;
 +    }
 +
-+    sha256_finish(&ctx, digest);
++    sha2_256_final(&ctx, digest);
 +
 +    ret = kimage_purgatory_get_set_symbol(image, "sha256_regions",
 +                                          regions, sizeof(regions), 0);
@@ -843,7 +838,7 @@ index 9961eac187e9..cc33ce653289 100644
 +        return ret;
 +
 +    ret = kimage_purgatory_get_set_symbol(image, "sha256_digest",
-+                                          &digest, sizeof(digest), 0);
++                                          digest, sizeof(digest), 0);
 +    if ( ret )
 +        return ret;
 +

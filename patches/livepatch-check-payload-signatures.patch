@@ -24,7 +24,7 @@ index 5496b0c1fd3d..aad89ec919fe 100644
  obj-y += notifier.o
  obj-$(CONFIG_NUMA) += numa.o
 diff --git a/xen/common/livepatch.c b/xen/common/livepatch.c
-index 5c973d4ce33d..f5ca4c0fb581 100644
+index 5c973d4ce33d..a8c6bf055b48 100644
 --- a/xen/common/livepatch.c
 +++ b/xen/common/livepatch.c
 @@ -22,6 +22,11 @@
@@ -32,7 +32,7 @@ index 5c973d4ce33d..f5ca4c0fb581 100644
  #include <xen/vmap.h>
  #include <xen/wait.h>
 +#include <xen/mpi.h>
-+#include <xen/sha256.h>
++#include <xen/sha2.h>
 +#include <xen/rsa.h>
 +#include <xen/param.h>
 +#include <xen/lockdown.h>
@@ -102,7 +102,7 @@ index 5c973d4ce33d..f5ca4c0fb581 100644
 +static int check_rsa_sha256_signature(void *data, size_t datalen,
 +                                      void *sig, uint32_t siglen)
 +{
-+    sha256_context hash;
++    struct sha2_256_state hash;
 +    MPI s;
 +    int ret;
 +
@@ -113,9 +113,9 @@ index 5c973d4ce33d..f5ca4c0fb581 100644
 +        return -ENOMEM;
 +    }
 +
-+    sha256_starts(&hash);
++    sha2_256_init(&hash);
 +
-+    sha256_update(&hash, data, datalen);
++    sha2_256_update(&hash, data, datalen);
 +
 +    ret = rsa_sha256_verify(&builtin_payload_key, &hash, s);
 +    if (ret)
@@ -2054,7 +2054,7 @@ index 000000000000..e3e3ecd42283
 +	return (limb & (((mpi_limb_t)1) << bitno))? 1: 0;
 +}
 diff --git a/xen/crypto/Makefile b/xen/crypto/Makefile
-index b5ccb1759543..32b30287e8c6 100644
+index 90d6d01296d9..06579ea0f8db 100644
 --- a/xen/crypto/Makefile
 +++ b/xen/crypto/Makefile
 @@ -1,6 +1,7 @@
@@ -2067,10 +2067,10 @@ index b5ccb1759543..32b30287e8c6 100644
  key_path := $(srctree)/crypto/$(patsubst "%",%,$(CONFIG_PAYLOAD_SIG_KEY))
 diff --git a/xen/crypto/rsa.c b/xen/crypto/rsa.c
 new file mode 100644
-index 000000000000..cb4a3b9171b9
+index 000000000000..c58b5f7d32f7
 --- /dev/null
 +++ b/xen/crypto/rsa.c
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,195 @@
 +/* rsa.c
 +
 +   The RSA publickey algorithm.
@@ -2108,6 +2108,7 @@ index 000000000000..cb4a3b9171b9
 +#include <xen/lib.h>
 +#include <xen/err.h>
 +#include <xen/bug.h>
++#include <xen/sha2.h>
 +#include <xen/string.h>
 +
 +void rsa_public_key_init(struct rsa_public_key *key)
@@ -2200,7 +2201,7 @@ index 000000000000..cb4a3b9171b9
 +};
 +
 +static int pkcs1_rsa_sha256_encode(MPI *m, size_t key_size,
-+                                   sha256_context *hash)
++                                   struct sha2_256_state *hash)
 +{
 +    uint8_t *ptr;
 +    uint8_t *buf;
@@ -2211,14 +2212,14 @@ index 000000000000..cb4a3b9171b9
 +
 +    ptr = pkcs1_signature_prefix(key_size, buf,
 +                                 sizeof(sha256_prefix), sha256_prefix,
-+                                 SHA256_DIGEST_SIZE);
++                                 SHA2_256_DIGEST_SIZE);
 +    if ( !ptr )
 +    {
 +        xfree(buf);
 +        return -EINVAL;
 +    }
 +
-+    sha256_finish(hash, ptr);
++    sha2_256_final(hash, ptr);
 +    *m = mpi_read_raw_data(buf, key_size);
 +    xfree(buf);
 +    return 0;
@@ -2250,7 +2251,7 @@ index 000000000000..cb4a3b9171b9
 +}
 +
 +int rsa_sha256_verify(const struct rsa_public_key *key,
-+                        sha256_context *hash, MPI s)
++                      struct sha2_256_state *hash, MPI s)
 +{
 +    int ret;
 +    MPI m;
@@ -2395,10 +2396,10 @@ index 000000000000..987971b848e8
 +#endif /* MPI_H */
 diff --git a/xen/include/xen/rsa.h b/xen/include/xen/rsa.h
 new file mode 100644
-index 000000000000..ed6000eeeb82
+index 000000000000..8721a1a89bcb
 --- /dev/null
 +++ b/xen/include/xen/rsa.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,73 @@
 +/* rsa.h
 +
 +   The RSA publickey algorithm.
@@ -2436,8 +2437,9 @@ index 000000000000..ed6000eeeb82
 +#define RSA_H
 +
 +#include <xen/mpi.h>
-+#include <xen/sha256.h>
 +#include <xen/types.h>
++
++struct sha2_256_state;
 +
 +/*
 + * This limit is somewhat arbitrary. Technically, the smallest modulo
@@ -2467,33 +2469,7 @@ index 000000000000..ed6000eeeb82
 +int rsa_public_key_prepare(struct rsa_public_key *key);
 +
 +int rsa_sha256_verify(const struct rsa_public_key *key,
-+                      sha256_context *hash,
++                      struct sha2_256_state *hash,
 +                      MPI signature);
 +
 +#endif /* RSA_H */
-diff --git a/xen/include/xen/sha256.h b/xen/include/xen/sha256.h
-index 0214b745ff80..fbab30cb452b 100644
---- a/xen/include/xen/sha256.h
-+++ b/xen/include/xen/sha256.h
-@@ -23,6 +23,8 @@
- 
- #include <xen/types.h>
- 
-+#define SHA256_DIGEST_SIZE 32
-+
- typedef struct
- {
- 	size_t total[2];
-@@ -38,11 +40,10 @@ typedef struct
- }
- sha256_region_t;
- 
--typedef uint8_t sha256_digest_t[32];
-+typedef uint8_t sha256_digest_t[SHA256_DIGEST_SIZE];
- 
- void sha256_starts( sha256_context *ctx );
- void sha256_update( sha256_context *ctx, const uint8_t *input, size_t length );
- void sha256_finish( sha256_context *ctx, sha256_digest_t digest );
- 
--
- #endif /* SHA256_H */
