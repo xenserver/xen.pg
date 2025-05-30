@@ -378,7 +378,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{__install} -p -D -m 644 xen/build-shim/xen-syms %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim-syms
 
 # Build test case metadata
-%{__python} %{SOURCE5} -i %{buildroot}%{_libexecdir}/%{name} -o %{buildroot}%{_datadir}/xen-dom0-tests-metadata.json
+%{__python} %{SOURCE5} -i %{buildroot}%{_libexecdir}/%{name}/tests -o %{buildroot}%{_datadir}/xen-dom0-tests-metadata.json
 
 %{__install} -D -m 644 %{SOURCE1} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
 %{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/xen/xl.conf
@@ -857,12 +857,13 @@ install_xen -%{hv_rel}-d build-xen-debug
 
 %files dom0-tests
 %exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker
-%{_libexecdir}/%{name}/bin/test-cpu-policy
-%{_libexecdir}/%{name}/bin/test-paging-mempool
-%{_libexecdir}/%{name}/bin/test-resource
-%{_libexecdir}/%{name}/bin/test-tsx
-%{_libexecdir}/%{name}/bin/test-xenstore
-%{_libexecdir}/%{name}/bin/test_x86_emulator
+%{_libexecdir}/%{name}/tests/test-cpu-policy
+%{_libexecdir}/%{name}/tests/test-paging-mempool
+%{_libexecdir}/%{name}/tests/test-resource
+%{_libexecdir}/%{name}/tests/test-tsx
+%{_libexecdir}/%{name}/tests/test-xenstore
+%{_libexecdir}/%{name}/tests/test_vpci
+%{_libexecdir}/%{name}/tests/test_x86_emulator
 %{_datadir}/xen-dom0-tests-metadata.json
 
 %files lp-devel_%{version}_%{release}

@@ -1,0 +1,126 @@
+From 4c3ce492ede17902d086ef925dd120c25d974a87 Mon Sep 17 00:00:00 2001
+From: Kevin Lampis <kevin.lampis@cloud.com>
+Date: Thu, 8 May 2025 18:01:56 +0100
+Subject: livepatch: Pass buffer size to list sysctl
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The livepatch list sysctl writes metadata into a buffer provided by the
+caller. The caller is expected to allocate an appropriately sized buffer
+but this is racy and may result in Xen writing beyond the end of the
+buffer should the metadata size change.
+
+The name buffer is expected to be an array of elements with size
+XEN_LIVEPATCH_NAME_SIZE to avoid this kind of race but the xen-livepatch
+tool allocates only as many bytes as needed, therefore encountering the
+same potential race condition.
+
+Fix both these issues by requiring the caller to pass in the size of the
+name and metadata buffers and then not writing beyond the allocated
+size.
+
+The sysctl interface version is bumped due to the change in semantics of
+the fields.
+
+Signed-off-by: Kevin Lampis <kevin.lampis@cloud.com>
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Fixes: b145b4a39c13 ('livepatch: Handle arbitrary size names with the list operation')
+Fixes: 5083e0ff939d ('livepatch: Add metadata runtime retrieval mechanism')
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/tools/libs/ctrl/xc_misc.c b/tools/libs/ctrl/xc_misc.c
+index 50282fd60dcc..1318e3c7355c 100644
+--- a/tools/libs/ctrl/xc_misc.c
++++ b/tools/libs/ctrl/xc_misc.c
+@@ -865,6 +865,9 @@ int xc_livepatch_list(xc_interface *xch, const unsigned int max,
+         set_xen_guest_handle(sysctl.u.livepatch.u.list.metadata, metadata);
+         set_xen_guest_handle(sysctl.u.livepatch.u.list.metadata_len, metadata_len);
+ 
++        sysctl.u.livepatch.u.list.name_total_size = name_sz;
++        sysctl.u.livepatch.u.list.metadata_total_size = metadata_sz;
++
+         rc = do_sysctl(xch, &sysctl);
+         /*
+          * From here on we MUST call xc_hypercall_bounce. If rc < 0 we
+diff --git a/xen/common/livepatch.c b/xen/common/livepatch.c
+index 6ce77bf021b7..17fb0624b56a 100644
+--- a/xen/common/livepatch.c
++++ b/xen/common/livepatch.c
+@@ -1253,11 +1253,10 @@ static int livepatch_list(struct xen_sysctl_livepatch_list *list)
+         return -EINVAL;
+     }
+ 
+-    list->name_total_size = 0;
+-    list->metadata_total_size = 0;
+     if ( list->nr )
+     {
+         size_t name_offset = 0, metadata_offset = 0;
++        size_t name_total_copied = 0, metadata_total_copied = 0;
+ 
+         list_for_each_entry( data, &payload_list, list )
+         {
+@@ -1270,10 +1269,15 @@ static int livepatch_list(struct xen_sysctl_livepatch_list *list)
+             status.rc = data->rc;
+ 
+             name_len = strlen(data->name) + 1;
+-            list->name_total_size += name_len;
+-
+             metadata_len = data->metadata.len;
+-            list->metadata_total_size += metadata_len;
++
++            if ( (name_total_copied + name_len) > list->name_total_size ||
++                 (metadata_total_copied + metadata_len) >
++                 list->metadata_total_size )
++            {
++                rc = -ENOBUFS;
++                break;
++            }
+ 
+             if ( !guest_handle_subrange_okay(list->name, name_offset,
+                                              name_offset + name_len - 1) ||
+@@ -1297,6 +1301,9 @@ static int livepatch_list(struct xen_sysctl_livepatch_list *list)
+                 break;
+             }
+ 
++            name_total_copied += name_len;
++            metadata_total_copied += metadata_len;
++
+             idx++;
+             name_offset += name_len;
+             metadata_offset += metadata_len;
+@@ -1304,9 +1311,15 @@ static int livepatch_list(struct xen_sysctl_livepatch_list *list)
+             if ( (idx >= list->nr) || hypercall_preempt_check() )
+                 break;
+         }
++
++        list->name_total_size = name_total_copied;
++        list->metadata_total_size = metadata_total_copied;
+     }
+     else
+     {
++        list->name_total_size = 0;
++        list->metadata_total_size = 0;
++
+         list_for_each_entry( data, &payload_list, list )
+         {
+             list->name_total_size += strlen(data->name) + 1;
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index 3a6e7d48f02e..eb1637170e70 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -1091,8 +1091,12 @@ struct xen_sysctl_livepatch_list {
+                                                amount of payloads and version.
+                                                OUT: How many payloads left. */
+     uint32_t pad;                           /* IN: Must be zero. */
+-    uint32_t name_total_size;               /* OUT: Total size of all transfer names */
+-    uint32_t metadata_total_size;           /* OUT: Total size of all transfer metadata */
++    uint32_t name_total_size;               /* IN: Size of name buffer
++                                               OUT: Total size of transferred
++                                               names */
++    uint32_t metadata_total_size;           /* IN: Size of metadata buffer
++                                               OUT: Total size of transferred
++                                               metadata */
+     XEN_GUEST_HANDLE_64(xen_livepatch_status_t) status;  /* OUT. Must have enough
+                                                space allocate for nr of them. */
+     XEN_GUEST_HANDLE_64(char) name;         /* OUT: Array of names. Each member
