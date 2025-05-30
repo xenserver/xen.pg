@@ -378,7 +378,10 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{__install} -p -D -m 644 xen/build-shim/xen-syms %{buildroot}%{_libexecdir}/%{name}/boot/xen-shim-syms
 
 # Build test case metadata
-%{__python} %{SOURCE5} -i %{buildroot}%{_libexecdir}/%{name}/tests -o %{buildroot}%{_datadir}/xen-dom0-tests-metadata.json
+%{__python} %{SOURCE5} \
+    -r %{buildroot} \
+    -i %{buildroot}%{_libexecdir}/%{name}/tests \
+    -o %{buildroot}%{_datadir}/xen-dom0-tests-metadata.json
 
 %{__install} -D -m 644 %{SOURCE1} %{buildroot}%{_sysconfdir}/sysconfig/kernel-xen
 %{__install} -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/xen/xl.conf

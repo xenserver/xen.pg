@@ -23,6 +23,7 @@ def parse_args():
     Parse arguments from command line
     """
     parser = argparse.ArgumentParser(description='Generate test metadata')
+    parser.add_argument('-r', '--root', default=".", help="Filesystem root")
     parser.add_argument('-i', '--input', default='.', help="Folder contains tests, default to .")
     parser.add_argument('-o', '--output', default='xen-dom0-tests-metadata.json',
                         help="output metadata file name, default to xen-dom0-tests-metadata.json")
@@ -57,11 +58,17 @@ def filter_tests(test_cases, skip):
     return [t for t in test_cases if t not in skip]
 
 
-def build_metadata(test_cases):
+def build_metadata(args, test_cases):
     """
-    Build the whole metadata
+    Build the whole metadata.  testdir wants to be as packaged in dom0
     """
+
+    dir = args.input
+    if dir.startswith(args.root):
+        dir = dir[len(args.root):]
+
     return {
+        "testdir": dir,
         "tests": test_cases,
     }
 
@@ -79,6 +86,6 @@ if __name__ == "__main__":
     args = parse_args()
     tests = [os.path.basename(test) for test in find_tests(args.input)]
     tests = filter_tests(tests, args.skip)
-    metadata = build_metadata(tests)
+    metadata = build_metadata(args, tests)
     save_metadata(metadata, args.output)
     logging.info("Generate test metadata: %s", metadata)
