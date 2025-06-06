@@ -24,10 +24,6 @@
 %global __requires_exclude_from ^%{lp_devel_dir}/.*$
 %global __brp_mangle_shebangs_exclude_from ^%{lp_devel_dir}/.*$
 
-%if 0%{?xenserver} < 9
-%global __patch /usr/bin/patch --fuzz=0
-%endif
-
 Summary: Xen is a virtual machine monitor
 Name:    xen
 Version: 4.19.2
@@ -46,13 +42,6 @@ BuildRequires: python3-devel
 BuildRequires: python3-rpm-macros
 %global py_sitearch %{python3_sitearch}
 %global __python %{__python3}
-
-%if 0%{?xenserver} < 9
-# Interim, build Python2 bindings too
-%global py2_compat 1
-BuildRequires: python2-devel
-BuildRequires: python2-rpm-macros
-%endif
 
 # These build dependencies are needed for building the xen.gz as
 # well as live patches.
@@ -304,12 +293,6 @@ diff -Naur public-abi xen/include/public
 %{?_cov_wrap} %{make_build} build-tools
 %{make_build} -C docs man-pages
 
-%if 0%{?py2_compat}
-# Interim python2 bindings too
-%{make_build} DESTDIR=%{buildroot} PYTHON=python2 -C tools/python
-%{make_build} DESTDIR=%{buildroot} PYTHON=python2 -C tools/pygrub
-%endif
-
 # The hypervisor build system can't cope with RPM's {C,LD}FLAGS
 unset CFLAGS
 unset LDFLAGS
@@ -345,13 +328,6 @@ export PYTHON="%{__python}"
 
 # The existence of this directory causes ocamlfind to put things in it
 mkdir -p %{buildroot}%{_libdir}/ocaml/stublibs
-
-%if 0%{?py2_compat}
-# Interim python2 bindings.  Must be installed ahead of the main install-tools
-# so the Python3 scripts take priority.
-%{make_build} DESTDIR=%{buildroot} PYTHON=python2 install -C tools/python
-%{make_build} DESTDIR=%{buildroot} PYTHON=python2 install -C tools/pygrub
-%endif
 
 # Install tools and man pages
 %{make_build} DESTDIR=%{buildroot} install-tools
@@ -619,20 +595,9 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{py_sitearch}/xenfsimage.cpython*.so
 %{py_sitearch}/pygrub-0.7-py*.egg-info
 
-%if 0%{?py2_compat}
-%{python2_sitearch}/grub/
-%{python2_sitearch}/xenfsimage.so
-%{python2_sitearch}/pygrub-0.7-py*.egg-info
-%endif
-
 # Xen python libs
 %{py_sitearch}/xen-3.0-py*.egg-info
 %{py_sitearch}/xen/
-
-%if 0%{?py2_compat}
-%{python2_sitearch}/xen-3.0-py*.egg-info
-%{python2_sitearch}/xen/
-%endif
 
 %{_libexecdir}/%{name}/bin/convert-legacy-stream
 %{_libexecdir}/%{name}/bin/init-xenstore-domain
