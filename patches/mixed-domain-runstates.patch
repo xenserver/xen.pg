@@ -284,11 +284,11 @@ index 34062e24dfb7..0733cf8e62a4 100644
      INIT_PAGE_LIST_HEAD(&d->extra_page_list);
      INIT_PAGE_LIST_HEAD(&d->xenpage_list);
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index ea16b759109e..1e63fa8a54d7 100644
+index ea16b759109e..d09a3b9b08ce 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -866,6 +866,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
-                 __HYPERVISOR_domctl, "h", u_domctl);
+@@ -528,6 +528,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+                                         &d->node_affinity);
          break;
  
 +    case XEN_DOMCTL_get_runstate_info:
@@ -296,11 +296,11 @@ index ea16b759109e..1e63fa8a54d7 100644
 +        copyback = 1;
 +        break;
 +
-     default:
-         ret = arch_do_domctl(op, d, u_domctl);
-         break;
+     case XEN_DOMCTL_setvcpuaffinity:
+     case XEN_DOMCTL_getvcpuaffinity:
+         ret = vcpu_affinity_domctl(d, op->cmd, &op->u.vcpuaffinity);
 diff --git a/xen/common/sched/core.c b/xen/common/sched/core.c
-index 5f88b88ab4da..304f9c337309 100644
+index 5f88b88ab4da..ee26318ecfca 100644
 --- a/xen/common/sched/core.c
 +++ b/xen/common/sched/core.c
 @@ -276,6 +276,7 @@ static inline bool is_running_nonaffine(const struct vcpu *v,
@@ -381,7 +381,7 @@ index 5f88b88ab4da..304f9c337309 100644
      return ret;
  }
  
-+void domain_runstate_get(struct domain *d, domain_runstate_info_t *info)
++void domain_runstate_get(struct domain *d, struct xen_domctl_runstate_info_ext *info)
 +{
 +    struct vcpu *v;
 +
@@ -416,12 +416,12 @@ index 5f88b88ab4da..304f9c337309 100644
  {
      struct vcpu_runstate_info state = { 0 };
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index 2a49fe46ce25..8fdfb31e87d5 100644
+index 2a49fe46ce25..13aeb650e17c 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1218,6 +1218,50 @@ struct xen_domctl_dt_overlay {
+@@ -319,6 +319,49 @@ struct xen_domctl_nodeaffinity {
+     struct xenctl_bitmap nodemap;/* IN */
  };
- #endif
  
 +/*
 + * Return information about the state and running time of a domain.
@@ -466,83 +466,73 @@ index 2a49fe46ce25..8fdfb31e87d5 100644
 +};
 +typedef struct xen_domctl_runstate_info_ext xen_domctl_runstate_info_ext_t;
 +DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_ext_t);
-+
- struct xen_domctl {
-     uint32_t cmd;
- #define XEN_DOMCTL_createdomain                   1
-@@ -1306,6 +1350,7 @@ struct xen_domctl {
- #define XEN_DOMCTL_get_paging_mempool_size       85
- #define XEN_DOMCTL_set_paging_mempool_size       86
- #define XEN_DOMCTL_dt_overlay                    87
+ 
+ /* Get/set which physical cpus a vcpu can execute on. */
+ /* XEN_DOMCTL_setvcpuaffinity */
+@@ -1231,6 +1274,7 @@ struct xen_domctl {
+ #define XEN_DOMCTL_setvcpuaffinity                9
+ #define XEN_DOMCTL_shadow_op                     10
+ #define XEN_DOMCTL_max_mem                       11
 +#define XEN_DOMCTL_get_runstate_info             98
- #define XEN_DOMCTL_gdbsx_guestmemio            1000
- #define XEN_DOMCTL_gdbsx_pausevcpu             1001
- #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
-@@ -1356,6 +1401,7 @@ struct xen_domctl {
-         struct xen_domctl_set_access_required access_required;
-         struct xen_domctl_audit_p2m         audit_p2m;
-         struct xen_domctl_set_virq_handler  set_virq_handler;
+ #define XEN_DOMCTL_setvcpucontext                12
+ #define XEN_DOMCTL_getvcpucontext                13
+ #define XEN_DOMCTL_getvcpuinfo                   14
+@@ -1318,6 +1362,7 @@ struct xen_domctl {
+         struct xen_domctl_getdomaininfo     getdomaininfo;
+         struct xen_domctl_getpageframeinfo3 getpageframeinfo3;
+         struct xen_domctl_nodeaffinity      nodeaffinity;
 +        struct xen_domctl_runstate_info_ext domain_runstate;
-         struct xen_domctl_gdbsx_memio       gdbsx_guest_memio;
-         struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
-         struct xen_domctl_cacheflush        cacheflush;
+         struct xen_domctl_vcpuaffinity      vcpuaffinity;
+         struct xen_domctl_shadow_op         shadow_op;
+         struct xen_domctl_max_mem           max_mem;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 9be7bb93778e..0b8bc5e43611 100644
+index 9be7bb93778e..1d05aa17eccd 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -377,6 +377,8 @@ struct evtchn_port_ops;
+@@ -560,6 +560,11 @@ struct domain
  
- #define MAX_NR_IOREQ_SERVERS 8
+     struct arch_domain arch;
  
-+typedef struct xen_domctl_runstate_info_ext domain_runstate_info_t;
-+
- struct domain
- {
-     domid_t          domain_id;
-@@ -652,6 +654,11 @@ struct domain
- 
-     /* Holding CDF_* constant. Internal flags for domain creation. */
-     unsigned int cdf;
-+
 +    /* Domain runstates */
 +    spinlock_t runstate_lock;
 +    atomic_t runstate_missed_changes;
-+    domain_runstate_info_t runstate;
- } __aligned(PAGE_SIZE);
- 
- static inline struct page_list_head *page_to_list(
-@@ -1092,6 +1099,7 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
++    struct xen_domctl_runstate_info_ext runstate;
++
+     void *ssid; /* sHype security subject identifier */
+ #ifdef CONFIG_XSM_SILO
+     uint32_t silo_magic;
+@@ -1092,6 +1097,7 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
  
  struct vcpu_runstate_extra vcpu_runstate_get(
      const struct vcpu *v, struct vcpu_runstate_info *runstate);
-+void domain_runstate_get(struct domain *d, domain_runstate_info_t *info);
++void domain_runstate_get(struct domain *d, struct xen_domctl_runstate_info_ext *info);
  
  uint64_t get_cpu_idle_time(unsigned int cpu);
  void sched_guest_idle(void (*idle) (void), unsigned int cpu);
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
-index 415edee251f0..ab19d64ee47d 100644
+index 415edee251f0..c43b8f1242d3 100644
 --- a/xen/xsm/flask/hooks.c
 +++ b/xen/xsm/flask/hooks.c
-@@ -841,6 +841,9 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
-     case XEN_DOMCTL_set_paging_mempool_size:
-         return current_has_perm(d, SECCLASS_DOMAIN, DOMAIN__SETPAGINGMEMPOOL);
+@@ -717,6 +717,9 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
+     case XEN_DOMCTL_unpausedomain:
+         return current_has_perm(d, SECCLASS_DOMAIN, DOMAIN__UNPAUSE);
  
 +    case XEN_DOMCTL_get_runstate_info:
 +        return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__GET_RUNSTATE_INFO);
 +
-     case XEN_DOMCTL_dt_overlay:
-         return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__DT_OVERLAY);
- 
+     case XEN_DOMCTL_setvcpuaffinity:
+     case XEN_DOMCTL_setnodeaffinity:
+         return current_has_perm(d, SECCLASS_DOMAIN, DOMAIN__SETAFFINITY);
 diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
-index 78fe37583b18..0e10169d37a4 100644
+index 78fe37583b18..3b296bce88a8 100644
 --- a/xen/xsm/flask/policy/access_vectors
 +++ b/xen/xsm/flask/policy/access_vectors
-@@ -249,6 +249,8 @@ class domain2
-     psr_alloc
- # XENMEM_resource_map
-     resource_map
+@@ -219,6 +219,8 @@ class domain2
+     gettsc
+ # XEN_DOMCTL_settscinfo
+     settsc
 +# XEN_DOMCTL_get_runstate_info
 +    get_runstate_info
- # XEN_DOMCTL_get_cpu_policy
-     get_cpu_policy
- # XEN_DOMCTL_vuart_op
+ # XEN_DOMCTL_scheduler_op with XEN_DOMCTL_SCHEDOP_putinfo
+     setscheduler
+ # XENMEM_claim_pages
