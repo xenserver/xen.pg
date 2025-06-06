@@ -1,11 +1,11 @@
 # -*- rpm-spec -*-
 
 # Commitish for Source0, required by tooling.
-%global package_srccommit RELEASE-4.19.2
+%global package_srccommit RELEASE-4.20.1
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 13
+%global hv_rel 1
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -26,7 +26,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.19.2
+Version: 4.20.1
 Release: %{?xsrel}%{?dist}
 License: GPLv2 and LGPLv2 and MIT and Public Domain
 URL:     https://www.xenproject.org
@@ -497,8 +497,8 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/libxentoolcore.so.1.0
 %{_libdir}/libxentoollog.so.1
 %{_libdir}/libxentoollog.so.1.0
-%{_libdir}/libxenvchan.so.4.19
-%{_libdir}/libxenvchan.so.4.19.0
+%{_libdir}/libxenvchan.so.4.20
+%{_libdir}/libxenvchan.so.4.20.0
 
 %files libs-devel
 
@@ -616,6 +616,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libexecdir}/%{name}/bin/xenpaging
 %{_libexecdir}/%{name}/boot/hvmloader
 %{_libexecdir}/%{name}/boot/xen-shim
+%{_libexecdir}/%{name}/ocaml/xsd_glue/xenctrl_plugin/domain_getinfo_v1.cmxs
 %{_sbindir}/flask-get-bool
 %{_sbindir}/flask-getenforce
 %{_sbindir}/flask-label-pci
@@ -692,24 +693,24 @@ install_xen -%{hv_rel}-d build-xen-debug
 %files dom0-libs
 %{_libdir}/libxencall.so.1
 %{_libdir}/libxencall.so.1.3
-%{_libdir}/libxenctrl.so.4.19
-%{_libdir}/libxenctrl.so.4.19.0
+%{_libdir}/libxenctrl.so.4.20
+%{_libdir}/libxenctrl.so.4.20.0
 %{_libdir}/libxendevicemodel.so.1
 %{_libdir}/libxendevicemodel.so.1.4
 %{_libdir}/libxenforeignmemory.so.1
 %{_libdir}/libxenforeignmemory.so.1.4
-%{_libdir}/libxenfsimage.so.4.19
-%{_libdir}/libxenfsimage.so.4.19.0
-%{_libdir}/libxenguest.so.4.19
-%{_libdir}/libxenguest.so.4.19.0
+%{_libdir}/libxenfsimage.so.4.20
+%{_libdir}/libxenfsimage.so.4.20.0
+%{_libdir}/libxenguest.so.4.20
+%{_libdir}/libxenguest.so.4.20.0
 %{_libdir}/libxenhypfs.so.1
 %{_libdir}/libxenhypfs.so.1.0
-%{_libdir}/libxenlight.so.4.19
-%{_libdir}/libxenlight.so.4.19.0
-%{_libdir}/libxenstat.so.4.19
-%{_libdir}/libxenstat.so.4.19.0
-%{_libdir}/libxlutil.so.4.19
-%{_libdir}/libxlutil.so.4.19.0
+%{_libdir}/libxenlight.so.4.20
+%{_libdir}/libxenlight.so.4.20.0
+%{_libdir}/libxenstat.so.4.20
+%{_libdir}/libxenstat.so.4.20.0
+%{_libdir}/libxlutil.so.4.20
+%{_libdir}/libxlutil.so.4.20.0
 %{_libdir}/xenfsimage/btrfs/fsimage.so
 %{_libdir}/xenfsimage/ext2fs-lib/fsimage.so
 %{_libdir}/xenfsimage/fat/fsimage.so
@@ -730,6 +731,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/libxencall.so
 %{_libdir}/pkgconfig/xencall.pc
 
+%{_includedir}/xen-barrier.h
 %{_includedir}/xenctrl.h
 %{_includedir}/xenctrl_compat.h
 %{_libdir}/libxenctrl.a
@@ -797,6 +799,11 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_libdir}/ocaml/xenstore/META
 %exclude %{_libdir}/ocaml/xenstore/xenstore.cma
 %exclude %{_libdir}/ocaml/xenstore/xenstore.cmo
+%{_libdir}/ocaml/xsd_glue/META
+%{_libdir}/ocaml/xsd_glue/plugin_interface_v1.a
+%{_libdir}/ocaml/xsd_glue/plugin_interface_v1.cma
+%{_libdir}/ocaml/xsd_glue/plugin_interface_v1.cmi
+%{_libdir}/ocaml/xsd_glue/plugin_interface_v1.cmxa
 
 %files ocaml-devel
 %exclude %{_libdir}/ocaml/xenbus/libxenbus_stubs.a
