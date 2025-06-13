@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 13
+%global hv_rel 14
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,11 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Fri Jun 13 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-14
+- Fix for XSA-470 CVE-2025-27465
+- Fix booting on servers with RAM above the 16T boundary
+- Fix possible watchdog timeout caused by unnecessary cache flushing
+
 * Thu May  8 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-13
 - Fix for XSA-469 CVE-2024-28956
 
