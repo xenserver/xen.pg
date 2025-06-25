@@ -1,0 +1,64 @@
+From aa70996a6896dfc9de60f60540098b7d3ac3fb4f Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Wed, 11 Jun 2025 11:05:42 +0200
+Subject: x86/pmstat: Check size of PMSTAT_get_pxstat buffers
+
+Check that the total number of states passed in and hence the size of
+buffers is sufficient to avoid writing more than the caller has
+allocated.
+
+The interface is not explicit about whether getpx.total is expected to
+be set by the caller in this case but since it is always set in
+libxenctrl it seems reasonable to check it and make it explicit.
+
+Fixes: c06a7db0c547 ("X86 and IA64: Update cpufreq statistic logic for supporting both x86 and ia64")
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/drivers/acpi/pmstat.c b/xen/drivers/acpi/pmstat.c
+index f607bc110f0a..63c2cec5cc8c 100644
+--- a/xen/drivers/acpi/pmstat.c
++++ b/xen/drivers/acpi/pmstat.c
+@@ -103,8 +103,11 @@ int do_get_pm_info(struct xen_sysctl_get_pmstat *op)
+ 
+         cpufreq_residency_update(op->cpuid, pxpt->u.cur);
+ 
+-        ct = pmpt->perf.state_count;
+-        if ( copy_to_guest(op->u.getpx.trans_pt, pxpt->u.trans_pt, ct*ct) )
++        ct = min(pmpt->perf.state_count, op->u.getpx.total + 0U);
++
++        /* Avoid partial copying of 2-D array */
++        if ( ct == op->u.getpx.total &&
++             copy_to_guest(op->u.getpx.trans_pt, pxpt->u.trans_pt, ct * ct) )
+         {
+             spin_unlock(cpufreq_statistic_lock);
+             ret = -EFAULT;
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index eb1637170e70..8597645ffcec 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -205,11 +205,22 @@ typedef struct pm_px_val pm_px_val_t;
+ DEFINE_XEN_GUEST_HANDLE(pm_px_val_t);
+ 
+ struct pm_px_stat {
+-    uint8_t total;        /* total Px states */
++    /*
++     * IN: Number of elements in pt, number of rows/columns in trans_pt
++     *     (PMSTAT_get_pxstat)
++     * OUT: total Px states (PMSTAT_get_max_px, PMSTAT_get_pxstat)
++     */
++    uint8_t total;
+     uint8_t usable;       /* usable Px states */
+     uint8_t last;         /* last Px state */
+     uint8_t cur;          /* current Px state */
+-    XEN_GUEST_HANDLE_64(uint64) trans_pt;   /* Px transition table */
++    /*
++     * OUT: Px transition table. This should have total * total elements.
++     *      As it is a 2-D array, this will not be copied if input total is
++     *      less than output total. (PMSTAT_get_pxstat)
++     */
++    XEN_GUEST_HANDLE_64(uint64) trans_pt;
++    /* OUT: This should have total elements (PMSTAT_get_pxstat) */
+     XEN_GUEST_HANDLE_64(pm_px_val_t) pt;
+ };
+ 
