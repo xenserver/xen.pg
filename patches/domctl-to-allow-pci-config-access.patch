@@ -25,6 +25,8 @@ This interface would not allow writing to dom0's devices.
 
 Signed-off-by: Jennifer Herbert <jennifer.herbert@cloud.com>
 Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@cloud.com>
+
 diff --git a/tools/include/xenctrl.h b/tools/include/xenctrl.h
 index 4328b757c06f..d1f4a2cc2c25 100644
 --- a/tools/include/xenctrl.h
@@ -96,35 +98,13 @@ index af6348b6d957..24ba6d301d0d 100644
                   int min_width,
                   int max_width,
 diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
-index 44055c8ede85..23d7ad01128e 100644
+index 44055c8ede85..69c9b31c6915 100644
 --- a/xen/arch/x86/domctl.c
 +++ b/xen/arch/x86/domctl.c
-@@ -147,6 +147,127 @@ void arch_get_domain_info(const struct domain *d,
+@@ -147,6 +147,105 @@ void arch_get_domain_info(const struct domain *d,
      info->gpaddr_bits = hap_paddr_bits;
  }
  
-+static bool check_for_bar_access(struct pci_dev *pdev, uint32_t pos)
-+{
-+    uint8_t header_type;
-+
-+    if ( pos < PCI_BASE_ADDRESS_0 || pos > PCI_BASE_ADDRESS_5 )
-+        return false;
-+
-+    header_type = (pci_conf_read8(pdev->sbdf, PCI_HEADER_TYPE) & 0x7f);
-+
-+    if ( header_type == PCI_HEADER_TYPE_NORMAL )
-+        return true;
-+
-+    if ( header_type == PCI_HEADER_TYPE_BRIDGE &&
-+         ( pos == PCI_BASE_ADDRESS_0 || pos == PCI_BASE_ADDRESS_1 ) )
-+        return true;
-+
-+    if ( header_type == PCI_HEADER_TYPE_CARDBUS && pos == PCI_BASE_ADDRESS_0 )
-+        return true;
-+
-+    return false;
-+}
-+
 +static int pci_access(struct domain *d,
 +                      uint16_t seg, uint8_t bus, uint8_t dev, uint8_t func,
 +                      uint8_t size, uint8_t dir, uint32_t pos, uint64_t *data)
@@ -160,7 +140,7 @@ index 44055c8ede85..23d7ad01128e 100644
 +
 +    if ( dir & XEN_DOMCTL_pci_write )
 +    {
-+        if ( check_for_bar_access(pdev, pos) )
++        if ( !pdev_has_write_access(pdev, pos, size) )
 +        {
 +            rc = -EACCES;
 +        }
@@ -227,7 +207,7 @@ index 44055c8ede85..23d7ad01128e 100644
  static int do_vmtrace_op(struct domain *d, struct xen_domctl_vmtrace_op *op,
                           XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
  {
-@@ -219,6 +340,26 @@ long arch_do_domctl(
+@@ -219,6 +318,26 @@ long arch_do_domctl(
          copyback = true;
          break;
  
@@ -254,6 +234,220 @@ index 44055c8ede85..23d7ad01128e 100644
      case XEN_DOMCTL_ioport_permission:
      {
          unsigned int fp = domctl->u.ioport_permission.first_port;
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index fefa0e107f6f..bbe1f09dcec9 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -28,6 +28,7 @@
+ #include <xen/event.h>
+ #include <xen/guest_access.h>
+ #include <xen/paging.h>
++#include <xen/rangeset.h>
+ #include <xen/radix-tree.h>
+ #include <xen/softirq.h>
+ #include <xen/tasklet.h>
+@@ -53,6 +54,8 @@ struct pci_seg {
+ 
+ static DEFINE_RSPINLOCK(_pcidevs_lock);
+ 
++static int pdev_config_writable_init(struct pci_dev *pdev);
++
+ /* Do not use, as it has no speculation barrier, use pcidevs_lock() instead. */
+ void pcidevs_lock_unsafe(void)
+ {
+@@ -340,6 +343,8 @@ static struct pci_dev *alloc_pdev(struct pci_seg *pseg, u8 bus, u8 devfn)
+     arch_pci_init_pdev(pdev);
+ 
+     rc = pdev_msi_init(pdev);
++    if ( !rc )
++        rc = pdev_config_writable_init(pdev);
+     if ( rc )
+     {
+         xfree(pdev);
+@@ -459,6 +464,8 @@ static void free_pdev(struct pci_seg *pseg, struct pci_dev *pdev)
+     if ( pdev->info.is_virtfn )
+         list_del(&pdev->vf_list);
+ 
++    rangeset_destroy(pdev->config_writable);
++
+     xfree(pdev);
+ }
+ 
+@@ -1976,6 +1983,174 @@ int pci_iterate_devices(int (*handler)(struct pci_dev *pdev, void *arg),
+     return pci_segments_iterate(iterate_all, &iter) ?: iter.rc;
+ }
+ 
++struct pci_dev_config {
++    uint16_t start:12;
++    uint16_t version:4;
++    uint16_t id;
++};
++
++static int add_write_accessible(struct rangeset *config_writable,
++                                uint16_t start, uint16_t len)
++{
++    /* some sanity check */
++    if ( start >= 4096 || start + len > 4096 )
++        return 0;
++
++    return rangeset_add_range(config_writable, start, start + len - 1);
++}
++
++static int add_accesses(struct pci_dev *pdev,
++                        struct pci_dev_config *configs, uint16_t num_configs)
++{
++    int rc;
++    struct rangeset *config_writable = rangeset_new(NULL, "config writable", 0);
++
++    if ( !config_writable )
++        return -ENOMEM;
++
++#define add_write_accessible(start, len) do { \
++        rc = add_write_accessible(config_writable, start, len); \
++        if ( rc < 0 ) goto fail; \
++    } while(0)
++
++    /* Base ones (offsets 0-0x40) */
++    add_write_accessible(PCI_COMMAND, 2);
++    add_write_accessible(PCI_STATUS, 2);
++
++    /* Scan various configurations */
++    for ( unsigned int i = 0; i < num_configs; ++i )
++    {
++        const struct pci_dev_config *const config = &configs[i];
++
++        if ( config->start < 0x100 && config->id == PCI_CAP_ID_MSIX )
++            add_write_accessible(config->start + PCI_MSIX_FLAGS, 2);
++    }
++
++    /* Link to the device */
++    pdev->config_writable = config_writable;
++    return 0;
++
++ fail:
++    rangeset_destroy(config_writable);
++    return rc;
++}
++
++static int pdev_config_writable_init(struct pci_dev *pdev)
++{
++    /*
++     * Capabilities starts at a multiple of 4 bytes, use a bitmap to mark
++     * already encountered starts.
++     * We need to do this to avoid circular scanning, the order of the
++     * capability offsets is not always increasing.
++     */
++    enum { NUM_CAP_STARTS = 4096 / 4 };
++    struct pci_dev_config *configs = NULL;
++    uint16_t num_configs;
++    DECLARE_BITMAP(cap_starts, NUM_CAP_STARTS);
++    uint16_t status;
++    uint32_t header;
++    int rc;
++
++    bitmap_zero(cap_starts, NUM_CAP_STARTS);
++
++    /* Scan all capabilities */
++    status = pci_conf_read16(pdev->sbdf, PCI_STATUS);
++    if ( (status & PCI_STATUS_CAP_LIST) != 0 )
++    {
++        for ( uint8_t pos = PCI_CAPABILITY_LIST; ; pos += PCI_CAP_LIST_NEXT )
++        {
++            uint8_t id;
++
++            pos = pci_conf_read8(pdev->sbdf, pos);
++            if ( pos < 0x40 )
++                break;
++
++            pos &= ~3;
++            /* avoids recursion */
++            if ( test_bit(pos / 4, cap_starts) )
++                break;
++            set_bit(pos / 4, cap_starts);
++
++            id = pci_conf_read8(pdev->sbdf, pos + PCI_CAP_LIST_ID);
++
++            if ( id == 0xff )
++                break;
++        }
++    }
++
++    /* Scan all extended capabilities */
++    header = pci_conf_read32(pdev->sbdf, 0x100);
++
++    /*
++     * If we have no capabilities, this is indicated by cap ID,
++     * cap version and next pointer all being 0.
++     */
++    if ( header != 0 && header != -1 )
++    {
++        unsigned int pos = 0x100;
++
++        for ( ; ; )
++        {
++            /* avoids recursion */
++            if ( test_bit(pos / 4, cap_starts) )
++                break;
++            set_bit(pos / 4, cap_starts);
++
++            pos = PCI_EXT_CAP_NEXT(header);
++            if ( pos < 0x100 )
++                break;
++            header = pci_conf_read32(pdev->sbdf, pos);
++        }
++    }
++
++    num_configs = bitmap_weight(cap_starts, NUM_CAP_STARTS);
++    configs = xzalloc_array(struct pci_dev_config, num_configs);
++    if ( !configs )
++        return -ENOMEM;
++
++    for ( unsigned int start = find_first_bit(cap_starts, NUM_CAP_STARTS),
++          i = 0;
++          start < NUM_CAP_STARTS;
++          start = find_next_bit(cap_starts, NUM_CAP_STARTS, start + 1) )
++    {
++        const unsigned int pos = start * 4;
++        struct pci_dev_config *const config = &configs[i++];
++
++        config->start = pos;
++        if ( pos < 0x100 )
++        {
++            uint8_t id = pci_conf_read8(pdev->sbdf, pos + PCI_CAP_LIST_ID);
++
++            config->version = 0;
++            config->id = id;
++        }
++        else
++        {
++            uint32_t header = pci_conf_read32(pdev->sbdf, pos);
++
++            config->version = PCI_EXT_CAP_VER(header);
++            config->id = PCI_EXT_CAP_ID(header);
++        }
++    }
++
++    rc = add_accesses(pdev, configs, num_configs);
++    xfree(configs);
++
++    return min(rc, 0);
++}
++
++bool pdev_has_write_access(const struct pci_dev *pdev,
++                           uint32_t pos, uint8_t size)
++{
++    ASSERT(pdev->config_writable);
++
++    if ( pos >= 4096 )
++        return false;
++
++    /* Search entry in writable table */
++    return rangeset_contains_range(pdev->config_writable, pos, pos + size - 1);
++}
++
+ /*
+  * Local variables:
+  * mode: C
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
 index 13aeb650e17c..4cca5eefd6f5 100644
 --- a/xen/include/public/domctl.h
@@ -310,3 +504,24 @@ index 13aeb650e17c..4cca5eefd6f5 100644
          struct xen_domctl_vcpucontext       vcpucontext;
          struct xen_domctl_getvcpuinfo       getvcpuinfo;
          struct xen_domctl_max_vcpus         max_vcpus;
+diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
+index 93a07503f31d..76660381db8f 100644
+--- a/xen/include/xen/pci.h
++++ b/xen/include/xen/pci.h
+@@ -167,6 +167,8 @@ struct pci_dev {
+ 
+     /* Data for vPCI. */
+     struct vpci *vpci;
++
++    struct rangeset *config_writable;
+ };
+ 
+ #define for_each_pdev(domain, pdev) \
+@@ -289,4 +291,7 @@ static inline int arch_pci_clean_pirqs(struct domain *d)
+ }
+ #endif /* CONFIG_HVM */
+ 
++bool pdev_has_write_access(const struct pci_dev *pdev,
++                           uint32_t pos, uint8_t size);
++
+ #endif /* __XEN_PCI_H__ */
