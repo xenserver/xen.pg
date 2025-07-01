@@ -5,7 +5,36 @@ device assigned to the target domain. This prevents a malicious dom0 userspace
 mapping iomem into a domain and then using it to control a device to attack
 dom0 kernel space.
 
+In current vGPU implementation card is owned by dom0 but guests has also
+access to card memory.
+Currently if secure boot is enabled memory can be accessed only by
+assigned domain.
+Allow Nidia GPU cards memory to be shared with other guests to make vGPU
+work.
+
+The list of card device IDs was extracted from vgpuConfig.xml
+configuration file using this file (stripped down to put into this commit
+message, original script had many more checks):
+
+#!/usr/bin/env python3
+import xml.dom.minidom
+
+fn = 'vgpuConfig.xml'
+doc = xml.dom.minidom.parseString(open(fn).read())
+
+ids = set()
+for p in doc.getElementsByTagName('pgpu'):
+    dev = p.getElementsByTagName('devId')[0]
+    v = dev.getAttribute('vendorId')
+    dev = dev.getAttribute('deviceId')
+    assert v.lower() == '0x10de' and dev != ''
+    if p.getAttribute('hostVgpuMode') != 'sriov':
+        ids.add(dev.lower())
+print('\n'.join(sorted(ids)))
+
 Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Signed-off-by: Kevin Lampis <kevin.lampis@cloud.com>
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
 index 54f510394fbb..da4f941c005b 100644
 --- a/xen/common/domctl.c
@@ -21,26 +50,57 @@ index 54f510394fbb..da4f941c005b 100644
          else if ( allow )
              ret = iomem_permit_access(d, mfn, mfn + nr_mfns - 1);
 diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
-index bb935ac126a5..0ba8ed5d339f 100644
+index bb935ac126a5..34ba7623211f 100644
 --- a/xen/drivers/passthrough/pci.c
 +++ b/xen/drivers/passthrough/pci.c
-@@ -640,6 +640,168 @@ out:
-     return rc;
+@@ -584,6 +584,227 @@ struct pci_dev *pci_get_pdev(const struct domain *d, pci_sbdf_t sbdf)
+     return NULL;
  }
  
-+int check_iomem_access(const struct domain *d, xen_pfn_t mfn_start,
-+                       xen_pfn_t mfn_end)
++static bool is_nvidia_legacy_vgpu(uint16_t device_id)
++{
++    switch ( device_id )
++    {
++    /* list of Nvidia device IDs implementing legacy vGPU */
++    case 0x13bd: /* GM107GL [Tesla M10] */
++    case 0x13f2:
++    case 0x13f3:
++    case 0x15f7:
++    case 0x15f8:
++    case 0x15f9:
++    case 0x1b38:
++    case 0x1bb3:
++    case 0x1bb4:
++    case 0x1db1: /* GV100GL [Tesla V100-SXM2-16GB] */
++    case 0x1db3: /* GV100GL [Tesla V100-FHHL-16GB] */
++    case 0x1db4: /* GV100GL [Tesla V100-PCIE-16GB] */
++    case 0x1db5: /* GV100GL [Tesla V100-SXM2-32GB] */
++    case 0x1db6: /* GV100GL [Tesla V100-PCIE-32GB] */
++    case 0x1df6: /* GV100GL [Tesla V100S-PCIE-32GB] */
++    case 0x1e30: /* TU102GL [Quadro RTX 6000/8000] */
++    case 0x1e78: /* TU102GL [Quadro RTX 6000/8000] */
++    case 0x1eb8: /* TU104GL [Tesla T4] */
++        return true;
++    }
++    return false;
++}
++
++static int check_iomem_access_vgpu(const struct domain *d, xen_pfn_t mfn_start,
++                                   xen_pfn_t mfn_end, bool vgpu)
 +{
 +    struct pci_dev *pdev;
 +    int rc = 0;
-+
-+    if ( !is_locked_down() )
-+        return 0;
 +
 +    pcidevs_lock();
 +    list_for_each_entry ( pdev, &d->pdev_list, domain_list )
 +    {
 +        unsigned int i;
++
++        /* filter out no vGPU if vGPU is required */
++        if ( vgpu &&
++             (pci_conf_read16(pdev->sbdf, PCI_VENDOR_ID) != PCI_VENDOR_ID_NVIDIA ||
++              !is_nvidia_legacy_vgpu(pci_conf_read16(pdev->sbdf, PCI_DEVICE_ID))) )
++            continue;
 +
 +        if ( pdev->info.is_virtfn )
 +        {
@@ -140,11 +200,19 @@ index bb935ac126a5..0ba8ed5d339f 100644
 +                    continue;
 +                }
 +
-+                addr = 0;
-+                size = 0;
-+                rc = pci_size_mem_bar(pdev->sbdf, idx, &addr, &size,
-+                                      (i == PCI_HEADER_NORMAL_NR_BARS - 1) ?
-+                                          PCI_BAR_LAST : 0);
++                if ( !pdev->bar[i].init )
++                {
++                    rc = pci_size_mem_bar(pdev->sbdf, idx, &pdev->bar[i].addr, &pdev->bar[i].size,
++                                          (i == PCI_HEADER_NORMAL_NR_BARS - 1) ?
++                                              PCI_BAR_LAST : 0);
++                    pdev->bar[i].is64 = (rc == 2);
++                    pdev->bar[i].init = true;
++                }
++
++                addr = pdev->bar[i].addr;
++                size = pdev->bar[i].size;
++                rc = pdev->bar[i].is64 ? 2 : 1;
++
 +                i += rc;
 +
 +                if ( !addr || !size )
@@ -159,6 +227,7 @@ index bb935ac126a5..0ba8ed5d339f 100644
 +            }
 +
 +            /* Handle the ROM BAR */
++            /* TODO use pci_size_mem_bar() if possible */
 +            addr = 0;
 +            size = 0;
 +
@@ -166,7 +235,9 @@ index bb935ac126a5..0ba8ed5d339f 100644
 +            addr = bar & PCI_ROM_ADDRESS_MASK;
 +
 +            pci_conf_write32(pdev->sbdf,
-+                             PCI_ROM_ADDRESS, bar | (uint32_t)PCI_ROM_ADDRESS_MASK);
++                             PCI_ROM_ADDRESS,
++                             (bar | PCI_ROM_ADDRESS_MASK) & ~PCI_ROM_ADDRESS_ENABLE);
++
 +            size = pci_conf_read32(pdev->sbdf, PCI_ROM_ADDRESS);
 +            pci_conf_write32(pdev->sbdf, PCI_ROM_ADDRESS, bar);
 +            size &= ~(size - 1);
@@ -190,14 +261,45 @@ index bb935ac126a5..0ba8ed5d339f 100644
 +    return rc;
 +}
 +
- /**
-  * pci_enable_acs - enable ACS if hardware support it
-  * @dev: the PCI device
++int check_iomem_access(const struct domain *d, xen_pfn_t mfn_start,
++                       xen_pfn_t mfn_end)
++{
++    int rc;
++
++    if ( !is_locked_down() )
++        return 0;
++
++    rc = check_iomem_access_vgpu(d, mfn_start, mfn_end, false);
++    if ( rc == 0 ||
++         current->domain == d ||
++         !is_hardware_domain(current->domain) )
++        return rc;
++
++    return check_iomem_access_vgpu(current->domain, mfn_start, mfn_end, true);
++}
++
+ int check_ioport_access(const struct domain *d, unsigned int port_start,
+                         unsigned int port_end)
+ {
 diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
-index 23bcc846b35c..09a6bf958f7f 100644
+index 23bcc846b35c..062dd6fa2dbb 100644
 --- a/xen/include/xen/pci.h
 +++ b/xen/include/xen/pci.h
-@@ -270,6 +270,9 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
+@@ -172,6 +172,13 @@ struct pci_dev {
+     struct vpci *vpci;
+ 
+     struct rangeset *config_writable;
++
++    struct bar {
++        uint64_t addr;
++        uint64_t size;
++        bool init;
++        bool is64;
++    } bar[PCI_HEADER_NORMAL_NR_BARS];
+ };
+ 
+ #define for_each_pdev(domain, pdev) \
+@@ -270,6 +277,9 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
  int check_ioport_access(const struct domain *d, unsigned int port_start,
                          unsigned int port_end);
  
