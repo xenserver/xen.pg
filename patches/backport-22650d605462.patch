@@ -1,0 +1,307 @@
+From 22650d6054625be10172fe0c78b9cadd1a39bd63 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Mon, 26 May 2025 13:27:45 +0200
+Subject: x86/hvmloader: select xen platform pci MMIO BAR UC or WB MTRR cache
+ attribute
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Xen platform PCI device (vendor ID 0x5853) exposed to x86 HVM guests
+doesn't have the functionality of a traditional PCI device.  The exposed
+MMIO BAR is used by some guests (including Linux) as a safe place to map
+foreign memory, including the grant table itself.
+
+Traditionally BARs from devices have the uncacheable (UC) cache attribute
+from the MTRR, to ensure correct functionality of such devices.  hvmloader
+mimics this behavior and sets the MTRR attributes of both the low and high
+PCI MMIO windows (where BARs of PCI devices reside) as UC in MTRR.
+
+This however causes performance issues for users of the Xen platform PCI
+device BAR, as for the purposes of mapping remote memory there's no need to
+use the UC attribute.  On Intel systems this is worked around by using
+iPAT, that allows the hypervisor to force the effective cache attribute of
+a p2m entry regardless of the guest PAT value.  AMD however doesn't have an
+equivalent of iPAT, and guest PAT values are always considered.
+
+Linux commit:
+
+41925b105e34 xen: replace xen_remap() with memremap()
+
+Attempted to mitigate this by forcing mappings of the grant-table to use
+the write-back (WB) cache attribute.  However Linux memremap() takes MTRRs
+into account to calculate which PAT type to use, and seeing the MTRR cache
+attribute for the region being UC the PAT also ends up as UC, regardless of
+the caller having requested WB.
+
+As a workaround to allow current Linux to map the grant-table as WB using
+memremap() introduce an xl.cfg option (xen_platform_pci_bar_uc=0) that can
+be used to select whether the Xen platform PCI device BAR will have the UC
+attribute in MTRR.  Such workaround in hvmloader should also be paired with
+a fix for Linux so it attempts to change the MTRR of the Xen platform PCI
+device BAR to WB by itself.
+
+Overall, the long term solution would be to provide the guest with a safe
+range in the guest physical address space where mappings to foreign pages
+can be created.
+
+Some vif throughput performance figures provided by Anthoine from a 8
+vCPUs, 4GB of RAM HVM guest(s) running on AMD hardware:
+
+Without this patch:
+vm -> dom0: 1.1Gb/s
+vm -> vm:   5.0Gb/s
+
+With the patch:
+vm -> dom0: 4.5Gb/s
+vm -> vm:   7.0Gb/s
+
+Reported-by: Anthoine Bourgeois <anthoine.bourgeois@vates.tech>
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Oleksii Kurochko<oleksii.kurochko@gmail.com>
+Acked-by: Jan Beulich <jbeulich@suse.com> # hvmloader
+Reviewed-by: Anthony PERARD <anthony.perard@vates.tech>
+
+diff --git a/docs/man/xl.cfg.5.pod.in b/docs/man/xl.cfg.5.pod.in
+index 17324aa0ac1a..30475b864bc4 100644
+--- a/docs/man/xl.cfg.5.pod.in
++++ b/docs/man/xl.cfg.5.pod.in
+@@ -2205,6 +2205,14 @@ Windows L<https://xenproject.org/windows-pv-drivers/>.
+ Setting B<xen_platform_pci=0> with the default device_model "qemu-xen"
+ requires at least QEMU 1.6.
+ 
++
++=item B<xen_platform_pci_bar_uc=BOOLEAN>
++
++B<x86 only:> Select whether the memory BAR of the Xen platform PCI device
++should have uncacheable (UC) cache attribute set in MTRR.
++
++Default is B<true>.
++
+ =item B<viridian=[ "GROUP", "GROUP", ...]> or B<viridian=BOOLEAN>
+ 
+ The groups of Microsoft Hyper-V (AKA viridian) compatible enlightenments
+diff --git a/docs/misc/xenstore-paths.pandoc b/docs/misc/xenstore-paths.pandoc
+index bffb8ea5442b..3a4107a0f50a 100644
+--- a/docs/misc/xenstore-paths.pandoc
++++ b/docs/misc/xenstore-paths.pandoc
+@@ -234,6 +234,11 @@ These xenstore values are used to override some of the default string
+ values in the SMBIOS table constructed in hvmloader. See the SMBIOS
+ table specification at http://www.dmtf.org/standards/smbios/ 
+ 
++#### ~/hvmloader/pci/xen-platform-pci-bar-uc = ("1"|"0") [HVM,INTERNAL]
++
++Select whether the Xen platform PCI device MMIO BAR will have the uncacheable
++cache attribute set in the MTRRs by hvmloader.
++
+ #### ~/bios-strings/oem-* = STRING [HVM,INTERNAL]
+ 
+ 1 to 99 OEM strings can be set in xenstore using values of the form
+diff --git a/tools/firmware/hvmloader/config.h b/tools/firmware/hvmloader/config.h
+index cd716bf39245..4e21468743a8 100644
+--- a/tools/firmware/hvmloader/config.h
++++ b/tools/firmware/hvmloader/config.h
+@@ -57,7 +57,7 @@ extern uint8_t ioapic_version;
+ #define ACPI_TIS_HDR_ADDRESS 0xFED40F00UL
+ 
+ extern uint32_t pci_mem_start;
+-extern const uint32_t pci_mem_end;
++extern uint32_t pci_mem_end;
+ extern uint64_t pci_hi_mem_start, pci_hi_mem_end;
+ 
+ extern bool acpi_enabled;
+diff --git a/tools/firmware/hvmloader/pci.c b/tools/firmware/hvmloader/pci.c
+index c3c61ca060a6..6d9dfb89d80b 100644
+--- a/tools/firmware/hvmloader/pci.c
++++ b/tools/firmware/hvmloader/pci.c
+@@ -29,8 +29,10 @@
+ #include <xen/hvm/hvm_xs_strings.h>
+ #include <xen/hvm/e820.h>
+ 
++#define PCI_VENDOR_ID_XEN       0x5853
++
+ uint32_t pci_mem_start = HVM_BELOW_4G_MMIO_START;
+-const uint32_t pci_mem_end = RESERVED_MEMBASE;
++uint32_t pci_mem_end = RESERVED_MEMBASE;
+ uint64_t pci_hi_mem_start = 0, pci_hi_mem_end = 0;
+ 
+ /*
+@@ -126,6 +128,8 @@ void pci_setup(void)
+      * option that will have the least impact.
+      */
+     bool allow_memory_relocate = 1;
++    /* Select the MTRR cache attribute of the xen platform pci device BAR. */
++    bool xenpci_bar_uc = true;
+ 
+     BUILD_BUG_ON((typeof(*pci_devfn_decode_type))PCI_COMMAND_IO !=
+                  PCI_COMMAND_IO);
+@@ -140,6 +144,12 @@ void pci_setup(void)
+     printf("Relocating guest memory for lowmem MMIO space %s\n",
+            allow_memory_relocate?"enabled":"disabled");
+ 
++    s = xenstore_read(HVM_XS_XEN_PLATFORM_PCI_BAR_UC, NULL);
++    if ( s )
++        xenpci_bar_uc = strtoll(s, NULL, 0);
++    printf("Xen platform PCI device BAR MTRR cache attribute set to %s\n",
++           xenpci_bar_uc ? "UC" : "WB");
++
+     s = xenstore_read("platform/mmio_hole_size", NULL);
+     if ( s )
+         mmio_hole_size = strtoll(s, NULL, 0);
+@@ -281,6 +291,44 @@ void pci_setup(void)
+             if ( bar_sz == 0 )
+                 continue;
+ 
++            if ( !xenpci_bar_uc &&
++                 ((bar_data & PCI_BASE_ADDRESS_SPACE) ==
++                   PCI_BASE_ADDRESS_SPACE_MEMORY) &&
++                 vendor_id == PCI_VENDOR_ID_XEN &&
++                 (device_id == 0x0001 || device_id == 0x0002) )
++            {
++                if ( is_64bar )
++                {
++                     printf("xen platform pci dev %02x:%x unexpected MMIO 64bit BAR%u\n",
++                            devfn >> 3, devfn & 7, bar);
++                     goto skip_xenpci;
++                }
++
++                if ( bar_sz > pci_mem_end ||
++                     ((pci_mem_end - bar_sz) & ~(bar_sz - 1)) < pci_mem_start )
++                {
++                     printf("xen platform pci dev %02x:%x BAR%u size %llx overflows low PCI hole\n",
++                            devfn >> 3, devfn & 7, bar, bar_sz);
++                     goto skip_xenpci;
++                }
++
++                /* Put unconditionally at the end of the low PCI MMIO hole. */
++                pci_mem_end -= bar_sz;
++                pci_mem_end &= ~(bar_sz - 1);
++                bar_data &= ~PCI_BASE_ADDRESS_MEM_MASK;
++                bar_data |= pci_mem_end;
++                pci_writel(devfn, bar_reg, bar_data);
++                pci_devfn_decode_type[devfn] |= PCI_COMMAND_MEMORY;
++
++                /* Prefix BAR address with a 0 to match format used below. */
++                printf("pci dev %02x:%x bar %02x size "PRIllx": 0%08x\n",
++                       devfn >> 3, devfn & 7, bar_reg,
++                       PRIllx_arg(bar_sz), bar_data);
++
++                continue;
++            }
++ skip_xenpci:
++
+             for ( i = 0; i < nr_bars; i++ )
+                 if ( bars[i].bar_sz < bar_sz )
+                     break;
+@@ -320,7 +368,7 @@ void pci_setup(void)
+         }
+ 
+         /* Enable bus master for this function later */
+-        pci_devfn_decode_type[devfn] = PCI_COMMAND_MASTER;
++        pci_devfn_decode_type[devfn] |= PCI_COMMAND_MASTER;
+     }
+ 
+     if ( mmio_hole_size )
+diff --git a/tools/firmware/hvmloader/util.c b/tools/firmware/hvmloader/util.c
+index d3b3f9038e64..9b858c8721b0 100644
+--- a/tools/firmware/hvmloader/util.c
++++ b/tools/firmware/hvmloader/util.c
+@@ -874,7 +874,7 @@ void hvmloader_acpi_build_tables(struct acpi_config *config,
+         config->table_flags |= ACPI_HAS_HPET;
+ 
+     config->pci_start = pci_mem_start;
+-    config->pci_len = pci_mem_end - pci_mem_start;
++    config->pci_len = RESERVED_MEMBASE - pci_mem_start;
+     if ( pci_hi_mem_end > pci_hi_mem_start )
+     {
+         config->pci_hi_start = pci_hi_mem_start;
+diff --git a/tools/include/libxl.h b/tools/include/libxl.h
+index a3c7efc7f261..8ee95368177a 100644
+--- a/tools/include/libxl.h
++++ b/tools/include/libxl.h
+@@ -1416,6 +1416,15 @@ void libxl_mac_copy(libxl_ctx *ctx, libxl_mac *dst, const libxl_mac *src);
+  */
+ #define LIBXL_HAVE_CREATEINFO_XEND_SUSPEND_EVTCHN_COMPAT
+ 
++/*
++ * LIBXL_HAVE_XEN_PLATFORM_PCI_BAR_UC
++ *
++ * libxl_domain_build_info contains a boolean 'u.hvm.xen_platform_pci_bar_uc'
++ * field to signal whether the XenPCI device BAR should have UC cache attribute
++ * set in MTRR.
++ */
++#define LIBXL_HAVE_XEN_PLATFORM_PCI_BAR_UC
++
+ typedef char **libxl_string_list;
+ void libxl_string_list_dispose(libxl_string_list *sl);
+ int libxl_string_list_length(const libxl_string_list *sl);
+diff --git a/tools/libs/light/libxl_create.c b/tools/libs/light/libxl_create.c
+index 6e8888f37da9..2ec10ca604a4 100644
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -376,6 +376,7 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
+         libxl_defbool_setdefault(&b_info->u.hvm.usb,                false);
+         libxl_defbool_setdefault(&b_info->u.hvm.vkb_device,         true);
+         libxl_defbool_setdefault(&b_info->u.hvm.xen_platform_pci,   true);
++        libxl_defbool_setdefault(&b_info->u.hvm.xen_platform_pci_bar_uc, true);
+         libxl_defbool_setdefault(&b_info->u.hvm.pirq,               false);
+ 
+         libxl_defbool_setdefault(&b_info->u.hvm.spice.enable, false);
+diff --git a/tools/libs/light/libxl_dom.c b/tools/libs/light/libxl_dom.c
+index 7df3a5353818..7ddc1b762486 100644
+--- a/tools/libs/light/libxl_dom.c
++++ b/tools/libs/light/libxl_dom.c
+@@ -786,6 +786,15 @@ static int hvm_build_set_xs_values(libxl__gc *gc,
+             goto err;
+     }
+ 
++    if (info->type == LIBXL_DOMAIN_TYPE_HVM) {
++        path = GCSPRINTF("/local/domain/%d/" HVM_XS_XEN_PLATFORM_PCI_BAR_UC,
++                         domid);
++        ret = libxl__xs_printf(gc, XBT_NULL, path, "%d",
++            libxl_defbool_val(info->u.hvm.xen_platform_pci_bar_uc));
++        if (ret)
++            goto err;
++    }
++
+     return 0;
+ 
+ err:
+diff --git a/tools/libs/light/libxl_types.idl b/tools/libs/light/libxl_types.idl
+index 011d82e2cc32..9390129a513d 100644
+--- a/tools/libs/light/libxl_types.idl
++++ b/tools/libs/light/libxl_types.idl
+@@ -628,6 +628,7 @@ libxl_domain_build_info = Struct("domain_build_info",[
+                                        ("vkb_device",       libxl_defbool),
+                                        ("soundhw",          string),
+                                        ("xen_platform_pci", libxl_defbool),
++                                       ("xen_platform_pci_bar_uc", libxl_defbool),
+                                        ("usbdevice_list",   libxl_string_list),
+                                        ("vendor_device",    libxl_vendor_device),
+                                        # See libxl_ms_vm_genid_generate()
+diff --git a/tools/xl/xl_parse.c b/tools/xl/xl_parse.c
+index 685177a8361c..242263d06fd5 100644
+--- a/tools/xl/xl_parse.c
++++ b/tools/xl/xl_parse.c
+@@ -2711,6 +2711,8 @@ skip_usbdev:
+         xlu_cfg_replace_string (config, "soundhw", &b_info->u.hvm.soundhw, 0);
+         xlu_cfg_get_defbool(config, "xen_platform_pci",
+                             &b_info->u.hvm.xen_platform_pci, 0);
++        xlu_cfg_get_defbool(config, "xen_platform_pci_bar_uc",
++                            &b_info->u.hvm.xen_platform_pci_bar_uc, 0);
+ 
+         if(b_info->u.hvm.vnc.listen
+            && b_info->u.hvm.vnc.display
+diff --git a/xen/include/public/hvm/hvm_xs_strings.h b/xen/include/public/hvm/hvm_xs_strings.h
+index e1ed078628a0..e977d5a8b186 100644
+--- a/xen/include/public/hvm/hvm_xs_strings.h
++++ b/xen/include/public/hvm/hvm_xs_strings.h
+@@ -14,6 +14,8 @@
+ #define HVM_XS_BIOS                    "hvmloader/bios"
+ #define HVM_XS_GENERATION_ID_ADDRESS   "hvmloader/generation-id-address"
+ #define HVM_XS_ALLOW_MEMORY_RELOCATE   "hvmloader/allow-memory-relocate"
++/* Set Xen platform pci device BAR as UC in MTRR */
++#define HVM_XS_XEN_PLATFORM_PCI_BAR_UC "hvmloader/pci/xen-platform-pci-bar-uc"
+ 
+ /* The following values allow additional ACPI tables to be added to the
+  * virtual ACPI BIOS that hvmloader constructs. The values specify the guest

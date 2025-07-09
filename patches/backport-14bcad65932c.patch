@@ -1,4 +1,4 @@
-From 619fa301612ca2ab9e105ae2676d9160b02eb7ff Mon Sep 17 00:00:00 2001
+From 14bcad65932ce4d5651885de2bade58e8792715a Mon Sep 17 00:00:00 2001
 From: Andrew Cooper <andrew.cooper3@citrix.com>
 Date: Thu, 29 Aug 2024 17:36:11 +0100
 Subject: x86/spec-ctrl: Mitigate Transitive Scheduler Attacks
@@ -11,18 +11,20 @@ unaffected parts to date.
 
 A third new bit indicates that VERW now has a flushing side effect.  Xen must
 synthesise this bit on affected systems based on microcode version.  As with
-other VERW-based flusing features, VERW_CLEAR needs OR-ing across a resource
+other VERW-based flushing features, VERW_CLEAR needs OR-ing across a resource
 pool, and guests which have seen it can safely migrate in.
 
 This is part of XSA-471 / CVE-2024-36350 / CVE-2024-36357.
 
 Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 578b34adb1cc149dfeeb2491f84eed43fcd1ee2f)
+
 diff --git a/tools/misc/xen-cpuid.c b/tools/misc/xen-cpuid.c
-index e909ae2e5130..1f1ce6bf7307 100644
+index 7704980b8a9b..04035d565eb5 100644
 --- a/tools/misc/xen-cpuid.c
 +++ b/tools/misc/xen-cpuid.c
-@@ -196,6 +196,7 @@ static const char *const str_7a1[32] =
+@@ -194,6 +194,7 @@ static const char *const str_7a1[32] =
  static const char *const str_e21a[32] =
  {
      [ 2] = "lfence+",
@@ -30,7 +32,7 @@ index e909ae2e5130..1f1ce6bf7307 100644
      [ 6] = "nscb",
      [ 8] = "auto-ibrs",
  
-@@ -250,6 +251,8 @@ static const char *const str_m10Al[64] =
+@@ -246,6 +247,8 @@ static const char *const str_m10Al[64] =
  
  static const char *const str_e21c[32] =
  {
@@ -40,10 +42,10 @@ index e909ae2e5130..1f1ce6bf7307 100644
  
  static const struct {
 diff --git a/xen/arch/x86/cpu-policy.c b/xen/arch/x86/cpu-policy.c
-index 460a78d3caed..3720691c777d 100644
+index b4d3fa824363..f259c77435ea 100644
 --- a/xen/arch/x86/cpu-policy.c
 +++ b/xen/arch/x86/cpu-policy.c
-@@ -505,6 +505,17 @@ static void __init guest_common_max_feature_adjustments(uint32_t *fs)
+@@ -476,6 +476,17 @@ static void __init guest_common_max_feature_adjustments(uint32_t *fs)
          if ( test_bit(X86_FEATURE_RTM, fs) )
              __set_bit(X86_FEATURE_RTM_ALWAYS_ABORT, fs);
          break;
@@ -61,7 +63,7 @@ index 460a78d3caed..3720691c777d 100644
      }
  
      /*
-@@ -583,6 +594,17 @@ static void __init guest_common_default_feature_adjustments(uint32_t *fs)
+@@ -554,6 +565,17 @@ static void __init guest_common_default_feature_adjustments(uint32_t *fs)
              __set_bit(X86_FEATURE_RTM_ALWAYS_ABORT, fs);
          }
          break;
@@ -80,23 +82,24 @@ index 460a78d3caed..3720691c777d 100644
  
      /*
 diff --git a/xen/arch/x86/hvm/svm/entry.S b/xen/arch/x86/hvm/svm/entry.S
-index fa56477dcb0b..b6e11b209a68 100644
+index 8779856fb5a6..9233d6fbfbc5 100644
 --- a/xen/arch/x86/hvm/svm/entry.S
 +++ b/xen/arch/x86/hvm/svm/entry.S
-@@ -101,6 +101,8 @@ __UNLIKELY_END(nsvm_hap)
-         pop  %rsi
+@@ -94,6 +94,9 @@ __UNLIKELY_END(nsvm_hap)
          pop  %rdi
  
+         sti
++
 +        SPEC_CTRL_COND_VERW     /* Req: %rsp=eframe                    Clob: efl */
 +
          vmrun
  
          SAVE_ALL
 diff --git a/xen/arch/x86/include/asm/cpufeature.h b/xen/arch/x86/include/asm/cpufeature.h
-index 13c9b4cc1333..9e4803d43c3c 100644
+index 020414e98c4d..801a8cbbc016 100644
 --- a/xen/arch/x86/include/asm/cpufeature.h
 +++ b/xen/arch/x86/include/asm/cpufeature.h
-@@ -153,6 +153,7 @@
+@@ -150,6 +150,7 @@
  
  /* CPUID level 0x80000021.eax */
  #define cpu_has_lfence_dispatch boot_cpu_has(X86_FEATURE_LFENCE_DISPATCH)
@@ -104,8 +107,8 @@ index 13c9b4cc1333..9e4803d43c3c 100644
  #define cpu_has_nscb            boot_cpu_has(X86_FEATURE_NSCB)
  
  /* MSR_ARCH_CAPS */
-@@ -174,6 +175,10 @@
- #define cpu_has_pb_opt_ctrl     boot_cpu_has(X86_FEATURE_PB_OPT_CTRL)
+@@ -170,6 +171,10 @@
+ #define cpu_has_rfds_clear      boot_cpu_has(X86_FEATURE_RFDS_CLEAR)
  #define cpu_has_its_no          boot_cpu_has(X86_FEATURE_ITS_NO)
  
 +/* CPUID level 0x80000021.ecx */
@@ -116,10 +119,10 @@ index 13c9b4cc1333..9e4803d43c3c 100644
  #define cpu_has_arch_perfmon    boot_cpu_has(X86_FEATURE_ARCH_PERFMON)
  #define cpu_has_cpuid_faulting  boot_cpu_has(X86_FEATURE_CPUID_FAULTING)
 diff --git a/xen/arch/x86/spec_ctrl.c b/xen/arch/x86/spec_ctrl.c
-index b8d2366e8297..7b8e6f360480 100644
+index 559ee90b44dc..5005f0acdde9 100644
 --- a/xen/arch/x86/spec_ctrl.c
 +++ b/xen/arch/x86/spec_ctrl.c
-@@ -504,7 +504,7 @@ custom_param("pv-l1tf", parse_pv_l1tf);
+@@ -496,7 +496,7 @@ custom_param("pv-l1tf", parse_pv_l1tf);
  
  static void __init print_details(enum ind_thunk thunk)
  {
@@ -128,7 +131,7 @@ index b8d2366e8297..7b8e6f360480 100644
      uint64_t caps = 0;
  
      /* Collect diagnostics about available mitigations. */
-@@ -515,7 +515,7 @@ static void __init print_details(enum ind_thunk thunk)
+@@ -507,7 +507,7 @@ static void __init print_details(enum ind_thunk thunk)
      if ( boot_cpu_data.extended_cpuid_level >= 0x80000008 )
          cpuid(0x80000008, &tmp, &e8b, &tmp, &tmp);
      if ( boot_cpu_data.extended_cpuid_level >= 0x80000021 )
@@ -137,48 +140,48 @@ index b8d2366e8297..7b8e6f360480 100644
      if ( cpu_has_arch_caps )
          rdmsrl(MSR_ARCH_CAPABILITIES, caps);
  
-@@ -525,7 +525,7 @@ static void __init print_details(enum ind_thunk thunk)
+@@ -517,7 +517,7 @@ static void __init print_details(enum ind_thunk thunk)
       * Hardware read-only information, stating immunity to certain issues, or
       * suggestions of which mitigation to use.
       */
--    printk("  Hardware hints:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
-+    printk("  Hardware hints:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+-    printk("  Hardware hints:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
++    printk("  Hardware hints:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
             (caps & ARCH_CAPS_RDCL_NO)                        ? " RDCL_NO"        : "",
             (caps & ARCH_CAPS_EIBRS)                          ? " EIBRS"          : "",
             (caps & ARCH_CAPS_RSBA)                           ? " RSBA"           : "",
-@@ -550,10 +550,12 @@ static void __init print_details(enum ind_thunk thunk)
+@@ -541,10 +541,12 @@ static void __init print_details(enum ind_thunk thunk)
+            (e8b  & cpufeat_mask(X86_FEATURE_BTC_NO))         ? " BTC_NO"         : "",
             (e8b  & cpufeat_mask(X86_FEATURE_IBPB_RET))       ? " IBPB_RET"       : "",
             (e21a & cpufeat_mask(X86_FEATURE_IBPB_BRTYPE))    ? " IBPB_BRTYPE"    : "",
-            (e21a & cpufeat_mask(X86_FEATURE_SRSO_NO))        ? " SRSO_NO"        : "",
--           (e21a & cpufeat_mask(X86_FEATURE_SRSO_US_NO))     ? " SRSO_US_NO"     : "");
-+           (e21a & cpufeat_mask(X86_FEATURE_SRSO_US_NO))     ? " SRSO_US_NO"     : "",
+-           (e21a & cpufeat_mask(X86_FEATURE_SRSO_NO))        ? " SRSO_NO"        : "");
++           (e21a & cpufeat_mask(X86_FEATURE_SRSO_NO))        ? " SRSO_NO"        : "",
 +           (e21c & cpufeat_mask(X86_FEATURE_TSA_SQ_NO))      ? " TSA_SQ_NO"      : "",
 +           (e21c & cpufeat_mask(X86_FEATURE_TSA_L1_NO))      ? " TSA_L1_NO"      : "");
  
      /* Hardware features which need driving to mitigate issues. */
--    printk("  Hardware features:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
-+    printk("  Hardware features:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+-    printk("  Hardware features:%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
++    printk("  Hardware features:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
             (e8b  & cpufeat_mask(X86_FEATURE_IBPB)) ||
             (_7d0 & cpufeat_mask(X86_FEATURE_IBRSB))          ? " IBPB"           : "",
             (e8b  & cpufeat_mask(X86_FEATURE_IBRS)) ||
-@@ -573,7 +575,8 @@ static void __init print_details(enum ind_thunk thunk)
+@@ -563,7 +565,8 @@ static void __init print_details(enum ind_thunk thunk)
+            (caps & ARCH_CAPS_FB_CLEAR_CTRL)                  ? " FB_CLEAR_CTRL"  : "",
             (caps & ARCH_CAPS_GDS_CTRL)                       ? " GDS_CTRL"       : "",
             (caps & ARCH_CAPS_RFDS_CLEAR)                     ? " RFDS_CLEAR"     : "",
-            (e21a & cpufeat_mask(X86_FEATURE_SBPB))           ? " SBPB"           : "",
--           (e21a & cpufeat_mask(X86_FEATURE_SRSO_MSR_FIX))   ? " SRSO_MSR_FIX"   : "");
-+           (e21a & cpufeat_mask(X86_FEATURE_SRSO_MSR_FIX))   ? " SRSO_MSR_FIX"   : "",
+-           (e21a & cpufeat_mask(X86_FEATURE_SBPB))           ? " SBPB"           : "");
++           (e21a & cpufeat_mask(X86_FEATURE_SBPB))           ? " SBPB"           : "",
 +           (e21a & cpufeat_mask(X86_FEATURE_VERW_CLEAR))     ? " VERW_CLEAR"     : "");
  
      /* Compiled-in support which pertains to mitigations. */
      if ( IS_ENABLED(CONFIG_INDIRECT_THUNK) || IS_ENABLED(CONFIG_SHADOW_PAGING) ||
-@@ -1557,6 +1560,77 @@ static void __init rfds_calculations(void)
+@@ -1526,6 +1529,77 @@ static void __init rfds_calculations(void)
      setup_force_cpu_cap(X86_FEATURE_RFDS_NO);
  }
  
 +/*
 + * Transient Scheduler Attacks
 + *
-+ * TODO: TSA Whitepaper URL
++ * https://www.amd.com/content/dam/amd/en/documents/resources/bulletin/technical-guidance-for-mitigating-transient-scheduler-attacks.pdf
 + */
 +static void __init tsa_calculations(void)
 +{
@@ -249,15 +252,15 @@ index b8d2366e8297..7b8e6f360480 100644
  static bool __init cpu_has_gds(void)
  {
      /*
-@@ -2250,6 +2324,7 @@ void __init init_speculation_mitigations(void)
+@@ -2219,6 +2293,7 @@ void __init init_speculation_mitigations(void)
       * https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/intel-analysis-microarchitectural-data-sampling.html
       * https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/processor-mmio-stale-data-vulnerabilities.html
       * https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/advisory-guidance/register-file-data-sampling.html
-+     * TODO: TSA Whitepaper URL
++     * https://www.amd.com/content/dam/amd/en/documents/resources/bulletin/technical-guidance-for-mitigating-transient-scheduler-attacks.pdf
       *
       * Relevant ucodes:
       *
-@@ -2282,9 +2357,18 @@ void __init init_speculation_mitigations(void)
+@@ -2251,9 +2326,18 @@ void __init init_speculation_mitigations(void)
       *
       * - March 2023, for RFDS.  Enumerate RFDS_CLEAR to mean that VERW now
       *   scrubs non-architectural entries from certain register files.
@@ -276,7 +279,7 @@ index b8d2366e8297..7b8e6f360480 100644
  
      /*
       * Parts which enumerate FB_CLEAR are those with now-updated microcode
-@@ -2316,21 +2400,27 @@ void __init init_speculation_mitigations(void)
+@@ -2285,21 +2369,27 @@ void __init init_speculation_mitigations(void)
       * MLPDS/MFBDS when SMT is enabled.
       */
      if ( opt_verw_pv == -1 )
@@ -311,18 +314,18 @@ index b8d2366e8297..7b8e6f360480 100644
          setup_force_cpu_cap(X86_FEATURE_SC_VERW_IDLE);
  
 diff --git a/xen/include/public/arch-x86/cpufeatureset.h b/xen/include/public/arch-x86/cpufeatureset.h
-index ba8454710181..e94563b6b442 100644
+index 03cd1419c5cb..42db132b4c2f 100644
 --- a/xen/include/public/arch-x86/cpufeatureset.h
 +++ b/xen/include/public/arch-x86/cpufeatureset.h
-@@ -291,6 +291,7 @@ XEN_CPUFEATURE(WRMSRNS,      10*32+19) /*S  WRMSR Non-Serialising */
+@@ -284,6 +284,7 @@ XEN_CPUFEATURE(FSRCS,        10*32+12) /*A  Fast Short REP CMPSB/SCASB */
  
  /* AMD-defined CPU features, CPUID level 0x80000021.eax, word 11 */
  XEN_CPUFEATURE(LFENCE_DISPATCH,    11*32+ 2) /*A  LFENCE always serializing */
-+XEN_CPUFEATURE(VERW_CLEAR,         11*32+ 5) /*!A| VERW clears microarchitectural buffers */
++XEN_CPUFEATURE(VERW_CLEAR,         11*32+ 5) /*!A VERW clears microarchitectural buffers */
  XEN_CPUFEATURE(NSCB,               11*32+ 6) /*A  Null Selector Clears Base (and limit too) */
- XEN_CPUFEATURE(AUTO_IBRS,          11*32+ 8) /*S  Automatic IBRS */
+ XEN_CPUFEATURE(AUTO_IBRS,          11*32+ 8) /*   Automatic IBRS */
  XEN_CPUFEATURE(SBPB,               11*32+27) /*A  Selective Branch Predictor Barrier */
-@@ -348,6 +349,8 @@ XEN_CPUFEATURE(PB_OPT_CTRL,        16*32+32) /*   MSR_PB_OPT_CTRL.IBPB_ALT */
+@@ -338,6 +339,8 @@ XEN_CPUFEATURE(RFDS_CLEAR,         16*32+28) /*!A Register File(s) cleared by VE
  XEN_CPUFEATURE(ITS_NO,             16*32+62) /*!A No Indirect Target Selection */
  
  /* AMD-defined CPU features, CPUID level 0x80000021.ecx, word 18 */
