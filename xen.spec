@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9
+%global hv_rel 10
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -892,6 +892,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Fri Jul 11 2025 Ross Lagerwall <ross.lagerwall@citrix.com> - 4.19.2-10
+- Rebuild to use new certificates
+
 * Mon Jul 07 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.19.2-9
 - Fix for XSA-471 CVE-2024-36350 CVE-2024-36357
 - Fix build ID detection
