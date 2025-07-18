@@ -1,0 +1,201 @@
+From cca662dea76059d63ca93d32e2362c31579266ab Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Tue, 8 Jul 2025 11:37:24 +0200
+Subject: x86/ept: move vmx_domain_flush_pml_buffers() to p2m-ept.c
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No functional change intended.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
+index 11464c60ed47..13f1329bfd27 100644
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -1695,7 +1695,7 @@ void vmx_vcpu_disable_pml(struct vcpu *v)
+         return;
+ 
+     /* Make sure we don't lose any logged GPAs. */
+-    vmx_vcpu_flush_pml_buffer(v);
++    ept_vcpu_flush_pml_buffer(v);
+ 
+     vmx_vmcs_enter(v);
+ 
+@@ -1709,61 +1709,6 @@ void vmx_vcpu_disable_pml(struct vcpu *v)
+     v->arch.hvm.vmx.pml_pg = NULL;
+ }
+ 
+-void vmx_vcpu_flush_pml_buffer(struct vcpu *v)
+-{
+-    uint64_t *pml_buf;
+-    unsigned long pml_idx;
+-
+-    ASSERT((v == current) || (!vcpu_runnable(v) && !v->is_running));
+-    ASSERT(vmx_vcpu_pml_enabled(v));
+-
+-    vmx_vmcs_enter(v);
+-
+-    __vmread(GUEST_PML_INDEX, &pml_idx);
+-
+-    /* Do nothing if PML buffer is empty. */
+-    if ( pml_idx == (NR_PML_ENTRIES - 1) )
+-        goto out;
+-
+-    pml_buf = __map_domain_page(v->arch.hvm.vmx.pml_pg);
+-
+-    /*
+-     * PML index can be either 2^16-1 (buffer is full), or 0 ~ NR_PML_ENTRIES-1
+-     * (buffer is not full), and in latter case PML index always points to next
+-     * available entity.
+-     */
+-    if ( pml_idx >= NR_PML_ENTRIES )
+-        pml_idx = 0;
+-    else
+-        pml_idx++;
+-
+-    for ( ; pml_idx < NR_PML_ENTRIES; pml_idx++ )
+-    {
+-        unsigned long gfn = pml_buf[pml_idx] >> PAGE_SHIFT;
+-
+-        /*
+-         * Need to change type from log-dirty to normal memory for logged GFN.
+-         * hap_track_dirty_vram depends on it to work. And we mark all logged
+-         * GFNs to be dirty, as we cannot be sure whether it's safe to ignore
+-         * GFNs on which p2m_change_type_one returns failure. The failure cases
+-         * are very rare, and additional cost is negligible, but a missing mark
+-         * is extremely difficult to debug.
+-         */
+-        p2m_change_type_one(v->domain, gfn, p2m_ram_logdirty, p2m_ram_rw);
+-
+-        /* HVM guest: pfn == gfn */
+-        paging_mark_pfn_dirty(v->domain, _pfn(gfn));
+-    }
+-
+-    unmap_domain_page(pml_buf);
+-
+-    /* Reset PML index */
+-    __vmwrite(GUEST_PML_INDEX, NR_PML_ENTRIES - 1);
+-
+- out:
+-    vmx_vmcs_exit(v);
+-}
+-
+ bool_t vmx_domain_pml_enabled(const struct domain *d)
+ {
+     return d->arch.hvm.vmx.status & VMX_DOMAIN_PML_ENABLED;
+@@ -1837,7 +1782,7 @@ void vmx_domain_flush_pml_buffers(struct domain *d)
+         return;
+ 
+     for_each_vcpu ( d, v )
+-        vmx_vcpu_flush_pml_buffer(v);
++        ept_vcpu_flush_pml_buffer(v);
+ }
+ 
+ static void vmx_vcpu_update_eptp(struct vcpu *v, u64 eptp)
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 6bd925d62d06..895b02cdb63e 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -4674,7 +4674,7 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+              !(idtv_info & INTR_INFO_VALID_MASK) )
+             undo_nmis_unblocked_by_iret();
+ 
+-        vmx_vcpu_flush_pml_buffer(v);
++        ept_vcpu_flush_pml_buffer(v);
+         break;
+ 
+     case EXIT_REASON_XSAVES:
+diff --git a/xen/arch/x86/include/asm/hvm/vmx/vmcs.h b/xen/arch/x86/include/asm/hvm/vmx/vmcs.h
+index 63074a49c076..3e6a3c21321b 100644
+--- a/xen/arch/x86/include/asm/hvm/vmx/vmcs.h
++++ b/xen/arch/x86/include/asm/hvm/vmx/vmcs.h
+@@ -694,7 +694,6 @@ DECLARE_PER_CPU(bool_t, vmxon);
+ bool_t vmx_vcpu_pml_enabled(const struct vcpu *v);
+ int vmx_vcpu_enable_pml(struct vcpu *v);
+ void vmx_vcpu_disable_pml(struct vcpu *v);
+-void vmx_vcpu_flush_pml_buffer(struct vcpu *v);
+ bool_t vmx_domain_pml_enabled(const struct domain *d);
+ int vmx_domain_enable_pml(struct domain *d);
+ void vmx_domain_disable_pml(struct domain *d);
+diff --git a/xen/arch/x86/include/asm/hvm/vmx/vmx.h b/xen/arch/x86/include/asm/hvm/vmx/vmx.h
+index 4ff19488ea9f..116b126db113 100644
+--- a/xen/arch/x86/include/asm/hvm/vmx/vmx.h
++++ b/xen/arch/x86/include/asm/hvm/vmx/vmx.h
+@@ -610,6 +610,7 @@ void ept_walk_table(struct domain *d, unsigned long gfn);
+ bool_t ept_handle_misconfig(uint64_t gpa);
+ int epte_get_entry_emt(struct domain *d, gfn_t gfn, mfn_t mfn,
+                        unsigned int order, bool *ipat, p2m_type_t type);
++void ept_vcpu_flush_pml_buffer(struct vcpu *v);
+ void setup_ept_dump(void);
+ /* Locate an alternate p2m by its EPTP */
+ unsigned int p2m_find_altp2m_by_eptp(struct domain *d, uint64_t eptp);
+diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
+index 57fc1d352ca8..54d5754e157f 100644
+--- a/xen/arch/x86/mm/p2m-ept.c
++++ b/xen/arch/x86/mm/p2m-ept.c
+@@ -1382,6 +1382,62 @@ static void cf_check ept_flush_pml_buffers(struct p2m_domain *p2m)
+     vmx_domain_flush_pml_buffers(p2m->domain);
+ }
+ 
++void ept_vcpu_flush_pml_buffer(struct vcpu *v)
++{
++    uint64_t *pml_buf;
++    unsigned long pml_idx;
++
++    ASSERT((v == current) || (!vcpu_runnable(v) && !v->is_running));
++    ASSERT(vmx_vcpu_pml_enabled(v));
++
++    vmx_vmcs_enter(v);
++
++    __vmread(GUEST_PML_INDEX, &pml_idx);
++
++    /* Do nothing if PML buffer is empty. */
++    if ( pml_idx == (NR_PML_ENTRIES - 1) )
++        goto out;
++
++    pml_buf = __map_domain_page(v->arch.hvm.vmx.pml_pg);
++
++    /*
++     * PML index can be either 2^16-1 (buffer is full), or 0 ~ NR_PML_ENTRIES-1
++     * (buffer is not full), and in latter case PML index always points to next
++     * available entity.
++     */
++    if ( pml_idx >= NR_PML_ENTRIES )
++        pml_idx = 0;
++    else
++        pml_idx++;
++
++    for ( ; pml_idx < NR_PML_ENTRIES; pml_idx++ )
++    {
++        unsigned long gfn = pml_buf[pml_idx] >> PAGE_SHIFT;
++
++        /*
++         * Need to change type from log-dirty to normal memory for logged GFN.
++         * hap_track_dirty_vram depends on it to work. And we mark all loqgged
++         * GFNs to be dirty, as we cannot be sure whether it's safe to ignore
++         * GFNs on which p2m_change_type_one returns failure. The failure cases
++         * are very rare, and additional cost is negligible, but a missing mark
++         * is extremely difficult to debug.
++         */
++        p2m_change_type_one(v->domain, gfn, p2m_ram_logdirty, p2m_ram_rw);
++
++        /* HVM guest: pfn == gfn */
++        paging_mark_pfn_dirty(v->domain, _pfn(gfn));
++    }
++
++    unmap_domain_page(pml_buf);
++
++    /* Reset PML index */
++    __vmwrite(GUEST_PML_INDEX, NR_PML_ENTRIES - 1);
++
++ out:
++    vmx_vmcs_exit(v);
++
++}
++
+ int ept_p2m_init(struct p2m_domain *p2m)
+ {
+     struct ept_data *ept = &p2m->ept;

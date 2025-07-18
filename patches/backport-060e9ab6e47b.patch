@@ -1,0 +1,64 @@
+From 060e9ab6e47bfe15dd1358332ea87e66c2d051f8 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Tue, 8 Jul 2025 11:39:47 +0200
+Subject: x86/ept: batch PML p2m type-changes into single locked region
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The current p2m type-change loop in ept_vcpu_flush_pml_buffer() relies on
+each call to p2m_change_type_one() taking the p2m lock, doing the change
+and then dropping the lock and flushing the p2m.  Instead take the p2m lock
+outside of the loop, so that calls to gfn_{,un}lock() inside
+p2m_change_type_one() just take the p2m lock recursively, and more
+importantly, the flush is deferred until the p2m is unlocked in
+ept_vcpu_flush_pml_buffer().
+
+No functional change intended in the end result of
+ept_vcpu_flush_pml_buffer(), however a possibly noticeable performance
+improvement is expected.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
+index 015911ba6c80..62fc8e50689f 100644
+--- a/xen/arch/x86/mm/p2m-ept.c
++++ b/xen/arch/x86/mm/p2m-ept.c
+@@ -1375,6 +1375,8 @@ static void cf_check ept_flush_pml_buffers(struct p2m_domain *p2m)
+ 
+ void ept_vcpu_flush_pml_buffer(struct vcpu *v)
+ {
++    struct domain *d = v->domain;
++    struct p2m_domain *p2m = p2m_get_hostp2m(d);
+     uint64_t *pml_buf;
+     unsigned long pml_idx;
+ 
+@@ -1401,6 +1403,12 @@ void ept_vcpu_flush_pml_buffer(struct vcpu *v)
+     else
+         pml_idx++;
+ 
++    /*
++     * Take the lock outside of the loop, so all the type changes are done
++     * inside of the same locked region and the EPT flush is deferred until the
++     * end of the loop.
++     */
++    p2m_lock(p2m);
+     for ( ; pml_idx < NR_PML_ENTRIES; pml_idx++ )
+     {
+         unsigned long gfn = pml_buf[pml_idx] >> PAGE_SHIFT;
+@@ -1413,11 +1421,12 @@ void ept_vcpu_flush_pml_buffer(struct vcpu *v)
+          * are very rare, and additional cost is negligible, but a missing mark
+          * is extremely difficult to debug.
+          */
+-        p2m_change_type_one(v->domain, gfn, p2m_ram_logdirty, p2m_ram_rw);
++        p2m_change_type_one(d, gfn, p2m_ram_logdirty, p2m_ram_rw);
+ 
+         /* HVM guest: pfn == gfn */
+-        paging_mark_pfn_dirty(v->domain, _pfn(gfn));
++        paging_mark_pfn_dirty(d, _pfn(gfn));
+     }
++    p2m_unlock(p2m);
+ 
+     unmap_domain_page(pml_buf);
+ 
