@@ -102,10 +102,10 @@ index 84f7e747d520..af6348b6d957 100644
                                  uint32_t domid,
                                  uint32_t first_port,
 diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
-index 55923857ec0a..ac9fc6d1ac46 100644
+index 55923857ec0a..4cf1468f7c81 100644
 --- a/tools/ocaml/libs/xc/xenctrl.ml
 +++ b/tools/ocaml/libs/xc/xenctrl.ml
-@@ -208,6 +208,42 @@ external domain_create_stub: handle -> domid -> domctl_create_config -> domid
+@@ -208,6 +208,44 @@ external domain_create_stub: handle -> domid -> domctl_create_config -> domid
  let domain_create handle ?(domid=0) config =
    domain_create_stub handle domid config
  
@@ -138,6 +138,8 @@ index 55923857ec0a..ac9fc6d1ac46 100644
 +      time4: int64;
 +      time5: int64;
 +      runnable: int64;
++      running: int64;
++      nonaffine: int64;
 +    }
 +    external domain_get : handle -> int -> t = "stub_xc_get_runstate_info2"
 +  end
@@ -149,10 +151,10 @@ index 55923857ec0a..ac9fc6d1ac46 100644
    = "stub_xc_domain_sethandle"
  
 diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
-index 9b4b45db3a6d..ff7c393d3925 100644
+index 9b4b45db3a6d..f11aea20c80b 100644
 --- a/tools/ocaml/libs/xc/xenctrl.mli
 +++ b/tools/ocaml/libs/xc/xenctrl.mli
-@@ -168,6 +168,42 @@ val close_handle: unit -> unit
+@@ -168,6 +168,44 @@ val close_handle: unit -> unit
  
  val domain_create: handle -> ?domid:int -> domctl_create_config -> domid
  
@@ -185,6 +187,8 @@ index 9b4b45db3a6d..ff7c393d3925 100644
 +      time4: int64;
 +      time5: int64;
 +      runnable: int64;
++      running: int64;
++      nonaffine: int64;
 +    }
 +    external domain_get : handle -> int -> t = "stub_xc_get_runstate_info2"
 +  end
@@ -196,10 +200,10 @@ index 9b4b45db3a6d..ff7c393d3925 100644
  external domain_max_vcpus : handle -> domid -> int -> unit
    = "stub_xc_domain_max_vcpus"
 diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
-index 1d8ef6c68133..5e8f9d4e1f2a 100644
+index 1d8ef6c68133..5eb25c5c1eab 100644
 --- a/tools/ocaml/libs/xc/xenctrl_stubs.c
 +++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
-@@ -534,6 +534,65 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch_val, value domid, value vcpu)
+@@ -534,6 +534,67 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch_val, value domid, value vcpu)
  	CAMLreturn(result);
  }
  
@@ -247,7 +251,7 @@ index 1d8ef6c68133..5e8f9d4e1f2a 100644
 +	if (retval < 0)
 +		failwith_xc(xch);
 +
-+	result = caml_alloc_tuple(10);
++	result = caml_alloc_tuple(12);
 +	Store_field(result, 0, caml_copy_int32(d.u.domain_runstate.state));
 +	Store_field(result, 1, caml_copy_int32(d.u.domain_runstate.missed_changes));
 +	Store_field(result, 2, caml_copy_int64(d.u.domain_runstate.state_entry_time));
@@ -258,6 +262,8 @@ index 1d8ef6c68133..5e8f9d4e1f2a 100644
 +	Store_field(result, 7, caml_copy_int64(d.u.domain_runstate.time[4]));
 +	Store_field(result, 8, caml_copy_int64(d.u.domain_runstate.time[5]));
 +	Store_field(result, 9, caml_copy_int64(d.u.domain_runstate.runnable));
++	Store_field(result, 10, caml_copy_int64(d.u.domain_runstate.running));
++	Store_field(result, 11, caml_copy_int64(d.u.domain_runstate.nonaffine));
 +
 +	CAMLreturn(result);
 +}
@@ -294,10 +300,10 @@ index ea16b759109e..1e63fa8a54d7 100644
          ret = arch_do_domctl(op, d, u_domctl);
          break;
 diff --git a/xen/common/sched/core.c b/xen/common/sched/core.c
-index 4fdacc8f97f8..f465110470bc 100644
+index 5f88b88ab4da..304f9c337309 100644
 --- a/xen/common/sched/core.c
 +++ b/xen/common/sched/core.c
-@@ -262,6 +262,7 @@ static inline void vcpu_urgent_count_update(struct vcpu *v)
+@@ -276,6 +276,7 @@ static inline bool is_running_nonaffine(const struct vcpu *v,
  static inline void vcpu_runstate_change(
      struct vcpu *v, int new_state, s_time_t new_entry_time)
  {
@@ -305,7 +311,7 @@ index 4fdacc8f97f8..f465110470bc 100644
      s_time_t delta;
      struct sched_unit *unit = v->sched_unit;
  
-@@ -287,6 +288,65 @@ static inline void vcpu_runstate_change(
+@@ -305,6 +306,65 @@ static inline void vcpu_runstate_change(
      }
  
      v->runstate.state = new_state;
@@ -371,8 +377,8 @@ index 4fdacc8f97f8..f465110470bc 100644
  }
  
  void sched_guest_idle(void (*idle) (void), unsigned int cpu)
-@@ -332,6 +392,30 @@ void vcpu_runstate_get(const struct vcpu *v,
-     rcu_read_unlock(&sched_res_rculock);
+@@ -372,6 +432,37 @@ struct vcpu_runstate_extra vcpu_runstate_get(
+     return ret;
  }
  
 +void domain_runstate_get(struct domain *d, domain_runstate_info_t *info)
@@ -390,12 +396,19 @@ index 4fdacc8f97f8..f465110470bc 100644
 +    spin_unlock_irq(&d->runstate_lock);
 +
 +    info->runnable = 0;
++    info->running = 0;
++    info->nonaffine = 0;
 +    for_each_vcpu ( d, v )
 +    {
++        /* Get a snapshot of the accumulated vcpu times (until this moment) */
 +        struct vcpu_runstate_info vcpu_runstate;
++        struct vcpu_runstate_extra ret = vcpu_runstate_get(v, &vcpu_runstate);
 +
-+        vcpu_runstate_get(v, &vcpu_runstate);
++        /* Aggregate the vCPU time sum of the domain in the runnable state */
 +        info->runnable += vcpu_runstate.time[RUNSTATE_runnable] / d->max_vcpus;
++        /* Aggregate the vCPU time sum of the domain in the running state */
++        info->running += vcpu_runstate.time[RUNSTATE_running] / d->max_vcpus;
++        info->nonaffine += ret.nonaffine_time / d->max_vcpus;
 +    }
 +}
 +
@@ -403,10 +416,10 @@ index 4fdacc8f97f8..f465110470bc 100644
  {
      struct vcpu_runstate_info state = { 0 };
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index 2a49fe46ce25..12717442e429 100644
+index 2a49fe46ce25..8fdfb31e87d5 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1218,6 +1218,46 @@ struct xen_domctl_dt_overlay {
+@@ -1218,6 +1218,50 @@ struct xen_domctl_dt_overlay {
  };
  #endif
  
@@ -446,6 +459,10 @@ index 2a49fe46ce25..12717442e429 100644
 +
 +    /* Average runnable time of vCPUs in the domain */
 +    uint64_aligned_t runnable;
++    /* Normalised vCPU time running */
++    uint64_aligned_t running;
++    /* Normalised vCPU time running non-affine */
++    uint64_aligned_t nonaffine;
 +};
 +typedef struct xen_domctl_runstate_info_ext xen_domctl_runstate_info_ext_t;
 +DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_ext_t);
@@ -453,7 +470,7 @@ index 2a49fe46ce25..12717442e429 100644
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1306,6 +1346,7 @@ struct xen_domctl {
+@@ -1306,6 +1350,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_get_paging_mempool_size       85
  #define XEN_DOMCTL_set_paging_mempool_size       86
  #define XEN_DOMCTL_dt_overlay                    87
@@ -461,7 +478,7 @@ index 2a49fe46ce25..12717442e429 100644
  #define XEN_DOMCTL_gdbsx_guestmemio            1000
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
-@@ -1356,6 +1397,7 @@ struct xen_domctl {
+@@ -1356,6 +1401,7 @@ struct xen_domctl {
          struct xen_domctl_set_access_required access_required;
          struct xen_domctl_audit_p2m         audit_p2m;
          struct xen_domctl_set_virq_handler  set_virq_handler;
@@ -470,10 +487,10 @@ index 2a49fe46ce25..12717442e429 100644
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 38acbc6e8dc9..f271b59787ce 100644
+index 9be7bb93778e..0b8bc5e43611 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -365,6 +365,8 @@ struct evtchn_port_ops;
+@@ -377,6 +377,8 @@ struct evtchn_port_ops;
  
  #define MAX_NR_IOREQ_SERVERS 8
  
@@ -482,7 +499,7 @@ index 38acbc6e8dc9..f271b59787ce 100644
  struct domain
  {
      domid_t          domain_id;
-@@ -640,6 +642,11 @@ struct domain
+@@ -652,6 +654,11 @@ struct domain
  
      /* Holding CDF_* constant. Internal flags for domain creation. */
      unsigned int cdf;
@@ -494,15 +511,14 @@ index 38acbc6e8dc9..f271b59787ce 100644
  } __aligned(PAGE_SIZE);
  
  static inline struct page_list_head *page_to_list(
-@@ -1080,6 +1087,8 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
+@@ -1092,6 +1099,7 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
  
- void vcpu_runstate_get(const struct vcpu *v,
-                        struct vcpu_runstate_info *runstate);
+ struct vcpu_runstate_extra vcpu_runstate_get(
+     const struct vcpu *v, struct vcpu_runstate_info *runstate);
 +void domain_runstate_get(struct domain *d, domain_runstate_info_t *info);
-+
+ 
  uint64_t get_cpu_idle_time(unsigned int cpu);
  void sched_guest_idle(void (*idle) (void), unsigned int cpu);
- void scheduler_enable(void);
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
 index 415edee251f0..ab19d64ee47d 100644
 --- a/xen/xsm/flask/hooks.c
