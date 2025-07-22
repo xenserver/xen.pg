@@ -308,9 +308,9 @@ build_xen () { # $1=vendorversion $2=buildconfig $3=outdir $4=cov
     mkdir xen/$3 && cp -a buildconfigs/$2 xen/$3/.config
     $mk olddefconfig
     $mk build MAP
-    if [ -f xen/$3/xen.pe ]; then
-        %sign -c XEN_SIGN_KEY_XS9 -i xen/$3/xen.pe -o xen/$3/xen-signed.pe
-        mv -f xen/$3/xen-signed.pe xen/$3/xen.efi
+    if [ -f xen/$3/xen.efi ]; then
+        %sign -c XEN_SIGN_KEY_XS9 -i xen/$3/xen.efi -o xen/$3/xen-signed.efi
+        mv -f xen/$3/xen-signed.efi xen/$3/xen.efi
     fi
 }
 
