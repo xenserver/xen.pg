@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 15
+%global hv_rel 16
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Tue Jul 22 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-16
+- Relax cache attributes for Xen Platform PCI device BAR
+- Optimize flushing of Intel PML buffer
+
 * Fri Jul  4 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-15
 - Fix for XSA-471 CVE-2024-36350 CVE-2024-36357
 - Perform provenance checks on AMD microcode blobs
