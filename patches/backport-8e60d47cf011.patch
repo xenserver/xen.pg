@@ -1,0 +1,188 @@
+From 8e60d47cf0112c145b6b0e454d102b04c857db8c Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Fri, 7 Mar 2025 10:16:01 +0100
+Subject: x86/iommu: avoid MSI address and data writes if IRT index hasn't
+ changed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Attempt to reduce the MSI entry writes, and the associated checking whether
+memory decoding and MSI-X is enabled for the PCI device, when the MSI data
+hasn't changed.
+
+When using Interrupt Remapping the MSI entry will contain an index into
+the remapping table, and it's in such remapping table where the MSI vector
+and destination CPU is stored.  As such, when using interrupt remapping,
+changes to the interrupt affinity shouldn't result in changes to the MSI
+entry, and the MSI entry update can be avoided.
+
+Signal from the IOMMU update_ire_from_msi hook whether the MSI data or
+address fields have changed, and thus need writing to the device registers.
+Such signaling is done by returning 1 from the function.  Otherwise
+returning 0 means no update of the MSI fields, and thus no write
+required.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/hpet.c b/xen/arch/x86/hpet.c
+index 84f820fef605..891887a97581 100644
+--- a/xen/arch/x86/hpet.c
++++ b/xen/arch/x86/hpet.c
+@@ -280,8 +280,12 @@ static int hpet_msi_write(struct hpet_event_channel *ch, struct msi_msg *msg)
+     {
+         int rc = iommu_update_ire_from_msi(&ch->msi, msg);
+ 
+-        if ( rc )
++        if ( rc < 0 )
+             return rc;
++        /*
++         * Always propagate writes, to avoid having to pass a flag for handling
++         * a forceful write in the resume from suspension case.
++         */
+     }
+ 
+     hpet_write32(msg->data, HPET_Tn_ROUTE(ch->idx));
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index cb2cc8aa288b..552dd18350b3 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -417,7 +417,18 @@ static int cf_check vmx_pi_update_irte(const struct vcpu *v,
+ 
+     ASSERT_PDEV_LIST_IS_READ_LOCKED(msi_desc->dev->domain);
+ 
+-    return iommu_update_ire_from_msi(msi_desc, &msg);
++    rc = iommu_update_ire_from_msi(msi_desc, &msg);
++    if ( rc > 0 )
++    {
++        /*
++         * Callers of vmx_pi_update_irte() won't propagate the updated MSI
++         * fields to the hardware, must assert there are no changes.
++         */
++        ASSERT_UNREACHABLE();
++        rc = -EILSEQ;
++    }
++
++    return rc;
+ 
+  unlock_out:
+     spin_unlock_irq(&desc->lock);
+diff --git a/xen/arch/x86/msi.c b/xen/arch/x86/msi.c
+index 0c099215c783..8108ab11931f 100644
+--- a/xen/arch/x86/msi.c
++++ b/xen/arch/x86/msi.c
+@@ -186,7 +186,8 @@ void msi_compose_msg(unsigned vector, const cpumask_t *cpu_mask, struct msi_msg
+                 MSI_DATA_VECTOR(vector);
+ }
+ 
+-static int write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
++static int write_msi_msg(struct msi_desc *entry, struct msi_msg *msg,
++                         bool force)
+ {
+     entry->msg = *msg;
+ 
+@@ -196,7 +197,7 @@ static int write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+ 
+         ASSERT(msg != &entry->msg);
+         rc = iommu_update_ire_from_msi(entry, msg);
+-        if ( rc )
++        if ( rc < 0 || (rc == 0 && !force) )
+             return rc;
+     }
+ 
+@@ -261,7 +262,7 @@ void cf_check set_msi_affinity(struct irq_desc *desc, const cpumask_t *mask)
+     msg.address_lo |= MSI_ADDR_DEST_ID(dest);
+     msg.dest32 = dest;
+ 
+-    write_msi_msg(msi_desc, &msg);
++    write_msi_msg(msi_desc, &msg, false);
+ }
+ 
+ void __msi_set_enable(u16 seg, u8 bus, u8 slot, u8 func, int pos, int enable)
+@@ -532,7 +533,7 @@ int __setup_msi_irq(struct irq_desc *desc, struct msi_desc *msidesc,
+     desc->msi_desc = msidesc;
+     desc->handler = handler;
+     msi_compose_msg(desc->arch.vector, desc->arch.cpu_mask, &msg);
+-    ret = write_msi_msg(msidesc, &msg);
++    ret = write_msi_msg(msidesc, &msg, false);
+     if ( unlikely(ret) )
+     {
+         desc->handler = &no_irq_type;
+@@ -1412,7 +1413,7 @@ int pci_restore_msi_state(struct pci_dev *pdev)
+         type = entry->msi_attrib.type;
+ 
+         msg = entry->msg;
+-        write_msi_msg(entry, &msg);
++        write_msi_msg(entry, &msg, true);
+ 
+         for ( i = 0; ; )
+         {
+diff --git a/xen/drivers/passthrough/amd/iommu_intr.c b/xen/drivers/passthrough/amd/iommu_intr.c
+index c0273059cb1d..9abdc38053d7 100644
+--- a/xen/drivers/passthrough/amd/iommu_intr.c
++++ b/xen/drivers/passthrough/amd/iommu_intr.c
+@@ -492,7 +492,7 @@ static int update_intremap_entry_from_msi_msg(
+                get_ivrs_mappings(iommu->seg)[alias_id].intremap_table);
+     }
+ 
+-    return 0;
++    return fresh;
+ }
+ 
+ static struct amd_iommu *_find_iommu_for_device(int seg, int bdf)
+@@ -546,7 +546,7 @@ int cf_check amd_iommu_msi_msg_update_ire(
+     rc = update_intremap_entry_from_msi_msg(iommu, bdf, nr,
+                                             &msi_desc->remap_index,
+                                             msg, &data);
+-    if ( !rc )
++    if ( rc > 0 )
+     {
+         for ( i = 1; i < nr; ++i )
+             msi_desc[i].remap_index = msi_desc->remap_index + i;
+diff --git a/xen/drivers/passthrough/vtd/intremap.c b/xen/drivers/passthrough/vtd/intremap.c
+index 820616a8de93..fe529ea4047a 100644
+--- a/xen/drivers/passthrough/vtd/intremap.c
++++ b/xen/drivers/passthrough/vtd/intremap.c
+@@ -506,6 +506,7 @@ static int msi_msg_to_remap_entry(
+     unsigned int index, i, nr = 1;
+     unsigned long flags;
+     const struct pi_desc *pi_desc = msi_desc->pi_desc;
++    bool alloc = false;
+ 
+     if ( msi_desc->msi_attrib.type == PCI_CAP_ID_MSI )
+         nr = msi_desc->msi.nvec;
+@@ -529,6 +530,7 @@ static int msi_msg_to_remap_entry(
+         index = alloc_remap_entry(iommu, nr);
+         for ( i = 0; i < nr; ++i )
+             msi_desc[i].remap_index = index + i;
++        alloc = true;
+     }
+     else
+         index = msi_desc->remap_index;
+@@ -601,7 +603,7 @@ static int msi_msg_to_remap_entry(
+     unmap_vtd_domain_page(iremap_entries);
+     spin_unlock_irqrestore(&iommu->intremap.lock, flags);
+ 
+-    return 0;
++    return alloc;
+ }
+ 
+ int cf_check msi_msg_write_remap_rte(
+diff --git a/xen/include/xen/iommu.h b/xen/include/xen/iommu.h
+index 04f195be043a..36851c668e46 100644
+--- a/xen/include/xen/iommu.h
++++ b/xen/include/xen/iommu.h
+@@ -435,6 +435,12 @@ extern struct page_list_head iommu_pt_cleanup_list;
+ bool arch_iommu_use_permitted(const struct domain *d);
+ 
+ #ifdef CONFIG_X86
++/*
++ * Return values:
++ *  - < 0 on error.
++ *  - 0 on success and no need to write msi_msg to the hardware.
++ *  - 1 on success and msi_msg must be propagated to the hardware.
++ */
+ static inline int iommu_update_ire_from_msi(
+     struct msi_desc *msi_desc, struct msi_msg *msg)
+ {
