@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10
+%global hv_rel 11
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -892,6 +892,12 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Wed Jul 30 2025 Ross Lagerwall <ross.lagerwall@citrix.com> - 4.19.2-11
+- Strip xen.efi and provide a non-stripped version
+- Reduce overhead of PML buffer flushing
+- Account for PCI MMIO used memory in hvmloader
+- Drop multiboot2 PE patches
+
 * Fri Jul 11 2025 Ross Lagerwall <ross.lagerwall@citrix.com> - 4.19.2-10
 - Rebuild to use new certificates
 
