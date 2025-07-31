@@ -1,5 +1,4 @@
-Collect domain runstate information in the hypervisor, and export
-through a domctl operation.
+Hypercall to obtain aggregated domain runstate information, and bindings.
 
 diff --git a/tools/flask/policy/modules/dom0.te b/tools/flask/policy/modules/dom0.te
 index f1dcff48e227..522d0278db93 100644
@@ -50,15 +49,18 @@ index 9047b163e8f8..58abe36770c6 100644
                                  uint32_t domid,
                                  uint32_t first_port,
 diff --git a/tools/libs/ctrl/xc_domain.c b/tools/libs/ctrl/xc_domain.c
-index 19e218f73987..6088b3523164 100644
+index 19e218f73987..6e0692ed008f 100644
 --- a/tools/libs/ctrl/xc_domain.c
 +++ b/tools/libs/ctrl/xc_domain.c
-@@ -1339,6 +1339,22 @@ int xc_vcpu_getinfo(xc_interface *xch,
+@@ -1339,6 +1339,25 @@ int xc_vcpu_getinfo(xc_interface *xch,
      return rc;
  }
  
 +int xc_get_runstate_info(xc_interface *xch, uint32_t domid, xc_runstate_info_t *info)
 +{
++    /* The main caller is statically linked.  Careful with the ABI. */
++    BUILD_BUG_ON(sizeof(*info) != 64);
++
 +    struct xen_domctl domctl = {
 +        .cmd = XEN_DOMCTL_get_runstate_info,
 +        .domain = domid,
@@ -141,10 +143,10 @@ index 22131db920d0..5c4f544f3635 100644
         = "stub_xc_domain_ioport_permission"
  external domain_iomem_permission: handle -> domid -> nativeint -> nativeint -> bool -> unit
 diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
-index be2241487e2e..968205a57187 100644
+index 93ff008dc5d8..0bf73d7bc312 100644
 --- a/tools/ocaml/libs/xc/xenctrl_stubs.c
 +++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
-@@ -506,6 +506,37 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch, value domid, value vcpu)
+@@ -500,6 +500,37 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch, value domid, value vcpu)
  	CAMLreturn(result);
  }
  
@@ -183,10 +185,10 @@ index be2241487e2e..968205a57187 100644
                                          value cpu)
  {
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index f40f1b851340..f6325446332b 100644
+index 70a2284a1299..428ebef6490a 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -601,6 +601,7 @@ struct domain *domain_create(domid_t domid,
+@@ -602,6 +602,7 @@ struct domain *domain_create(domid_t domid,
      spin_lock_init_prof(d, domain_lock);
      spin_lock_init_prof(d, page_alloc_lock);
      spin_lock_init(&d->hypercall_deadlock_mutex);
@@ -195,10 +197,10 @@ index f40f1b851340..f6325446332b 100644
      INIT_PAGE_LIST_HEAD(&d->extra_page_list);
      INIT_PAGE_LIST_HEAD(&d->xenpage_list);
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index 505e29c0dcc2..7391373ccba2 100644
+index 6cf78d4975bd..bda8548348ec 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -858,6 +858,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+@@ -860,6 +860,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
                  __HYPERVISOR_domctl, "h", u_domctl);
          break;
  
@@ -211,33 +213,10 @@ index 505e29c0dcc2..7391373ccba2 100644
          ret = arch_do_domctl(op, d, u_domctl);
          break;
 diff --git a/xen/common/sched/core.c b/xen/common/sched/core.c
-index 078beb1adbbd..deb5affe6238 100644
+index 78c5917788fe..29c874eb0f8d 100644
 --- a/xen/common/sched/core.c
 +++ b/xen/common/sched/core.c
-@@ -259,9 +259,30 @@ static inline void vcpu_urgent_count_update(struct vcpu *v)
-     }
- }
- 
-+/* Used to quickly map the vcpu runstate mask to a domain runstate */
-+static int mask_to_state[] = {
-+    /* 000: Nothing in any runstate.  Should never happen. */
-+    -1,
-+    /* 001: All running */
-+    DOMAIN_RUNSTATE_full_run,
-+    /* 010: All runnable */
-+    DOMAIN_RUNSTATE_full_contention,
-+    /* 011: Some running, some runnable */
-+    DOMAIN_RUNSTATE_concurrency_hazard,
-+    /* 100: All blocked / offline */
-+    DOMAIN_RUNSTATE_blocked,
-+    /* 101: Some running, some blocked / offline */
-+    DOMAIN_RUNSTATE_partial_run,
-+    /* 110: Some blocked / offline, some runnable */
-+    DOMAIN_RUNSTATE_partial_contention,
-+    /* 111: Some in every state.  Mixed running + runnable is most important. */
-+    DOMAIN_RUNSTATE_concurrency_hazard
-+};
-+
+@@ -262,6 +262,7 @@ static inline void vcpu_urgent_count_update(struct vcpu *v)
  static inline void vcpu_runstate_change(
      struct vcpu *v, int new_state, s_time_t new_entry_time)
  {
@@ -245,7 +224,7 @@ index 078beb1adbbd..deb5affe6238 100644
      s_time_t delta;
      struct sched_unit *unit = v->sched_unit;
  
-@@ -287,6 +308,46 @@ static inline void vcpu_runstate_change(
+@@ -287,6 +288,65 @@ static inline void vcpu_runstate_change(
      }
  
      v->runstate.state = new_state;
@@ -253,6 +232,25 @@ index 078beb1adbbd..deb5affe6238 100644
 +    /* Update domain runstate */
 +    if ( spin_trylock(&d->runstate_lock) )
 +    {
++        static const char mask_to_state[] = {
++            /* 000: Nothing in any runstate.  Should never happen. */
++            -1,
++            /* 001: All running */
++            DOMAIN_RUNSTATE_full_run,
++            /* 010: All runnable */
++            DOMAIN_RUNSTATE_full_contention,
++            /* 011: Some running, some runnable */
++            DOMAIN_RUNSTATE_concurrency_hazard,
++            /* 100: All blocked / offline */
++            DOMAIN_RUNSTATE_blocked,
++            /* 101: Some running, some blocked / offline */
++            DOMAIN_RUNSTATE_partial_run,
++            /* 110: Some blocked / offline, some runnable */
++            DOMAIN_RUNSTATE_partial_contention,
++            /* 111: Some in every state.  Mixed running + runnable is most important. */
++            DOMAIN_RUNSTATE_concurrency_hazard,
++        };
++
 +        unsigned mask=0;
 +        struct vcpu *ov;
 +
@@ -292,32 +290,31 @@ index 078beb1adbbd..deb5affe6238 100644
  }
  
  void sched_guest_idle(void (*idle) (void), unsigned int cpu)
-@@ -332,6 +393,20 @@ void vcpu_runstate_get(const struct vcpu *v,
+@@ -332,6 +392,19 @@ void vcpu_runstate_get(const struct vcpu *v,
      rcu_read_unlock(&sched_res_rculock);
  }
  
-+void domain_runstate_get(struct domain *d, domain_runstate_info_t *runstate)
++void domain_runstate_get(struct domain *d, domain_runstate_info_t *info)
 +{
-+    unsigned long flags;
 +    /* Have to disable interrupts because the other user of the lock runs
 +     * in interrupt context. */
-+    spin_lock_irqsave(&d->runstate_lock, flags);
++    spin_lock_irq(&d->runstate_lock);
 +
-+    memcpy(runstate, &d->runstate, sizeof(*runstate));
-+    runstate->time[d->runstate.state] += NOW() - runstate->state_entry_time;
-+    runstate->missed_changes = atomic_read(&d->runstate_missed_changes);
++    memcpy(info, &d->runstate, sizeof(*info));
++    info->time[d->runstate.state] += NOW() - info->state_entry_time;
++    info->missed_changes = atomic_read(&d->runstate_missed_changes);
 +
-+    spin_unlock_irqrestore(&d->runstate_lock, flags);
++    spin_unlock_irq(&d->runstate_lock);
 +}
 +
  uint64_t get_cpu_idle_time(unsigned int cpu)
  {
      struct vcpu_runstate_info state = { 0 };
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index 7ba3a565209e..c2c536a93df1 100644
+index 7ba3a565209e..fb95fde8c016 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1189,6 +1189,46 @@ struct xen_domctl_vmtrace_op {
+@@ -1189,6 +1189,33 @@ struct xen_domctl_vmtrace_op {
  typedef struct xen_domctl_vmtrace_op xen_domctl_vmtrace_op_t;
  DEFINE_XEN_GUEST_HANDLE(xen_domctl_vmtrace_op_t);
  
@@ -328,43 +325,30 @@ index 7ba3a565209e..c2c536a93df1 100644
 + * @extra_arg == pointer to domain_runstate_info structure.
 + */
 +struct xen_domctl_runstate_info {
-+    /* VCPU's current state (RUNSTATE_*). */
++#define DOMAIN_RUNSTATE_full_run           0 /* All vcpus are running */
++#define DOMAIN_RUNSTATE_full_contention    1 /* All vcpus are runnable (i.e., waiting for cpu) */
++#define DOMAIN_RUNSTATE_concurrency_hazard 2 /* Some vcpus are running, some are runnable */
++#define DOMAIN_RUNSTATE_blocked            3 /* All vcpus are blocked / offline */
++#define DOMAIN_RUNSTATE_partial_run        4 /* Some vpcus are running, some are blocked */
++#define DOMAIN_RUNSTATE_partial_contention 5 /* Some vcpus are runnable, some are blocked */
 +    uint32_t      state;
 +    uint32_t missed_changes;
 +    /* Number of times we missed an update due to contention */
 +    /* When was current state entered (system time, ns)? */
-+    uint64_t state_entry_time;
++    uint64_aligned_t state_entry_time;
 +    /*
 +     * Time spent in each RUNSTATE_* (ns). The sum of these times is
 +     * NOT guaranteed not to drift from system time.
 +     */
-+    uint64_t time[6];
++    uint64_aligned_t time[6];
 +};
 +typedef struct xen_domctl_runstate_info xen_domctl_runstate_info_t;
 +DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
 +
-+/* All vcpus are running */
-+#define DOMAIN_RUNSTATE_full_run           0
-+
-+/* All vcpus are runnable (i.e., waiting for cpu) */
-+#define DOMAIN_RUNSTATE_full_contention    1
-+
-+/* Some vcpus are running, some are runnable */
-+#define DOMAIN_RUNSTATE_concurrency_hazard 2
-+
-+/* All vcpus are blocked / offline */
-+#define DOMAIN_RUNSTATE_blocked            3
-+
-+/* Some vpcus are running, some are blocked */
-+#define DOMAIN_RUNSTATE_partial_run        4
-+
-+/* Some vcpus are runnable, some are blocked */
-+#define DOMAIN_RUNSTATE_partial_contention 5
-+
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1276,6 +1316,7 @@ struct xen_domctl {
+@@ -1276,6 +1303,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_vmtrace_op                    84
  #define XEN_DOMCTL_get_paging_mempool_size       85
  #define XEN_DOMCTL_set_paging_mempool_size       86
@@ -372,7 +356,7 @@ index 7ba3a565209e..c2c536a93df1 100644
  #define XEN_DOMCTL_gdbsx_guestmemio            1000
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
-@@ -1326,6 +1367,7 @@ struct xen_domctl {
+@@ -1326,6 +1354,7 @@ struct xen_domctl {
          struct xen_domctl_set_access_required access_required;
          struct xen_domctl_audit_p2m         audit_p2m;
          struct xen_domctl_set_virq_handler  set_virq_handler;
@@ -381,7 +365,7 @@ index 7ba3a565209e..c2c536a93df1 100644
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 9a3dbf998b56..cb46a5892268 100644
+index 4ba6f5e28a0e..d9e5f0e7abce 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
 @@ -364,6 +364,8 @@ struct evtchn_port_ops;
@@ -409,16 +393,16 @@ index 9a3dbf998b56..cb46a5892268 100644
  
  void vcpu_runstate_get(const struct vcpu *v,
                         struct vcpu_runstate_info *runstate);
-+void domain_runstate_get(struct domain *d, domain_runstate_info_t *runstate);
++void domain_runstate_get(struct domain *d, domain_runstate_info_t *info);
 +
  uint64_t get_cpu_idle_time(unsigned int cpu);
  void sched_guest_idle(void (*idle) (void), unsigned int cpu);
  void scheduler_enable(void);
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
-index 78225f68c15c..c7610f027911 100644
+index 42857c212223..2737c4f2cc4a 100644
 --- a/xen/xsm/flask/hooks.c
 +++ b/xen/xsm/flask/hooks.c
-@@ -828,6 +828,9 @@ static int cf_check flask_domctl(struct domain *d, int cmd)
+@@ -838,6 +838,9 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
      case XEN_DOMCTL_set_paging_mempool_size:
          return current_has_perm(d, SECCLASS_DOMAIN, DOMAIN__SETPAGINGMEMPOOL);
  
