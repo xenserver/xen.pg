@@ -1,5 +1,12 @@
 Hypercall to obtain aggregated domain runstate information, and bindings.
 
+The "legacy" struct xen_domctl_runstate_info cannot change.  The Ocaml
+types/functions (runstate, domain_get_runstate_info, etc) cannot change.
+
+The newer xen_domctl_runstate_info_ext can be extended if a new Ocaml
+Runstateinfo.Vn module is created, and become set in stone when the next build
+of Xen is produced.
+
 diff --git a/tools/flask/policy/modules/dom0.te b/tools/flask/policy/modules/dom0.te
 index f1dcff48e227..522d0278db93 100644
 --- a/tools/flask/policy/modules/dom0.te
@@ -25,7 +32,7 @@ index 11c1562aa5da..e3e9be2e70be 100644
  	allow $1 $2:security check_context;
  	allow $1 $2:shadow enable;
 diff --git a/tools/include/xenctrl.h b/tools/include/xenctrl.h
-index 9047b163e8f8..58abe36770c6 100644
+index 9047b163e8f8..97e5e92ba503 100644
 --- a/tools/include/xenctrl.h
 +++ b/tools/include/xenctrl.h
 @@ -445,6 +445,7 @@ typedef struct xc_core_header {
@@ -36,7 +43,7 @@ index 9047b163e8f8..58abe36770c6 100644
  
  static inline unsigned int dominfo_shutdown_reason(const xc_domaininfo_t *info)
  {
-@@ -1371,6 +1372,11 @@ int xc_domain_get_pod_target(xc_interface *xch,
+@@ -1371,6 +1372,15 @@ int xc_domain_get_pod_target(xc_interface *xch,
                               uint64_t *pod_cache_pages,
                               uint64_t *pod_entries);
  
@@ -44,15 +51,19 @@ index 9047b163e8f8..58abe36770c6 100644
 +int xc_get_runstate_info(xc_interface *xch,
 +			 uint32_t domid,
 +			 xc_runstate_info_t *info);
++#define XENCTRL_HAS_GET_RUNSTATE_INFO_EXT 1
++int xc_get_runstate_info_ext(xc_interface *xch,
++                             uint32_t domid,
++                             struct xen_domctl *domctl);
 +
  int xc_domain_ioport_permission(xc_interface *xch,
                                  uint32_t domid,
                                  uint32_t first_port,
 diff --git a/tools/libs/ctrl/xc_domain.c b/tools/libs/ctrl/xc_domain.c
-index 19e218f73987..6e0692ed008f 100644
+index 19e218f73987..951ab2a53079 100644
 --- a/tools/libs/ctrl/xc_domain.c
 +++ b/tools/libs/ctrl/xc_domain.c
-@@ -1339,6 +1339,25 @@ int xc_vcpu_getinfo(xc_interface *xch,
+@@ -1339,6 +1339,37 @@ int xc_vcpu_getinfo(xc_interface *xch,
      return rc;
  }
  
@@ -70,83 +81,123 @@ index 19e218f73987..6e0692ed008f 100644
 +    if ( ret < 0 )
 +        return ret;
 +
++    /* Note, this takes the runstate_info subset of the runstate_info_ext field. */
 +    memcpy(info, &domctl.u.domain_runstate, sizeof(*info));
 +
 +    return ret;
++}
++
++/* Passes back the whole domctl structure, so it can be extended more easily. */
++int xc_get_runstate_info_ext(xc_interface *xch, uint32_t domid, struct xen_domctl *domctl)
++{
++    *domctl = (struct xen_domctl){
++        .cmd = XEN_DOMCTL_get_runstate_info,
++        .domain = domid,
++    };
++
++    return do_domctl(xch, domctl);
 +}
 +
  int xc_domain_ioport_permission(xc_interface *xch,
                                  uint32_t domid,
                                  uint32_t first_port,
 diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
-index 3578c48fa99a..0acc1718aa39 100644
+index 3578c48fa99a..923952c707b7 100644
 --- a/tools/ocaml/libs/xc/xenctrl.ml
 +++ b/tools/ocaml/libs/xc/xenctrl.ml
-@@ -89,6 +89,18 @@ type domctl_create_config =
- 	arch: arch_domainconfig;
- }
+@@ -205,6 +205,41 @@ external domain_create_stub: handle -> domid -> domctl_create_config -> domid
+ let domain_create handle ?(domid=0) config =
+ 	domain_create_stub handle domid config
  
-+type runstateinfo = {
-+  state : int32;
-+  missed_changes: int32;
-+  state_entry_time : int64;
-+  time0 : int64;
-+  time1 : int64;
-+  time2 : int64;
-+  time3 : int64;
-+  time4 : int64;
-+  time5 : int64;
-+}
++module Runstateinfo = struct
++  module V1 = struct
++    (* Retain old names for backwards compatibility *)
++    type runstateinfo = {
++      state: int32;
++      missed_changes: int32;
++      state_entry_time: int64;
++      time0: int64;
++      time1: int64;
++      time2: int64;
++      time3: int64;
++      time4: int64;
++      time5: int64;
++    }
++    external domain_get_runstate_info : handle -> int -> runstateinfo = "stub_xc_get_runstate_info"
++  end
 +
- type domaininfo =
- {
- 	domid             : domid;
-@@ -246,6 +258,8 @@ external domain_getinfo: handle -> domid -> domaininfo= "stub_xc_domain_getinfo"
++  module V2 = struct
++    type t = {
++      state: int32;
++      missed_changes: int32;
++      state_entry_time: int64;
++      time0: int64;
++      time1: int64;
++      time2: int64;
++      time3: int64;
++      time4: int64;
++      time5: int64;
++    }
++    external domain_get : handle -> int -> t = "stub_xc_get_runstate_info2"
++  end
++end
++
++include Runstateinfo.V1
++
+ external domain_sethandle: handle -> domid -> string -> unit
+        = "stub_xc_domain_sethandle"
  
- external domain_get_vcpuinfo: handle -> int -> int -> vcpuinfo
-        = "stub_xc_vcpu_getinfo"
-+external domain_get_runstate_info : handle -> int -> runstateinfo
-+  = "stub_xc_get_runstate_info"
- 
- external domain_ioport_permission: handle -> domid -> int -> int -> bool -> unit
-        = "stub_xc_domain_ioport_permission"
 diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
-index 22131db920d0..5c4f544f3635 100644
+index 22131db920d0..b22cb68203b8 100644
 --- a/tools/ocaml/libs/xc/xenctrl.mli
 +++ b/tools/ocaml/libs/xc/xenctrl.mli
-@@ -81,6 +81,18 @@ type domctl_create_config = {
-   arch: arch_domainconfig;
- }
+@@ -165,6 +165,41 @@ val close_handle: unit -> unit
  
-+type runstateinfo = {
-+  state : int32;
-+  missed_changes: int32;
-+  state_entry_time : int64;
-+  time0 : int64;
-+  time1 : int64;
-+  time2 : int64;
-+  time3 : int64;
-+  time4 : int64;
-+  time5 : int64;
-+}
+ val domain_create: handle -> ?domid:int -> domctl_create_config -> domid
+ 
++module Runstateinfo : sig
++  module V1 : sig
++    (* Retain old names for backwards compatibility *)
++    type runstateinfo = {
++      state: int32;
++      missed_changes: int32;
++      state_entry_time: int64;
++      time0: int64;
++      time1: int64;
++      time2: int64;
++      time3: int64;
++      time4: int64;
++      time5: int64;
++    }
++    external domain_get_runstate_info : handle -> int -> runstateinfo = "stub_xc_get_runstate_info"
++  end
 +
- type domaininfo = {
-   domid : domid;
-   dying : bool;
-@@ -182,6 +194,8 @@ external domain_getinfo : handle -> domid -> domaininfo
-   = "stub_xc_domain_getinfo"
- external domain_get_vcpuinfo : handle -> int -> int -> vcpuinfo
-   = "stub_xc_vcpu_getinfo"
-+external domain_get_runstate_info : handle -> int -> runstateinfo
-+  = "stub_xc_get_runstate_info"
- external domain_ioport_permission: handle -> domid -> int -> int -> bool -> unit
-        = "stub_xc_domain_ioport_permission"
- external domain_iomem_permission: handle -> domid -> nativeint -> nativeint -> bool -> unit
++  module V2 : sig
++    type t = {
++      state: int32;
++      missed_changes: int32;
++      state_entry_time: int64;
++      time0: int64;
++      time1: int64;
++      time2: int64;
++      time3: int64;
++      time4: int64;
++      time5: int64;
++    }
++    external domain_get : handle -> int -> t = "stub_xc_get_runstate_info2"
++  end
++end
++
++include module type of Runstateinfo.V1
++
+ external domain_sethandle : handle -> domid -> string -> unit = "stub_xc_domain_sethandle"
+ external domain_max_vcpus : handle -> domid -> int -> unit
+   = "stub_xc_domain_max_vcpus"
 diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
-index 93ff008dc5d8..0bf73d7bc312 100644
+index 93ff008dc5d8..924ed52761a5 100644
 --- a/tools/ocaml/libs/xc/xenctrl_stubs.c
 +++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
-@@ -500,6 +500,37 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch, value domid, value vcpu)
+@@ -500,6 +500,65 @@ CAMLprim value stub_xc_vcpu_getinfo(value xch, value domid, value vcpu)
  	CAMLreturn(result);
  }
  
@@ -179,6 +230,34 @@ index 93ff008dc5d8..0bf73d7bc312 100644
 +        Store_field(result, 8, caml_copy_int64(info.time[5]));
 +
 +        CAMLreturn(result);
++}
++
++CAMLprim value stub_xc_get_runstate_info2(value xch, value domid)
++{
++	CAMLparam2(xch, domid);
++	CAMLlocal1(result);
++	struct xen_domctl d;
++	int retval;
++
++	caml_enter_blocking_section();
++	retval = xc_get_runstate_info_ext(_H(xch), _D(domid), &d);
++	caml_leave_blocking_section();
++
++	if (retval < 0)
++		failwith_xc(_H(xch));
++
++	result = caml_alloc_tuple(9);
++	Store_field(result, 0, caml_copy_int32(d.u.domain_runstate.state));
++	Store_field(result, 1, caml_copy_int32(d.u.domain_runstate.missed_changes));
++	Store_field(result, 2, caml_copy_int64(d.u.domain_runstate.state_entry_time));
++	Store_field(result, 3, caml_copy_int64(d.u.domain_runstate.time[0]));
++	Store_field(result, 4, caml_copy_int64(d.u.domain_runstate.time[1]));
++	Store_field(result, 5, caml_copy_int64(d.u.domain_runstate.time[2]));
++	Store_field(result, 6, caml_copy_int64(d.u.domain_runstate.time[3]));
++	Store_field(result, 7, caml_copy_int64(d.u.domain_runstate.time[4]));
++	Store_field(result, 8, caml_copy_int64(d.u.domain_runstate.time[5]));
++
++	CAMLreturn(result);
 +}
 +
  CAMLprim value stub_xc_vcpu_context_get(value xch, value domid,
@@ -311,10 +390,10 @@ index 78c5917788fe..29c874eb0f8d 100644
  {
      struct vcpu_runstate_info state = { 0 };
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index 7ba3a565209e..fb95fde8c016 100644
+index 7ba3a565209e..356656a9d0de 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1189,6 +1189,33 @@ struct xen_domctl_vmtrace_op {
+@@ -1189,6 +1189,43 @@ struct xen_domctl_vmtrace_op {
  typedef struct xen_domctl_vmtrace_op xen_domctl_vmtrace_op_t;
  DEFINE_XEN_GUEST_HANDLE(xen_domctl_vmtrace_op_t);
  
@@ -345,10 +424,20 @@ index 7ba3a565209e..fb95fde8c016 100644
 +typedef struct xen_domctl_runstate_info xen_domctl_runstate_info_t;
 +DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_t);
 +
++/* A form of xen_domctl_runstate_info which can be extended in some circumstances. */
++struct xen_domctl_runstate_info_ext {
++    uint32_t state;
++    uint32_t missed_changes;
++    uint64_aligned_t state_entry_time;
++    uint64_aligned_t time[6]; /* up to here must be identical to xen_domctl_runstate_info */
++};
++typedef struct xen_domctl_runstate_info_ext xen_domctl_runstate_info_ext_t;
++DEFINE_XEN_GUEST_HANDLE(xen_domctl_runstate_info_ext_t);
++
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1276,6 +1303,7 @@ struct xen_domctl {
+@@ -1276,6 +1313,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_vmtrace_op                    84
  #define XEN_DOMCTL_get_paging_mempool_size       85
  #define XEN_DOMCTL_set_paging_mempool_size       86
@@ -356,23 +445,23 @@ index 7ba3a565209e..fb95fde8c016 100644
  #define XEN_DOMCTL_gdbsx_guestmemio            1000
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
-@@ -1326,6 +1354,7 @@ struct xen_domctl {
+@@ -1326,6 +1364,7 @@ struct xen_domctl {
          struct xen_domctl_set_access_required access_required;
          struct xen_domctl_audit_p2m         audit_p2m;
          struct xen_domctl_set_virq_handler  set_virq_handler;
-+        struct xen_domctl_runstate_info     domain_runstate;
++        struct xen_domctl_runstate_info_ext domain_runstate;
          struct xen_domctl_gdbsx_memio       gdbsx_guest_memio;
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 4ba6f5e28a0e..d9e5f0e7abce 100644
+index 4ba6f5e28a0e..26ba83ba4ae1 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
 @@ -364,6 +364,8 @@ struct evtchn_port_ops;
  
  #define MAX_NR_IOREQ_SERVERS 8
  
-+typedef struct xen_domctl_runstate_info domain_runstate_info_t;
++typedef struct xen_domctl_runstate_info_ext domain_runstate_info_t;
 +
  struct domain
  {
