@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 11
+%global hv_rel 12
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -892,6 +892,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Aug  4 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.2-12
+- Domain runstate extentions for more RRDs
+
 * Wed Jul 30 2025 Ross Lagerwall <ross.lagerwall@citrix.com> - 4.19.2-11
 - Strip xen.efi and provide a non-stripped version
 - Reduce overhead of PML buffer flushing
