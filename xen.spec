@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 17
+%global hv_rel 18
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Tue Aug  5 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-18
+- Domain runstate extentions for more RRDs
+- Mwait-idle updates for Intel Alder Lake thru Granite Rapids platforms
+
 * Wed Jul 23 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-17
 - Fix bad interaction of cache attribute relax with vGPU
 
