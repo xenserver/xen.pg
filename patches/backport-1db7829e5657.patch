@@ -1,0 +1,52 @@
+From 1db7829e56578970c1037c4dd1c27f939be4c054 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Tue, 5 Aug 2025 11:25:15 +0200
+Subject: x86/hpet: do local APIC EOI after interrupt processing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The current logic in the HPET interrupt ->ack() hook will perform a local
+APIC EOI ahead of enabling interrupts, possibly leading to recursion in the
+interrupt handler.
+
+Fix this by doing the local APIC EOI strictly after the window with
+interrupt enabled, as that prevents the recursion, and would only allow for
+interrupts with higher priority to be serviced.
+
+Use the generic ack_nonmaskable_msi_irq() and end_nonmaskable_irq()
+functions, removing the need for hpet_msi_ack().
+
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Fixes: 3ba523ff957c ('CPUIDLE: enable MSI capable HPET for timer broadcast')
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/hpet.c b/xen/arch/x86/hpet.c
+index 192de433cfd1..d05b5eb1361f 100644
+--- a/xen/arch/x86/hpet.c
++++ b/xen/arch/x86/hpet.c
+@@ -303,13 +303,6 @@ static unsigned int cf_check hpet_msi_startup(struct irq_desc *desc)
+ 
+ #define hpet_msi_shutdown hpet_msi_mask
+ 
+-static void cf_check hpet_msi_ack(struct irq_desc *desc)
+-{
+-    irq_complete_move(desc);
+-    move_native_irq(desc);
+-    ack_APIC_irq();
+-}
+-
+ static void cf_check hpet_msi_set_affinity(
+     struct irq_desc *desc, const cpumask_t *mask)
+ {
+@@ -337,7 +330,8 @@ static hw_irq_controller hpet_msi_type = {
+     .shutdown   = hpet_msi_shutdown,
+     .enable	    = hpet_msi_unmask,
+     .disable    = hpet_msi_mask,
+-    .ack        = hpet_msi_ack,
++    .ack        = ack_nonmaskable_msi_irq,
++    .end        = end_nonmaskable_irq,
+     .set_affinity   = hpet_msi_set_affinity,
+ };
+ 
