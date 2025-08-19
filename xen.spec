@@ -828,6 +828,8 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker
 %{_libexecdir}/%{name}/tests/test-cpu-policy
 %{_libexecdir}/%{name}/tests/test-paging-mempool
+%{_libexecdir}/%{name}/tests/test-pdx-mask
+%{_libexecdir}/%{name}/tests/test-pdx-offset
 %{_libexecdir}/%{name}/tests/test-resource
 %{_libexecdir}/%{name}/tests/test-tsx
 %{_libexecdir}/%{name}/tests/test-xenstore
