@@ -1,0 +1,198 @@
+From bd0b3a876d805b95c5cfcf292d7651334c8dba80 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Fri, 20 Jun 2025 09:50:51 +0200
+Subject: pdx: allow per-arch optimization of PDX conversion helpers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There are four performance critical PDX conversion helpers that do the PFN
+to/from PDX and the physical addresses to/from directmap offsets
+translations.
+
+In the absence of an active PDX compression, those functions would still do
+the calculations needed, just to return the same input value as no
+translation is in place and hence PFN and PDX spaces are identity mapped.
+
+To reduce the overhead of having to do the pointless calculations allow
+architectures to implement the translation helpers in a per-arch header.
+Rename the existing conversion functions to add a trailing _xlate suffix,
+so that the per-arch headers can define the non suffixed versions.
+
+Currently only x86 implements meaningful custom handlers to short circuit
+the translation when not active, using asm goto.  Other architectures use
+generic macros that map the non-xlate to the xlate variants to keep the
+previous behavior.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/include/asm/cpufeatures.h b/xen/arch/x86/include/asm/cpufeatures.h
+index 56231b00f15d..1d8630335698 100644
+--- a/xen/arch/x86/include/asm/cpufeatures.h
++++ b/xen/arch/x86/include/asm/cpufeatures.h
+@@ -43,6 +43,7 @@ XEN_CPUFEATURE(XEN_IBT,           X86_SYNTH(27)) /* Xen uses CET Indirect Branch
+ XEN_CPUFEATURE(IBPB_ENTRY_PV,     X86_SYNTH(28)) /* MSR_PRED_CMD used by Xen for PV */
+ XEN_CPUFEATURE(IBPB_ENTRY_HVM,    X86_SYNTH(29)) /* MSR_PRED_CMD used by Xen for HVM */
+ XEN_CPUFEATURE(USE_VMCALL,        X86_SYNTH(30)) /* Use VMCALL instead of VMMCALL */
++XEN_CPUFEATURE(PDX_COMPRESSION,   X86_SYNTH(31)) /* PDX compression */
+ 
+ /* Bug words follow the synthetic words. */
+ #define X86_NR_BUG 1
+diff --git a/xen/arch/x86/srat.c b/xen/arch/x86/srat.c
+index d03438d73fd8..275cae025067 100644
+--- a/xen/arch/x86/srat.c
++++ b/xen/arch/x86/srat.c
+@@ -527,7 +527,8 @@ void __init srat_parse_regions(paddr_t addr)
+ 	acpi_table_parse_srat(ACPI_SRAT_TYPE_MEMORY_AFFINITY,
+ 			      srat_parse_region, 0);
+ 
+-	pfn_pdx_compression_setup(addr);
++	if (!pfn_pdx_compression_setup(addr))
++		return;
+ 
+ 	/* Ensure all RAM ranges in the e820 are covered. */
+ 	for (i = 0; i < e820.nr_map; i++) {
+@@ -547,6 +548,9 @@ void __init srat_parse_regions(paddr_t addr)
+ 			return;
+ 		}
+ 	}
++
++	/* If we got this far compression is working as expected. */
++	setup_force_cpu_cap(X86_FEATURE_PDX_COMPRESSION);
+ }
+ 
+ /* Use the information discovered above to actually set up the nodes. */
+diff --git a/xen/common/pdx.c b/xen/common/pdx.c
+index 6878a508bd43..2fcced518bc5 100644
+--- a/xen/common/pdx.c
++++ b/xen/common/pdx.c
+@@ -214,7 +214,7 @@ static uint64_t __init pdx_init_mask(uint64_t base_addr)
+                          (uint64_t)1 << (MAX_ORDER + PAGE_SHIFT)) - 1);
+ }
+ 
+-void __init pfn_pdx_compression_setup(paddr_t base)
++bool __init pfn_pdx_compression_setup(paddr_t base)
+ {
+     unsigned int i, j, bottom_shift = 0, hole_shift = 0;
+     unsigned long mask = pdx_init_mask(base) >> PAGE_SHIFT;
+@@ -223,7 +223,7 @@ void __init pfn_pdx_compression_setup(paddr_t base)
+     {
+         printk(XENLOG_DEBUG "PFN compression disabled%s\n",
+                pdx_compress ? ": no ranges provided" : "");
+-        return;
++        return false;
+     }
+ 
+     if ( nr_ranges > ARRAY_SIZE(ranges) )
+@@ -231,7 +231,7 @@ void __init pfn_pdx_compression_setup(paddr_t base)
+         printk(XENLOG_WARNING
+                "Too many PFN ranges (%u > %zu), not attempting PFN compression\n",
+                nr_ranges, ARRAY_SIZE(ranges));
+-        return;
++        return false;
+     }
+ 
+     for ( i = 0; i < nr_ranges; i++ )
+@@ -262,7 +262,7 @@ void __init pfn_pdx_compression_setup(paddr_t base)
+         }
+     }
+     if ( !hole_shift )
+-        return;
++        return false;
+ 
+     printk(KERN_INFO "PFN compression on bits %u...%u\n",
+            bottom_shift, bottom_shift + hole_shift - 1);
+@@ -273,6 +273,8 @@ void __init pfn_pdx_compression_setup(paddr_t base)
+     pfn_hole_mask       = ((1UL << hole_shift) - 1) << bottom_shift;
+     pfn_top_mask        = ~(pfn_pdx_bottom_mask | pfn_hole_mask);
+     ma_top_mask         = pfn_top_mask << PAGE_SHIFT;
++
++    return true;
+ }
+ 
+ void __init pfn_pdx_compression_reset(void)
+diff --git a/xen/include/xen/pdx.h b/xen/include/xen/pdx.h
+index fe396233674c..f969f7faae43 100644
+--- a/xen/include/xen/pdx.h
++++ b/xen/include/xen/pdx.h
+@@ -111,7 +111,7 @@ extern unsigned long pfn_top_mask, ma_top_mask;
+  * @param pfn Frame number
+  * @return Obtained pdx after compressing the pfn
+  */
+-static inline unsigned long pfn_to_pdx(unsigned long pfn)
++static inline unsigned long pfn_to_pdx_xlate(unsigned long pfn)
+ {
+     return (pfn & pfn_pdx_bottom_mask) |
+            ((pfn & pfn_top_mask) >> pfn_pdx_hole_shift);
+@@ -123,7 +123,7 @@ static inline unsigned long pfn_to_pdx(unsigned long pfn)
+  * @param pdx Page index
+  * @return Obtained pfn after decompressing the pdx
+  */
+-static inline unsigned long pdx_to_pfn(unsigned long pdx)
++static inline unsigned long pdx_to_pfn_xlate(unsigned long pdx)
+ {
+     return (pdx & pfn_pdx_bottom_mask) |
+            ((pdx << pfn_pdx_hole_shift) & pfn_top_mask);
+@@ -136,7 +136,7 @@ static inline unsigned long pdx_to_pfn(unsigned long pdx)
+  * @return Offset on the direct map where that
+  *         machine address can be accessed
+  */
+-static inline unsigned long maddr_to_directmapoff(paddr_t ma)
++static inline unsigned long maddr_to_directmapoff_xlate(paddr_t ma)
+ {
+     return (((ma & ma_top_mask) >> pfn_pdx_hole_shift) |
+             (ma & ma_va_bottom_mask));
+@@ -148,7 +148,7 @@ static inline unsigned long maddr_to_directmapoff(paddr_t ma)
+  * @param offset Offset into the direct map
+  * @return Corresponding machine address of that virtual location
+  */
+-static inline paddr_t directmapoff_to_maddr(unsigned long offset)
++static inline paddr_t directmapoff_to_maddr_xlate(unsigned long offset)
+ {
+     return ((((paddr_t)offset << pfn_pdx_hole_shift) & ma_top_mask) |
+             (offset & ma_va_bottom_mask));
+@@ -178,8 +178,9 @@ static inline void pfn_pdx_add_region(paddr_t base, paddr_t size)
+ {
+ }
+ 
+-static inline void pfn_pdx_compression_setup(paddr_t base)
++static inline bool pfn_pdx_compression_setup(paddr_t base)
+ {
++    return false;
+ }
+ 
+ static inline void pfn_pdx_compression_reset(void)
+@@ -188,6 +189,21 @@ static inline void pfn_pdx_compression_reset(void)
+ 
+ #else /* !CONFIG_PDX_NONE */
+ 
++/*
++ * Allow each architecture to define its (possibly optimized) versions of the
++ * translation functions.
++ *
++ * Do not use _xlate suffixed functions, always use the non _xlate variants.
++ */
++#if __has_include(<asm/pdx.h>)
++# include <asm/pdx.h>
++#else
++# define pdx_to_pfn pdx_to_pfn_xlate
++# define pfn_to_pdx pfn_to_pdx_xlate
++# define maddr_to_directmapoff maddr_to_directmapoff_xlate
++# define directmapoff_to_maddr directmapoff_to_maddr_xlate
++#endif
++
+ /* Shared functions implemented by all PDX compressions. */
+ 
+ /**
+@@ -212,8 +228,9 @@ void pfn_pdx_add_region(paddr_t base, paddr_t size);
+  * range of the current memory regions.
+  *
+  * @param base address to start compression from.
++ * @return True if PDX compression has been enabled.
+  */
+-void pfn_pdx_compression_setup(paddr_t base);
++bool pfn_pdx_compression_setup(paddr_t base);
+ 
+ /**
+  * Reset the global variables to it's default values, thus disabling PFN

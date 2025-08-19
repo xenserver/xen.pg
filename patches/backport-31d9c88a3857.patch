@@ -1,0 +1,77 @@
+From 31d9c88a3857b1140d8dc39d7b5d3a4efca8498a Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Wed, 18 Jun 2025 12:24:44 +0200
+Subject: pdx: introduce command line compression toggle
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Introduce a command line option to allow disabling PDX compression.  The
+disabling is done by turning pfn_pdx_add_region() into a no-op, so when
+attempting to initialize the selected compression algorithm the array of
+ranges to compress is empty.
+
+Signed-off-by: Roger Pau Monné <roger.pau@cloud.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/docs/misc/xen-command-line.pandoc b/docs/misc/xen-command-line.pandoc
+index ba9033d998ca..6b9bb8f81fa4 100644
+--- a/docs/misc/xen-command-line.pandoc
++++ b/docs/misc/xen-command-line.pandoc
+@@ -1943,6 +1943,15 @@ for all of them (`true`), only for those subject to XPTI (`xpti`) or for
+ those not subject to XPTI (`no-xpti`). The feature is used only in case
+ INVPCID is supported and not disabled via `invpcid=false`.
+ 
++### pdx-compress
++> `= <boolean>`
++
++> Default: `true` if CONFIG_PDX_NONE is unset
++
++Only relevant when the hypervisor is build with PFN PDX compression. Controls
++whether Xen will engage in PFN compression.  The algorithm used for PFN
++compression is selected at build time from Kconfig.
++
+ ### pku (x86)
+ > `= <boolean>`
+ 
+diff --git a/xen/common/pdx.c b/xen/common/pdx.c
+index edde7268ef54..6878a508bd43 100644
+--- a/xen/common/pdx.c
++++ b/xen/common/pdx.c
+@@ -19,6 +19,7 @@
+ #include <xen/mm.h>
+ #include <xen/bitops.h>
+ #include <xen/nospec.h>
++#include <xen/param.h>
+ #include <xen/pfn.h>
+ 
+ /**
+@@ -75,9 +76,13 @@ static struct pfn_range {
+ } ranges[MAX_PFN_RANGES] __initdata;
+ static unsigned int __initdata nr_ranges;
+ 
++static bool __initdata pdx_compress = true;
++boolean_param("pdx-compress", pdx_compress);
++
+ void __init pfn_pdx_add_region(paddr_t base, paddr_t size)
+ {
+-    if ( !size )
++    /* Without ranges there's no PFN compression. */
++    if ( !size || !pdx_compress )
+         return;
+ 
+     if ( nr_ranges >= ARRAY_SIZE(ranges) )
+@@ -214,6 +219,13 @@ void __init pfn_pdx_compression_setup(paddr_t base)
+     unsigned int i, j, bottom_shift = 0, hole_shift = 0;
+     unsigned long mask = pdx_init_mask(base) >> PAGE_SHIFT;
+ 
++    if ( !nr_ranges )
++    {
++        printk(XENLOG_DEBUG "PFN compression disabled%s\n",
++               pdx_compress ? ": no ranges provided" : "");
++        return;
++    }
++
+     if ( nr_ranges > ARRAY_SIZE(ranges) )
+     {
+         printk(XENLOG_WARNING

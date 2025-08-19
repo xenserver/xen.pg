@@ -1,0 +1,481 @@
+From cb50e4033717632e948a47599ebcaa1d1f4e048c Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Tue, 17 Jun 2025 10:19:58 +0200
+Subject: test/pdx: add PDX compression unit tests
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Introduce a set of unit tests for PDX compression.  The unit tests contains
+both real and crafted memory maps that are then compressed using the
+selected PDX algorithm.  Note the build system for the unit tests has been
+done in a way to support adding new compression algorithms easily.  That
+requires generating a new test-pdx-<compress> executable that's build with
+the selected PDX compression enabled.
+
+Currently the only generated executable is test-pdx-mask that tests PDX
+mask compression.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Anthony PERARD <anthony.perard@vates.tech>
+
+diff --git a/tools/tests/Makefile b/tools/tests/Makefile
+index 1319c3a9d88c..5809c6c427f8 100644
+--- a/tools/tests/Makefile
++++ b/tools/tests/Makefile
+@@ -10,6 +10,7 @@ SUBDIRS-$(CONFIG_X86) += x86_emulator
+ endif
+ SUBDIRS-y += xenstore
+ SUBDIRS-y += depriv
++SUBDIRS-y += pdx
+ SUBDIRS-y += vpci
+ SUBDIRS-y += paging-mempool
+ 
+diff --git a/tools/tests/pdx/.gitignore b/tools/tests/pdx/.gitignore
+new file mode 100644
+index 000000000000..a32c7db4de79
+--- /dev/null
++++ b/tools/tests/pdx/.gitignore
+@@ -0,0 +1,2 @@
++/pdx.h
++/test-pdx-mask
+diff --git a/tools/tests/pdx/Makefile b/tools/tests/pdx/Makefile
+new file mode 100644
+index 000000000000..da5bc422ddaf
+--- /dev/null
++++ b/tools/tests/pdx/Makefile
+@@ -0,0 +1,49 @@
++XEN_ROOT=$(CURDIR)/../../..
++include $(XEN_ROOT)/tools/Rules.mk
++
++TARGETS := test-pdx-mask
++
++.PHONY: all
++all: $(TARGETS)
++
++.PHONY: run
++run: $(TARGETS)
++ifeq ($(CC),$(HOSTCC))
++	set -e;             \
++	for test in $? ; do \
++		./$$test ;  \
++	done
++else
++	$(warning HOSTCC != CC, will not run test)
++endif
++
++.PHONY: clean
++clean:
++	$(RM) -- *.o $(TARGETS) $(DEPS_RM) pdx.h
++
++.PHONY: distclean
++distclean: clean
++	$(RM) -- *~
++
++.PHONY: install
++install: all
++	$(INSTALL_DIR) $(DESTDIR)$(LIBEXEC_BIN)
++	$(INSTALL_PROG) $(TARGETS) $(DESTDIR)$(LIBEXEC_BIN)
++
++.PHONY: uninstall
++uninstall:
++	$(RM) -- $(patsubst %,$(DESTDIR)$(LIBEXEC_BIN)%,$(TARGETS))
++
++pdx.h: $(XEN_ROOT)/xen/include/xen/pdx.h
++	sed -E -e '/^#[[:space:]]*include/d' <$< >$@
++
++CFLAGS += -D__XEN_TOOLS__
++CFLAGS += $(APPEND_CFLAGS)
++CFLAGS += $(CFLAGS_xeninclude)
++
++test-pdx-mask: CFLAGS += -DCONFIG_PDX_MASK_COMPRESSION
++
++test-pdx-%: test-pdx.c pdx.h
++	$(CC) $(CPPFLAGS) $(CFLAGS) $(CFLAGS_$*.o) -o $@ $< $(APPEND_CFLAGS)
++
++-include $(DEPS_INCLUDE)
+diff --git a/tools/tests/pdx/harness.h b/tools/tests/pdx/harness.h
+new file mode 100644
+index 000000000000..80f251134e26
+--- /dev/null
++++ b/tools/tests/pdx/harness.h
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Unit tests for PDX compression.
++ *
++ * Copyright (C) 2025 Cloud Software Group
++ */
++
++#ifndef _TEST_HARNESS_
++#define _TEST_HARNESS_
++
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <xen-tools/libs.h>
++
++#define __init
++#define __initdata
++#define __ro_after_init
++#define cf_check
++
++#define printk printf
++#define XENLOG_INFO
++#define XENLOG_DEBUG
++#define XENLOG_WARNING
++#define KERN_INFO
++
++#define BITS_PER_LONG (unsigned int)(sizeof(unsigned long) * 8)
++
++#define PAGE_SHIFT    12
++/* Some libcs define PAGE_SIZE in limits.h. */
++#undef  PAGE_SIZE
++#define PAGE_SIZE     (1L << PAGE_SHIFT)
++#define MAX_ORDER     18 /* 2 * PAGETABLE_ORDER (9) */
++
++#define PFN_DOWN(x)   ((x) >> PAGE_SHIFT)
++#define PFN_UP(x)     (((x) + PAGE_SIZE-1) >> PAGE_SHIFT)
++
++#define pfn_to_paddr(pfn) ((paddr_t)(pfn) << PAGE_SHIFT)
++#define paddr_to_pfn(pa)  ((unsigned long)((pa) >> PAGE_SHIFT))
++
++#define MAX_RANGES 16
++#define MAX_PFN_RANGES MAX_RANGES
++
++#define ASSERT assert
++
++#define CONFIG_DEBUG
++
++static inline unsigned int find_next(
++    const unsigned long *addr, unsigned int size, unsigned int off, bool value)
++{
++    unsigned int i;
++
++    ASSERT(size <= BITS_PER_LONG);
++
++    for ( i = off; i < size; i++ )
++        if ( !!(*addr & (1UL << i)) == value )
++            return i;
++
++    return size;
++}
++
++#define find_next_zero_bit(a, s, o) find_next(a, s, o, false)
++#define find_next_bit(a, s, o)      find_next(a, s, o, true)
++
++#define boolean_param(name, func)
++
++typedef uint64_t paddr_t;
++
++#include "pdx.h"
++
++#endif
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/tools/tests/pdx/test-pdx.c b/tools/tests/pdx/test-pdx.c
+new file mode 100644
+index 000000000000..0798ccee359b
+--- /dev/null
++++ b/tools/tests/pdx/test-pdx.c
+@@ -0,0 +1,267 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Unit tests for PDX compression.
++ *
++ * Copyright (C) 2025 Cloud Software Group
++ */
++
++#include "harness.h"
++
++#include "../../xen/common/pdx.c"
++
++struct range {
++    /* Ranges are defined as [start, end). */
++    unsigned long start, end;
++};
++
++static void print_ranges(const struct range *r)
++{
++    unsigned int i;
++
++    printf("Ranges:\n");
++
++    for ( i = 0; i < MAX_RANGES; i++ )
++    {
++        if ( !r[i].start && !r[i].end )
++            break;
++
++        printf(" %013lx-%013lx\n", r[i].start, r[i].end);
++    }
++}
++
++int main(int argc, char **argv)
++{
++    static const struct {
++        struct range ranges[MAX_RANGES];
++        bool compress;
++    } tests[] = {
++#ifdef __LP64__
++        /*
++         * Only for targets where unsigned long is 64bits, otherwise compiler
++         * will complain about truncation from 'long long' -> 'long' conversion.
++         *
++         * Real memory map from a 4s Intel GNR.  Not compressible using PDX
++         * mask compression.
++         */
++        {
++            .ranges = {
++                { .start =           0,   .end =     0x80000UL },
++                { .start =   0x0100000UL, .end =   0x8080000UL },
++                { .start =  0x63e80000UL, .end =  0x6be80000UL },
++                { .start =  0xc7e80000UL, .end =  0xcfe80000UL },
++                { .start = 0x12be80000UL, .end = 0x133e80000UL },
++            },
++            .compress = false,
++        },
++        /* Simple hole. */
++        {
++            .ranges = {
++                { .start =                                                 0,
++                  .end   =                            (1UL << MAX_ORDER) * 1 },
++                { .start = (1UL << (MAX_ORDER * 2)) |                      0,
++                  .end   = (1UL << (MAX_ORDER * 2)) | (1UL << MAX_ORDER) * 1 },
++            },
++            .compress = true,
++        },
++        /* Simple hole, unsorted ranges. */
++        {
++            .ranges = {
++                { .start = (1UL << (MAX_ORDER * 2)) |                      0,
++                  .end   = (1UL << (MAX_ORDER * 2)) | (1UL << MAX_ORDER) * 1 },
++                { .start =                                                 0,
++                  .end   =                            (1UL << MAX_ORDER) * 1 },
++            },
++            .compress = true,
++        },
++        /* PDX compression, 2 ranges covered by the lower mask. */
++        {
++            .ranges = {
++                { .start =                    0,
++                  .end   = (1 << MAX_ORDER) * 1 },
++                { .start = (1 << MAX_ORDER) * 2,
++                  .end   = (1 << MAX_ORDER) * 3 },
++                { .start = (1 << MAX_ORDER) * 20,
++                  .end   = (1 << MAX_ORDER) * 22 },
++            },
++            .compress = true,
++        },
++        /* Single range not starting at 0. */
++        {
++            .ranges = {
++                { .start = (1 << MAX_ORDER) * 10,
++                  .end   = (1 << MAX_ORDER) * 11 },
++            },
++            .compress = true,
++        },
++        /* Resulting PDX region size leads to no compression. */
++        {
++            .ranges = {
++                { .start =                    0,
++                  .end   = (1 << MAX_ORDER) * 1 },
++                { .start = (1 << MAX_ORDER) * 2,
++                  .end   = (1 << MAX_ORDER) * 3 },
++                { .start = (1 << MAX_ORDER) * 4,
++                  .end   = (1 << MAX_ORDER) * 7 },
++                { .start = (1 << MAX_ORDER) * 8,
++                  .end   = (1 << MAX_ORDER) * 12 },
++            },
++            .compress = false,
++        },
++        /* AMD Versal Gen 2 ARM board. */
++        {
++            .ranges = {
++                { .start =          0,   .end =    0x80000UL },
++                { .start =   0x800000UL, .end =   0x880000UL },
++                { .start = 0x50000000UL, .end = 0x50080000UL },
++                { .start = 0x60000000UL, .end = 0x60080000UL },
++                { .start = 0x70000000UL, .end = 0x70080000UL },
++            },
++            .compress = true,
++        },
++        /* Unsorted ranges, lower one not starting at 0. */
++        {
++        .ranges = {
++                { .start = (1UL << (35 - PAGE_SHIFT)) + (1 << MAX_ORDER) * 2,
++                  .end =   (1UL << (35 - PAGE_SHIFT)) + (1 << MAX_ORDER) * 3 },
++                { .start = (1 << MAX_ORDER) * 2,
++                  .end =   (1 << MAX_ORDER) * 3 },
++            },
++            .compress = true,
++        },
++        /* Two ranges with the same high bit set. */
++        {
++        .ranges = {
++                { .start = (1UL << (51 - PAGE_SHIFT)) + (1 << MAX_ORDER) * 0,
++                  .end =   (1UL << (51 - PAGE_SHIFT)) + (1 << MAX_ORDER) * 1 },
++                { .start = (1UL << (51 - PAGE_SHIFT)) + (1 << MAX_ORDER) * 3,
++                  .end =   (1UL << (51 - PAGE_SHIFT)) + (1 << MAX_ORDER) * 4 },
++            },
++            .compress = true,
++        },
++#endif
++        /* AMD Naples Epyc 7281 2 sockets, 8 NUMA nodes. */
++        {
++            .ranges = {
++                { .start =         0,   .end =      0xa0UL },
++                { .start =     0x100UL, .end =   0xb0000UL },
++                { .start =  0x100000UL, .end =  0x430000UL },
++                { .start =  0x430000UL, .end =  0x830000UL },
++                { .start =  0x830000UL, .end =  0xc30000UL },
++                { .start =  0xc30000UL, .end = 0x1030000UL },
++                { .start = 0x1030000UL, .end = 0x1430000UL },
++                { .start = 0x1430000UL, .end = 0x1830000UL },
++                { .start = 0x1830000UL, .end = 0x1c30000UL },
++                { .start = 0x1c30000UL, .end = 0x2030000UL },
++            },
++            .compress = false,
++        },
++        /* 2-node 2GB per-node QEMU layout. */
++        {
++            .ranges = {
++                { .start =        0,   .end =  0x80000UL },
++                { .start = 0x100000UL, .end = 0x180000UL },
++            },
++            .compress = true,
++        },
++        /* Not compressible, smaller than MAX_ORDER. */
++        {
++            .ranges = {
++                { .start =     0,   .end =     1   },
++                { .start = 0x100UL, .end = 0x101UL },
++            },
++            .compress = false,
++        },
++        /* Compressible, requires adjusting size to (1 << MAX_ORDER). */
++        {
++            .ranges = {
++                { .start =        0,   .end =        1   },
++                { .start = 0x100000UL, .end = 0x100001UL },
++            },
++            .compress = true,
++        },
++        /* 2s Intel CLX with contiguous ranges, no compression. */
++        {
++            .ranges = {
++                { .start =        0  , .end =  0x180000UL },
++                { .start = 0x180000UL, .end = 0x3040000UL },
++            },
++            .compress = false,
++        },
++    };
++    int ret_code = EXIT_SUCCESS;
++
++    for ( unsigned int i = 0 ; i < ARRAY_SIZE(tests); i++ )
++    {
++        unsigned int j;
++
++        pfn_pdx_compression_reset();
++
++        for ( j = 0; j < ARRAY_SIZE(tests[i].ranges); j++ )
++        {
++            unsigned long size = tests[i].ranges[j].end -
++                                 tests[i].ranges[j].start;
++
++            if ( !tests[i].ranges[j].start && !tests[i].ranges[j].end )
++                break;
++
++            pfn_pdx_add_region(tests[i].ranges[j].start << PAGE_SHIFT,
++                               size << PAGE_SHIFT);
++        }
++
++        if ( pfn_pdx_compression_setup(0) != tests[i].compress )
++        {
++            printf("PFN compression diverge, expected %scompressible\n",
++                   tests[i].compress ? "" : "un");
++            print_ranges(tests[i].ranges);
++
++            ret_code = EXIT_FAILURE;
++            continue;
++        }
++
++        if ( !tests[i].compress )
++            continue;
++
++        for ( j = 0; j < ARRAY_SIZE(tests[i].ranges); j++ )
++        {
++            unsigned long start = tests[i].ranges[j].start;
++            unsigned long end = tests[i].ranges[j].end;
++
++            if ( !start && !end )
++                break;
++
++            if ( !pdx_is_region_compressible(start << PAGE_SHIFT, 1) ||
++                 !pdx_is_region_compressible((end - 1) << PAGE_SHIFT, 1) )
++            {
++                printf(
++    "PFN compression invalid, pages %#lx and %#lx should be compressible\n",
++                       start, end - 1);
++                print_ranges(tests[i].ranges);
++                ret_code = EXIT_FAILURE;
++            }
++
++            if ( start != pdx_to_pfn(pfn_to_pdx(start)) ||
++                 end - 1 != pdx_to_pfn(pfn_to_pdx(end - 1)) )
++            {
++                printf("Compression is not bi-directional:\n");
++                printf(" PFN %#lx -> PDX %#lx -> PFN %#lx\n",
++                       start, pfn_to_pdx(start), pdx_to_pfn(pfn_to_pdx(start)));
++                printf(" PFN %#lx -> PDX %#lx -> PFN %#lx\n",
++                       end - 1, pfn_to_pdx(end - 1),
++                       pdx_to_pfn(pfn_to_pdx(end - 1)));
++                print_ranges(tests[i].ranges);
++                ret_code = EXIT_FAILURE;
++            }
++        }
++    }
++
++    return ret_code;
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff --git a/xen/common/pdx.c b/xen/common/pdx.c
+index 2fcced518bc5..ea168da60008 100644
+--- a/xen/common/pdx.c
++++ b/xen/common/pdx.c
+@@ -15,6 +15,8 @@
+  * along with this program; If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++/* Trim content when built for the test harness. */
++#ifdef __XEN__
+ #include <xen/init.h>
+ #include <xen/mm.h>
+ #include <xen/bitops.h>
+@@ -56,6 +58,8 @@ void set_pdx_range(unsigned long smfn, unsigned long emfn)
+         __set_bit(idx, pdx_group_valid);
+ }
+ 
++#endif /* __XEN__ */
++
+ #ifndef CONFIG_PDX_NONE
+ 
+ #ifdef CONFIG_X86
