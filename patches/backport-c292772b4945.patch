@@ -1,0 +1,103 @@
+From c292772b4945d3a264a61c3c1920f1aebd17998b Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Mon, 18 Aug 2025 10:16:36 +0200
+Subject: x86/iommu: setup MMCFG ahead of IOMMU
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Otherwise the PCI accesses to segments different than the first one done by
+the IOMMU initialization code would silently fail by returning all ones.
+
+Introduce a new helper, called pci_setup(), and move both the creation of
+PCI segment 0 internal data structures, plus the parsing of ACPI MMCFG
+table to it.  This moves acpi_mmcfg_init() slightly earlier from
+acpi_boot_init() into pci_setup().
+
+Note that further work will be needed to support systems where access
+methods to segments different than 0 is not discoverable by Xen.
+
+Fixes: 3950f2485bbc ('x86/x2APIC: defer probe until after IOMMU ACPI table parsing')
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/acpi/boot.c b/xen/arch/x86/acpi/boot.c
+index 170f9783c55e..aa9ab1a2e34b 100644
+--- a/xen/arch/x86/acpi/boot.c
++++ b/xen/arch/x86/acpi/boot.c
+@@ -748,8 +748,6 @@ int __init acpi_boot_init(void)
+ 
+ 	acpi_table_parse(ACPI_SIG_HPET, acpi_parse_hpet);
+ 
+-	acpi_mmcfg_init();
+-
+ 	erst_init();
+ 
+ 	acpi_hest_init();
+diff --git a/xen/arch/x86/include/asm/pci.h b/xen/arch/x86/include/asm/pci.h
+index fd5480d67d43..5bec6c67a6ab 100644
+--- a/xen/arch/x86/include/asm/pci.h
++++ b/xen/arch/x86/include/asm/pci.h
+@@ -67,4 +67,6 @@ static inline bool pci_check_bar(const struct pci_dev *pdev,
+     return is_memory_hole(start, end);
+ }
+ 
++void pci_setup(void);
++
+ #endif /* __X86_PCI_H__ */
+diff --git a/xen/arch/x86/pci.c b/xen/arch/x86/pci.c
+index 97b792e578f1..d685ecd7e562 100644
+--- a/xen/arch/x86/pci.c
++++ b/xen/arch/x86/pci.c
+@@ -6,7 +6,10 @@
+ 
+ #include <xen/spinlock.h>
+ #include <xen/pci.h>
++
++#include <asm/acpi.h>
+ #include <asm/io.h>
++
+ #include <xsm/xsm.h>
+ 
+ static DEFINE_SPINLOCK(pci_config_lock);
+@@ -98,3 +101,9 @@ int pci_conf_write_intercept(unsigned int seg, unsigned int bdf,
+ 
+     return rc;
+ }
++
++void __init pci_setup(void)
++{
++    /* Parse ACPI MMCFG to see if other segments are available. */
++    acpi_mmcfg_init();
++}
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 2148dde05f38..131d4357fef3 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -1802,6 +1802,12 @@ void asmlinkage __init noreturn __start_xen(unsigned long mbi_p)
+      */
+     setup_system_domains();
+ 
++    /*
++     * Initialize PCI (create segment 0, setup MMCFG access) ahead of IOMMU
++     * setup, as devices in segment > 0 must also be discoverable.
++     */
++    pci_setup();
++
+     /*
+      * IOMMU-related ACPI table parsing has to happen before APIC probing, for
+      * check_x2apic_preenabled() to be able to observe respective findings, in
+diff --git a/xen/arch/x86/x86_64/mmconfig-shared.c b/xen/arch/x86/x86_64/mmconfig-shared.c
+index b3b2da73626f..7818ae5c3fe7 100644
+--- a/xen/arch/x86/x86_64/mmconfig-shared.c
++++ b/xen/arch/x86/x86_64/mmconfig-shared.c
+@@ -403,6 +403,9 @@ void __init acpi_mmcfg_init(void)
+ 
+     pci_segments_init();
+ 
++    if ( acpi_disabled )
++        return;
++
+     /* MMCONFIG disabled */
+     if ((pci_probe & PCI_PROBE_MMCONF) == 0)
+         return;
