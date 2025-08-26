@@ -895,7 +895,7 @@ fi
 %{?_cov_results_package}
 
 %changelog
-* Mon Aug  4 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.2-12
+* Mon Aug 04 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.2-12
 - Domain runstate extentions for more RRDs
 
 * Wed Jul 30 2025 Ross Lagerwall <ross.lagerwall@citrix.com> - 4.19.2-11
@@ -937,7 +937,7 @@ fi
 - Perform provenance checks on AMD microcode blobs
 - Work around Ice Lake erratum ICX143, which manifests as a hang on boot
 
-* Mon Apr  7 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.19.2-1
+* Mon Apr 07 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.19.2-1
 - Update to Xen 4.19.2.
 
 * Mon Mar 24 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.1-4
@@ -945,7 +945,7 @@ fi
 - Add xenguest support for the platform:mmio_hole_size attribute
 - Fix crash on boot when operating on the dom0 or initrd binaries
 
-* Mon Mar  3 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.1-3
+* Mon Mar 03 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.19.1-3
 - Fix for XSA-467 CVE-2025-1713
 - Scan for microcode by default
 - Fix build warning in oxenstored
@@ -965,7 +965,7 @@ fi
 - Fix emulation of MOVBE instruction
 - Fix Ocaml rpath setting
 
-* Tue Dec  3 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-6
+* Tue Dec 03 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-6
 - Fix migration of VMs from CH 8.2 CU1 to XS8 when the guest is using BHI_DIS_S
 
 * Mon Nov 25 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-5
@@ -973,7 +973,7 @@ fi
 - Fix dom0 pIRQ limit calculation
 - Fix emulation of BMI1/2 instructions
 
-* Tue Nov  5 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-4
+* Tue Nov 05 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-4
 - Fixes for
   - XSA-463 CVE-2024-45818
   - XSA-464 CVE-2024-45819
@@ -995,7 +995,7 @@ fi
 * Wed Aug 21 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-1
 - Update to Xen 4.17.5
 
-* Fri Aug  2 2024 Roger Pau Monné <roger.pau@citrix.com> - 4.17.4-8
+* Fri Aug 02 2024 Roger Pau Monné <roger.pau@citrix.com> - 4.17.4-8
 - Fix for XSA-460 CVE-2024-31145
 - Fix IO breakpoint recognition in PV guests
 - Fix libxenstore.so to not modify SIGBUS behind the back of the application
@@ -1007,7 +1007,7 @@ fi
 - Don't package Ocaml Xenbus library
 - Inject #DF instead of overwriting RIP in xen-hvmcrash
 
-* Wed Jul  3 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-6
+* Wed Jul 03 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-6
 - Fix for XSA-458 CVE-2024-31143
 - Fix early detection of CPU features on hardware with the CPUID Limit active
   in firmware
@@ -1033,7 +1033,7 @@ fi
 - Fix xentop cpu% sort order
 - Fix possible watchdog timeouts or NULL pointer deference with CPU hotplug
 
-* Tue May  7 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-2
+* Tue May 07 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-2
 - Fix a heterogeneous CPU levelling bug between ICX and CLX
 
 * Tue Apr 30 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.4-1
@@ -1044,16 +1044,16 @@ fi
   host crash
 - Include the debug xen debug symbols in in the lp-devel subpackage
 
-* Tue Apr  9 2024 Alex Brett <alex.brett@cloud.com> - 4.17.3-6
+* Tue Apr 09 2024 Alex Brett <alex.brett@cloud.com> - 4.17.3-6
 - CA-391273: Rebuild to resolve xen-dom0-tools dependency issue
 
-* Wed Apr  3 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-5
+* Wed Apr 03 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-5
 - Fixes for:
   - XSA-454 CVE-2023-46842
   - XSA-455 CVE-2024-31142
   - XSA-456 CVE-2024-2201
 
-* Fri Mar  8 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-4
+* Fri Mar 08 2024 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.3-4
 - Fixes for:
   - XSA-453 CVE-2024-2193, off by default
   - XSA-452 CVE-2023-28746
@@ -1094,20 +1094,20 @@ fi
 - Rebuild with updated Ocaml 4.14 runtime.
 - Fix possible memory leak in libxenguest cpu-policy infrastructure.
 
-* Mon Dec 4 2023 Alejandro Vallejo <alejandro.vallejo@cloud.com> - 4.13.5-10.58
+* Mon Dec 04 2023 Alejandro Vallejo <alejandro.vallejo@cloud.com> - 4.13.5-10.58
 - Remove limit of 64 CPUs from hvmloader.
 - Fix pygrub incompatibility with python3.
 - Improve the livepatch infrastructure.
 
-* Wed Nov 8 2023 Roger Pau Monné <roger.pau@citrix.com> - 4.13.5-10.57
+* Wed Nov 08 2023 Roger Pau Monné <roger.pau@citrix.com> - 4.13.5-10.57
 - Add new x2APIC 'Mixed mode' driver, and use it by default.
 
-* Wed Nov 1 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.56
+* Wed Nov 01 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.56
 - Fixes for
   - XSA-445 CVE-2023-46835
   - XSA-446 CVE-2023-46836
 
-* Wed Nov 1 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.55
+* Wed Nov 01 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.55
 - Fix for AMD erratum #1485, which has been observed to cause #UD exception on
   AMD Zen4 systems.
 - Allow using the platform/ovmf-override key to configure the OVMF firwmare to
@@ -1147,12 +1147,12 @@ fi
   workaround for XSA-246, but wasn't effective owing to poor error handling
   elsewhere.
 
-* Thu Aug 3 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.50
+* Thu Aug 03 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.50
 - Fixes for
   - XSA-434 CVE-2023-20569
   - XSA-435 CVE-2022-40982
 
-* Thu Aug 3 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.49
+* Thu Aug 03 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.49
 - Fix bug in XSA-433 fix, which accidentally disabled a hardware errata
   workaround.
 - Update IO-APIC IRTEs atomically.  Fixes a race condition which causes
@@ -1206,7 +1206,7 @@ fi
 - Remove the xen-installer-files subpackage.  It was a vestigial remnant of an
   old build system.
 
-* Mon Mar 6 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.42
+* Mon Mar 06 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.42
 - Fixes for
   - XSA-427 CVE-2022-42332
   - XSA-428 CVE-2022-42333 CVE-2022-42334
@@ -1215,19 +1215,19 @@ fi
   was all specific to dom0, and ineligible to be used elsewhere.
 - Reintroduce the python2 pygrub/libfsimage bindings.
 
-* Fri Mar 3 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.41
+* Fri Mar 03 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.41
 - Load AMD microcode on all logical processors.
 - Switch to using Python 3.  Retain Python 2 builds of xen.lowlevel in the
   short term until dependent packages have been updated.
 - Fix libfsimage build in the presence of newer Linux headers.
 
-* Mon Feb 6 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.40
+* Mon Feb 06 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.40
 - Fix for XSA-426 CVE-2022-27672.
 - More fixes for memory corruption issues in the Ocaml bindings.
 - On xenstored live update, validate the config file before launching
   into the new xenstored.
 
-* Thu Feb 2 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.39
+* Thu Feb 02 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.39
 - Fix memory corruption issues in the Ocaml bindings.
 
 * Mon Jan 16 2023 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.5-10.38
@@ -1246,11 +1246,11 @@ fi
 - Fix timer affinity after S3.
 - Drop Introspection Extensions.
 
-* Fri Dec 2 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.36
+* Fri Dec 02 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.36
 - Activate AVX-512 by default on AMD platforms.
 - Fixes for oxenstored live update.
 
-* Fri Nov 4 2022  Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.35
+* Fri Nov 04 2022  Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.35
 - Fix for XSA-422 CVE-2022-23824
 
 * Thu Oct 27 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.34
@@ -1266,7 +1266,7 @@ fi
   - XSA-420 CVE-2022-42324
   - XSA-421 CVE-2022-42325 CVE-2022-42326
 
-* Thu Oct 6 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.33
+* Thu Oct 06 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.33
 - Fixes for XSA-410 CVE-2022-33746, XSA-411 CVE-2022-33748.
 - Activate DOITM (Data Operand Invariant Timing Mode) unilaterally on capable
   hardware (Intel IceLake/Gracemont and later) to keep properly-written crypto
@@ -1285,10 +1285,10 @@ fi
 - Rework specfile so tools get the default RPM CFLAGS/LDFLAGS, including
   various hardening settings.
 
-* Tue Aug 9 2022 Pau Ruiz Safont <pau.safont@citrix.com> - 4.13.4-10.30
+* Tue Aug 09 2022 Pau Ruiz Safont <pau.safont@citrix.com> - 4.13.4-10.30
 - Bump release and rebuild with OCaml 4.13.1-3 compiler.
 
-* Fri Aug 5 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.29
+* Fri Aug 05 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.29
 - Improve boot speed by using WC mappings for the VGA framebuffer.
 - Fix crash on boot on AMD Zen2/3 systems when x2apic is disabled by firmware.
 - Correct the RPM license fields.
@@ -1296,7 +1296,7 @@ fi
 * Tue Jul 26 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.28
 - Fix for XSA-408 CVE-2022-33745.
 
-* Fri Jul 8 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.27
+* Fri Jul 08 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.27
 - Fixes for XSA-407 CVE-2022-23816 CVE-2022-23825.
 - Switch to x2APIC physical destination mode by default.  Addresses problems
   with vector exhaustion on large systems.
@@ -1305,7 +1305,7 @@ fi
 * Thu Jun 16 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.26
 - Fixes for XSA-404 CVE-2022-21123 CVE-2022-21125 CVE-2022-21166.
 
-* Thu Jun 9 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.25
+* Thu Jun 09 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.25
 - Fixes for XSA-401 CVE-2022-26362, XSA-402 CVE-2022-26363 CVE-2022-26364.
 
 * Wed Apr 13 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.24
@@ -1325,7 +1325,7 @@ fi
 - Rebuild with OCaml 4.13.1 compiler.
 - CP-37343: Drop Ocaml/CPUID technical debt.
 
-* Tue Feb 8 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.19
+* Tue Feb 08 2022 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-10.19
 - Fixes for XSA-394 CVE-2022-23034, XSA-395 CVE-2022-23035.
 - Support for AMD MSR_SPEC_CTRL in HVM guests.
 - Logic to match the Intel Feb 2022 microcode.  De-featuring TSX on more
@@ -1347,7 +1347,7 @@ fi
 - Fix compat hypercall translation
 - Perf improvements at boot, for hypercalls, and for the XSM subsystem
 
-* Wed Oct 6 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-2
+* Wed Oct 06 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-2
 - Fix boot failure if a PCI Bridge is has a subordinate bus of 255.
 - Reduce overhead from the trace infrastructure.
 - Fix for XSA-386 CVE-2021-28702.
@@ -1355,11 +1355,11 @@ fi
 * Fri Sep 10 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.4-1
 - Update to RELEASE-4.13.4.
 
-* Wed Sep 8 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.16
+* Wed Sep 08 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.16
 - Fix for XSA-384 CVE-2021-28701.
 - Bugfixes to XSA-378 fix.
 
-* Wed Sep 1 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.15
+* Wed Sep 01 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.15
 - Fixes for XSA-378 CVE-2021-28694 CVE-2021-28695 CVE-2021-28696, XSA-379
   CVE-2021-28697, XSA-380 CVE-2021-28698, XSA-382 CVE-2021-28699.
 - Retain visibility of HLE/RTM CPUID bits in guests when resuming on a client
@@ -1394,7 +1394,7 @@ fi
 * Mon Jun 14 2021 Igor Druzhinin <igor.druzhinin@citrix.com> - 4.13.3-10.8
 - Fix another race with vCPU timers
 
-* Wed Jun 9 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.7
+* Wed Jun 09 2021 Andrew Cooper <andrew.cooper3@citrix.com> - 4.13.3-10.7
 - LBR and PMU fixes for Icelake Server
 - Don't assume that VT-d Register based invalidation is available.  Expected
   to be necessary to boot on Sapphire Rapids Server.
