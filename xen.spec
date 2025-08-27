@@ -912,6 +912,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Wed Aug 27 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.20.1-1
+- Update to Xen 4.20.1
+
 * Wed Aug 27 2025 Lin Liu <Lin.Liu01@cloud.com> - 4.19.2-13
 - Add support for 4 or more socket Intel Granite Rapids systems
 - Fix usage of PCI devices on segments other than 0
