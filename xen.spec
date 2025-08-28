@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 18
+%global hv_rel 19
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -886,6 +886,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Thu Aug 28 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-19
+- Add support for 4 or more socket Intel Granite Rapids systems
+- Fix usage of PCI devices on segments other than 0
+
 * Tue Aug  5 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.5-18
 - Domain runstate extentions for more RRDs
 - Mwait-idle updates for Intel Alder Lake thru Granite Rapids platforms
