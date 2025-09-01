@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 19
+%global hv_rel 20
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -886,6 +886,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Sep 01 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-20
+- Fix for XSA-472 CVE-2025-27466 CVE-2025-58142 CVE-2025-58143
+
 * Thu Aug 28 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-19
 - Add support for 4 or more socket Intel Granite Rapids systems
 - Fix usage of PCI devices on segments other than 0
