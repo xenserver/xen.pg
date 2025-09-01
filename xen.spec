@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 2
+%global hv_rel 3
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -912,6 +912,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Sep 01 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.20.1-3
+- Fix for XSA-472 CVE-2025-27466 CVE-2025-58142 CVE-2025-58143
+
 * Fri Aug 29 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.20.1-2
 - Update xen.efi to support NX and the Memory Attributes protocol
 
