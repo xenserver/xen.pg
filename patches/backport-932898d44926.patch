@@ -1,0 +1,55 @@
+From 932898d4492609f99e3016d423a9323235392864 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Thu, 13 Mar 2025 11:08:05 +0100
+Subject: x86/dom0: placate GCC 12 compile-time errors with UBSAN and PVH_GUEST
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When building Xen with GCC 12 with UBSAN and PVH_GUEST both enabled the
+compiler emits the following errors:
+
+arch/x86/setup.c: In function '__start_xen':
+arch/x86/setup.c:1504:19: error: 'consider_modules' reading 40 bytes from a region of size 4 [-Werror=stringop-overread]
+ 1504 |             end = consider_modules(s, e, reloc_size + mask,
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1505 |                                    bi->mods, bi->nr_modules, -1);
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+arch/x86/setup.c:1504:19: note: referencing argument 4 of type 'const struct boot_module[0]'
+arch/x86/setup.c:686:24: note: in a call to function 'consider_modules'
+  686 | static uint64_t __init consider_modules(
+      |                        ^~~~~~~~~~~~~~~~
+arch/x86/setup.c:1535:19: error: 'consider_modules' reading 40 bytes from a region of size 4 [-Werror=stringop-overread]
+ 1535 |             end = consider_modules(s, e, size, bi->mods,
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1536 |                                    bi->nr_modules + relocated, j);
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+arch/x86/setup.c:1535:19: note: referencing argument 4 of type 'const struct boot_module[0]'
+arch/x86/setup.c:686:24: note: in a call to function 'consider_modules'
+  686 | static uint64_t __init consider_modules(
+      |                        ^~~~~~~~~~~~~~~~
+
+This seems to be the result of some function manipulation done by UBSAN
+triggering GCC stringops related errors.  Placate the errors by declaring
+the function parameter as `const struct *boot_module` instead of `const
+struct boot_module[]`.
+
+Note that GCC 13 seems to be fixed, and doesn't trigger the error when
+using `[]`.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index 10d55884ab75..3dc8de3114eb 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -682,7 +682,7 @@ static void __init noinline move_xen(void)
+ #undef BOOTSTRAP_MAP_LIMIT
+ 
+ static uint64_t __init consider_modules(
+-    uint64_t s, uint64_t e, uint32_t size, const struct boot_module mods[],
++    uint64_t s, uint64_t e, uint32_t size, const struct boot_module *mods,
+     unsigned int nr_mods, unsigned int this_mod)
+ {
+     unsigned int i;
