@@ -1,0 +1,50 @@
+From 5d492ce33d66397f60692f3c2b1b1e0ea6a6ea2e Mon Sep 17 00:00:00 2001
+From: Gerald Elder-Vass <gerald.elder-vass@cloud.com>
+Date: Thu, 11 Sep 2025 08:24:28 +0000
+Subject: efi: Protect against unnecessary image unloading
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Commit 59a1d6d3ea1e introduced Shim's LoadImage protocol and unloads the
+image after loading it (for verification purposes) regardless of the
+returned status. The protocol API implies this is the correct behaviour
+but we should add a check to protect against the unlikely case this
+frees any memory in use.
+
+Signed-off-by: Gerald Elder-Vass <gerald.elder-vass@cloud.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Marek Marczykowski-Górecki <marmarek@invisiblethingslab.com>
+Release-Acked-By: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+
+diff --git a/xen/common/efi/boot.c b/xen/common/efi/boot.c
+index 45b179b4dc4e..014265b6adff 100644
+--- a/xen/common/efi/boot.c
++++ b/xen/common/efi/boot.c
+@@ -1058,7 +1058,7 @@ static void __init efi_verify_kernel(EFI_HANDLE ImageHandle)
+     static EFI_GUID __initdata shim_image_guid = SHIM_IMAGE_LOADER_GUID;
+     static EFI_GUID __initdata shim_lock_guid = SHIM_LOCK_PROTOCOL_GUID;
+     SHIM_IMAGE_LOADER *shim_loader;
+-    EFI_HANDLE loaded_kernel;
++    EFI_HANDLE loaded_kernel = NULL;
+     EFI_SHIM_LOCK_PROTOCOL *shim_lock;
+     EFI_STATUS status;
+     bool verified = false;
+@@ -1074,11 +1074,13 @@ static void __init efi_verify_kernel(EFI_HANDLE ImageHandle)
+             verified = true;
+ 
+         /*
+-         * Always unload the image.  We only needed LoadImage() to perform
+-         * verification anyway, and in the case of a failure there may still
+-         * be cleanup needing to be performed.
++         * If the kernel was loaded, unload it. We only needed LoadImage() to
++         * perform verification anyway, and in the case of a failure there may
++         * still be cleanup needing to be performed.
+          */
+-        shim_loader->UnloadImage(loaded_kernel);
++        if ( loaded_kernel &&
++             (!EFI_ERROR(status) || status == EFI_SECURITY_VIOLATION) )
++            shim_loader->UnloadImage(loaded_kernel);
+     }
+ 
+     /* Otherwise, fall back to SHIM_LOCK. */
