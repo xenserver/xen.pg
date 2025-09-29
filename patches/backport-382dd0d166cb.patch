@@ -1,0 +1,45 @@
+From 382dd0d166cb85139d86ff26fd96af102ae4fef3 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Wed, 24 Sep 2025 09:59:46 +0200
+Subject: x86/cpu: populate CPUID 0x1.edx features early for self-snoop
+ detection
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Otherwise the check for the SS feature in
+check_memory_type_self_snoop_errata() fails unconditionally, which leads to
+X86_FEATURE_XEN_SELFSNOOP never being set.
+
+We could also avoid this by not doing the reset_cpuinfo() for the BSP in
+identify_cpu(), because SS detection uses boot_cpu_data.  However that
+creates an imbalance on the state of the BSP versus the APs in the
+identify_cpu() code.
+
+I've opted for the less controversial solution of populating FEATURESET_1d
+in generic_identify(), as the value is already there.  The same is done for
+the AMD faulting probe code.  While there also populate the FEATURESET_1c
+element, as the value is in context.
+
+Fixes: f2663ca2e520 ("x86/cpu/intel: Clear cache self-snoop capability in CPUs with known errata")
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
+index 3b10247b84db..095c7b13591d 100644
+--- a/xen/arch/x86/cpu/common.c
++++ b/xen/arch/x86/cpu/common.c
+@@ -439,6 +439,13 @@ static void generic_identify(struct cpuinfo_x86 *c)
+ 	c->apicid = phys_pkg_id((ebx >> 24) & 0xFF, 0);
+ 	c->phys_proc_id = c->apicid;
+ 
++	/*
++	 * Early init of Self Snoop support requires 0x1.edx, while there also
++	 * set 0x1.ecx as the value is in context.
++	 */
++	c->x86_capability[FEATURESET_1c] = ecx;
++	c->x86_capability[FEATURESET_1d] = edx;
++
+ 	if (actual_cpu.c_early_init)
+ 		alternative_vcall(actual_cpu.c_early_init, c);
+ 
