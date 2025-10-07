@@ -1,0 +1,75 @@
+From a3d5e5effb933b865f8545f5354f3a8f8606e971 Mon Sep 17 00:00:00 2001
+From: Bernhard Kaindl <bernhard.kaindl@cloud.com>
+Date: Tue, 26 Aug 2025 12:00:00 +0200
+Subject: [PATCH v2 1/7] xen/page_alloc: Simplify domain_adjust_tot_pages for
+ future changes
+
+domain_adjust_tot_pages() is used to update the domain's total pages
+after allocating and freeing memory.
+
+Simplify the design for updating it for single and even more so
+for multi-node claims regarding the case where we could have
+allocated more memory than we had claims left.
+
+Replace it with min_t() to avoid reducing the outstadings claims
+by more than we had left to claim:
+
+When domain memory is freed, we skip changing the claim. Thus, this
+only handles reducing the claims after allocating. So, min_t() is fine.
+
+Signed-off-by: Bernhard Kaindl <bernhard.kaindl@cloud.com>
+
+diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
+index 5f9c9305ef37..5040ae24ee60 100644
+--- a/xen/common/page_alloc.c
++++ b/xen/common/page_alloc.c
+@@ -488,8 +488,15 @@ static long total_avail_pages;
+ static DEFINE_SPINLOCK(heap_lock);
+ static long outstanding_claims; /* total outstanding claims by all domains */
+ 
++/*
++ * Update the total number of pages and outstanding claims of a domain.
++ * - When pages were freed, we do not increase outstanding claims.
++ * - On a domain's claims update, global outstanding_claims are updated as well.
++ */
+ unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
+ {
++    unsigned long adjustment;
++
+     ASSERT(rspin_is_locked(&d->page_alloc_lock));
+     d->tot_pages += pages;
+ 
+@@ -497,23 +504,22 @@ unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
+      * can test d->outstanding_pages race-free because it can only change
+      * if d->page_alloc_lock and heap_lock are both held, see also
+      * domain_set_outstanding_pages below
++     *
++     * If the domain has no outstanding claims (or we freed pages instead),
++     * we don't update outstanding claims and skip the claims adjustment.
+      */
+     if ( !d->outstanding_pages || pages <= 0 )
+         goto out;
+ 
+     spin_lock(&heap_lock);
+     BUG_ON(outstanding_claims < d->outstanding_pages);
+-    if ( d->outstanding_pages < pages )
+-    {
+-        /* `pages` exceeds the domain's outstanding count. Zero it out. */
+-        outstanding_claims -= d->outstanding_pages;
+-        d->outstanding_pages = 0;
+-    }
+-    else
+-    {
+-        outstanding_claims -= pages;
+-        d->outstanding_pages -= pages;
+-    }
++    /*
++     * Reduce claims by outstanding claims or pages (whichever is smaller):
++     * If allocated > outstanding, reduce the claims only by outstanding pages.
++     */
++    adjustment = min_t(unsigned long, d->outstanding_pages, pages);
++    d->outstanding_pages -= adjustment;
++    outstanding_claims -= adjustment;
+     spin_unlock(&heap_lock);
+ 
+ out:
