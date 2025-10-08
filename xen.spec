@@ -86,7 +86,7 @@ BuildRequires: xz-devel
 BuildRequires: zlib-devel
 
 # For libxl
-BuildRequires: yajl-devel
+BuildRequires: json-c-devel
 BuildRequires: libuuid-devel
 BuildRequires: perl-interpreter
 
@@ -111,7 +111,6 @@ BuildRequires: ocaml-findlib
 BuildRequires: perl-podlators
 
 # For xenguest
-BuildRequires: json-c-devel
 BuildRequires: libempserver-devel
 
 %if 0%{?xenserver} < 9
