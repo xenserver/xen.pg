@@ -887,7 +887,6 @@ fi
 
 %post dom0-tools
 %systemd_post proc-xen.mount
-%systemd_post var-lib-xenstored.mount
 %systemd_post xen-init-dom0.service
 %systemd_post xen-watchdog.service
 %systemd_post xenconsoled.service
@@ -895,7 +894,6 @@ fi
 
 %preun dom0-tools
 %systemd_preun proc-xen.mount
-%systemd_preun var-lib-xenstored.mount
 %systemd_preun xen-init-dom0.service
 %systemd_preun xen-watchdog.service
 %systemd_preun xenconsoled.service
@@ -903,7 +901,6 @@ fi
 
 %postun dom0-tools
 %systemd_postun proc-xen.mount
-%systemd_postun var-lib-xenstored.mount
 %systemd_postun xen-init-dom0.service
 %systemd_postun xen-watchdog.service
 %systemd_postun xenconsoled.service
