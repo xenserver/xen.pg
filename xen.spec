@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 4
+%global hv_rel 5
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -909,6 +909,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Thu Oct 09 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.20.1-5
+- Support NUMA aware memory claims
+
 * Wed Oct 08 2025 Ross Lagerwall <ross.lagerwall@citrix.com> - 4.20.1-4
 - Secure PCI passthrough for Secure Boot
 - Use superpages where possible on migrate/resume
