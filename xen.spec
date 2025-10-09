@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 20
+%global hv_rel 21
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -886,6 +886,11 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Thu Oct 09 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-21
+- Fix for XSA-475 CVE-2025-58147 CVE-2025-58148
+- Use superpages where possible on migrate/resume
+- Populate CPUID 0x1.edx features early for self-snoop detection
+
 * Mon Sep 01 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-20
 - Fix for XSA-472 CVE-2025-27466 CVE-2025-58142 CVE-2025-58143
 
