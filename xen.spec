@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 21
+%global hv_rel 22
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -886,6 +886,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Oct 27 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-22
+- Fix for XSA-476 CVE-2025-58149
+- Support passthrough of devices on PCI segment different than 0
+
 * Thu Oct 09 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.17.5-21
 - Fix for XSA-475 CVE-2025-58147 CVE-2025-58148
 - Use superpages where possible on migrate/resume
