@@ -20,7 +20,7 @@ emit () {
     SUBJECT=`git log -n1 $1 --pretty=format:"%s"`
 
     # Obtain date in absolute UTC without a Timezone shift
-    DATE=`date -d @$(TZ=UTC git log -n1 --format="%ct" $1) "+%Y-%m-%d %T"`
+    DATE=`date -u -d @$(TZ=UTC git log -n1 --format="%ct" $1) "+%Y-%m-%d %T"`
 
     git format-patch -kp --no-signature --no-base $1 -N1 --stdout > .git/patches/$BRANCH/backport-$SHORTSHA.patch
     echo "backport-$SHORTSHA.patch #   $DATE - $SUBJECT" >> .git/patches/$BRANCH/snippet-for-series
