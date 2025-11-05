@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 7
+%global hv_rel 8
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -908,6 +908,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Wed Nov 05 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.20.1-8
+- Support loading post-entrysign microcode
+- Fix dynamic linking of xsd_glue for external oxenstored
+
 * Mon Oct 27 2025 Roger Pau Monné <roger.pau@citrix.com> - 4.20.1-7
 - Fix for XSA-476 CVE-2025-58149
 - Support passthrough of devices on PCI segment different than 0
