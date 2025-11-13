@@ -1,6 +1,6 @@
-From b304f948427218421af24abcb04b40d3c34fefbf Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
-Date: Wed, 11 Feb 2026 12:19:54 +0100
+From 83a784a15b479827ad21a519b4b685b65ee6d781 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Mon, 12 Jan 2026 16:18:59 +0100
 Subject: xen/mm: allow deferred scrub of physmap populate allocated pages
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -43,14 +43,12 @@ allocation in populate_physmap() once the domain is running.
 Fixes: 74d2e11ccfd2 ("mm: Scrub pages in alloc_heap_pages() if needed")
 Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
-master commit: 83a784a15b479827ad21a519b4b685b65ee6d781
-master date: 2026-02-05 08:53:07 +0100
 
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index fe5daaae42bc..68e867796274 100644
+index 376351b528c9..163f7fc96658 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -446,6 +446,18 @@ static int __init cf_check parse_dom0_param(const char *s)
+@@ -615,6 +615,18 @@ static int __init cf_check parse_dom0_param(const char *s)
  }
  custom_param("dom0", parse_dom0_param);
  
@@ -69,25 +67,23 @@ index fe5daaae42bc..68e867796274 100644
  /*
   * Release resources held by a domain.  There may or may not be live
   * references to the domain, and it may or may not be fully constructed.
-@@ -505,6 +517,9 @@ static int domain_teardown(struct domain *d)
-     case PROG_none:
-         BUILD_BUG_ON(PROG_none != 0);
+@@ -676,6 +688,7 @@ static int domain_teardown(struct domain *d)
  
-+        /* Trivial teardown, not long-running enough to need a preemption check. */
+         /* Trivial teardown, not long-running enough to need a preemption check. */
+         domain_llc_coloring_free(d);
 +        domain_pending_scrub_free(d);
-+
+ 
      PROGRESS(gnttab_mappings):
          rc = gnttab_release_mappings(d);
-         if ( rc )
-@@ -547,6 +562,7 @@ static void _domain_destroy(struct domain *d)
+@@ -719,6 +732,7 @@ static void _domain_destroy(struct domain *d)
  {
      BUG_ON(!d->is_dying);
      BUG_ON(atomic_read(&d->refcnt) != DOMAIN_DESTROYED);
 +    ASSERT(!d->pending_scrub);
  
-     xfree(d->pbuf);
+     XVFREE(d->console);
  
-@@ -1478,6 +1494,15 @@ int domain_unpause_by_systemcontroller(struct domain *d)
+@@ -1678,6 +1692,15 @@ int domain_unpause_by_systemcontroller(struct domain *d)
       */
      if ( new == 0 && !d->creation_finished )
      {
@@ -104,10 +100,10 @@ index fe5daaae42bc..68e867796274 100644
          arch_domain_creation_finished(d);
      }
 diff --git a/xen/common/memory.c b/xen/common/memory.c
-index 73469dce308c..aeb3a1765b62 100644
+index 10becf7c1f4c..9240a6005e42 100644
 --- a/xen/common/memory.c
 +++ b/xen/common/memory.c
-@@ -156,6 +156,73 @@ static void increase_reservation(struct memop_args *a)
+@@ -159,6 +159,73 @@ static void increase_reservation(struct memop_args *a)
      a->nr_done = i;
  }
  
@@ -181,7 +177,7 @@ index 73469dce308c..aeb3a1765b62 100644
  static void populate_physmap(struct memop_args *a)
  {
      struct page_info *page;
-@@ -272,7 +339,19 @@ static void populate_physmap(struct memop_args *a)
+@@ -275,7 +342,19 @@ static void populate_physmap(struct memop_args *a)
              }
              else
              {
@@ -202,7 +198,7 @@ index 73469dce308c..aeb3a1765b62 100644
  
                  if ( unlikely(!page) )
                  {
-@@ -283,6 +362,30 @@ static void populate_physmap(struct memop_args *a)
+@@ -286,6 +365,30 @@ static void populate_physmap(struct memop_args *a)
                      goto out;
                  }
  
@@ -217,7 +213,7 @@ index 73469dce308c..aeb3a1765b62 100644
 +                                                 &page[j].count_info) )
 +                            continue;
 +
-+                        scrub_one_page(&page[j]);
++                        scrub_one_page(&page[j], true);
 +
 +                        if ( (j + 1) != (1U << a->extent_order) &&
 +                             !(++dirty_cnt & 0xff) &&
@@ -234,27 +230,26 @@ index 73469dce308c..aeb3a1765b62 100644
                  {
                      for ( j = 0; j < (1U << a->extent_order); j++ )
 diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
-index 60c33b2609eb..cab35bc39cbb 100644
+index 2ee249ac365a..588b5b99cbc7 100644
 --- a/xen/common/page_alloc.c
 +++ b/xen/common/page_alloc.c
-@@ -764,7 +764,7 @@ static void page_list_add_scrub(struct page_info *pg, unsigned int node,
+@@ -792,7 +792,7 @@ static void page_list_add_scrub(struct page_info *pg, unsigned int node,
+ # define scrub_page_cold clear_page_cold
  #endif
- #define SCRUB_BYTE_PATTERN   (SCRUB_PATTERN & 0xff)
  
--static void scrub_one_page(const struct page_info *pg)
-+void scrub_one_page(const struct page_info *pg)
+-static void scrub_one_page(const struct page_info *pg, bool cold)
++void scrub_one_page(const struct page_info *pg, bool cold)
  {
-     if ( unlikely(pg->count_info & PGC_broken) )
-         return;
+     void *ptr;
+ 
 diff --git a/xen/include/xen/mm.h b/xen/include/xen/mm.h
-index 16f733281af3..e8f4a2fba352 100644
+index 426362adb2f4..d80bfba6d393 100644
 --- a/xen/include/xen/mm.h
 +++ b/xen/include/xen/mm.h
-@@ -144,6 +144,17 @@ unsigned long avail_domheap_pages(void);
- unsigned long avail_node_heap_pages(unsigned int nodeid);
+@@ -145,6 +145,16 @@ unsigned long avail_node_heap_pages(unsigned int nodeid);
  #define alloc_domheap_page(d,f) (alloc_domheap_pages(d,0,f))
  #define free_domheap_page(p)  (free_domheap_pages(p,0))
-+
+ 
 +/* Free an allocation, and zero the pointer to it. */
 +#define FREE_DOMHEAP_PAGES(p, o) do { \
 +    void *_ptr_ = (p);                \
@@ -263,19 +258,19 @@ index 16f733281af3..e8f4a2fba352 100644
 +} while ( false )
 +#define FREE_DOMHEAP_PAGE(p) FREE_DOMHEAP_PAGES(p, 0)
 +
-+void scrub_one_page(const struct page_info *pg);
++void scrub_one_page(const struct page_info *pg, bool cold);
 +
- unsigned int online_page(mfn_t mfn, uint32_t *status);
+ int online_page(mfn_t mfn, uint32_t *status);
  int offline_page(mfn_t mfn, int broken, uint32_t *status);
  int query_page_offline(mfn_t mfn, uint32_t *status);
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 238d6134f2e1..6f78b3e41ab9 100644
+index 91d6a49daf16..735d5b76b411 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -646,6 +646,11 @@ struct domain
-     unsigned int num_llc_colors;
-     const unsigned int *llc_colors;
- #endif
+@@ -661,6 +661,11 @@ struct domain
+ 
+     /* Pointer to console settings; NULL for system domains. */
+     struct domain_console *console;
 +
 +    /* Pointer to allocated domheap page that possibly needs scrubbing. */
 +    struct page_info *pending_scrub;

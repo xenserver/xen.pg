@@ -1,11 +1,11 @@
 # -*- rpm-spec -*-
 
 # Commitish for Source0, required by tooling.
-%global package_srccommit RELEASE-4.20.2
+%global package_srccommit RELEASE-4.21.1
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 10
+%global hv_rel 1
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -24,7 +24,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.20.2
+Version: 4.21.1
 Release: %{?xsrel}%{?dist}
 License: GPLv2 and LGPLv2 and MIT and Public Domain
 URL:     https://www.xenproject.org
@@ -264,8 +264,7 @@ echo "${base_cset:0:12}, pq ${pq_cset:0:12}" > .scmversion
 export XEN_TARGET_ARCH=%{_arch}
 export PYTHON="%{__python}"
 
-%configure --disable-qemu-traditional \
-           --disable-seabios \
+%configure --disable-seabios \
            --disable-stubdom \
            --disable-xsmpolicy \
            --disable-pvshim \
@@ -424,6 +423,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_includedir}/%{name}/arch-x86_32.h
 %{_includedir}/%{name}/arch-x86_64.h
 %{_includedir}/%{name}/argo.h
+%{_includedir}/%{name}/bootfdt.h
 %{_includedir}/%{name}/callback.h
 %{_includedir}/%{name}/device_tree_defs.h
 %{_includedir}/%{name}/dom0_ops.h
@@ -499,13 +499,13 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/libxengnttab.so.1
 %{_libdir}/libxengnttab.so.1.2
 %{_libdir}/libxenstore.so.4
-%{_libdir}/libxenstore.so.4.0
+%{_libdir}/libxenstore.so.4.1
 %{_libdir}/libxentoolcore.so.1
 %{_libdir}/libxentoolcore.so.1.0
 %{_libdir}/libxentoollog.so.1
 %{_libdir}/libxentoollog.so.1.0
-%{_libdir}/libxenvchan.so.4.20
-%{_libdir}/libxenvchan.so.4.20.0
+%{_libdir}/libxenvchan.so.4.21
+%{_libdir}/libxenvchan.so.4.21.0
 
 %files libs-devel
 
@@ -595,6 +595,7 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_sysconfdir}/%{name}/xlexample.pvhlinux
 %exclude %{_sysconfdir}/%{name}/xlexample.pvlinux
 %config %{_sysconfdir}/xen/xl.conf
+%{_systemd_util_dir}/system-sleep/xen-watchdog-sleep.sh
 %{_bindir}/vchan-socket-proxy
 %{_bindir}/xen-cpuid
 %{_bindir}/xen-detect
@@ -702,24 +703,26 @@ install_xen -%{hv_rel}-d build-xen-debug
 %files dom0-libs
 %{_libdir}/libxencall.so.1
 %{_libdir}/libxencall.so.1.3
-%{_libdir}/libxenctrl.so.4.20
-%{_libdir}/libxenctrl.so.4.20.0
+%{_libdir}/libxenctrl.so.4.21
+%{_libdir}/libxenctrl.so.4.21.0
 %{_libdir}/libxendevicemodel.so.1
 %{_libdir}/libxendevicemodel.so.1.4
 %{_libdir}/libxenforeignmemory.so.1
 %{_libdir}/libxenforeignmemory.so.1.4
-%{_libdir}/libxenfsimage.so.4.20
-%{_libdir}/libxenfsimage.so.4.20.0
-%{_libdir}/libxenguest.so.4.20
-%{_libdir}/libxenguest.so.4.20.0
+%{_libdir}/libxenfsimage.so.4.21
+%{_libdir}/libxenfsimage.so.4.21.0
+%{_libdir}/libxenguest.so.4.21
+%{_libdir}/libxenguest.so.4.21.0
 %{_libdir}/libxenhypfs.so.1
 %{_libdir}/libxenhypfs.so.1.0
-%{_libdir}/libxenlight.so.4.20
-%{_libdir}/libxenlight.so.4.20.0
-%{_libdir}/libxenstat.so.4.20
-%{_libdir}/libxenstat.so.4.20.0
-%{_libdir}/libxlutil.so.4.20
-%{_libdir}/libxlutil.so.4.20.0
+%{_libdir}/libxenlight.so.4.21
+%{_libdir}/libxenlight.so.4.21.0
+%{_libdir}/libxenmanage.so.1
+%{_libdir}/libxenmanage.so.1.0
+%{_libdir}/libxenstat.so.4.21
+%{_libdir}/libxenstat.so.4.21.0
+%{_libdir}/libxlutil.so.4.21
+%{_libdir}/libxlutil.so.4.21.0
 %{_libdir}/xenfsimage/btrfs/fsimage.so
 %{_libdir}/xenfsimage/ext2fs-lib/fsimage.so
 %{_libdir}/xenfsimage/fat/fsimage.so
@@ -782,6 +785,11 @@ install_xen -%{hv_rel}-d build-xen-debug
 %{_libdir}/pkgconfig/xenlight.pc
 %{_libdir}/pkgconfig/xlutil.pc
 
+%{_includedir}/xenmanage.h
+%{_libdir}/libxenmanage.a
+%{_libdir}/libxenmanage.so
+%{_libdir}/pkgconfig/xenmanage.pc
+
 %{_includedir}/xenstat.h
 %{_libdir}/libxenstat.a
 %{_libdir}/libxenstat.so
@@ -841,12 +849,13 @@ install_xen -%{hv_rel}-d build-xen-debug
 %exclude %{_libdir}/ocaml/xenstore/xenstore.cmxa
 
 %files dom0-tests
-%exclude %{_libexecdir}/%{name}/bin/depriv-fd-checker
 %{_libexecdir}/%{name}/tests/test-cpu-policy
+%{_libexecdir}/%{name}/tests/test-domid
 %{_libexecdir}/%{name}/tests/test-mem-claim
 %{_libexecdir}/%{name}/tests/test-paging-mempool
 %{_libexecdir}/%{name}/tests/test-pdx-mask
 %{_libexecdir}/%{name}/tests/test-pdx-offset
+%{_libexecdir}/%{name}/tests/test-rangeset
 %{_libexecdir}/%{name}/tests/test-resource
 %{_libexecdir}/%{name}/tests/test-tsx
 %{_libexecdir}/%{name}/tests/test-xenstore
