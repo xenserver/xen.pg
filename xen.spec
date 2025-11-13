@@ -1,11 +1,11 @@
 # -*- rpm-spec -*-
 
 # Commitish for Source0, required by tooling.
-%global package_srccommit RELEASE-4.20.1
+%global package_srccommit RELEASE-4.20.2
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 8
+%global hv_rel 1
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -26,7 +26,7 @@
 
 Summary: Xen is a virtual machine monitor
 Name:    xen
-Version: 4.20.1
+Version: 4.20.2
 Release: %{?xsrel}%{?dist}
 License: GPLv2 and LGPLv2 and MIT and Public Domain
 URL:     https://www.xenproject.org
@@ -908,6 +908,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Thu Nov 13 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.20.2-1
+- Update to Xen 4.20.2
+
 * Wed Nov 05 2025 Andrew Cooper <andrew.cooper3@citrix.com> - 4.20.1-8
 - Support loading post-entrysign microcode
 - Fix dynamic linking of xsd_glue for external oxenstored
