@@ -27,10 +27,10 @@ Signed-off-by: Bernhard Kaindl <bernhard.kaindl@cloud.com>
 Signed-off-by: Marcus Granado <marcus.granado@cloud.com>
 
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index 150eea904b1b..b4d9e38d09b3 100644
+index 852a7fbb8ccb..8e2a86b0f7d5 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -729,6 +729,7 @@ struct domain *domain_create(domid_t domid,
+@@ -920,6 +920,7 @@ struct domain *domain_create(domid_t domid,
      spin_lock_init(&d->node_affinity_lock);
      d->node_affinity = NODE_MASK_ALL;
      d->auto_node_affinity = 1;
@@ -38,7 +38,7 @@ index 150eea904b1b..b4d9e38d09b3 100644
  
      spin_lock_init(&d->shutdown_lock);
      d->shutdown_code = SHUTDOWN_CODE_INVALID;
-@@ -1083,7 +1084,7 @@ int domain_kill(struct domain *d)
+@@ -1287,7 +1288,7 @@ int domain_kill(struct domain *d)
          rspin_barrier(&d->domain_lock);
          argo_destroy(d);
          vnuma_destroy(d->vnuma);
@@ -48,10 +48,10 @@ index 150eea904b1b..b4d9e38d09b3 100644
      case DOMDYING_dying:
          rc = domain_teardown(d);
 diff --git a/xen/common/memory.c b/xen/common/memory.c
-index 73469dce308c..3785258dd3a9 100644
+index 10becf7c1f4c..3f45ecf23c79 100644
 --- a/xen/common/memory.c
 +++ b/xen/common/memory.c
-@@ -1683,7 +1683,8 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -1689,7 +1689,8 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
              rc = -EINVAL;
  
          if ( !rc )
@@ -62,18 +62,18 @@ index 73469dce308c..3785258dd3a9 100644
          rcu_unlock_domain(d);
  
 diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
-index 576d99e7ae00..1f2bb266d1f0 100644
+index c24adfd02d37..d839b704c2fb 100644
 --- a/xen/common/page_alloc.c
 +++ b/xen/common/page_alloc.c
-@@ -490,6 +490,7 @@ static unsigned long per_node_avail_pages[MAX_NUMNODES];
+@@ -491,6 +491,7 @@ static unsigned long per_node_avail_pages[MAX_NUMNODES];
  
  static DEFINE_SPINLOCK(heap_lock);
  static long outstanding_claims; /* total outstanding claims by all domains */
 +static unsigned long per_node_outstanding_claims[MAX_NUMNODES];
  
- unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
- {
-@@ -499,11 +500,19 @@ unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
+ static unsigned long avail_heap_pages(
+     unsigned int zone_lo, unsigned int zone_hi, unsigned int node)
+@@ -521,11 +522,19 @@ unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
      return d->tot_pages;
  }
  
@@ -94,7 +94,7 @@ index 576d99e7ae00..1f2bb266d1f0 100644
      /*
       * Two locks are needed here:
       *  - d->page_alloc_lock: protects accesses to d->{tot,max,extra}_pages.
-@@ -517,7 +526,12 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
+@@ -539,7 +548,12 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
      if ( pages == 0 )
      {
          outstanding_claims -= d->outstanding_pages;
@@ -107,7 +107,7 @@ index 576d99e7ae00..1f2bb266d1f0 100644
          ret = 0;
          goto out;
      }
-@@ -549,6 +563,19 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
+@@ -571,6 +585,19 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
      if ( claim > avail_pages )
          goto out;
  
@@ -127,7 +127,7 @@ index 576d99e7ae00..1f2bb266d1f0 100644
      /* yay, claim fits in available memory, stake the claim, success! */
      d->outstanding_pages = claim;
      outstanding_claims += d->outstanding_pages;
-@@ -880,6 +907,20 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
+@@ -908,6 +935,20 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
       */
      for ( ; ; )
      {
@@ -148,7 +148,7 @@ index 576d99e7ae00..1f2bb266d1f0 100644
          zone = zone_hi;
          do {
              /* Check if target node can support the allocation. */
-@@ -909,6 +950,7 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
+@@ -937,6 +978,7 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
              }
          } while ( zone-- > zone_lo ); /* careful: unsigned zone may wrap */
  
@@ -156,7 +156,7 @@ index 576d99e7ae00..1f2bb266d1f0 100644
          if ( (memflags & MEMF_exact_node) && req_node != NUMA_NO_NODE )
              return NULL;
  
-@@ -1025,7 +1067,8 @@ static struct page_info *alloc_heap_pages(
+@@ -1053,7 +1095,8 @@ static struct page_info *alloc_heap_pages(
      total_avail_pages -= request;
      ASSERT(total_avail_pages >= 0);
  
@@ -166,7 +166,7 @@ index 576d99e7ae00..1f2bb266d1f0 100644
      {
          /*
           * Adjust claims in the same locked region where total_avail_pages is
-@@ -1044,6 +1087,15 @@ static struct page_info *alloc_heap_pages(
+@@ -1072,6 +1115,15 @@ static struct page_info *alloc_heap_pages(
           */
          unsigned long outstanding = min(d->outstanding_pages + 0UL, request);
  
@@ -183,18 +183,18 @@ index 576d99e7ae00..1f2bb266d1f0 100644
          outstanding_claims -= outstanding;
          d->outstanding_pages -= outstanding;
 diff --git a/xen/include/xen/mm.h b/xen/include/xen/mm.h
-index 16f733281af3..0d0ae1562311 100644
+index 426362adb2f4..0f067a6c7d12 100644
 --- a/xen/include/xen/mm.h
 +++ b/xen/include/xen/mm.h
-@@ -66,6 +66,7 @@
- #include <xen/mm-frame.h>
+@@ -67,6 +67,7 @@
+ #include <xen/mm-types.h>
  #include <xen/types.h>
  #include <xen/list.h>
 +#include <xen/numa.h>
  #include <xen/spinlock.h>
  #include <xen/perfc.h>
  #include <public/memory.h>
-@@ -130,7 +131,8 @@ int populate_pt_range(unsigned long virt, unsigned long nr_mfns);
+@@ -131,7 +132,8 @@ int populate_pt_range(unsigned long virt, unsigned long nr_mfns);
  /* Claim handling */
  unsigned long __must_check domain_adjust_tot_pages(struct domain *d,
      long pages);
@@ -205,10 +205,10 @@ index 16f733281af3..0d0ae1562311 100644
  
  /* Domain suballocator. These functions are *not* interrupt-safe.*/
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 470468391e39..643043f94860 100644
+index 8b7a074a4bea..4d7b8ffdb5d5 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -413,6 +413,7 @@ struct domain
+@@ -430,6 +430,7 @@ struct domain
      unsigned int     max_pages;         /* maximum value for domain_tot_pages() */
      unsigned int     extra_pages;       /* pages not included in domain_tot_pages() */
  
