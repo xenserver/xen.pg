@@ -15,8 +15,6 @@
 # `git describe` when not building an from a tagged changeset.
 %{!?xsrel: %global xsrel %{hv_rel}}
 
-%define base_dir  %{name}-%{version}
-
 %define lp_devel_dir %{_usrsrc}/xen-%{version}-%{release}
 
 # Prevent RPM adding Provides/Requires to lp-devel package, or mangling shebangs
@@ -34,7 +32,7 @@ Version: 4.17.5
 Release: %{?xsrel}%{?dist}
 License: GPLv2 and LGPLv2 and MIT and Public Domain
 URL:     https://www.xenproject.org
-Source0: https://code.citrite.net/rest/archive/latest/projects/XSU/repos/%{name}/archive?at=%{package_srccommit}&prefix=%{base_dir}&format=tar.gz#/%{base_dir}.tar.gz
+Source0: https://api.github.com/repos/csg-xenserver-oss/%{name}/tarball/%{package_srccommit}#/%{name}-%{version}.tar.gz
 Source1: sysconfig_kernel-xen
 Source2: xl.conf
 Source3: logrotate-xen-tools
