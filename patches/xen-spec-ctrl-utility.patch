@@ -42,10 +42,10 @@ index 07e9aa6814c1..8f2aa6ed62e6 100644
  -include $(DEPS_INCLUDE)
 diff --git a/tools/misc/xen-spec-ctrl.c b/tools/misc/xen-spec-ctrl.c
 new file mode 100644
-index 000000000000..d46778eca989
+index 000000000000..a6216c2e4877
 --- /dev/null
 +++ b/tools/misc/xen-spec-ctrl.c
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,49 @@
 +#define _GNU_SOURCE
 +
 +#include <stdio.h>
@@ -57,18 +57,20 @@ index 000000000000..d46778eca989
 +
 +void show_help(void)
 +{
-+    fprintf(stderr,
++    fprintf(stdout,
 +            "xen-spec-ctrl: Xen speculation control tool\n"
 +            "Usage: xen-spec-ctrl update\n");
 +}
 +
 +int main(int argc, char *argv[])
 +{
-+    int ret;
-+    struct xen_sysctl sysctl = {0};
++    struct xen_sysctl sysctl = {
++        .interface_version = XEN_SYSCTL_INTERFACE_VERSION,
++        .cmd = XEN_SYSCTL_spec_ctrl,
++        .u.spec_ctrl.op = XENPF_spec_ctrl_update,
++    };
 +    xc_interface *xch;
-+    char *str = "Mitigations have been updated! "
-+                "Check xen-cpuid output for the details.";
++    int ret;
 +
 +    if ( argc < 2 || strcmp(argv[1], "update") != 0 )
 +    {
@@ -80,27 +82,14 @@ index 000000000000..d46778eca989
 +    if ( xch == NULL )
 +        err(1, "xc_interface_open");
 +
-+    sysctl.interface_version = XEN_SYSCTL_INTERFACE_VERSION;
-+    sysctl.cmd = XEN_SYSCTL_spec_ctrl;
-+    sysctl.u.spec_ctrl.op = XENPF_spec_ctrl_update;
-+
 +    ret = xc_sysctl(xch, &sysctl);
-+    if ( ret != 0 )
-+    {
-+        switch ( errno )
-+        {
-+        case ENOEXEC:
-+            str = "No new H/W features have been found. "
-+                  "Did you forget to update the microcode with xen-ucode?";
-+            break;
 +
-+        default:
-+            str = strerror(errno);
-+            break;
-+        }
-+    }
-+
-+    fprintf(stderr, "Status: %s\n", str);
++    if ( ret == 0 )
++        fprintf(stdout, "Features updated\n");
++    else if ( ret == -1 && errno == ENOEXEC )
++        fprintf(stdout, "No new features found\n");
++    else
++        err(1, "Unexpected error: ");
 +
 +    xc_interface_close(xch);
 +
@@ -228,7 +217,7 @@ index fe721e5df8a6..af020e5fce1e 100644
      calculate_raw_cpu_policy();
      calculate_host_policy();
 diff --git a/xen/arch/x86/cpu/amd.c b/xen/arch/x86/cpu/amd.c
-index 31f785a446da..4a17fbe5a073 100644
+index e20cc66bd06c..7b4315c91091 100644
 --- a/xen/arch/x86/cpu/amd.c
 +++ b/xen/arch/x86/cpu/amd.c
 @@ -52,7 +52,7 @@ boolean_param("allow_unsafe", opt_allow_unsafe);
@@ -240,11 +229,21 @@ index 31f785a446da..4a17fbe5a073 100644
  
  static bool __read_mostly fam17_c6_disabled;
  
+@@ -1237,7 +1237,8 @@ static void cf_check init_amd(struct cpuinfo_x86 *c)
+ 	}
+ 
+ 	/* AMD CPUs do not support SYSENTER outside of legacy mode. */
+-	__clear_bit(X86_FEATURE_SEP, c->x86_capability);
++	if (c == &boot_cpu_data)
++		setup_clear_cpu_cap(X86_FEATURE_SEP);
+ 
+ 	if (c->x86 == 0x10) {
+ 		/* do this for boot cpu */
 diff --git a/xen/arch/x86/cpu/common.c b/xen/arch/x86/cpu/common.c
-index 3b10247b84db..249f4e9d645f 100644
+index 095c7b13591d..835eb3c081b1 100644
 --- a/xen/arch/x86/cpu/common.c
 +++ b/xen/arch/x86/cpu/common.c
-@@ -628,6 +628,139 @@ void identify_cpu(struct cpuinfo_x86 *c)
+@@ -635,6 +635,155 @@ void identify_cpu(struct cpuinfo_x86 *c)
  	setup_doitm();
  }
  
@@ -301,11 +300,22 @@ index 3b10247b84db..249f4e9d645f 100644
 +{
 +    volatile uint32_t *new_fs = data;
 +    uint32_t fs[FSCAPINTS] = {};
-+    unsigned int i, cpu = smp_processor_id();
++    unsigned int i;
++
++    /*
++     * Disable CPUID masking if in use, to avoid having current's
++     * cpu_policy affect the rescan.
++     */
++    if ( ctxt_switch_masking )
++        alternative_vcall(ctxt_switch_masking, NULL);
 +
 +    fill_featureset(fs);
 +
++    if ( ctxt_switch_masking )
++        alternative_vcall(ctxt_switch_masking, current);
++
 +    for ( i = 0; i < ARRAY_SIZE(fs); ++i )
++    {
 +        /*
 +         * The common case is no difference from the initiating CPU.  Only
 +         * issue the atomic operation if it looks like we have bits to clear.
@@ -314,13 +324,7 @@ index 3b10247b84db..249f4e9d645f 100644
 +            asm volatile ( "lock and %[fs], %[new_fs]"
 +                           : [new_fs] "+m" (new_fs[i])
 +                           : [fs] "r" (fs[i]) );
-+
-+    /*
-+     * Update cpu_data[], but skip CPU0 for now.  boot_cpu_data needs to wait
-+     * until all CPUs have merged.
-+     */
-+    if ( cpu != 0 )
-+        memcpy(cpu_data[cpu].x86_capability, fs, sizeof(fs));
++    }
 +}
 +
 +int sysctl_update_spec_ctrl_cpuid(void)
@@ -328,8 +332,19 @@ index 3b10247b84db..249f4e9d645f 100644
 +    uint32_t i, new_fs[FSCAPINTS] = {};
 +    bool lost = false, updated = false;
 +
++    /*
++     * Disable CPUID masking if in use, to avoid having current's
++     * cpu_policy affect the rescan.
++     */
++    if ( ctxt_switch_masking )
++        alternative_vcall(ctxt_switch_masking, NULL);
++
 +    /* Scan for new features on the current CPU. */
 +    fill_featureset(new_fs);
++
++    if ( ctxt_switch_masking )
++        alternative_vcall(ctxt_switch_masking, current);
++
 +    for ( i = 0; i < ARRAY_SIZE(new_fs); ++i )
 +        if ( new_fs[i] & ~boot_cpu_data.x86_capability[i] )
 +            break;
@@ -385,7 +400,7 @@ index 3b10247b84db..249f4e9d645f 100644
  #define SMT_LEVEL       0
  
 diff --git a/xen/arch/x86/include/asm/processor.h b/xen/arch/x86/include/asm/processor.h
-index 33f52b4b2d42..4895e0750e40 100644
+index 7458525d53b8..e516c3b24ad0 100644
 --- a/xen/arch/x86/include/asm/processor.h
 +++ b/xen/arch/x86/include/asm/processor.h
 @@ -579,6 +579,8 @@ void set_in_mcu_opt_ctrl(uint32_t mask, uint32_t val);
