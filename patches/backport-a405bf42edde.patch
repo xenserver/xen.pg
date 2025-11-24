@@ -1,0 +1,83 @@
+From a405bf42eddeb2a2e656807882176e37bd2378af Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 17 Nov 2025 19:00:02 +0000
+Subject: x86/ucode: Fix error handling during parallel ucode load
+
+The xen-ucode utility is sensitive to the overall error as -EEXIST is a
+special case for success, but the real error can get clobbered with -EBUSY.
+
+This can be demonstrated most easily by force loading an old microcode, which
+should yield -EIO but yields -EBUSY:
+
+  # xen-ucode /lib/firmware/amd-ucode/microcode_amd_fam17h.bin --force
+  Failed to update microcode. (err: Device or resource busy)
+
+  (XEN) 256 cores are to update their microcode
+  (XEN) microcode: CPU0 update rev 0x830107d to 0x830107c failed, result 0x830107d
+  (XEN) Late loading aborted: CPU0 failed to update ucode: -5
+
+wait_for_state() returns false on encountering LOADING_EXIT.  Right now, this
+is always transformed into -EBUSY and passed back to callers.
+
+However, control_thread_fn() can move directly to this state in the case of an
+early error; it is not an error condition for APs, but the latest write into
+stopmachine_data.fn_result wins, causing the real error, -EIO, to get
+clobbered with -EBUSY.
+
+Drop all the -EBUSY's, and treat hitting LOADING_EXIT as a success case.  This
+causes only a single error to be returned through stop_machine_run(), and
+preserves the -EIO
+
+  # xen-ucode /lib/firmware/amd-ucode/microcode_amd_fam17h.bin --force
+  Failed to update microcode. (err: Input/output error)
+
+  (XEN) 256 cores are to update their microcode
+  (XEN) microcode: CPU0 update rev 0x830107d to 0x830107c failed, result 0x830107d
+  (XEN) Late loading aborted: CPU0 failed to update ucode: -5
+
+Fixes: 5ed12565aa32 ("microcode: rendezvous CPUs in NMI handler and load ucode")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu/microcode/core.c b/xen/arch/x86/cpu/microcode/core.c
+index 77e5393c25c2..58032324f976 100644
+--- a/xen/arch/x86/cpu/microcode/core.c
++++ b/xen/arch/x86/cpu/microcode/core.c
+@@ -375,7 +375,9 @@ static int secondary_nmi_work(void)
+ {
+     cpumask_set_cpu(smp_processor_id(), &cpu_callin_map);
+ 
+-    return wait_for_state(LOADING_EXIT) ? 0 : -EBUSY;
++    wait_for_state(LOADING_EXIT);
++
++    return 0;
+ }
+ 
+ static int primary_thread_work(const struct microcode_patch *patch)
+@@ -385,7 +387,7 @@ static int primary_thread_work(const struct microcode_patch *patch)
+     cpumask_set_cpu(smp_processor_id(), &cpu_callin_map);
+ 
+     if ( !wait_for_state(LOADING_ENTER) )
+-        return -EBUSY;
++        return 0;
+ 
+     ret = alternative_call(ucode_ops.apply_microcode, patch);
+     if ( !ret )
+@@ -426,7 +428,7 @@ static int cf_check microcode_nmi_callback(
+ static int secondary_thread_fn(void)
+ {
+     if ( !wait_for_state(LOADING_CALLIN) )
+-        return -EBUSY;
++        return 0;
+ 
+     self_nmi();
+ 
+@@ -448,7 +450,7 @@ static int secondary_thread_fn(void)
+ static int primary_thread_fn(const struct microcode_patch *patch)
+ {
+     if ( !wait_for_state(LOADING_CALLIN) )
+-        return -EBUSY;
++        return 0;
+ 
+     if ( ucode_in_nmi )
+     {
