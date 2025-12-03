@@ -1,0 +1,77 @@
+From 601bbb00d267d7e9479e4027254ffb6416cedc29 Mon Sep 17 00:00:00 2001
+From: Tu Dinh <ngoc-tu.dinh@vates.tech>
+Date: Wed, 3 Dec 2025 11:43:57 +0100
+Subject: x86/vhpet: Fix sanitization of legacy IRQ route
+
+When setting a timer's config register, timer_sanitize_int_route will
+always reset the IRQ route value to what's valid corresponding to the
+!HPET_CFG_LEGACY case. This is applied even if the HPET is set to
+HPET_CFG_LEGACY.
+
+When some operating systems (e.g. Windows) try to write to a timer
+config, they will verify and rewrite the register if the values don't
+match what they expect. This causes an unnecessary write to HPET_Tn_CFG.
+
+Note, the HPET specification states that for the Tn_INT_ROUTE_CNF field:
+
+"If the value is not supported by this prarticular timer, then the value
+read back will not match what is written. [...] If the LegacyReplacement
+Route bit is set, then Timers 0 and 1 will have a different routing, and
+this bit field has no effect for those two timers."
+
+Therefore, Xen should not reset timer_int_route if legacy mode is
+enabled, regardless of what's in there.
+
+Fixes: ec40d3fe2147 ("x86/vhpet: check that the set interrupt route is valid")
+Signed-off-by: Tu Dinh <ngoc-tu.dinh@vates.tech>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: fb0e37df71a31318c61e0715ffed3e149ca8a4aa
+master date: 2025-11-26 12:10:21 +0100
+
+diff --git a/xen/arch/x86/hvm/hpet.c b/xen/arch/x86/hvm/hpet.c
+index f0e5f877f4a1..e317ec1f5f32 100644
+--- a/xen/arch/x86/hvm/hpet.c
++++ b/xen/arch/x86/hvm/hpet.c
+@@ -48,6 +48,8 @@
+ #define timer_is_32bit(h, n)     (timer_config(h, n) & HPET_TN_32BIT)
+ #define hpet_enabled(h)          ((h)->hpet.config & HPET_CFG_ENABLE)
+ #define timer_level(h, n)        (timer_config(h, n) & HPET_TN_LEVEL)
++#define timer_is_legacy(h, n) \
++    (((n) <= 1) && ((h)->hpet.config & HPET_CFG_LEGACY))
+ 
+ #define timer_int_route(h, n)    MASK_EXTR(timer_config(h, n), HPET_TN_ROUTE)
+ 
+@@ -55,7 +57,8 @@
+     MASK_EXTR(timer_config(h, n), HPET_TN_INT_ROUTE_CAP)
+ 
+ #define timer_int_route_valid(h, n) \
+-    ((1u << timer_int_route(h, n)) & timer_int_route_cap(h, n))
++    (timer_is_legacy(h, n) || \
++     ((1u << timer_int_route(h, n)) & timer_int_route_cap(h, n)))
+ 
+ static inline uint64_t hpet_read_maincounter(HPETState *h, uint64_t guest_time)
+ {
+@@ -275,7 +278,7 @@ static void hpet_set_timer(HPETState *h, unsigned int tn,
+             ? (uint32_t)diff : 0;
+ 
+     destroy_periodic_time(&h->pt[tn]);
+-    if ( (tn <= 1) && (h->hpet.config & HPET_CFG_LEGACY) )
++    if ( timer_is_legacy(h, tn) )
+     {
+         /* if LegacyReplacementRoute bit is set, HPET specification requires
+            timer0 be routed to IRQ0 in NON-APIC or IRQ2 in the I/O APIC,
+@@ -379,6 +382,14 @@ static int cf_check hpet_write(
+         h->hpet.config = hpet_fixup_reg(new_val, old_val,
+                                         HPET_CFG_ENABLE | HPET_CFG_LEGACY);
+ 
++        /*
++         * The first 2 channels' interrupt route values only matter when
++         * HPET_CFG_LEGACY is disabled. However, for simplicity's sake, always
++         * resanitize all channels anyway.
++         */
++        for ( i = 0; i < HPET_TIMER_NUM; i++ )
++            timer_sanitize_int_route(h, i);
++
+         if ( !(old_val & HPET_CFG_ENABLE) && (new_val & HPET_CFG_ENABLE) )
+         {
+             /* Enable main counter and interrupt generation. */

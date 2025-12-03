@@ -1,0 +1,44 @@
+From 9fb2b66c60a5b0389ad99ecdd02cb966ff7a9c37 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Wed, 3 Dec 2025 11:43:36 +0100
+Subject: x86/msix: fix incorrect refcount decrease in msixtlb
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The usage of atomic_dec_and_test() in msixtbl_pt_unregister() is inverted:
+the function will return true when the refcount reaches 0.  The current
+code does the opposite and calls del_msixtbl_entry() when there are still
+refcounts held on the object.
+
+However all callers of msixtbl_pt_unregister() are serialized on the domctl
+lock, and hence there cannot be parallel calls to msixtbl_pt_unregister()
+that could lead to double freeing of the same object.
+
+The incorrect freeing with active msixtlb entries will result in a possible
+guest visible malfunction, but no internal Xen state corruption.
+
+While entries are leaked once the last pIRQ is unbound, the same entry
+would get re-used if the device has pIRQs bound again.  The guest cannot
+exploit this incorrect refcount check to leak arbitrary amounts of memory
+by repeatedly enabling and disabling (binding and unbinding) MSI-X entries.
+
+Fixes: 34097f0d3080 ('hvm: passthrough MSI-X mask bit acceleration')
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: ea87662c7781c5abeddcd62923eb405d10522ae9
+master date: 2025-11-26 09:46:17 +0100
+
+diff --git a/xen/arch/x86/hvm/vmsi.c b/xen/arch/x86/hvm/vmsi.c
+index fd83abb929ec..e175b5eaa20e 100644
+--- a/xen/arch/x86/hvm/vmsi.c
++++ b/xen/arch/x86/hvm/vmsi.c
+@@ -758,7 +758,7 @@ out:
+     return;
+ 
+ found:
+-    if ( !atomic_dec_and_test(&entry->refcnt) )
++    if ( atomic_dec_and_test(&entry->refcnt) )
+         del_msixtbl_entry(entry);
+ 
+     spin_unlock_irq(&irqd->lock);
