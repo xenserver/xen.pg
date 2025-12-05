@@ -1,0 +1,239 @@
+From 6624c1b4a38f83899df0b231d917aad5e1af12e3 Mon Sep 17 00:00:00 2001
+From: Marcus Granado <marcus.granado@citrix.com>
+Date: Thu, 4 Dec 2025 13:20:00 +0000
+Subject: d->node_tot_pages
+
+Signed-off-by: Marcus Granado <marcus.granado@citrix.com>
+Signed-off-by: Bernhard Kaindl <bernhard.kaindl@citrix.com>
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index b4d9e38d09b3..b7966d6c03fc 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -1317,6 +1317,11 @@ void domain_destroy(struct domain *d)
+     /* Remove from the domlist/hash. */
+     domlist_remove(d);
+ 
++    /* Sanity check the NUMA node page count sum before destroying domain. */
++    nrspin_lock(&d->page_alloc_lock);
++    ASSERT_NUMA_PAGE_COUNT(d);
++    nrspin_unlock(&d->page_alloc_lock);
++
+     /* Schedule RCU asynchronous completion of domain destroy. */
+     call_rcu(&d->rcu, complete_domain_destroy);
+ }
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index d74d78cd445e..a634c16e0551 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -559,6 +559,8 @@ static long memory_exchange(XEN_GUEST_HANDLE_PARAM(xen_memory_exchange_t) arg)
+     long          rc = 0;
+     struct domain *d;
+     struct page_info *page;
++    /* Shadow page count adjustments. */
++    long node_tot_pages_adjustments[MAX_NUMNODES] = {};
+ 
+     if ( copy_from_guest(&exch, arg, 1) )
+         return -EFAULT;
+@@ -709,6 +711,8 @@ static long memory_exchange(XEN_GUEST_HANDLE_PARAM(xen_memory_exchange_t) arg)
+                 }
+ 
+                 page_list_add(page, &in_chunk_list);
++                /* Account the removed page for updating the per-node pages */
++                node_tot_pages_adjustments[page_to_nid(page)]--;
+ #ifdef CONFIG_X86
+                 put_gfn(d, gmfn + k);
+ #endif
+@@ -757,23 +761,36 @@ static long memory_exchange(XEN_GUEST_HANDLE_PARAM(xen_memory_exchange_t) arg)
+             if ( assign_page(page, exch.out.extent_order, d,
+                              MEMF_no_refcount) )
+             {
+-                unsigned long dec_count;
+-                bool drop_dom_ref;
++                bool drop_dom_ref = false;
+ 
+                 /*
+                  * Pages in in_chunk_list is stolen without
+                  * decreasing the tot_pages. If the domain is dying when
+                  * assign pages, we need decrease the count. For those pages
+                  * that has been assigned, it should be covered by
+-                 * domain_relinquish_resources().
++                 * domain_relinquish_resources().  This requires adjusting the
++                 * per NUMA node domain stats.
+                  */
+-                dec_count = (((1UL << exch.in.extent_order) *
+-                              (1UL << in_chunk_order)) -
+-                             (j * (1UL << exch.out.extent_order)));
+ 
+                 nrspin_lock(&d->page_alloc_lock);
+-                drop_dom_ref = (dec_count &&
+-                                !domain_adjust_tot_pages(d, page_to_nid(page), -dec_count));
++                for_each_online_node ( k )
++                {
++                    if ( !node_tot_pages_adjustments[k] )
++                        continue;
++                    d->node_tot_pages[k] += node_tot_pages_adjustments[k];
++                    d->tot_pages += node_tot_pages_adjustments[k];
++
++                    /*
++                     * drop_dom_ref needs setting if and only if d->tot_pages
++                     * drops to 0.
++                     *
++                     * d->tot_pages can only become 0 once, and doesn't
++                     * underflow.  Therefore, if it becomes 0, it does so on
++                     * the final iteration of the loop.
++                     */
++                    drop_dom_ref = !d->tot_pages;
++                }
++                ASSERT_NUMA_PAGE_COUNT(d);
+                 nrspin_unlock(&d->page_alloc_lock);
+ 
+                 if ( drop_dom_ref )
+@@ -782,6 +799,9 @@ static long memory_exchange(XEN_GUEST_HANDLE_PARAM(xen_memory_exchange_t) arg)
+                 free_domheap_pages(page, exch.out.extent_order);
+                 goto dying;
+             }
++            /* Account the assigned page for updating the per-node pages */
++            node_tot_pages_adjustments[page_to_nid(page)] +=
++                1 << exch.out.extent_order;
+ 
+             if ( __copy_from_guest_offset(&gpfn, exch.out.extent_start,
+                                           (i << out_chunk_order) + j, 1) )
+@@ -804,6 +824,16 @@ static long memory_exchange(XEN_GUEST_HANDLE_PARAM(xen_memory_exchange_t) arg)
+ 
+         if ( rc )
+             goto fail;
++
++        nrspin_lock(&d->page_alloc_lock);
++        /* Success: Adjust d->node_tot_pages[]. d->tot_pages did not change. */
++        for_each_online_node ( k )
++            if ( node_tot_pages_adjustments[k] )
++                d->node_tot_pages[k] += node_tot_pages_adjustments[k];
++        ASSERT_NUMA_PAGE_COUNT(d);
++        nrspin_unlock(&d->page_alloc_lock);
++        memset(node_tot_pages_adjustments, 0,
++               sizeof(node_tot_pages_adjustments));
+     }
+ 
+     exch.nr_exchanged = exch.in.nr_extents;
+@@ -823,11 +853,31 @@ static long memory_exchange(XEN_GUEST_HANDLE_PARAM(xen_memory_exchange_t) arg)
+      * cleared PGC_allocated.
+      */
+     while ( (page = page_list_remove_head(&in_chunk_list)) )
++    {
+         if ( assign_pages(page, 1, d, MEMF_no_refcount) )
+         {
+             BUG_ON(!d->is_dying);
+             free_domheap_page(page);
+         }
++        else
++            node_tot_pages_adjustments[page_to_nid(page)] += 1;
++    }
++
++    /*
++     * Adjust page stats with any pages we failed to add assign back to the
++     * domain.
++     */
++    nrspin_lock(&d->page_alloc_lock);
++    for_each_online_node ( k )
++    {
++        if ( !node_tot_pages_adjustments[k] )
++            continue;
++        d->node_tot_pages[k] += node_tot_pages_adjustments[k];
++        d->tot_pages += node_tot_pages_adjustments[k];
++    }
++    ASSERT_NUMA_PAGE_COUNT(d);
++    nrspin_unlock(&d->page_alloc_lock);
++    ASSERT(page_list_empty(&out_chunk_list));
+ 
+  dying:
+     rcu_unlock_domain(d);
+diff --git a/xen/common/numa.c b/xen/common/numa.c
+index ad75955a1622..9f38145579e0 100644
+--- a/xen/common/numa.c
++++ b/xen/common/numa.c
+@@ -737,26 +737,14 @@ static void cf_check dump_numa(unsigned char key)
+     printk("Memory location of each domain:\n");
+     for_each_domain ( d )
+     {
+-        const struct page_info *page;
+-        unsigned int page_num_node[MAX_NUMNODES];
+         const struct vnuma_info *vnuma;
+ 
+         process_pending_softirqs();
+ 
+         printk("%pd (total: %u):\n", d, domain_tot_pages(d));
+ 
+-        memset(page_num_node, 0, sizeof(page_num_node));
+-
+-        nrspin_lock(&d->page_alloc_lock);
+-        page_list_for_each ( page, &d->page_list )
+-        {
+-            i = page_to_nid(page);
+-            page_num_node[i]++;
+-        }
+-        nrspin_unlock(&d->page_alloc_lock);
+-
+         for_each_online_node ( i )
+-            printk("    Node %u: %u\n", i, page_num_node[i]);
++            printk("    Node %u: %u\n", i, d->node_tot_pages[i]);
+ 
+         if ( !read_trylock(&d->vnuma_rwlock) )
+             continue;
+diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
+index a80494854795..b84f11854d77 100644
+--- a/xen/common/page_alloc.c
++++ b/xen/common/page_alloc.c
+@@ -497,6 +497,13 @@ unsigned long domain_adjust_tot_pages(struct domain *d, nodeid_t node, long page
+     ASSERT(rspin_is_locked(&d->page_alloc_lock));
+     d->tot_pages += pages;
+ 
++#ifdef CONFIG_NUMA
++    ASSERT(node != NUMA_NO_NODE);
++    ASSERT(node_online(node));
++    d->node_tot_pages[node] += pages;
++    ASSERT_NUMA_PAGE_COUNT(d);
++#endif
++
+     return d->tot_pages;
+ }
+ 
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 643043f94860..38931e2d3636 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -625,6 +625,11 @@ struct domain
+     unsigned int last_alloc_node;
+     spinlock_t node_affinity_lock;
+ 
++#ifdef CONFIG_NUMA
++    /* Distribution of tot_pages across NUMA nodes. */
++    unsigned int node_tot_pages[MAX_NUMNODES];
++#endif
++
+     /* vNUMA topology accesses are protected by rwlock. */
+     rwlock_t vnuma_rwlock;
+     struct vnuma_info *vnuma;
+@@ -689,6 +694,21 @@ static inline unsigned int domain_tot_pages(const struct domain *d)
+     return d->tot_pages - d->extra_pages;
+ }
+ 
++/* Called while holding d->page_alloc_lock and in domain_destroy() */
++static inline void ASSERT_NUMA_PAGE_COUNT(const struct domain *d)
++{
++#if defined(CONFIG_NUMA) && defined(CONFIG_DEBUG)
++    unsigned int i, node_total = 0;
++
++    ASSERT(rspin_is_locked(&d->page_alloc_lock));
++
++    for_each_online_node ( i )
++        node_total += d->node_tot_pages[i];
++
++    ASSERT(node_total == d->tot_pages);
++#endif
++}
++
+ /* Protect updates/reads (resp.) of domain_list and domain_hash. */
+ extern spinlock_t domlist_update_lock;
+ extern rcu_read_lock_t domlist_read_lock;

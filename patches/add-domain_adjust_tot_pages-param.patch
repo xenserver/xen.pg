@@ -1,0 +1,133 @@
+From 6624c1b4a38f83899df0b231d917aad5e1af12e3 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 11 Dec 2025 18:22:53 +0000
+Subject: domain_adjust_tot_pages() node param
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index beffccf1a3b4..028991751d71 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -4452,7 +4452,8 @@ int steal_page(
+     page_list_del(page, &d->page_list);
+ 
+     /* Unlink from original owner. */
+-    if ( !(memflags & MEMF_no_refcount) && !domain_adjust_tot_pages(d, -1) )
++    if ( !(memflags & MEMF_no_refcount) &&
++         !domain_adjust_tot_pages(d, page_to_nid(page), -1) )
+         drop_dom_ref = true;
+ 
+     nrspin_unlock(&d->page_alloc_lock);
+diff --git a/xen/arch/x86/mm/mem_sharing.c b/xen/arch/x86/mm/mem_sharing.c
+index da28266ef076..c593e549c3cf 100644
+--- a/xen/arch/x86/mm/mem_sharing.c
++++ b/xen/arch/x86/mm/mem_sharing.c
+@@ -720,7 +720,7 @@ static int page_make_sharable(struct domain *d,
+     if ( !validate_only )
+     {
+         page_set_owner(page, dom_cow);
+-        drop_dom_ref = !domain_adjust_tot_pages(d, -1);
++        drop_dom_ref = !domain_adjust_tot_pages(d, page_to_nid(page), -1);
+         page_list_del(page, &d->page_list);
+     }
+ 
+@@ -766,7 +766,7 @@ static int page_make_private(struct domain *d, struct page_info *page)
+     ASSERT(page_get_owner(page) == dom_cow);
+     page_set_owner(page, d);
+ 
+-    if ( domain_adjust_tot_pages(d, 1) == 1 )
++    if ( domain_adjust_tot_pages(d, page_to_nid(page), 1) == 1 )
+         get_knownalive_domain(d);
+     page_list_add_tail(page, &d->page_list);
+     nrspin_unlock(&d->page_alloc_lock);
+diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
+index a8fc3b7aef43..5e9dc1d7a032 100644
+--- a/xen/common/grant_table.c
++++ b/xen/common/grant_table.c
+@@ -2429,7 +2429,7 @@ gnttab_transfer(
+         }
+ 
+         /* Okay, add the page to 'e'. */
+-        if ( unlikely(domain_adjust_tot_pages(e, 1) == 1) )
++        if ( unlikely(domain_adjust_tot_pages(e, page_to_nid(page), 1) == 1) )
+             get_knownalive_domain(e);
+ 
+         /*
+@@ -2455,7 +2455,7 @@ gnttab_transfer(
+              * page in the page total
+              */
+             nrspin_lock(&e->page_alloc_lock);
+-            drop_dom_ref = !domain_adjust_tot_pages(e, -1);
++            drop_dom_ref = !domain_adjust_tot_pages(e, page_to_nid(page), -1);
+             nrspin_unlock(&e->page_alloc_lock);
+ 
+             if ( okay /* i.e. e->is_dying due to the surrounding if() */ )
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index 48cccea9507d..d74d78cd445e 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -773,7 +773,7 @@ static long memory_exchange(XEN_GUEST_HANDLE_PARAM(xen_memory_exchange_t) arg)
+ 
+                 nrspin_lock(&d->page_alloc_lock);
+                 drop_dom_ref = (dec_count &&
+-                                !domain_adjust_tot_pages(d, -dec_count));
++                                !domain_adjust_tot_pages(d, page_to_nid(page), -dec_count));
+                 nrspin_unlock(&d->page_alloc_lock);
+ 
+                 if ( drop_dom_ref )
+diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
+index 1f2bb266d1f0..a80494854795 100644
+--- a/xen/common/page_alloc.c
++++ b/xen/common/page_alloc.c
+@@ -492,7 +492,7 @@ static DEFINE_SPINLOCK(heap_lock);
+ static long outstanding_claims; /* total outstanding claims by all domains */
+ static unsigned long per_node_outstanding_claims[MAX_NUMNODES];
+ 
+-unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
++unsigned long domain_adjust_tot_pages(struct domain *d, nodeid_t node, long pages)
+ {
+     ASSERT(rspin_is_locked(&d->page_alloc_lock));
+     d->tot_pages += pages;
+@@ -2679,7 +2679,7 @@ int assign_pages(
+             goto out;
+         }
+ 
+-        if ( unlikely(domain_adjust_tot_pages(d, nr) == nr) )
++        if ( unlikely(domain_adjust_tot_pages(d, page_to_nid(pg), nr) == nr) )
+             get_knownalive_domain(d);
+     }
+ 
+@@ -2812,7 +2812,7 @@ void free_domheap_pages(struct page_info *pg, unsigned int order)
+                 }
+             }
+ 
+-            drop_dom_ref = !domain_adjust_tot_pages(d, -(1 << order));
++            drop_dom_ref = !domain_adjust_tot_pages(d, page_to_nid(pg), -(1 << order));
+ 
+             rspin_unlock(&d->page_alloc_lock);
+ 
+@@ -3025,7 +3025,7 @@ void free_domstatic_page(struct page_info *page)
+ 
+     arch_free_heap_page(d, page);
+ 
+-    drop_dom_ref = !domain_adjust_tot_pages(d, -1);
++    drop_dom_ref = !domain_adjust_tot_pages(d, page_to_nid(page), -1);
+ 
+     unprepare_staticmem_pages(page, 1, scrub_debug);
+ 
+diff --git a/xen/include/xen/mm.h b/xen/include/xen/mm.h
+index 0d0ae1562311..4a0e493519c5 100644
+--- a/xen/include/xen/mm.h
++++ b/xen/include/xen/mm.h
+@@ -129,8 +129,8 @@ mfn_t xen_map_to_mfn(unsigned long va);
+  */
+ int populate_pt_range(unsigned long virt, unsigned long nr_mfns);
+ /* Claim handling */
+-unsigned long __must_check domain_adjust_tot_pages(struct domain *d,
+-    long pages);
++unsigned long __must_check domain_adjust_tot_pages(
++    struct domain *d, nodeid_t node, long pages);
+ int domain_set_outstanding_pages(struct domain *d, nodeid_t node,
+     unsigned long pages);
+ void get_outstanding_claims(uint64_t *free_pages, uint64_t *outstanding_pages);
