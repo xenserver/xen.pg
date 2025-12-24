@@ -1,0 +1,177 @@
+From a76278016ef709fb89fa01b0540fbfb2f1ef7d3a Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Fri, 12 Dec 2025 09:38:37 +0100
+Subject: libs/xg: allow caller to provide extra memflags for populate physmap
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Introduce an additional memflags field to the xc_dom_image and
+xc_sr_context structures and use it to pass additional memflags to use when
+populating the domain physmap.
+
+No meaningful usages of this new field are added as part of the patch.  The
+only know usage will be from the XAPI domain builder, which lives in a
+different repository.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Anthony PERARD <anthony.perard@vates.tech>
+
+diff --git a/tools/include/xenguest.h b/tools/include/xenguest.h
+index c88958faa9a3..7c3b8b098352 100644
+--- a/tools/include/xenguest.h
++++ b/tools/include/xenguest.h
+@@ -242,6 +242,9 @@ struct xc_dom_image {
+ 
+     /* Number of vCPUs */
+     unsigned int max_vcpus;
++
++    /* Caller provided memflags to use when populating physmap. */
++    unsigned int memflags;
+ };
+ 
+ /* --- arch specific hooks ----------------------------------------- */
+@@ -611,6 +614,8 @@ struct restore_callbacks {
+  *        specific data
+  * @param send_back_fd Only used for XC_STREAM_COLO.  Contains backchannel to
+  *        the source side.
++ * @param memflags Optional memflags to pass in
++ *        xc_domain_populate_physmap{_exact}() calls.
+  * @return 0 on success, -1 on failure
+  */
+ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+@@ -618,7 +623,8 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+                       uint32_t store_domid, unsigned int console_evtchn,
+                       unsigned long *console_mfn, uint32_t console_domid,
+                       xc_stream_type_t stream_type,
+-                      struct restore_callbacks *callbacks, int send_back_fd);
++                      struct restore_callbacks *callbacks, int send_back_fd,
++                      unsigned int memflags);
+ 
+ /**
+  * This function will create a domain for a paravirtualized Linux
+diff --git a/tools/libs/guest/xg_dom_x86.c b/tools/libs/guest/xg_dom_x86.c
+index a82b481a123f..268936efe25b 100644
+--- a/tools/libs/guest/xg_dom_x86.c
++++ b/tools/libs/guest/xg_dom_x86.c
+@@ -1260,14 +1260,15 @@ static int meminit_pv(struct xc_dom_image *dom)
+     /* allocate guest memory */
+     for ( i = 0; i < nr_vmemranges; i++ )
+     {
+-        unsigned int memflags;
++        unsigned int memflags = dom->memflags;
+         uint64_t pages, super_pages;
+         unsigned int pnode = vnode_to_pnode[vmemranges[i].nid];
+         xen_pfn_t extents[SUPERPAGE_BATCH_SIZE];
+         xen_pfn_t pfn_base_idx;
+ 
+-        memflags = 0;
+-        if ( pnode != XC_NUMA_NO_NODE )
++        if ( pnode != XC_NUMA_NO_NODE &&
++             /* Only set the node if the caller hasn't done so. */
++             XENMEMF_get_node(memflags) == XENMEMF_get_node(0) )
+             memflags |= XENMEMF_exact_node(pnode);
+ 
+         pages = (vmemranges[i].end - vmemranges[i].start) >> PAGE_SHIFT;
+@@ -1354,7 +1355,7 @@ static int meminit_hvm(struct xc_dom_image *dom)
+     int rc;
+     unsigned long stat_normal_pages = 0, stat_2mb_pages = 0,
+         stat_1gb_pages = 0;
+-    unsigned int memflags = 0;
++    unsigned int memflags = dom->memflags;
+     int claim_enabled = dom->claim_enabled;
+     uint64_t total_pages;
+     xen_vmemrange_t dummy_vmemrange[2];
+@@ -1500,7 +1501,9 @@ static int meminit_hvm(struct xc_dom_image *dom)
+         unsigned int vnode = vmemranges[vmemid].nid;
+         unsigned int pnode = vnode_to_pnode[vnode];
+ 
+-        if ( pnode != XC_NUMA_NO_NODE )
++        if ( pnode != XC_NUMA_NO_NODE &&
++             /* Only set the node if the caller hasn't done so. */
++             XENMEMF_get_node(new_memflags) == XENMEMF_get_node(0) )
+             new_memflags |= XENMEMF_exact_node(pnode);
+ 
+         end_pages = vmemranges[vmemid].end >> PAGE_SHIFT;
+diff --git a/tools/libs/guest/xg_nomigrate.c b/tools/libs/guest/xg_nomigrate.c
+index 6795c62ddc28..9790d2b4a844 100644
+--- a/tools/libs/guest/xg_nomigrate.c
++++ b/tools/libs/guest/xg_nomigrate.c
+@@ -33,7 +33,8 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+                       uint32_t store_domid, unsigned int console_evtchn,
+                       unsigned long *console_mfn, uint32_t console_domid,
+                       xc_stream_type_t stream_type,
+-                      struct restore_callbacks *callbacks, int send_back_fd)
++                      struct restore_callbacks *callbacks, int send_back_fd,
++                      unsigned int memflags)
+ {
+     errno = ENOSYS;
+     return -1;
+diff --git a/tools/libs/guest/xg_sr_common.h b/tools/libs/guest/xg_sr_common.h
+index 0e419c3a96a0..f1573aefcbff 100644
+--- a/tools/libs/guest/xg_sr_common.h
++++ b/tools/libs/guest/xg_sr_common.h
+@@ -295,6 +295,9 @@ struct xc_sr_context
+ 
+             /* Sender has invoked verify mode on the stream. */
+             bool verify;
++
++            /* memflags to pass to xc_domain_populate_physmap{_exact}(). */
++            unsigned int memflags;
+         } restore;
+     };
+ 
+diff --git a/tools/libs/guest/xg_sr_restore.c b/tools/libs/guest/xg_sr_restore.c
+index 4aed5cf4acb1..e148fc594a73 100644
+--- a/tools/libs/guest/xg_sr_restore.c
++++ b/tools/libs/guest/xg_sr_restore.c
+@@ -141,7 +141,8 @@ static bool populate_small_superpage(struct xc_sr_context *ctx, xen_pfn_t gfn)
+     xen_pfn_t mfn = gfn;
+ 
+     if ( xc_domain_populate_physmap_exact(
+-         ctx->xch, ctx->domid, 1, SMALL_SUPERPAGE_ORDER, 0, &mfn) )
++         ctx->xch, ctx->domid, 1, SMALL_SUPERPAGE_ORDER, ctx->restore.memflags,
++         &mfn) )
+         return false;
+ 
+     /*
+@@ -217,7 +218,7 @@ int populate_pfns(struct xc_sr_context *ctx, unsigned int count,
+     if ( nr_pfns )
+     {
+         rc = xc_domain_populate_physmap_exact(
+-            xch, ctx->domid, nr_pfns, 0, 0, mfns);
++            xch, ctx->domid, nr_pfns, 0, ctx->restore.memflags, mfns);
+         if ( rc )
+         {
+             PERROR("Failed to populate physmap");
+@@ -901,7 +902,8 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+                       uint32_t store_domid, unsigned int console_evtchn,
+                       unsigned long *console_gfn, uint32_t console_domid,
+                       xc_stream_type_t stream_type,
+-                      struct restore_callbacks *callbacks, int send_back_fd)
++                      struct restore_callbacks *callbacks, int send_back_fd,
++                      unsigned int memflags)
+ {
+     bool hvm;
+     xen_pfn_t nr_pfns;
+@@ -918,6 +920,7 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
+     ctx.restore.xenstore_domid = store_domid;
+     ctx.restore.callbacks = callbacks;
+     ctx.restore.send_back_fd = send_back_fd;
++    ctx.restore.memflags = memflags;
+ 
+     /* Sanity check stream_type-related parameters */
+     switch ( stream_type )
+diff --git a/tools/libs/light/libxl_save_helper.c b/tools/libs/light/libxl_save_helper.c
+index 65dff389bf8f..64bdeb3b32fd 100644
+--- a/tools/libs/light/libxl_save_helper.c
++++ b/tools/libs/light/libxl_save_helper.c
+@@ -285,7 +285,7 @@ int main(int argc, char **argv)
+ 
+         r = xc_domain_restore(xch, io_fd, dom, store_evtchn, &store_mfn,
+                               store_domid, console_evtchn, &console_mfn,
+-                              console_domid, stream_type, &cb, send_back_fd);
++                              console_domid, stream_type, &cb, send_back_fd, 0);
+         helper_stub_restore_results(store_mfn,console_mfn,0);
+         complete(r);
+ 
