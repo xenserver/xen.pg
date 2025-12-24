@@ -62,7 +62,7 @@ index 73469dce308c..3785258dd3a9 100644
          rcu_unlock_domain(d);
  
 diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
-index 576d99e7ae00..27d407b380e8 100644
+index 576d99e7ae00..aea5992b5c96 100644
 --- a/xen/common/page_alloc.c
 +++ b/xen/common/page_alloc.c
 @@ -490,6 +490,7 @@ static unsigned long per_node_avail_pages[MAX_NUMNODES];
@@ -120,62 +120,36 @@ index 576d99e7ae00..27d407b380e8 100644
      /* yay, claim fits in available memory, stake the claim, success! */
      d->outstanding_pages = claim;
      outstanding_claims += d->outstanding_pages;
-@@ -883,7 +904,15 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
+@@ -880,6 +901,20 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
+      */
+     for ( ; ; )
+     {
++        /*
++         * Check if the node have enough available memory taking into account
++         * any active per-node claims.
++         */
++        unsigned long avail_pages = per_node_avail_pages[node] -
++                                    per_node_outstanding_claims[node];
++
++        BUG_ON(per_node_outstanding_claims[node] > per_node_avail_pages[node]);
++
++        if ( d && d->claim_node == node && !(memflags & MEMF_no_refcount) )
++            avail_pages += d->outstanding_pages;
++        if ( avail_pages < (1UL << order) )
++            goto next_node;
++
          zone = zone_hi;
          do {
              /* Check if target node can support the allocation. */
--            if ( !avail[node] || (avail[node][zone] < (1UL << order)) )
-+            if ( !avail[node] || (avail[node][zone] < (1UL << order)) ||
-+                 /*
-+                  * For host-wide allocations, ensure we do not steal memory
-+                  * from nodes without enough unclaimed memory available.
-+                  */
-+                  (d && d->claim_node == NUMA_NO_NODE &&
-+                   per_node_outstanding_claims[node] > 0 &&
-+                   ((per_node_avail_pages[node] -
-+                     per_node_outstanding_claims[node]) < (1UL << order))) )
-                 continue;
+@@ -909,6 +944,7 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
+             }
+         } while ( zone-- > zone_lo ); /* careful: unsigned zone may wrap */
  
-             /* Find smallest order which can satisfy the request. */
-@@ -912,6 +941,37 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
++ next_node:
          if ( (memflags & MEMF_exact_node) && req_node != NUMA_NO_NODE )
              return NULL;
  
-+        /*
-+         * We got a request that we cannot satisfy on the current node.
-+         *
-+         * If the domain has a claim, but we'd have to allocate elsewhere,
-+         * fail, forcing smaller allocations on the claimed node.
-+         *
-+         * This ensures that domains with node-specific claims allocate
-+         * as much as possible on their claimed node, even if it means
-+         * to force meminit functions to do smaller allocations:
-+         *
-+         * For example, if a domain has a claim of 1GB on node 0, and then tries
-+         * to allocate a 1GB superpage for which we have no 1GB superpage left
-+         * on node 0, we fail rather than falling back to another node to
-+         * to allocate the superpage.  meminit functions then
-+         * fall back many to smaller allocations on the claimed node that
-+         * should be possible given the claim, allowing the overall allocation
-+         * of 1GB on the claimed node to succeed.
-+         *
-+         * In any case of a bug that would have led us to steal claimed memory
-+         * from the NUMA node claim, we also rather surface the problem to the
-+         * caller as in this case, ultimatively, we cannot fulfill the requests
-+         * rather than silently allocating memory from other nodes.
-+         *
-+         * When the domain does not have a sufficient claim for the allocation
-+         * e.g. when the domain has no claim after building the domain,
-+         * we allow to fall back to other NUMA nodes.
-+         */
-+        if ( d && d->claim_node != NUMA_NO_NODE &&
-+             (1UL << order) <= d->outstanding_pages )
-+            return NULL; /* Force smaller allocations */
-+
-         /* Pick next node. */
-         if ( !nodemask_test(node, &nodemask) )
-         {
-@@ -1025,7 +1085,8 @@ static struct page_info *alloc_heap_pages(
+@@ -1025,7 +1061,8 @@ static struct page_info *alloc_heap_pages(
      total_avail_pages -= request;
      ASSERT(total_avail_pages >= 0);
  
@@ -185,7 +159,7 @@ index 576d99e7ae00..27d407b380e8 100644
      {
          /*
           * Adjust claims in the same locked region where total_avail_pages is
-@@ -1044,6 +1105,15 @@ static struct page_info *alloc_heap_pages(
+@@ -1044,6 +1081,15 @@ static struct page_info *alloc_heap_pages(
           */
          unsigned long outstanding = min(d->outstanding_pages + 0UL, request);
  
