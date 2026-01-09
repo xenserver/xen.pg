@@ -62,7 +62,7 @@ index 73469dce308c..3785258dd3a9 100644
          rcu_unlock_domain(d);
  
 diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
-index 576d99e7ae00..b273b3aace53 100644
+index 576d99e7ae00..1f2bb266d1f0 100644
 --- a/xen/common/page_alloc.c
 +++ b/xen/common/page_alloc.c
 @@ -490,6 +490,7 @@ static unsigned long per_node_avail_pages[MAX_NUMNODES];
@@ -73,7 +73,7 @@ index 576d99e7ae00..b273b3aace53 100644
  
  unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
  {
-@@ -499,11 +500,16 @@ unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
+@@ -499,11 +500,19 @@ unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
      return d->tot_pages;
  }
  
@@ -88,10 +88,13 @@ index 576d99e7ae00..b273b3aace53 100644
 +         (node >= MAX_NUMNODES || !node_online(node)) )
 +        return -ENOENT;
 +
++    if ( !pages && node != NUMA_NO_NODE )
++        return -EINVAL;
++
      /*
       * Two locks are needed here:
       *  - d->page_alloc_lock: protects accesses to d->{tot,max,extra}_pages.
-@@ -517,6 +523,10 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
+@@ -517,7 +526,12 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
      if ( pages == 0 )
      {
          outstanding_claims -= d->outstanding_pages;
@@ -100,9 +103,11 @@ index 576d99e7ae00..b273b3aace53 100644
 +            per_node_outstanding_claims[d->claim_node] -= d->outstanding_pages;
 +
          d->outstanding_pages = 0;
++        d->claim_node = NUMA_NO_NODE;
          ret = 0;
          goto out;
-@@ -549,6 +559,18 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
+     }
+@@ -549,6 +563,19 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
      if ( claim > avail_pages )
          goto out;
  
@@ -114,6 +119,7 @@ index 576d99e7ae00..b273b3aace53 100644
 +        if ( claim > avail_pages )
 +            goto out;
 +
++        /* Success, stake the claim against this node. */
 +        d->claim_node = node;
 +        per_node_outstanding_claims[node] += claim;
 +    }
@@ -121,7 +127,7 @@ index 576d99e7ae00..b273b3aace53 100644
      /* yay, claim fits in available memory, stake the claim, success! */
      d->outstanding_pages = claim;
      outstanding_claims += d->outstanding_pages;
-@@ -880,6 +902,20 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
+@@ -880,6 +907,20 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
       */
      for ( ; ; )
      {
@@ -142,7 +148,7 @@ index 576d99e7ae00..b273b3aace53 100644
          zone = zone_hi;
          do {
              /* Check if target node can support the allocation. */
-@@ -909,6 +945,7 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
+@@ -909,6 +950,7 @@ static struct page_info *get_free_buddy(unsigned int zone_lo,
              }
          } while ( zone-- > zone_lo ); /* careful: unsigned zone may wrap */
  
@@ -150,7 +156,7 @@ index 576d99e7ae00..b273b3aace53 100644
          if ( (memflags & MEMF_exact_node) && req_node != NUMA_NO_NODE )
              return NULL;
  
-@@ -1025,7 +1062,8 @@ static struct page_info *alloc_heap_pages(
+@@ -1025,7 +1067,8 @@ static struct page_info *alloc_heap_pages(
      total_avail_pages -= request;
      ASSERT(total_avail_pages >= 0);
  
@@ -160,7 +166,7 @@ index 576d99e7ae00..b273b3aace53 100644
      {
          /*
           * Adjust claims in the same locked region where total_avail_pages is
-@@ -1044,6 +1082,15 @@ static struct page_info *alloc_heap_pages(
+@@ -1044,6 +1087,15 @@ static struct page_info *alloc_heap_pages(
           */
          unsigned long outstanding = min(d->outstanding_pages + 0UL, request);
  
