@@ -1,6 +1,6 @@
-From 75d29d9b5e226bafa0fbf9fba25623229660b81e Mon Sep 17 00:00:00 2001
-From: Roger Pau Monne <roger.pau@citrix.com>
-Date: Mon, 22 Dec 2025 12:16:13 +0100
+From 39748952e917e57d4def03f2bd993c11313a8a47 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Tue, 13 Jan 2026 15:46:37 +0100
 Subject: xen/mm: move adjustment of claimed pages counters on allocation
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -31,43 +31,49 @@ complexity for no real benefit.
 Fixes: 65c9792df600 ("mmu: Introduce XENMEM_claim_pages (subop of memory ops)")
 Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
 Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: 75d29d9b5e226bafa0fbf9fba25623229660b81e
+master date: 2026-01-08 11:05:30 +0100
 
 diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
-index 1f67b88a8933..2efc11ce095f 100644
+index 1bf070c8c5df..6919722e9a2a 100644
 --- a/xen/common/page_alloc.c
 +++ b/xen/common/page_alloc.c
-@@ -515,30 +515,6 @@ unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
+@@ -490,34 +490,9 @@ static long outstanding_claims; /* total outstanding claims by all domains */
+ 
+ unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
+ {
+-    long dom_before, dom_after, dom_claimed, sys_before, sys_after;
+-
      ASSERT(rspin_is_locked(&d->page_alloc_lock));
      d->tot_pages += pages;
  
 -    /*
--     * can test d->outstanding_pages race-free because it can only change
+-     * can test d->claimed_pages race-free because it can only change
 -     * if d->page_alloc_lock and heap_lock are both held, see also
 -     * domain_set_outstanding_pages below
 -     */
--    if ( !d->outstanding_pages || pages <= 0 )
+-    if ( !d->outstanding_pages )
 -        goto out;
 -
 -    spin_lock(&heap_lock);
--    BUG_ON(outstanding_claims < d->outstanding_pages);
--    if ( d->outstanding_pages < pages )
--    {
--        /* `pages` exceeds the domain's outstanding count. Zero it out. */
--        outstanding_claims -= d->outstanding_pages;
--        d->outstanding_pages = 0;
--    }
--    else
--    {
--        outstanding_claims -= pages;
--        d->outstanding_pages -= pages;
--    }
+-    /* adjust domain outstanding pages; may not go negative */
+-    dom_before = d->outstanding_pages;
+-    dom_after = dom_before - pages;
+-    BUG_ON(dom_before < 0);
+-    dom_claimed = dom_after < 0 ? 0 : dom_after;
+-    d->outstanding_pages = dom_claimed;
+-    /* flag accounting bug if system outstanding_claims would go negative */
+-    sys_before = outstanding_claims;
+-    sys_after = sys_before - (dom_before - dom_claimed);
+-    BUG_ON(sys_after < 0);
+-    outstanding_claims = sys_after;
 -    spin_unlock(&heap_lock);
 -
 -out:
      return d->tot_pages;
  }
  
-@@ -548,9 +524,10 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
+@@ -527,9 +502,10 @@ int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
      unsigned long claim, avail_pages;
  
      /*
@@ -81,7 +87,7 @@ index 1f67b88a8933..2efc11ce095f 100644
       */
      nrspin_lock(&d->page_alloc_lock);
      spin_lock(&heap_lock);
-@@ -1071,6 +1048,30 @@ static struct page_info *alloc_heap_pages(
+@@ -1044,6 +1020,30 @@ static struct page_info *alloc_heap_pages(
      total_avail_pages -= request;
      ASSERT(total_avail_pages >= 0);
  
@@ -113,10 +119,10 @@ index 1f67b88a8933..2efc11ce095f 100644
  
      if ( d != NULL )
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 1f77e0869b5d..d922c908c29f 100644
+index 037c83fda219..de621eb123a0 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -413,7 +413,8 @@ struct domain
+@@ -396,7 +396,8 @@ struct domain
      unsigned int     tot_pages;
  
      unsigned int     xenheap_pages;     /* pages allocated from Xen heap */
