@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 4
+%global hv_rel 5
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -907,6 +907,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Wed Jan 28 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.20.2-5
+- Fix error reporting with the iommu_op hypercall
+- Introduce new hypercall with memory claim details
+
 * Thu Jan 15 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.20.2-4
 - Fix for XSA-479 CVE-2026-23553
 
