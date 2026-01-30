@@ -1,0 +1,275 @@
+From d158869206e2598ea20feec774b60f94267d10ac Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 29 Jan 2026 14:45:42 +0000
+Subject: XEN_SYSCTL_numa_meminfo
+
+
+diff --git a/tools/include/xenctrl.h b/tools/include/xenctrl.h
+index b6f24463303d..30ff4abf0970 100644
+--- a/tools/include/xenctrl.h
++++ b/tools/include/xenctrl.h
+@@ -1153,6 +1153,8 @@ int xc_get_ucode_revision(xc_interface *xch,
+                           struct xenpf_ucode_revision *ucode_rev);
+ int xc_numainfo(xc_interface *xch, unsigned *max_nodes,
+                 xc_meminfo_t *meminfo, uint32_t *distance);
++int xc_numa_meminfo(xc_interface *xch, unsigned int *max_nodes,
++                    xen_sysctl_node_meminfo_t *meminfo);
+ int xc_pcitopoinfo(xc_interface *xch, unsigned num_devs,
+                    physdev_pci_device_t *devs, uint32_t *nodes);
+ 
+diff --git a/tools/libs/ctrl/xc_misc.c b/tools/libs/ctrl/xc_misc.c
+index 33e87bac2868..200c0d9d63c6 100644
+--- a/tools/libs/ctrl/xc_misc.c
++++ b/tools/libs/ctrl/xc_misc.c
+@@ -324,6 +324,33 @@ out:
+     return ret;
+ }
+ 
++int xc_numa_meminfo(xc_interface *xch, unsigned int *max_nodes,
++                    xen_sysctl_node_meminfo_t *meminfo)
++{
++    int ret;
++    struct xen_sysctl sysctl = {};
++    DECLARE_HYPERCALL_BOUNCE(meminfo, *max_nodes * sizeof(*meminfo),
++                             XC_HYPERCALL_BUFFER_BOUNCE_OUT);
++
++    if ( (ret = xc_hypercall_bounce_pre(xch, meminfo)) )
++        goto out;
++
++    sysctl.u.numa_meminfo.num_nodes = *max_nodes;
++    set_xen_guest_handle(sysctl.u.numa_meminfo.meminfo, meminfo);
++
++    sysctl.cmd = XEN_SYSCTL_numa_meminfo;
++
++    if ( (ret = do_sysctl(xch, &sysctl)) != 0 )
++        goto out;
++
++    *max_nodes = sysctl.u.numa_meminfo.num_nodes;
++
++out:
++    xc_hypercall_bounce_post(xch, meminfo);
++
++    return ret;
++}
++
+ int xc_pcitopoinfo(xc_interface *xch, unsigned num_devs,
+                    physdev_pci_device_t *devs,
+                    uint32_t *nodes)
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index cfc2a20ca1d5..5b9a54e8504f 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -344,6 +344,15 @@ external evtchn_status: handle -> domid -> int -> evtchn_status option =
+ external numa_get_distances : handle -> int array array
+   = "stub_numa_get_distances"
+ 
++type node_meminfo =
++  {
++    size: int64;
++    free: int64;
++    claimed: int64;
++  }
++external numa_get_meminfo : handle -> node_meminfo array
++  = "stub_numa_get_meminfo"
++
+ external readconsolering: handle -> string = "stub_xc_readconsolering"
+ 
+ external send_debug_keys: handle -> string -> unit = "stub_xc_send_debug_keys"
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index a2d2ecc67500..002095b4c771 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -273,6 +273,15 @@ external evtchn_status: handle -> domid -> int -> evtchn_status option =
+ external numa_get_distances : handle -> int array array
+   = "stub_numa_get_distances"
+ 
++type node_meminfo =
++  {
++    size: int64;
++    free: int64;
++    claimed: int64;
++  }
++external numa_get_meminfo : handle -> node_meminfo array
++  = "stub_numa_get_meminfo"
++
+ external readconsolering : handle -> string = "stub_xc_readconsolering"
+ external send_debug_keys : handle -> string -> unit = "stub_xc_send_debug_keys"
+ external physinfo : handle -> physinfo = "stub_xc_physinfo"
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index ccede1bc10b8..56ff401d0525 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -915,6 +915,56 @@ CAMLprim value stub_numa_get_distances(value xch_val)
+ 	CAMLreturn(result);
+ }
+ 
++CAMLprim value stub_numa_get_meminfo(value xch_val)
++{
++	static volatile unsigned nodes;
++
++	CAMLparam1(xch_val);
++	CAMLlocal2(result, info);
++
++	xc_interface *xch = xch_of_val(xch_val);
++	unsigned nr = nodes;
++	int ret;
++
++	/*
++	 * The number of nodes is fixed at boot.  Cache it on the first
++	 * request.  This is acceptably safe in concurrent circumstances; if
++	 * two requests race, both will update nodes with the same value.
++	 */
++	if (nr == 0) {
++		caml_enter_blocking_section();
++		ret = xc_numa_meminfo(xch, &nr, NULL);
++		caml_leave_blocking_section();
++
++		if (ret < 0)
++			failwith_xc(xch);
++
++		nodes = nr;
++	}
++
++	xen_sysctl_node_meminfo_t meminfo[nr];
++
++	caml_enter_blocking_section();
++	ret = xc_numa_meminfo(xch, &nr, meminfo);
++	caml_leave_blocking_section();
++
++	if (ret < 0)
++		failwith_xc(xch);
++
++	result = caml_alloc_tuple(nr);
++	for (unsigned i = 0; i < nr; ++i) {
++		info = caml_alloc_tuple(3);
++
++		Store_field(info, 0, caml_copy_int64(meminfo[i].size));
++		Store_field(info, 1, caml_copy_int64(meminfo[i].free));
++		Store_field(info, 2, caml_copy_int64(meminfo[i].claimed));
++
++		Store_field(result, i, info);
++	}
++
++	CAMLreturn(result);
++}
++
+ CAMLprim value stub_xc_readconsolering(value xch_val)
+ {
+ 	/* Safe to use outside of blocking sections because of Ocaml GC lock. */
+diff --git a/xen/common/sysctl.c b/xen/common/sysctl.c
+index 4d577170655b..2bdcc9c61a0a 100644
+--- a/xen/common/sysctl.c
++++ b/xen/common/sysctl.c
+@@ -363,6 +363,62 @@ long do_sysctl(XEN_GUEST_HANDLE_PARAM(xen_sysctl_t) u_sysctl)
+     }
+     break;
+ 
++    case XEN_SYSCTL_numa_meminfo:
++    {
++        unsigned int i, num_nodes;
++        struct xen_sysctl_numa_meminfo *mi = &op->u.numa_meminfo;
++
++        if ( op->u.numa_meminfo._rsvd )
++        {
++            ret = -EINVAL;
++            break;
++        }
++
++        num_nodes = last_node(node_online_map) + 1;
++
++        if ( !guest_handle_is_null(mi->meminfo) )
++        {
++            if ( num_nodes > mi->num_nodes )
++                num_nodes = mi->num_nodes;
++
++            for ( i = 0; i < num_nodes; ++i )
++            {
++                xen_sysctl_node_meminfo_t meminfo;
++
++                if ( node_online(i) )
++                {
++                    unsigned long claimed;
++
++                    meminfo.size = node_present_pages(i) << PAGE_SHIFT;
++                    meminfo.free = avail_node_heap_pages(i, &claimed) << PAGE_SHIFT;
++                    meminfo.claimed = claimed << PAGE_SHIFT;
++                }
++                else
++                    meminfo.size = meminfo.free = meminfo.claimed = -1;
++
++                if ( copy_to_guest_offset(mi->meminfo, i, &meminfo, 1) )
++                {
++                    ret = -EFAULT;
++                    break;
++                }
++            }
++        }
++        else
++            i = num_nodes;
++
++        if ( !ret && (mi->num_nodes != i) )
++        {
++            mi->num_nodes = i;
++            if ( __copy_field_to_guest(u_sysctl, op,
++                                       u.numa_meminfo.num_nodes) )
++            {
++                ret = -EFAULT;
++                break;
++            }
++        }
++    }
++    break;
++
+     case XEN_SYSCTL_cputopoinfo:
+     {
+         unsigned int i, num_cpus;
+diff --git a/xen/include/public/sysctl.h b/xen/include/public/sysctl.h
+index 3afe1203f497..367e5b5facf1 100644
+--- a/xen/include/public/sysctl.h
++++ b/xen/include/public/sysctl.h
+@@ -705,6 +705,17 @@ struct xen_sysctl_numainfo {
+     XEN_GUEST_HANDLE_64(uint32) distance;
+ };
+ 
++struct xen_sysctl_node_meminfo {
++    uint64_t size, free, claimed;
++};
++typedef struct xen_sysctl_node_meminfo xen_sysctl_node_meminfo_t;
++DEFINE_XEN_GUEST_HANDLE(xen_sysctl_node_meminfo_t);
++struct xen_sysctl_numa_meminfo {
++    uint32_t num_nodes;
++    uint32_t _rsvd;
++    XEN_GUEST_HANDLE_64(xen_sysctl_node_meminfo_t) meminfo;
++};
++
+ /* XEN_SYSCTL_cpupool_op */
+ #define XEN_SYSCTL_CPUPOOL_OP_CREATE                1  /* C */
+ #define XEN_SYSCTL_CPUPOOL_OP_DESTROY               2  /* D */
+@@ -1262,6 +1273,7 @@ struct xen_sysctl {
+ #define XEN_SYSCTL_lockprof_op                   15
+ #define XEN_SYSCTL_cputopoinfo                   16
+ #define XEN_SYSCTL_numainfo                      17
++#define XEN_SYSCTL_numa_meminfo                1117
+ #define XEN_SYSCTL_cpupool_op                    18
+ #define XEN_SYSCTL_scheduler_op                  19
+ #define XEN_SYSCTL_coverage_op                   20
+@@ -1283,6 +1295,7 @@ struct xen_sysctl {
+         struct xen_sysctl_cputopoinfo       cputopoinfo;
+         struct xen_sysctl_pcitopoinfo       pcitopoinfo;
+         struct xen_sysctl_numainfo          numainfo;
++        struct xen_sysctl_numa_meminfo      numa_meminfo;
+         struct xen_sysctl_sched_id          sched_id;
+         struct xen_sysctl_perfc_op          perfc_op;
+         struct xen_sysctl_getdomaininfolist getdomaininfolist;
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 0eca85d36941..f3e31feca40a 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -908,6 +908,7 @@ static int cf_check flask_sysctl(int cmd)
+     case XEN_SYSCTL_physinfo:
+     case XEN_SYSCTL_cputopoinfo:
+     case XEN_SYSCTL_numainfo:
++    case XEN_SYSCTL_numa_meminfo:
+     case XEN_SYSCTL_pcitopoinfo:
+     case XEN_SYSCTL_get_cpu_policy:
+         return domain_has_xen(current->domain, XEN__PHYSINFO);

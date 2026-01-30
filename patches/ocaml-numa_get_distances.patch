@@ -1,0 +1,101 @@
+From 636ec4131a3d3a13585d7ca302a1accab21c47c3 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 29 Jan 2026 17:06:52 +0000
+Subject: Ocaml bindings numa_get_distances
+
+
+diff --git a/tools/ocaml/libs/xc/xenctrl.ml b/tools/ocaml/libs/xc/xenctrl.ml
+index 8fb602e88503..cfc2a20ca1d5 100644
+--- a/tools/ocaml/libs/xc/xenctrl.ml
++++ b/tools/ocaml/libs/xc/xenctrl.ml
+@@ -341,6 +341,9 @@ type evtchn_status = { vcpu: int; status: evtchn_stat }
+ external evtchn_status: handle -> domid -> int -> evtchn_status option =
+   "stub_xc_evtchn_status"
+ 
++external numa_get_distances : handle -> int array array
++  = "stub_numa_get_distances"
++
+ external readconsolering: handle -> string = "stub_xc_readconsolering"
+ 
+ external send_debug_keys: handle -> string -> unit = "stub_xc_send_debug_keys"
+diff --git a/tools/ocaml/libs/xc/xenctrl.mli b/tools/ocaml/libs/xc/xenctrl.mli
+index a728103050ec..a2d2ecc67500 100644
+--- a/tools/ocaml/libs/xc/xenctrl.mli
++++ b/tools/ocaml/libs/xc/xenctrl.mli
+@@ -270,6 +270,9 @@ type evtchn_status = { vcpu: int; status: evtchn_stat }
+ external evtchn_status: handle -> domid -> int -> evtchn_status option =
+   "stub_xc_evtchn_status"
+ 
++external numa_get_distances : handle -> int array array
++  = "stub_numa_get_distances"
++
+ external readconsolering : handle -> string = "stub_xc_readconsolering"
+ external send_debug_keys : handle -> string -> unit = "stub_xc_send_debug_keys"
+ external physinfo : handle -> physinfo = "stub_xc_physinfo"
+diff --git a/tools/ocaml/libs/xc/xenctrl_stubs.c b/tools/ocaml/libs/xc/xenctrl_stubs.c
+index 3ebd9e5d8e71..ccede1bc10b8 100644
+--- a/tools/ocaml/libs/xc/xenctrl_stubs.c
++++ b/tools/ocaml/libs/xc/xenctrl_stubs.c
+@@ -859,6 +859,62 @@ CAMLprim value stub_xc_evtchn_status(value xch_val, value domid, value port)
+ 	CAMLreturn(result);
+ }
+ 
++CAMLprim value stub_numa_get_distances(value xch_val)
++{
++	static volatile unsigned nodes;
++
++	CAMLparam1(xch_val);
++	CAMLlocal2(result, row);
++
++	xc_interface *xch = xch_of_val(xch_val);
++	uint32_t *distances;
++	unsigned nr = nodes;
++	int ret;
++
++	/*
++	 * The number of nodes is fixed at boot.  Cache it on the first
++	 * request.  This is acceptably safe in concurrent circumstances; if
++	 * two requests race, both will update nodes with the same value.
++	 */
++	if (nr == 0) {
++		caml_enter_blocking_section();
++		ret = xc_numainfo(xch, &nr, NULL, NULL);
++		caml_leave_blocking_section();
++
++		if (ret < 0)
++			failwith_xc(xch);
++
++		nodes = nr;
++	}
++
++	distances = malloc(nr * nr * sizeof(*distances));
++	if (!distances)
++		caml_raise_out_of_memory();
++
++	caml_enter_blocking_section();
++	ret = xc_numainfo(xch, &nr, NULL, distances);
++	caml_leave_blocking_section();
++
++	if (ret < 0) {
++		free(distances);
++		failwith_xc(xch);
++	}
++
++	result = caml_alloc_tuple(nr);
++	for (unsigned i = 0; i < nr; ++i) {
++		row = caml_alloc_tuple(nr);
++
++		for (unsigned j = 0; j < nr; ++j)
++			Store_field(row, j, Val_int(distances[i * nr + j]));
++
++		Store_field(result, i, row);
++	}
++
++	free(distances);
++
++	CAMLreturn(result);
++}
++
+ CAMLprim value stub_xc_readconsolering(value xch_val)
+ {
+ 	/* Safe to use outside of blocking sections because of Ocaml GC lock. */
