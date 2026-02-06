@@ -1,0 +1,60 @@
+From cbb484d008e1c7982e0038b1331ff59f94201be5 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Thu, 29 Jan 2026 11:55:05 +0100
+Subject: xen/mm: remove aliasing of PGC_need_scrub over PGC_allocated
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Future changes will care about the state of the PGC_need_scrub flag even
+when pages have the PGC_allocated set, and hence it's no longer possible to
+alias both values.  Also introduce PGC_need_scrub to the set of preserved
+flags, so it's not dropped by assign_pages().
+
+No functional change intended, albeit the page counter on x86 looses a bit.
+
+Suggested-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/include/asm/mm.h b/xen/arch/x86/include/asm/mm.h
+index 5845b729c3f7..4603fe3a2294 100644
+--- a/xen/arch/x86/include/asm/mm.h
++++ b/xen/arch/x86/include/asm/mm.h
+@@ -86,18 +86,14 @@
+ /* Page is not reference counted */
+ #define _PGC_extra        PG_shift(7)
+ #define PGC_extra         PG_mask(1, 7)
++/* Page needs to be scrubbed. */
++#define _PGC_need_scrub   PG_shift(8)
++#define PGC_need_scrub    PG_mask(1, 8)
+ 
+ /* Count of references to this frame. */
+-#define PGC_count_width   PG_shift(7)
++#define PGC_count_width   PG_shift(8)
+ #define PGC_count_mask    ((1UL<<PGC_count_width)-1)
+ 
+-/*
+- * Page needs to be scrubbed. Since this bit can only be set on a page that is
+- * free (i.e. in PGC_state_free) we can reuse PGC_allocated bit.
+- */
+-#define _PGC_need_scrub   _PGC_allocated
+-#define PGC_need_scrub    PGC_allocated
+-
+ #ifndef CONFIG_BIGMEM
+ /*
+  * This definition is solely for the use in struct page_info (and
+diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
+index 62afb07bc65f..ebd88b7ce88f 100644
+--- a/xen/common/page_alloc.c
++++ b/xen/common/page_alloc.c
+@@ -2404,7 +2404,8 @@ int assign_pages(
+         page_set_owner(&pg[i], d);
+         smp_wmb(); /* Domain pointer must be visible before updating refcnt. */
+         pg[i].count_info =
+-            (pg[i].count_info & (PGC_extra | PGC_static)) | PGC_allocated | 1;
++            (pg[i].count_info & (PGC_extra | PGC_static | PGC_need_scrub)) |
++            PGC_allocated | 1;
+ 
+         page_list_add_tail(&pg[i], page_to_list(d, &pg[i]));
+     }

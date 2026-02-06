@@ -1,0 +1,103 @@
+From 8a9255405ca60b58d69ebb1a2dcdeb23cc42df1f Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Tue, 3 Feb 2026 10:50:48 +0100
+Subject: x86/domain: adjust limitation on shared_info allocation below 4G
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The limitation of shared_info being allocated below 4G to fit in the
+start_info field only applies to 32bit PV guests.  On 64bit PV guests the
+start_info field is 64bits wide.  HVM guests don't use start_info at all.
+
+Drop the restriction in arch_domain_create() and instead free and
+re-allocate the page from memory below 4G if needed in switch_compat(),
+when the guest is set to run in 32bit PV mode.
+
+Fixes: 3cadc0469d5c ("x86_64: shared_info must be allocated below 4GB as it is advertised to 32-bit guests via a 32-bit machine address field in start_info.")
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 7c43eee98dfc..e22bdbbd4a96 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -817,11 +817,7 @@ int arch_domain_create(struct domain *d,
+     if ( d->arch.ioport_caps == NULL )
+         goto fail;
+ 
+-    /*
+-     * The shared_info machine address must fit in a 32-bit field within a
+-     * 32-bit guest's start_info structure. Hence we specify MEMF_bits(32).
+-     */
+-    if ( (d->shared_info = alloc_xenheap_pages(0, MEMF_bits(32))) == NULL )
++    if ( (d->shared_info = alloc_xenheap_page()) == NULL )
+         goto fail;
+ 
+     clear_page(d->shared_info);
+diff --git a/xen/arch/x86/pv/domain.c b/xen/arch/x86/pv/domain.c
+index 2a445bb17b99..5302f7b36698 100644
+--- a/xen/arch/x86/pv/domain.c
++++ b/xen/arch/x86/pv/domain.c
+@@ -245,6 +245,34 @@ int switch_compat(struct domain *d)
+     d->arch.has_32bit_shinfo = 1;
+     d->arch.pv.is_32bit = true;
+ 
++    /*
++     * For 32bit PV guests the shared_info machine address must fit in a 32-bit
++     * field within the guest's start_info structure.  We might need to free
++     * the current page and allocate a new one that fulfills this requirement.
++     */
++    if ( virt_to_maddr(d->shared_info) >> 32 )
++    {
++        shared_info_t *prev = d->shared_info;
++
++        d->shared_info = alloc_xenheap_pages(0, MEMF_bits(32));
++        if ( !d->shared_info )
++        {
++            d->shared_info = prev;
++            rc = -ENOMEM;
++            goto undo_and_fail;
++        }
++        clear_page(d->shared_info);
++        share_xen_page_with_guest(virt_to_page(d->shared_info), d, SHARE_rw);
++        /*
++         * Ensure all pointers to the old shared_info page are replaced.  vCPUs
++         * below XEN_LEGACY_MAX_VCPUS may have stashed a pointer to
++         * shared_info->vcpu_info[id].
++         */
++        for_each_vcpu ( d, v )
++            vcpu_info_reset(v);
++        put_page(virt_to_page(prev));
++    }
++
+     for_each_vcpu( d, v )
+     {
+         if ( (rc = setup_compat_arg_xlat(v)) ||
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index a541946adebb..b40409734b89 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -123,7 +123,7 @@ static void vcpu_check_shutdown(struct vcpu *v)
+     spin_unlock(&d->shutdown_lock);
+ }
+ 
+-static void vcpu_info_reset(struct vcpu *v)
++void vcpu_info_reset(struct vcpu *v)
+ {
+     struct domain *d = v->domain;
+ 
+diff --git a/xen/include/xen/domain.h b/xen/include/xen/domain.h
+index 0de9cbc1696d..322c4a2ab367 100644
+--- a/xen/include/xen/domain.h
++++ b/xen/include/xen/domain.h
+@@ -73,6 +73,8 @@ void cf_check free_pirq_struct(void *);
+ int  arch_vcpu_create(struct vcpu *v);
+ void arch_vcpu_destroy(struct vcpu *v);
+ 
++void vcpu_info_reset(struct vcpu *v);
++
+ int map_vcpu_info(struct vcpu *v, unsigned long gfn, unsigned int offset);
+ void unmap_vcpu_info(struct vcpu *v);
+ 
