@@ -1,0 +1,105 @@
+From 6143f6f64d455624857d67b857da283315cace40 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Wed, 11 Feb 2026 12:20:17 +0100
+Subject: x86/domain: adjust limitation on shared_info allocation below 4G
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The limitation of shared_info being allocated below 4G to fit in the
+start_info field only applies to 32bit PV guests.  On 64bit PV guests the
+start_info field is 64bits wide.  HVM guests don't use start_info at all.
+
+Drop the restriction in arch_domain_create() and instead free and
+re-allocate the page from memory below 4G if needed in switch_compat(),
+when the guest is set to run in 32bit PV mode.
+
+Fixes: 3cadc0469d5c ("x86_64: shared_info must be allocated below 4GB as it is advertised to 32-bit guests via a 32-bit machine address field in start_info.")
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 8a9255405ca60b58d69ebb1a2dcdeb23cc42df1f
+master date: 2026-02-05 21:27:40 +0100
+
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 93580b9a58cf..60e14b3a49cd 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -845,11 +845,7 @@ int arch_domain_create(struct domain *d,
+     if ( d->arch.ioport_caps == NULL )
+         goto fail;
+ 
+-    /*
+-     * The shared_info machine address must fit in a 32-bit field within a
+-     * 32-bit guest's start_info structure. Hence we specify MEMF_bits(32).
+-     */
+-    if ( (d->shared_info = alloc_xenheap_pages(0, MEMF_bits(32))) == NULL )
++    if ( (d->shared_info = alloc_xenheap_page()) == NULL )
+         goto fail;
+ 
+     clear_page(d->shared_info);
+diff --git a/xen/arch/x86/pv/domain.c b/xen/arch/x86/pv/domain.c
+index 7aef628f55be..745c1dbb217a 100644
+--- a/xen/arch/x86/pv/domain.c
++++ b/xen/arch/x86/pv/domain.c
+@@ -246,6 +246,34 @@ int switch_compat(struct domain *d)
+     d->arch.has_32bit_shinfo = 1;
+     d->arch.pv.is_32bit = true;
+ 
++    /*
++     * For 32bit PV guests the shared_info machine address must fit in a 32-bit
++     * field within the guest's start_info structure.  We might need to free
++     * the current page and allocate a new one that fulfills this requirement.
++     */
++    if ( virt_to_maddr(d->shared_info) >> 32 )
++    {
++        shared_info_t *prev = d->shared_info;
++
++        d->shared_info = alloc_xenheap_pages(0, MEMF_bits(32));
++        if ( !d->shared_info )
++        {
++            d->shared_info = prev;
++            rc = -ENOMEM;
++            goto undo_and_fail;
++        }
++        clear_page(d->shared_info);
++        share_xen_page_with_guest(virt_to_page(d->shared_info), d, SHARE_rw);
++        /*
++         * Ensure all pointers to the old shared_info page are replaced.  vCPUs
++         * below XEN_LEGACY_MAX_VCPUS may have stashed a pointer to
++         * shared_info->vcpu_info[id].
++         */
++        for_each_vcpu ( d, v )
++            vcpu_info_reset(v);
++        put_page(virt_to_page(prev));
++    }
++
+     for_each_vcpu( d, v )
+     {
+         if ( (rc = setup_compat_arg_xlat(v)) ||
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index 0df41f6950eb..68e867796274 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -177,7 +177,7 @@ static void vcpu_check_shutdown(struct vcpu *v)
+     spin_unlock(&d->shutdown_lock);
+ }
+ 
+-static void vcpu_info_reset(struct vcpu *v)
++void vcpu_info_reset(struct vcpu *v)
+ {
+     struct domain *d = v->domain;
+ 
+diff --git a/xen/include/xen/domain.h b/xen/include/xen/domain.h
+index 3de563529113..ae2b72d5c646 100644
+--- a/xen/include/xen/domain.h
++++ b/xen/include/xen/domain.h
+@@ -83,6 +83,8 @@ void cf_check free_pirq_struct(void *ptr);
+ int  arch_vcpu_create(struct vcpu *v);
+ void arch_vcpu_destroy(struct vcpu *v);
+ 
++void vcpu_info_reset(struct vcpu *v);
++
+ int map_guest_area(struct vcpu *v, paddr_t gaddr, unsigned int size,
+                    struct guest_area *area,
+                    void (*populate)(void *dst, struct vcpu *v));
