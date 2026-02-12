@@ -293,6 +293,8 @@ echo %{?_devtoolset_enable} > ../livepatch-src/prepare-build
 # Any changes here must be checked. If necessary, update the hypercall
 # filter code in the dom0 kernel. To resolve this, copy xen/include/public to
 # public-abi and refresh public-abi.patch.
+# If the hypercall changes are not backwards compatible, bump the filter ABI
+# version in xen/include/xen/lockdown.h file (PRIVCMD_FILTERING_ABI_VERSION).
 diff -Naur public-abi xen/include/public
 
 # Build tools and man pages

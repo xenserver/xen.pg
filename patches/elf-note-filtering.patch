@@ -1,0 +1,179 @@
+diff --git a/public-abi/elfnote.h b/public-abi/elfnote.h
+index e2743f74c195..3d1b7bcea843 100644
+--- a/public-abi/elfnote.h
++++ b/public-abi/elfnote.h
+@@ -283,7 +283,14 @@
+  */
+ #define XS_ELFNOTE_PV_IOMMU               0
+ 
+-#define XS_ELFNOTE_MAX XS_ELFNOTE_PV_IOMMU
++/*
++ * If this is present, Dom0 support hypercall filtering,
++ * needed for Secure Boot.
++ * The number contains a version of the filter.
++ */
++#define XS_ELFNOTE_PRIVCMD_FILTERING      1
++
++#define XS_ELFNOTE_MAX XS_ELFNOTE_PRIVCMD_FILTERING
+ 
+ #endif /* __XEN_PUBLIC_ELFNOTE_H__ */
+ 
+diff --git a/xen/arch/x86/dom0_build.c b/xen/arch/x86/dom0_build.c
+index ec42d23b2a26..d1c74a218c7d 100644
+--- a/xen/arch/x86/dom0_build.c
++++ b/xen/arch/x86/dom0_build.c
+@@ -7,6 +7,7 @@
+ #include <xen/init.h>
+ #include <xen/iocap.h>
+ #include <xen/libelf.h>
++#include <xen/lockdown.h>
+ #include <xen/param.h>
+ #include <xen/pfn.h>
+ #include <xen/sched.h>
+@@ -320,6 +321,42 @@ unsigned long __init dom0_paging_pages(const struct domain *d,
+ }
+ 
+ 
++int __init dom0_check_parms(
++    const struct elf_dom_parms *parms, bool is_pv_shim)
++{
++    if ( parms->elf_notes[XEN_ELFNOTE_SUPPORTED_FEATURES].type != XEN_ENT_NONE )
++    {
++        if ( !is_pv_shim && !test_bit(XENFEAT_dom0, parms->f_supported) )
++        {
++            printk("Kernel does not support Dom0 operation\n");
++            return -EINVAL;
++        }
++    }
++
++    if ( is_locked_down() )
++    {
++        uint64_t filter_version =
++            parms->xs_elf_notes[XS_ELFNOTE_PRIVCMD_FILTERING].data.num;
++
++        if ( filter_version == 0 )
++        {
++            printk(XENLOG_ERR
++                   "Kernel hypercall filtering version is missing\n");
++            return -EINVAL;
++        }
++        if ( filter_version != PRIVCMD_FILTERING_ABI_VERSION )
++        {
++            printk(XENLOG_ERR
++                   "Kernel hypercall filtering version %#" PRIx64
++                   " is not compatible with expected %#lx\n",
++                   filter_version, PRIVCMD_FILTERING_ABI_VERSION);
++            return -EINVAL;
++        }
++    }
++
++    return 0;
++}
++
+ /*
+  * If allocation isn't specified, reserve 1/16th of available memory for
+  * things like DMA buffers. This reservation is clamped to a maximum of 128MB.
+diff --git a/xen/arch/x86/hvm/dom0_build.c b/xen/arch/x86/hvm/dom0_build.c
+index b85b887dc8d9..3355547ad1a6 100644
+--- a/xen/arch/x86/hvm/dom0_build.c
++++ b/xen/arch/x86/hvm/dom0_build.c
+@@ -697,6 +697,9 @@ static int __init pvh_load_kernel(
+     if ( !check_and_adjust_load_address(d, &elf, &parms) )
+         return -ENOSPC;
+ 
++    if ( (rc = dom0_check_parms(&parms, false)) != 0 )
++        return rc;
++
+     elf_set_vcpu(&elf, v);
+     rc = elf_load_binary(&elf);
+     if ( rc < 0 )
+diff --git a/xen/arch/x86/include/asm/dom0_build.h b/xen/arch/x86/include/asm/dom0_build.h
+index 2d67b17213dc..4628c36c71eb 100644
+--- a/xen/arch/x86/include/asm/dom0_build.h
++++ b/xen/arch/x86/include/asm/dom0_build.h
+@@ -8,6 +8,8 @@
+ 
+ extern unsigned int dom0_memflags;
+ 
++int dom0_check_parms(const struct elf_dom_parms *parms,
++                     bool is_pv_shim);
+ unsigned long dom0_compute_nr_pages(struct domain *d,
+                                     struct elf_dom_parms *parms,
+                                     unsigned long initrd_len);
+diff --git a/xen/arch/x86/pv/dom0_build.c b/xen/arch/x86/pv/dom0_build.c
+index fe80824238ca..93347383fb05 100644
+--- a/xen/arch/x86/pv/dom0_build.c
++++ b/xen/arch/x86/pv/dom0_build.c
+@@ -502,14 +502,8 @@ static int __init dom0_construct(struct boot_info *bi, struct domain *d)
+         return -EINVAL;
+     }
+ 
+-    if ( parms.elf_notes[XEN_ELFNOTE_SUPPORTED_FEATURES].type != XEN_ENT_NONE )
+-    {
+-        if ( !pv_shim && !test_bit(XENFEAT_dom0, parms.f_supported) )
+-        {
+-            printk("Kernel does not support Dom0 operation\n");
+-            return -EINVAL;
+-        }
+-    }
++    if ( (rc = dom0_check_parms(&parms, pv_shim)) != 0 )
++        goto out;
+ 
+     nr_pages = dom0_compute_nr_pages(d, &parms, initrd_len);
+ 
+diff --git a/xen/common/libelf/libelf-dominfo.c b/xen/common/libelf/libelf-dominfo.c
+index 387ea2909ee0..4dd3a2a3ea1f 100644
+--- a/xen/common/libelf/libelf-dominfo.c
++++ b/xen/common/libelf/libelf-dominfo.c
+@@ -278,6 +278,7 @@ elf_errorstatus elf_xs_parse_note(struct elf_binary *elf,
+         bool str;
+     } note_desc[] = {
+         [XS_ELFNOTE_PV_IOMMU] = { "XS_PV_IOMMU", 0},
++        [XS_ELFNOTE_PRIVCMD_FILTERING] = { "XS_PRIVCMD_FILTERING", 0},
+     };
+ /* *INDENT-ON* */
+ 
+diff --git a/xen/include/public/elfnote.h b/xen/include/public/elfnote.h
+index e2743f74c195..3d1b7bcea843 100644
+--- a/xen/include/public/elfnote.h
++++ b/xen/include/public/elfnote.h
+@@ -283,7 +283,14 @@
+  */
+ #define XS_ELFNOTE_PV_IOMMU               0
+ 
+-#define XS_ELFNOTE_MAX XS_ELFNOTE_PV_IOMMU
++/*
++ * If this is present, Dom0 support hypercall filtering,
++ * needed for Secure Boot.
++ * The number contains a version of the filter.
++ */
++#define XS_ELFNOTE_PRIVCMD_FILTERING      1
++
++#define XS_ELFNOTE_MAX XS_ELFNOTE_PRIVCMD_FILTERING
+ 
+ #endif /* __XEN_PUBLIC_ELFNOTE_H__ */
+ 
+diff --git a/xen/include/xen/lockdown.h b/xen/include/xen/lockdown.h
+index b2baa31caac8..09660507246e 100644
+--- a/xen/include/xen/lockdown.h
++++ b/xen/include/xen/lockdown.h
+@@ -6,4 +6,19 @@
+ bool is_locked_down(void);
+ void lockdown_init(const char *cmdline);
+ 
++/*
++ * Filtering code versioning.
++ * Dom0 kernel should define this in the ELF notes.
++ * Xen, if Secure Boot (or lockdown) is enabled will check that the
++ * version is in a given range; this to prevent loading kernel not
++ * properly filtering hypercalls from userspace (potentially possible
++ * in case of OEM signed kernels).
++ *
++ * The current schema is 0xMMmmnn where "MM" is the XenServer major "mm"
++ * is XenServer minor and "nn" is an incremental number.
++ * If we update the hypercall ABI in a way that is not compatible with
++ * the kernel filtering code "nn" should be increased.
++ */
++#define PRIVCMD_FILTERING_ABI_VERSION 0x090001UL
++
+ #endif /* XEN__LOCKDOWN_H */
