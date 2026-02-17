@@ -1,0 +1,55 @@
+x86/hap: Defer TLB flushes
+
+Improve performance by deferring TLB flushes to reduce the number of
+flushes and avoid holding the P2M lock while flushing.
+
+Suggested-by: Roger Pau Monne <roger.pau@citrix.com>
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/arch/x86/mm/hap/hap.c b/xen/arch/x86/mm/hap/hap.c
+index 3ad39a7dd781..1a1536b4dc5b 100644
+--- a/xen/arch/x86/mm/hap/hap.c
++++ b/xen/arch/x86/mm/hap/hap.c
+@@ -834,16 +834,26 @@ static void cf_check hap_update_paging_modes(struct vcpu *v)
+ 
+ static void cf_check
+ hap_write_p2m_entry_post(struct p2m_domain *p2m, unsigned int oflags)
++{
++    if ( oflags & _PAGE_PRESENT )
++    {
++        ASSERT(p2m->defer_flush);
++        p2m->need_flush = true;
++    }
++}
++
++static void cf_check
++hap_p2m_tlb_flush(struct p2m_domain *p2m)
+ {
+     struct domain *d = p2m->domain;
+ 
+-    if ( oflags & _PAGE_PRESENT )
+-        guest_flush_tlb_mask(d, d->dirty_cpumask);
++    guest_flush_tlb_mask(d, d->dirty_cpumask);
+ }
+ 
+ void hap_p2m_init(struct p2m_domain *p2m)
+ {
+     p2m->write_p2m_entry_post = hap_write_p2m_entry_post;
++    p2m->tlb_flush = hap_p2m_tlb_flush;
+ }
+ 
+ static unsigned long cf_check hap_gva_to_gfn_real_mode(
+diff --git a/xen/arch/x86/mm/p2m-pt.c b/xen/arch/x86/mm/p2m-pt.c
+index f02ebae3725e..e7b07576e0cf 100644
+--- a/xen/arch/x86/mm/p2m-pt.c
++++ b/xen/arch/x86/mm/p2m-pt.c
+@@ -767,7 +767,10 @@ p2m_pt_set_entry(struct p2m_domain *p2m, gfn_t gfn_, mfn_t mfn,
+      * avoid a potential use-after-free.
+      */
+     if ( l1e_get_flags(intermediate_entry) & _PAGE_PRESENT )
++    {
++        p2m_tlb_flush_sync(p2m);
+         p2m_free_entry(p2m, &intermediate_entry, page_order);
++    }
+ 
+  out:
+     unmap_domain_page(table);

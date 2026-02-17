@@ -1,0 +1,50 @@
+x86/hap: Flush TLB using alternative mechanism
+
+Improve performance by using the SVM mechanism to flush the TLB on VMRUN
+rather than the hypervisor TLB flush mechanism which avoids relying on
+the flush_lock, which is already heavily contended by other usages.
+
+Suggested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+diff --git a/xen/arch/x86/mm/hap/hap.c b/xen/arch/x86/mm/hap/hap.c
+index 1a1536b4dc5b..81985661a410 100644
+--- a/xen/arch/x86/mm/hap/hap.c
++++ b/xen/arch/x86/mm/hap/hap.c
+@@ -752,12 +752,10 @@ static bool flush_vcpu(const struct vcpu *v, const unsigned long *vcpu_bitmap)
+     return !vcpu_bitmap || test_bit(v->vcpu_id, vcpu_bitmap);
+ }
+ 
+-/* Flush TLB of selected vCPUs.  NULL for all. */
+-static bool cf_check flush_tlb(const unsigned long *vcpu_bitmap)
++static bool __flush_tlb(struct domain *d, const unsigned long *vcpu_bitmap)
+ {
+     static DEFINE_PER_CPU(cpumask_t, flush_cpumask);
+     cpumask_t *mask = &this_cpu(flush_cpumask);
+-    struct domain *d = current->domain;
+     unsigned int this_cpu = smp_processor_id();
+     struct vcpu *v;
+ 
+@@ -789,6 +787,12 @@ static bool cf_check flush_tlb(const unsigned long *vcpu_bitmap)
+     return true;
+ }
+ 
++/* Flush TLB of selected vCPUs.  NULL for all. */
++static bool cf_check flush_tlb(const unsigned long *vcpu_bitmap)
++{
++    return __flush_tlb(current->domain, vcpu_bitmap);
++}
++
+ const struct paging_mode *
+ hap_paging_get_mode(struct vcpu *v)
+ {
+@@ -845,9 +849,7 @@ hap_write_p2m_entry_post(struct p2m_domain *p2m, unsigned int oflags)
+ static void cf_check
+ hap_p2m_tlb_flush(struct p2m_domain *p2m)
+ {
+-    struct domain *d = p2m->domain;
+-
+-    guest_flush_tlb_mask(d, d->dirty_cpumask);
++    __flush_tlb(p2m->domain, NULL);
+ }
+ 
+ void hap_p2m_init(struct p2m_domain *p2m)
