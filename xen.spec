@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 3
+%global hv_rel 4
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Feb 23 2026 Ross Lagerwall <ross.lagerwall@citrix.com> - 4.17.6-4
+- Improve migration performance
+
 * Mon Feb 09 2026 Roger Pau Monné <roger.pau@citrix.com> - 4.17.6-3
 - Fix Xen watchdog triggering during domain construction.
 
