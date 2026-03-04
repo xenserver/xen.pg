@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 7
+%global hv_rel 8
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -909,6 +909,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Mar 09 2026 Frediano Ziglio <frediano.ziglio@citrix.com> - 4.20.2-8
+- Add elf note to check kernel supports hypercall filtering
+
 * Fri Mar 06 2026 Roger Pau Monné <roger.pau@citrix.com> - 4.20.2-7
 - Fix for XSA-480 CVE-2026-23554
 - Fix for XSA-481 CVE-2026-23555
