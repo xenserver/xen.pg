@@ -1,0 +1,261 @@
+From c01855bec572bb81d3934e0d217dd9671a6b4e54 Mon Sep 17 00:00:00 2001
+From: Stewart Hildebrand <stewart.hildebrand@amd.com>
+Date: Thu, 31 Oct 2024 12:42:51 +0100
+Subject: x86/msi: harden stale pdev handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dom0 normally informs Xen of PCI device removal via
+PHYSDEVOP_pci_device_remove, e.g. in response to SR-IOV disable or
+hot-unplug. We might find ourselves with stale pdevs if a buggy dom0
+fails to report removal via PHYSDEVOP_pci_device_remove. In this case,
+attempts to access the config space of the stale pdevs would be invalid
+and return all 1s.
+
+Some possible conditions leading to this are:
+
+1. Dom0 disables SR-IOV without reporting VF removal to Xen.
+
+The Linux SR-IOV subsystem normally reports VF removal when a PF driver
+disables SR-IOV. In case of a buggy dom0 SR-IOV subsystem, SR-IOV could
+become disabled with stale dangling VF pdevs in both dom0 Linux and Xen.
+
+2. Dom0 reporting PF removal without reporting VF removal.
+
+During SR-IOV PF removal (hot-unplug), a buggy PF driver may fail to
+disable SR-IOV, thus failing to remove the VFs, leaving stale dangling
+VFs behind in both Xen and Linux. At least Linux warns in this case:
+
+[  100.000000]  0000:01:00.0: driver left SR-IOV enabled after remove
+
+In either case, Xen is left with stale VF pdevs, risking invalid PCI
+config space accesses.
+
+When Xen is built with CONFIG_DEBUG=y, the following Xen crashes were
+observed when dom0 attempted to access the config space of a stale VF:
+
+(XEN) Assertion 'pos' failed at arch/x86/msi.c:1274
+(XEN) ----[ Xen-4.20-unstable  x86_64  debug=y  Tainted:   C    ]----
+...
+(XEN) Xen call trace:
+(XEN)    [<ffff82d040346834>] R pci_msi_conf_write_intercept+0xa2/0x1de
+(XEN)    [<ffff82d04035d6b4>] F pci_conf_write_intercept+0x68/0x78
+(XEN)    [<ffff82d0403264e5>] F arch/x86/pv/emul-priv-op.c#pci_cfg_ok+0xa0/0x114
+(XEN)    [<ffff82d04032660e>] F arch/x86/pv/emul-priv-op.c#guest_io_write+0xb5/0x1c8
+(XEN)    [<ffff82d0403267bb>] F arch/x86/pv/emul-priv-op.c#write_io+0x9a/0xe0
+(XEN)    [<ffff82d04037c77a>] F x86_emulate+0x100e5/0x25f1e
+(XEN)    [<ffff82d0403941a8>] F x86_emulate_wrapper+0x29/0x64
+(XEN)    [<ffff82d04032802b>] F pv_emulate_privileged_op+0x12e/0x217
+(XEN)    [<ffff82d040369f12>] F do_general_protection+0xc2/0x1b8
+(XEN)    [<ffff82d040201aa7>] F x86_64/entry.S#handle_exception_saved+0x2b/0x8c
+
+(XEN) Assertion 'pos' failed at arch/x86/msi.c:1246
+(XEN) ----[ Xen-4.20-unstable  x86_64  debug=y  Tainted:   C    ]----
+...
+(XEN) Xen call trace:
+(XEN)    [<ffff82d040346b0a>] R pci_reset_msix_state+0x47/0x50
+(XEN)    [<ffff82d040287eec>] F pdev_msix_assign+0x19/0x35
+(XEN)    [<ffff82d040286184>] F drivers/passthrough/pci.c#assign_device+0x181/0x471
+(XEN)    [<ffff82d040287c36>] F iommu_do_pci_domctl+0x248/0x2ec
+(XEN)    [<ffff82d040284e1f>] F iommu_do_domctl+0x26/0x44
+(XEN)    [<ffff82d0402483b8>] F do_domctl+0x8c1/0x1660
+(XEN)    [<ffff82d04032977e>] F pv_hypercall+0x5ce/0x6af
+(XEN)    [<ffff82d0402012d3>] F lstar_enter+0x143/0x150
+
+These ASSERTs triggered because the MSI-X capability position can't be
+found for a stale pdev.
+
+Latch the capability positions of MSI and MSI-X during device init, and
+replace instances of pci_find_cap_offset(..., PCI_CAP_ID_MSI{,X}) with
+the stored value. Introduce one additional ASSERT, while the two
+existing ASSERTs in question continue to work as intended, even with a
+stale pdev.
+
+Fixes: 484d7c852e4f ("x86/MSI-X: track host and guest mask-all requests separately")
+Fixes: 575e18d54d19 ("pci: clear {host/guest}_maskall field on assign")
+Signed-off-by: Stewart Hildebrand <stewart.hildebrand@amd.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/arch/x86/msi.c b/xen/arch/x86/msi.c
+index 3d36fc420403..5809ab8ef2f0 100644
+--- a/xen/arch/x86/msi.c
++++ b/xen/arch/x86/msi.c
+@@ -278,26 +278,21 @@ void __msi_set_enable(u16 seg, u8 bus, u8 slot, u8 func, int pos, int enable)
+ 
+ static void msi_set_enable(struct pci_dev *dev, int enable)
+ {
+-    int pos;
++    unsigned int pos = dev->msi_pos;
+     u16 seg = dev->seg;
+     u8 bus = dev->bus;
+     u8 slot = PCI_SLOT(dev->devfn);
+     u8 func = PCI_FUNC(dev->devfn);
+ 
+-    pos = pci_find_cap_offset(seg, bus, slot, func, PCI_CAP_ID_MSI);
+     if ( pos )
+         __msi_set_enable(seg, bus, slot, func, pos, enable);
+ }
+ 
+ static void msix_set_enable(struct pci_dev *dev, int enable)
+ {
+-    int pos;
+-    u16 control, seg = dev->seg;
+-    u8 bus = dev->bus;
+-    u8 slot = PCI_SLOT(dev->devfn);
+-    u8 func = PCI_FUNC(dev->devfn);
++    unsigned int pos = dev->msix_pos;
++    uint16_t control;
+ 
+-    pos = pci_find_cap_offset(seg, bus, slot, func, PCI_CAP_ID_MSIX);
+     if ( pos )
+     {
+         control = pci_conf_read16(dev->sbdf, msix_control_reg(pos));
+@@ -609,13 +604,10 @@ static int msi_capability_init(struct pci_dev *dev,
+     struct msi_desc *entry;
+     int pos;
+     unsigned int i, mpos;
+-    u16 control, seg = dev->seg;
+-    u8 bus = dev->bus;
+-    u8 slot = PCI_SLOT(dev->devfn);
+-    u8 func = PCI_FUNC(dev->devfn);
++    uint16_t control;
+ 
+     ASSERT(pcidevs_locked());
+-    pos = pci_find_cap_offset(seg, bus, slot, func, PCI_CAP_ID_MSI);
++    pos = dev->msi_pos;
+     if ( !pos )
+         return -ENODEV;
+     control = pci_conf_read16(dev->sbdf, msi_control_reg(pos));
+@@ -778,8 +770,7 @@ static int msix_capability_init(struct pci_dev *dev,
+     u8 slot = PCI_SLOT(dev->devfn);
+     u8 func = PCI_FUNC(dev->devfn);
+     bool maskall = msix->host_maskall, zap_on_error = false;
+-    unsigned int pos = pci_find_cap_offset(seg, bus, slot, func,
+-                                           PCI_CAP_ID_MSIX);
++    unsigned int pos = dev->msix_pos;
+ 
+     if ( !pos )
+         return -ENODEV;
+@@ -1103,16 +1094,13 @@ static void _pci_cleanup_msix(struct arch_msix *msix)
+ static void __pci_disable_msix(struct msi_desc *entry)
+ {
+     struct pci_dev *dev = entry->dev;
+-    u16 seg = dev->seg;
+-    u8 bus = dev->bus;
+-    u8 slot = PCI_SLOT(dev->devfn);
+-    u8 func = PCI_FUNC(dev->devfn);
+-    unsigned int pos = pci_find_cap_offset(seg, bus, slot, func,
+-                                           PCI_CAP_ID_MSIX);
++    unsigned int pos = dev->msix_pos;
+     u16 control = pci_conf_read16(dev->sbdf,
+                                   msix_control_reg(entry->msi_attrib.pos));
+     bool maskall = dev->msix->host_maskall;
+ 
++    ASSERT(pos);
++
+     if ( unlikely(!(control & PCI_MSIX_FLAGS_ENABLE)) )
+     {
+         dev->msix->host_maskall = 1;
+@@ -1212,8 +1200,7 @@ void pci_cleanup_msi(struct pci_dev *pdev)
+ 
+ int pci_reset_msix_state(struct pci_dev *pdev)
+ {
+-    unsigned int pos = pci_find_cap_offset(pdev->seg, pdev->bus, pdev->sbdf.dev,
+-                                           pdev->sbdf.fn, PCI_CAP_ID_MSIX);
++    unsigned int pos = pdev->msix_pos;
+ 
+     ASSERT(pos);
+     /*
+@@ -1235,19 +1222,13 @@ int pci_reset_msix_state(struct pci_dev *pdev)
+ int pci_msi_conf_write_intercept(struct pci_dev *pdev, unsigned int reg,
+                                  unsigned int size, uint32_t *data)
+ {
+-    u16 seg = pdev->seg;
+-    u8 bus = pdev->bus;
+-    u8 slot = PCI_SLOT(pdev->devfn);
+-    u8 func = PCI_FUNC(pdev->devfn);
+     struct msi_desc *entry;
+     unsigned int pos;
+ 
+     if ( pdev->msix )
+     {
+         entry = find_msi_entry(pdev, -1, PCI_CAP_ID_MSIX);
+-        pos = entry ? entry->msi_attrib.pos
+-                    : pci_find_cap_offset(seg, bus, slot, func,
+-                                          PCI_CAP_ID_MSIX);
++        pos = entry ? entry->msi_attrib.pos : pdev->msix_pos;
+         ASSERT(pos);
+ 
+         if ( reg >= pos && reg < msix_pba_offset_reg(pos) + 4 )
+diff --git a/xen/drivers/passthrough/msi.c b/xen/drivers/passthrough/msi.c
+index fb78e2ebe8a4..336c5db84155 100644
+--- a/xen/drivers/passthrough/msi.c
++++ b/xen/drivers/passthrough/msi.c
+@@ -30,6 +30,7 @@ int pdev_msi_init(struct pci_dev *pdev)
+     {
+         uint16_t ctrl = pci_conf_read16(pdev->sbdf, msi_control_reg(pos));
+ 
++        pdev->msi_pos = pos;
+         pdev->msi_maxvec = multi_msi_capable(ctrl);
+     }
+ 
+@@ -43,6 +44,8 @@ int pdev_msi_init(struct pci_dev *pdev)
+         if ( !msix )
+             return -ENOMEM;
+ 
++        pdev->msix_pos = pos;
++
+         spin_lock_init(&msix->table_lock);
+ 
+         ctrl = pci_conf_read16(pdev->sbdf, msix_control_reg(pos));
+diff --git a/xen/drivers/vpci/msi.c b/xen/drivers/vpci/msi.c
+index 8f2b59e61aa4..216ef518f2df 100644
+--- a/xen/drivers/vpci/msi.c
++++ b/xen/drivers/vpci/msi.c
+@@ -184,9 +184,7 @@ static void cf_check mask_write(
+ 
+ static int cf_check init_msi(struct pci_dev *pdev)
+ {
+-    uint8_t slot = PCI_SLOT(pdev->devfn), func = PCI_FUNC(pdev->devfn);
+-    unsigned int pos = pci_find_cap_offset(pdev->seg, pdev->bus, slot, func,
+-                                           PCI_CAP_ID_MSI);
++    unsigned int pos = pdev->msi_pos;
+     uint16_t control;
+     int ret;
+ 
+diff --git a/xen/drivers/vpci/msix.c b/xen/drivers/vpci/msix.c
+index cafddcf3053c..c8805a036eb9 100644
+--- a/xen/drivers/vpci/msix.c
++++ b/xen/drivers/vpci/msix.c
+@@ -659,14 +659,12 @@ int vpci_make_msix_hole(const struct pci_dev *pdev)
+ static int cf_check init_msix(struct pci_dev *pdev)
+ {
+     struct domain *d = pdev->domain;
+-    uint8_t slot = PCI_SLOT(pdev->devfn), func = PCI_FUNC(pdev->devfn);
+     unsigned int msix_offset, i, max_entries;
+     uint16_t control;
+     struct vpci_msix *msix;
+     int rc;
+ 
+-    msix_offset = pci_find_cap_offset(pdev->seg, pdev->bus, slot, func,
+-                                      PCI_CAP_ID_MSIX);
++    msix_offset = pdev->msix_pos;
+     if ( !msix_offset )
+         return 0;
+ 
+diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
+index b373f139d136..aecf3827f31b 100644
+--- a/xen/include/xen/pci.h
++++ b/xen/include/xen/pci.h
+@@ -102,6 +102,9 @@ struct pci_dev {
+         pci_sbdf_t sbdf;
+     };
+ 
++    uint8_t msi_pos;
++    uint8_t msix_pos;
++
+     uint8_t msi_maxvec;
+     uint8_t phantom_stride;
+ 
