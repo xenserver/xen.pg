@@ -1,25 +1,5 @@
-diff --git a/public-abi/elfnote.h b/public-abi/elfnote.h
-index e2743f74c195..3d1b7bcea843 100644
---- a/public-abi/elfnote.h
-+++ b/public-abi/elfnote.h
-@@ -283,7 +283,14 @@
-  */
- #define XS_ELFNOTE_PV_IOMMU               0
- 
--#define XS_ELFNOTE_MAX XS_ELFNOTE_PV_IOMMU
-+/*
-+ * If this is present, Dom0 support hypercall filtering,
-+ * needed for Secure Boot.
-+ * The number contains a version of the filter.
-+ */
-+#define XS_ELFNOTE_PRIVCMD_FILTERING      1
-+
-+#define XS_ELFNOTE_MAX XS_ELFNOTE_PRIVCMD_FILTERING
- 
- #endif /* __XEN_PUBLIC_ELFNOTE_H__ */
- 
 diff --git a/xen/arch/x86/dom0_build.c b/xen/arch/x86/dom0_build.c
-index ec42d23b2a26..d1c74a218c7d 100644
+index 957e49a406e9..afdcac058251 100644
 --- a/xen/arch/x86/dom0_build.c
 +++ b/xen/arch/x86/dom0_build.c
 @@ -7,6 +7,7 @@
@@ -30,22 +10,10 @@ index ec42d23b2a26..d1c74a218c7d 100644
  #include <xen/param.h>
  #include <xen/pfn.h>
  #include <xen/sched.h>
-@@ -320,6 +321,42 @@ unsigned long __init dom0_paging_pages(const struct domain *d,
- }
+@@ -329,6 +330,27 @@ int __init initdom_check_parms(
+         return -EINVAL;
+     }
  
- 
-+int __init dom0_check_parms(
-+    const struct elf_dom_parms *parms, bool is_pv_shim)
-+{
-+    if ( parms->elf_notes[XEN_ELFNOTE_SUPPORTED_FEATURES].type != XEN_ENT_NONE )
-+    {
-+        if ( !is_pv_shim && !test_bit(XENFEAT_dom0, parms->f_supported) )
-+        {
-+            printk("Kernel does not support Dom0 operation\n");
-+            return -EINVAL;
-+        }
-+    }
-+
 +    if ( is_locked_down() )
 +    {
 +        uint64_t filter_version =
@@ -67,59 +35,8 @@ index ec42d23b2a26..d1c74a218c7d 100644
 +        }
 +    }
 +
-+    return 0;
-+}
-+
- /*
-  * If allocation isn't specified, reserve 1/16th of available memory for
-  * things like DMA buffers. This reservation is clamped to a maximum of 128MB.
-diff --git a/xen/arch/x86/hvm/dom0_build.c b/xen/arch/x86/hvm/dom0_build.c
-index b85b887dc8d9..3355547ad1a6 100644
---- a/xen/arch/x86/hvm/dom0_build.c
-+++ b/xen/arch/x86/hvm/dom0_build.c
-@@ -697,6 +697,9 @@ static int __init pvh_load_kernel(
-     if ( !check_and_adjust_load_address(d, &elf, &parms) )
-         return -ENOSPC;
- 
-+    if ( (rc = dom0_check_parms(&parms, false)) != 0 )
-+        return rc;
-+
-     elf_set_vcpu(&elf, v);
-     rc = elf_load_binary(&elf);
-     if ( rc < 0 )
-diff --git a/xen/arch/x86/include/asm/dom0_build.h b/xen/arch/x86/include/asm/dom0_build.h
-index 2d67b17213dc..4628c36c71eb 100644
---- a/xen/arch/x86/include/asm/dom0_build.h
-+++ b/xen/arch/x86/include/asm/dom0_build.h
-@@ -8,6 +8,8 @@
- 
- extern unsigned int dom0_memflags;
- 
-+int dom0_check_parms(const struct elf_dom_parms *parms,
-+                     bool is_pv_shim);
- unsigned long dom0_compute_nr_pages(struct domain *d,
-                                     struct elf_dom_parms *parms,
-                                     unsigned long initrd_len);
-diff --git a/xen/arch/x86/pv/dom0_build.c b/xen/arch/x86/pv/dom0_build.c
-index fe80824238ca..93347383fb05 100644
---- a/xen/arch/x86/pv/dom0_build.c
-+++ b/xen/arch/x86/pv/dom0_build.c
-@@ -502,14 +502,8 @@ static int __init dom0_construct(struct boot_info *bi, struct domain *d)
-         return -EINVAL;
-     }
- 
--    if ( parms.elf_notes[XEN_ELFNOTE_SUPPORTED_FEATURES].type != XEN_ENT_NONE )
--    {
--        if ( !pv_shim && !test_bit(XENFEAT_dom0, parms.f_supported) )
--        {
--            printk("Kernel does not support Dom0 operation\n");
--            return -EINVAL;
--        }
--    }
-+    if ( (rc = dom0_check_parms(&parms, pv_shim)) != 0 )
-+        goto out;
- 
-     nr_pages = dom0_compute_nr_pages(d, &parms, initrd_len);
+     return 0;
+ }
  
 diff --git a/xen/common/libelf/libelf-dominfo.c b/xen/common/libelf/libelf-dominfo.c
 index 387ea2909ee0..4dd3a2a3ea1f 100644
