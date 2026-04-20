@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 6
+%global hv_rel 7
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Apr 20 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.6-7
+- Fix for XSA-488 CVE-2025-54505
+
 * Wed Mar 18 2026 Roger Pau Monné <roger.pau@citrix.com> - 4.17.6-6
 - Fix for CVE-2026-4397.
 
