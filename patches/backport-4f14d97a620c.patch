@@ -1,0 +1,51 @@
+From d5c70a51bfbe95e54fb7c78c8ef31cf43d10c5b1 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Mon, 20 Apr 2026 12:37:56 +0200
+Subject: x86/APIC: handle overflow in TMICT calculation
+
+With an expiry value on the order of 10 hours, and with a bus scale value
+of 256k (as supplied by qemu), the (signed) multiplication will be UB. As
+we've checked that the value is positive, we mean unsigned multiplication
+anyway. Yet let's play safe against even larger expiry and bus scale
+values, leveraging the compiler builtin that there is for this purpose.
+
+While there also drop the stray cast from the actual TMICT write.
+
+Fixes: 9062553a0dc1 ("added time and accurate timer support")
+Fixes: b95beb185810 ("x86: Clean up APIC local timer handling")
+Reported-by: Stewart Hildebrand <stewart.hildebrand@amd.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Tested-by: Stewart Hildebrand <stewart.hildebrand@amd.com>
+master commit: 4f14d97a620c3a005ad0604ae47ee6091281cda0
+master date: 2026-04-16 10:29:54 +0200
+
+diff --git a/xen/arch/x86/apic.c b/xen/arch/x86/apic.c
+index 52b7010b2aab..8bc8c9db268a 100644
+--- a/xen/arch/x86/apic.c
++++ b/xen/arch/x86/apic.c
+@@ -1348,10 +1348,21 @@ int reprogram_timer(s_time_t timeout)
+     }
+ 
+     if ( timeout && ((expire = timeout - NOW()) > 0) )
+-        apic_tmict = min_t(uint64_t, (bus_scale * expire) >> BUS_SCALE_SHIFT,
+-                           UINT32_MAX);
++    {
++        unsigned long product;
++        bool overflow;
++
++        apic_tmict = UINT32_MAX;
++        asm ( "mul %[expire]\n\t"
++              ASM_FLAG_OUT(, "setc %[cf]")
++              : "=a" (product), [cf] ASM_FLAG_OUT("=@ccc", "=qm") (overflow)
++              : "0" ((unsigned long)bus_scale), [expire] "r" (expire) );
++        if ( !overflow &&
++             (product >>= BUS_SCALE_SHIFT) < apic_tmict )
++            apic_tmict = product;
++    }
+ 
+-    apic_write(APIC_TMICT, (unsigned long)apic_tmict);
++    apic_write(APIC_TMICT, apic_tmict);
+ 
+     return apic_tmict || !timeout;
+ }

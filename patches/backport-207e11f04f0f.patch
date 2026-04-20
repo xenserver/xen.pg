@@ -1,0 +1,40 @@
+From 207e11f04f0f26120c5aedb916cdf5aeac751e74 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 20 Apr 2026 18:17:35 +0100
+Subject: x86/apic: Fix asm() constraints in TMICT calculation
+
+The encoded MUL is 64 bits, so writes %rdx too.  At a minimum, this needs
+expressing as a clobber.
+
+Also fix a logical disconnect between 'overflow' being the carry flag not the
+overflow flag.  CF and OF are always the same for MUL instructions, but update
+the variable name to match the flag being checked.
+
+Fixes: d5c70a51bfbe ("x86/APIC: handle overflow in TMICT calculation")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/apic.c b/xen/arch/x86/apic.c
+index daf597ed44b7..bee3785eb077 100644
+--- a/xen/arch/x86/apic.c
++++ b/xen/arch/x86/apic.c
+@@ -1313,14 +1313,15 @@ int reprogram_timer(s_time_t timeout)
+     if ( timeout && ((expire = timeout - NOW()) > 0) )
+     {
+         unsigned long product;
+-        bool overflow;
++        bool carry;
+ 
+         apic_tmict = UINT32_MAX;
+         asm ( "mul %[expire]\n\t"
+               ASM_FLAG_OUT(, "setc %[cf]")
+-              : "=a" (product), [cf] ASM_FLAG_OUT("=@ccc", "=qm") (overflow)
+-              : "0" ((unsigned long)bus_scale), [expire] "r" (expire) );
+-        if ( !overflow &&
++              : "=&a" (product), [cf] ASM_FLAG_OUT("=@ccc", "=qm") (carry)
++              : "0" ((unsigned long)bus_scale), [expire] "r" (expire)
++              : "rdx" );
++        if ( !carry &&
+              (product >>= BUS_SCALE_SHIFT) < apic_tmict )
+             apic_tmict = product;
+     }
