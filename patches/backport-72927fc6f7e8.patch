@@ -1,0 +1,60 @@
+From 72927fc6f7e87b8f791022e78a618bb6a66e5361 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 1 Jul 2026 14:27:39 +0100
+Subject: libs/guest: Allocate rec_pfns earlier in write_batch()
+
+For reasons which escape me, rec_pfns are allocated separately to the rest of
+the batch allocations.
+
+Allocate them all together.  This will allow for future simplifications to be
+performed in an incremental mannor.
+
+No functional change.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Anthony PERARD <anthony.perard@vates.tech>
+
+diff --git a/tools/libs/guest/xg_sr_save.c b/tools/libs/guest/xg_sr_save.c
+index 6f310d6d8c7a..185ef80e1fb6 100644
+--- a/tools/libs/guest/xg_sr_save.c
++++ b/tools/libs/guest/xg_sr_save.c
+@@ -115,8 +115,10 @@ static int write_batch(struct xc_sr_context *ctx)
+     local_pages = calloc(nr_pfns, sizeof(*local_pages));
+     /* iovec[] for writev(). */
+     iov = malloc((nr_pfns + 4) * sizeof(*iov));
++    /* page_data record PFNs list */
++    rec_pfns = malloc(nr_pfns * sizeof(*rec_pfns));
+ 
+-    if ( !mfns || !types || !errors || !guest_data || !local_pages || !iov )
++    if ( !mfns || !types || !errors || !guest_data || !local_pages || !iov || !rec_pfns )
+     {
+         ERROR("Unable to allocate arrays for a batch of %u pages",
+               nr_pfns);
+@@ -207,14 +209,6 @@ static int write_batch(struct xc_sr_context *ctx)
+         }
+     }
+ 
+-    rec_pfns = malloc(nr_pfns * sizeof(*rec_pfns));
+-    if ( !rec_pfns )
+-    {
+-        ERROR("Unable to allocate %zu bytes of memory for page data pfn list",
+-              nr_pfns * sizeof(*rec_pfns));
+-        goto err;
+-    }
+-
+     hdr.count = nr_pfns;
+ 
+     rec.length = sizeof(hdr);
+@@ -263,11 +257,11 @@ static int write_batch(struct xc_sr_context *ctx)
+     rc = ctx->save.nr_batch_pfns = 0;
+ 
+  err:
+-    free(rec_pfns);
+     if ( guest_mapping )
+         xenforeignmemory_unmap(xch->fmem, guest_mapping, nr_pages_mapped);
+     for ( i = 0; local_pages && i < nr_pfns; ++i )
+         free(local_pages[i]);
++    free(rec_pfns);
+     free(iov);
+     free(local_pages);
+     free(guest_data);

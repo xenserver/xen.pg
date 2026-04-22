@@ -1,0 +1,124 @@
+From 85bdb67eaa5354cbc19b5e1c2f5f3d0f1984dd5c Mon Sep 17 00:00:00 2001
+From: Frediano Ziglio <freddy77@gmail.com>
+Date: Thu, 9 Jul 2026 08:43:53 +0100
+Subject: libs/ctrl: Allow writev_exact() to change the iov array
+
+Avoid having to allocate and copy the array if a partial write happens.
+
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+
+diff --git a/tools/libs/ctrl/xc_private.c b/tools/libs/ctrl/xc_private.c
+index bb0f81d6f389..5398a7c62654 100644
+--- a/tools/libs/ctrl/xc_private.c
++++ b/tools/libs/ctrl/xc_private.c
+@@ -635,7 +635,7 @@ int write_exact(int fd, const void *data, size_t size)
+ /*
+  * MiniOS's libc doesn't know about writev(). Implement it as multiple write()s.
+  */
+-int writev_exact(int fd, const struct iovec *iov, int iovcnt)
++int writev_exact(int fd, struct iovec *iov, int iovcnt)
+ {
+     int rc, i;
+ 
+@@ -649,71 +649,33 @@ int writev_exact(int fd, const struct iovec *iov, int iovcnt)
+     return 0;
+ }
+ #else
+-int writev_exact(int fd, const struct iovec *iov, int iovcnt)
++int writev_exact(int fd, struct iovec *iov, int iovcnt)
+ {
+-    struct iovec *local_iov = NULL;
+-    int rc = 0, iov_idx = 0, saved_errno = 0;
+-    ssize_t len;
++    int iov_idx = 0;
++    ssize_t len = 0;
+ 
+     while ( iov_idx < iovcnt )
+     {
+-        /*
+-         * Skip over iov[] entries with 0 length.
+-         *
+-         * This is needed to cover the case where we took a partial write and
+-         * all remaining vectors are of 0 length.  In such a case, the results
+-         * from writev() are indistinguishable from EOF.
+-         */
+-        while ( iov[iov_idx].iov_len == 0 )
+-            if ( ++iov_idx == iovcnt )
+-                goto out;
++        /* Check iov[] to see whether we had a partial or complete write. */
++        if ( len >= iov[iov_idx].iov_len )
++        {
++            len -= iov[iov_idx++].iov_len;
++            continue;
++        }
++
++        /* Partial write of iov[iov_idx]. */
++        iov[iov_idx].iov_base += len;
++        iov[iov_idx].iov_len  -= len;
+ 
+         len = writev(fd, &iov[iov_idx], min(iovcnt - iov_idx, IOV_MAX));
+-        saved_errno = errno;
+ 
+         if ( (len == -1) && (errno == EINTR) )
+             continue;
+         if ( len <= 0 )
+-        {
+-            rc = -1;
+-            goto out;
+-        }
+-
+-        /* Check iov[] to see whether we had a partial or complete write. */
+-        while ( (len > 0) && (iov_idx < iovcnt) )
+-        {
+-            if ( len >= iov[iov_idx].iov_len )
+-                len -= iov[iov_idx++].iov_len;
+-            else
+-            {
+-                /* Partial write of iov[iov_idx]. Copy iov so we can adjust
+-                 * element iov_idx and resubmit the rest. */
+-                if ( !local_iov )
+-                {
+-                    local_iov = malloc(iovcnt * sizeof(*iov));
+-                    if ( !local_iov )
+-                    {
+-                        saved_errno = ENOMEM;
+-                        rc = -1;
+-                        goto out;
+-                    }
+-
+-                    iov = memcpy(local_iov, iov, iovcnt * sizeof(*iov));
+-                }
+-
+-                local_iov[iov_idx].iov_base += len;
+-                local_iov[iov_idx].iov_len  -= len;
+-                break;
+-            }
+-        }
++            return -1;
+     }
+ 
+-    saved_errno = 0;
+-
+- out:
+-    free(local_iov);
+-    errno = saved_errno;
+-    return rc;
++    return 0;
+ }
+ #endif
+ 
+diff --git a/tools/libs/ctrl/xc_private.h b/tools/libs/ctrl/xc_private.h
+index b5892ae8dc1e..8a325c17b0fa 100644
+--- a/tools/libs/ctrl/xc_private.h
++++ b/tools/libs/ctrl/xc_private.h
+@@ -383,7 +383,8 @@ int xc_flush_mmu_updates(xc_interface *xch, struct xc_mmu *mmu);
+ /* Return 0 on success; -1 on error setting errno. */
+ int read_exact(int fd, void *data, size_t size); /* EOF => -1, errno=0 */
+ int write_exact(int fd, const void *data, size_t size);
+-int writev_exact(int fd, const struct iovec *iov, int iovcnt);
++/* May alter @iov to cope with partial writes. */
++int writev_exact(int fd, struct iovec *iov, int iovcnt);
+ 
+ int xc_ffs8(uint8_t x);
+ int xc_ffs16(uint16_t x);

@@ -1,0 +1,121 @@
+From 0f133c8c73752f572cc31e4e9908f4955ae59550 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edwin.torok@citrix.com>
+Date: Mon, 13 Jul 2026 21:48:01 +0100
+Subject: libs/guest: allocate various migration arrays just once
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Allocate these array just once at the start of migration,
+using the maximum batch size, and free them at the end.
+
+Signed-off-by: Edwin Török <edwin.torok@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Reviewed-by: Anthony PERARD <anthony.perard@vates.tech>
+
+diff --git a/tools/libs/guest/xg_sr_common.h b/tools/libs/guest/xg_sr_common.h
+index 7574c9f5b669..c07c6db59e28 100644
+--- a/tools/libs/guest/xg_sr_common.h
++++ b/tools/libs/guest/xg_sr_common.h
+@@ -246,6 +246,12 @@ struct xc_sr_context
+             struct xc_sr_context_save_buffers
+             {
+                 xen_pfn_t batch_pfns[MAX_BATCH_SIZE];
++                xen_pfn_t mfns[MAX_BATCH_SIZE];
++                xen_pfn_t types[MAX_BATCH_SIZE];
++                void *local_pages[MAX_BATCH_SIZE];
++                struct iovec iov[MAX_BATCH_SIZE + 2]; /* Headers + data. */
++                uint64_t rec_pfns[MAX_BATCH_SIZE];
++                int errors[MAX_BATCH_SIZE];
+             } *buffers;
+         } save;
+ 
+diff --git a/tools/libs/guest/xg_sr_save.c b/tools/libs/guest/xg_sr_save.c
+index 22348db445d9..6a77e33a47dc 100644
+--- a/tools/libs/guest/xg_sr_save.c
++++ b/tools/libs/guest/xg_sr_save.c
+@@ -86,15 +86,12 @@ static int write_checkpoint_record(struct xc_sr_context *ctx)
+ static int write_batch(struct xc_sr_context *ctx)
+ {
+     xc_interface *xch = ctx->xch;
+-    xen_pfn_t *mfns = NULL, *types = NULL;
+     void *guest_mapping = NULL;
+-    void **local_pages = NULL;
+-    int *errors = NULL, rc = -1;
++    int rc = -1;
+     unsigned int i, p, nr_pages = 0, nr_pages_mapped = 0;
+     unsigned int nr_pfns = ctx->save.nr_batch_pfns;
+     void *page, *orig_page;
+-    uint64_t *rec_pfns = NULL;
+-    struct iovec *iov = NULL; int iovcnt = 0;
++    int iovcnt = 0;
+     xen_pfn_t *const batch_pfns = ctx->save.buffers->batch_pfns;
+     struct {
+         struct xc_sr_rhdr rec;
+@@ -110,28 +107,21 @@ static int write_batch(struct xc_sr_context *ctx)
+         },
+     };
+ 
+-    assert(nr_pfns != 0);
+-    assert(nr_pfns <= MAX_BATCH_SIZE);
+-
+     /* Mfns of the batch pfns. */
+-    mfns = malloc(nr_pfns * sizeof(*mfns));
++    xen_pfn_t *const mfns = ctx->save.buffers->mfns;
+     /* Types of the batch pfns. */
+-    types = malloc(nr_pfns * sizeof(*types));
++    xen_pfn_t *const types = ctx->save.buffers->types;
+     /* Errors from attempting to map the gfns. */
+-    errors = malloc(nr_pfns * sizeof(*errors));
++    int *const errors = ctx->save.buffers->errors;
+     /* Pointers to locally allocated pages.  Need freeing. */
+-    local_pages = calloc(nr_pfns, sizeof(*local_pages));
++    void **const local_pages = ctx->save.buffers->local_pages;
+     /* iovec[] for writev(). */
+-    iov = malloc((nr_pfns + 2) * sizeof(*iov));
++    struct iovec *const iov = ctx->save.buffers->iov;
+     /* page_data record PFNs list */
+-    rec_pfns = malloc(nr_pfns * sizeof(*rec_pfns));
++    uint64_t *const rec_pfns = ctx->save.buffers->rec_pfns;
+ 
+-    if ( !mfns || !types || !errors || !local_pages || !iov || !rec_pfns )
+-    {
+-        ERROR("Unable to allocate arrays for a batch of %u pages",
+-              nr_pfns);
+-        goto err;
+-    }
++    assert(nr_pfns != 0);
++    assert(nr_pfns <= MAX_BATCH_SIZE);
+ 
+     iov[0].iov_base = &hdrs;
+     iov[0].iov_len = sizeof(hdrs);
+@@ -249,14 +239,11 @@ static int write_batch(struct xc_sr_context *ctx)
+  err:
+     if ( guest_mapping )
+         xenforeignmemory_unmap(xch->fmem, guest_mapping, nr_pages_mapped);
+-    for ( i = 0; local_pages && i < nr_pfns; ++i )
++    for ( i = 0; i < nr_pfns; ++i )
++    {
+         free(local_pages[i]);
+-    free(rec_pfns);
+-    free(iov);
+-    free(local_pages);
+-    free(errors);
+-    free(types);
+-    free(mfns);
++        local_pages[i] = NULL;
++    }
+ 
+     return rc;
+ }
+@@ -790,8 +777,8 @@ static int setup(struct xc_sr_context *ctx)
+ 
+     if ( !ctx->save.buffers || !dirty_bitmap || !ctx->save.deferred_pages )
+     {
+-        ERROR("Unable to allocate memory for dirty bitmaps, batch pfns and"
+-              " deferred pages");
++        ERROR("Unable to allocate memory for dirty bitmaps, deferred pages"
++              " and various batch buffers");
+         rc = -1;
+         errno = ENOMEM;
+         goto err;

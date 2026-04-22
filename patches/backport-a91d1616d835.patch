@@ -1,0 +1,149 @@
+From a91d1616d8350a502ac7b6c9ab6455fd462ce5c5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Edwin=20T=C3=B6r=C3=B6k?= <edwin.torok@citrix.com>
+Date: Mon, 13 Jul 2026 21:47:59 +0100
+Subject: libs/call: cache up to 4 pages in hypercall bounce buffers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+During migration there are a lot of mmap/munmap calls,
+because xc_get_pfn_type_batch() exceeds the default hypercall bounce
+buffer cache size, and needs to allocate every time it is called.
+
+munmap() is slow, especially in a PV Dom0 (takes an emulation fault),
+so is best avoided.
+
+Eventually it'd be good if the memory pool from  xmalloc_tlsf.c
+was reused here, but for now make it handle the commonly encountered
+sizes (so far up to 4 pages).
+
+Signed-off-by: Edwin Török <edwin.torok@citrix.com>
+Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Reviewed-by: Anthony PERARD <anthony.perard@vates.tech>
+
+diff --git a/tools/libs/call/buffer.c b/tools/libs/call/buffer.c
+index 155e4f9d43eb..b7d00185c469 100644
+--- a/tools/libs/call/buffer.c
++++ b/tools/libs/call/buffer.c
+@@ -49,6 +49,9 @@ static void *cache_alloc(xencall_handle *xcall, size_t nr_pages)
+ {
+     void *p = NULL;
+ 
++    if ( nr_pages == 0 )
++        return NULL;
++
+     cache_lock(xcall);
+ 
+     xcall->buffer_total_allocations++;
+@@ -56,13 +59,13 @@ static void *cache_alloc(xencall_handle *xcall, size_t nr_pages)
+     if ( xcall->buffer_current_allocations > xcall->buffer_maximum_allocations )
+         xcall->buffer_maximum_allocations = xcall->buffer_current_allocations;
+ 
+-    if ( nr_pages > 1 )
++    if ( nr_pages > ARRAY_SIZE(xcall->buffer_cache) )
+     {
+         xcall->buffer_cache_toobig++;
+     }
+-    else if ( xcall->buffer_cache_nr > 0 )
++    else if ( xcall->buffer_cache_nr[nr_pages-1] > 0 )
+     {
+-        p = xcall->buffer_cache[--xcall->buffer_cache_nr];
++        p = xcall->buffer_cache[nr_pages-1][--xcall->buffer_cache_nr[nr_pages-1]];
+         xcall->buffer_cache_hits++;
+     }
+     else
+@@ -79,15 +82,18 @@ static int cache_free(xencall_handle *xcall, void *p, size_t nr_pages)
+ {
+     int rc = 0;
+ 
++    if ( nr_pages == 0 )
++        return 0;
++
+     cache_lock(xcall);
+ 
+     xcall->buffer_total_releases++;
+     xcall->buffer_current_allocations--;
+ 
+-    if ( nr_pages == 1 &&
+-         xcall->buffer_cache_nr < BUFFER_CACHE_SIZE )
++    if ( nr_pages && nr_pages <= ARRAY_SIZE(xcall->buffer_cache) &&
++         xcall->buffer_cache_nr[nr_pages-1] < BUFFER_CACHE_SIZE )
+     {
+-        xcall->buffer_cache[xcall->buffer_cache_nr++] = p;
++        xcall->buffer_cache[nr_pages-1][xcall->buffer_cache_nr[nr_pages-1]++] = p;
+         rc = 1;
+     }
+ 
+@@ -108,17 +114,23 @@ void buffer_release_cache(xencall_handle *xcall)
+     DBGPRINTF("current allocations:%d maximum allocations:%d",
+               xcall->buffer_current_allocations,
+               xcall->buffer_maximum_allocations);
+-    DBGPRINTF("cache current size:%d",
+-              xcall->buffer_cache_nr);
++    for ( unsigned int i = 0; i < ARRAY_SIZE(xcall->buffer_cache_nr); ++i )
++    {
++        DBGPRINTF("cache current size[%u pages]:%d", i+1,
++                xcall->buffer_cache_nr[i]);
++    }
+     DBGPRINTF("cache hits:%d misses:%d toobig:%d",
+               xcall->buffer_cache_hits,
+               xcall->buffer_cache_misses,
+               xcall->buffer_cache_toobig);
+ 
+-    while ( xcall->buffer_cache_nr > 0 )
++    for ( unsigned int i = 0; i < ARRAY_SIZE(xcall->buffer_cache_nr); ++i )
+     {
+-        p = xcall->buffer_cache[--xcall->buffer_cache_nr];
+-        osdep_free_pages(xcall, p, 1);
++        while ( xcall->buffer_cache_nr[i] > 0 )
++        {
++            p = xcall->buffer_cache[i][--xcall->buffer_cache_nr[i]];
++            osdep_free_pages(xcall, p, i + 1);
++        }
+     }
+ 
+     cache_unlock(xcall);
+diff --git a/tools/libs/call/core.c b/tools/libs/call/core.c
+index 02c4f8e1aefa..dd8877c1a0bd 100644
+--- a/tools/libs/call/core.c
++++ b/tools/libs/call/core.c
+@@ -14,6 +14,7 @@
+  */
+ 
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "private.h"
+ 
+@@ -44,7 +45,7 @@ xencall_handle *xencall_open(xentoollog_logger *logger, unsigned open_flags)
+     xentoolcore__register_active_handle(&xcall->tc_ah);
+ 
+     xcall->flags = open_flags;
+-    xcall->buffer_cache_nr = 0;
++    memset(xcall->buffer_cache_nr, 0, sizeof(xcall->buffer_cache_nr));
+ 
+     xcall->buffer_total_allocations = 0;
+     xcall->buffer_total_releases = 0;
+diff --git a/tools/libs/call/private.h b/tools/libs/call/private.h
+index 9c3aa432efe2..8e6a20897534 100644
+--- a/tools/libs/call/private.h
++++ b/tools/libs/call/private.h
+@@ -31,13 +31,15 @@ struct xencall_handle {
+     Xentoolcore__Active_Handle tc_ah;
+ 
+     /*
+-     * A simple cache of unused, single page, hypercall buffers
++     * A simple cache of unused, small, hypercall buffers
++     * buffer_cache[i]'s size is (i+1) pages
+      *
+      * Protected by a global lock.
+      */
+ #define BUFFER_CACHE_SIZE 4
+-    int buffer_cache_nr;
+-    void *buffer_cache[BUFFER_CACHE_SIZE];
++#define BUFFER_CACHE_NRPAGES 4
++    int buffer_cache_nr[BUFFER_CACHE_NRPAGES];
++    void *buffer_cache[BUFFER_CACHE_NRPAGES][BUFFER_CACHE_SIZE];
+ 
+     /*
+      * Hypercall buffer statistics. All protected by the global
