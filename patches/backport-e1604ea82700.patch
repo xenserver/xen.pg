@@ -1,0 +1,59 @@
+From e1604ea8270096e5bb15866a1db75fbe56a730c7 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Mon, 23 Mar 2026 11:17:06 +0100
+Subject: x86/hap: Defer NPT P2M TLB flushes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Like the EPT code, defer TLB flushes for NPT to reduce the number of
+flushes and avoid holding the P2M lock while flushing. This can
+substantially improve performance in some scenarios.
+
+The cases where the TLB needs to be flushed without deferring are
+already handled by the call to p2m_tlb_flush_sync() in p2m_free_ptp().
+
+Suggested-by: Roger Pau Monne <roger.pau@citrix.com>
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+
+diff --git a/xen/arch/x86/mm/hap/hap.c b/xen/arch/x86/mm/hap/hap.c
+index a337752bf488..5ccb80bda5d3 100644
+--- a/xen/arch/x86/mm/hap/hap.c
++++ b/xen/arch/x86/mm/hap/hap.c
+@@ -814,15 +814,33 @@ static void cf_check hap_update_paging_modes(struct vcpu *v)
+ static void cf_check
+ hap_write_p2m_entry_post(struct p2m_domain *p2m, unsigned int oflags)
+ {
+-    struct domain *d = p2m->domain;
++    if ( !(oflags & _PAGE_PRESENT) )
++        return;
++
++    if ( unlikely(!p2m->defer_flush) )
++    {
++        const struct domain *d = p2m->domain;
+ 
+-    if ( oflags & _PAGE_PRESENT )
++        ASSERT_UNREACHABLE();
+         guest_flush_tlb_mask(d, d->dirty_cpumask);
++        return;
++    }
++
++    p2m->need_flush = true;
++}
++
++static void cf_check
++hap_p2m_tlb_flush(struct p2m_domain *p2m)
++{
++    const struct domain *d = p2m->domain;
++
++    guest_flush_tlb_mask(d, d->dirty_cpumask);
+ }
+ 
+ void hap_p2m_init(struct p2m_domain *p2m)
+ {
+     p2m->write_p2m_entry_post = hap_write_p2m_entry_post;
++    p2m->tlb_flush = hap_p2m_tlb_flush;
+ }
+ 
+ static unsigned long cf_check hap_gva_to_gfn_real_mode(
