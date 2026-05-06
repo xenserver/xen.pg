@@ -1,0 +1,76 @@
+From 4ff927133ebc32498fd4af49a8025a846cfe1dc6 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Wed, 6 May 2026 14:00:19 +0200
+Subject: EFI: adjust cfg file buffer freeing
+
+The boot services FreePages() needs passing the size. Since we allocated
+one more byte to put a trailing nul there, we also need to bump the size
+passed there. Make a small helper function to centralize this.
+
+Note that there's no permanent memory leak because of the oversight: The
+allocation is done using EfiLoaderData, and all memory of that type is
+later reclaimed anyway.
+
+Fixes: df75f77092c1 ("EFI: avoid OOB config file reads")
+Reported-by: Bernhard Kaindl <bernhard.kaindl@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Bernhard Kaindl <bernhard.kaindl@citrix.com>
+Acked-by: Daniel P. Smith <dpsmith@apertussolutions.com>
+
+diff --git a/xen/common/efi/boot.c b/xen/common/efi/boot.c
+index b44762878be4..9ea2183c0b13 100644
+--- a/xen/common/efi/boot.c
++++ b/xen/common/efi/boot.c
+@@ -778,6 +778,16 @@ static void __init efi_relocate_esrt(EFI_SYSTEM_TABLE *SystemTable)
+  */
+ #include "efi-boot.h"
+ 
++static void __init free_cfg(void)
++{
++    if ( !cfg.need_to_free )
++        return;
++
++    /* One extra byte was allocated to put a nul character there. */
++    efi_bs->FreePages(cfg.addr, PFN_UP(cfg.size + 1));
++    cfg.need_to_free = false;
++}
++
+ void __init noreturn blexit(const CHAR16 *str)
+ {
+     if ( str )
+@@ -787,8 +797,7 @@ void __init noreturn blexit(const CHAR16 *str)
+     if ( !efi_bs )
+         efi_arch_halt();
+ 
+-    if ( cfg.need_to_free )
+-        efi_bs->FreePages(cfg.addr, PFN_UP(cfg.size));
++    free_cfg();
+     if ( kernel.need_to_free )
+         efi_bs->FreePages(kernel.addr, PFN_UP(kernel.size));
+     if ( ramdisk.need_to_free )
+@@ -1557,11 +1566,7 @@ void EFIAPI __init noreturn efi_start(EFI_HANDLE ImageHandle,
+             name.s = get_value(&cfg, "global", "chain");
+             if ( !name.s )
+                 break;
+-            if ( cfg.need_to_free )
+-            {
+-                efi_bs->FreePages(cfg.addr, PFN_UP(cfg.size));
+-                cfg.need_to_free = false;
+-            }
++            free_cfg();
+             if ( !read_file(dir_handle, s2w(&name), &cfg, NULL) )
+             {
+                 PrintStr(L"Chained configuration file '");
+@@ -1631,11 +1636,7 @@ void EFIAPI __init noreturn efi_start(EFI_HANDLE ImageHandle,
+ 
+         efi_arch_cfg_file_late(loaded_image, dir_handle, section.s);
+ 
+-        if ( cfg.need_to_free )
+-        {
+-            efi_bs->FreePages(cfg.addr, PFN_UP(cfg.size));
+-            cfg.need_to_free = false;
+-        }
++        free_cfg();
+ 
+         if ( dir_handle )
+             dir_handle->Close(dir_handle);

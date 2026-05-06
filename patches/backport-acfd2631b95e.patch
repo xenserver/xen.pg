@@ -1,0 +1,72 @@
+From acfd2631b95e29fd68b98d902a1663e07474ed5f Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Fri, 1 May 2026 17:50:44 +0100
+Subject: x86/boot: Disable interrupts when establishing SSP
+
+Gitlab CI reported a crash on boot on Alder Lake hardware.  The bug is years
+old, making it an incredibly rare occurance:
+
+  (XEN) *** DOUBLE FAULT ***
+  (XEN) ----[ Xen-4.22-unstable  x86_64  debug=y ubsan=y  Not tainted ]----
+  (XEN) CPU:    0
+  (XEN) RIP:    e008:[<ffff82d04077bbc4>] arch/x86/setup.c#reinit_bsp_stack+0xfa/0x160
+  (XEN) RFLAGS: 0000000000010202   CONTEXT: hypervisor
+  (XEN) rax: 0000000000000007   rbx: ffff83049a4b0000   rcx: 00000000000006a2
+  (XEN) rdx: 0000000000000000   rsi: 0000000000000000   rdi: 0000000000000000
+  (XEN) rbp: ffff83049a4b7f00   rsp: ffff83049a4b7ef8   r8:  ffff830497e47000
+  (XEN) r9:  00000000ffffffff   r10: 00000000900c2121   r11: 000000009a392956
+  (XEN) r12: ffff830497e47000   r13: ffff830497e49f40   r14: 0000000000000000
+  (XEN) r15: ffff82d0407dad10   cr0: 0000000080050033   cr4: 0000000000f526e0
+  (XEN) cr3: 0000000043c16000   cr2: fffffffffffffffc
+  (XEN) fsb: 0000000000000000   gsb: 0000000000000000   gss: 0000000000000000
+  (XEN) ds: 0000   es: 0000   fs: 0000   gs: 0000   ss: 0000   cs: e008
+  (XEN) Xen code around <ffff82d04077bbc4> (arch/x86/setup.c#reinit_bsp_stack+0xfa/0x160):
+  (XEN)  00 b9 a2 06 00 00 0f 30 <80> 3d 71 26 f1 ff 00 74 3e 48 8d 93 f8 5f 00 00
+  (XEN) Valid stack range: ffff83049a4b6000-ffff83049a4b8000, sp=ffff83049a4b7ef8, tss.rsp0=ffff83049a4b7fb0
+  (XEN) No stack overflow detected. Skipping stack trace.
+  (XEN)
+  (XEN) ****************************************
+  (XEN) Panic on CPU 0:
+  (XEN) DOUBLE FAULT -- system shutdown
+  (XEN) ****************************************
+
+This is on the instruction boundary after enabling CET (writing MSR_S_CET) and
+prior to establishing SSP.  Despite identifying this as a critical window
+where any fault was deadly (the CPU tries to push a shadow stack frame at 0,
+hence the CR2 value wrapping around to the top of the address space), I
+clearly forgot that this meant interrupts too, which are enabled.
+
+Disable interrupts during the critical period.
+
+Fixes: b60ab42db2f0 ("x86/shstk: Activate Supervisor Shadow Stacks")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Teddy Astie <teddy.astie@vates.tech>
+
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index d041cbd5f6f1..19ee857abfb8 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -908,6 +908,13 @@ static void __init noreturn reinit_bsp_stack(void)
+ 
+     if ( cpu_has_xen_shstk )
+     {
++        /*
++         * Immediately after enabling CET, SSP is 0 and most interrupts and
++         * exceptions are fatal.  Like the SYSCALL/SYSENTER gaps, IST vectors
++         * (including NMI and #MC) are safe owing to IST switching the shstk.
++         */
++        local_irq_disable();
++
+         wrmsrl(MSR_S_CET, xen_msr_s_cet_value());
+ 
+         /*
+@@ -932,6 +939,8 @@ static void __init noreturn reinit_bsp_stack(void)
+         }
+         else
+             asm volatile ( "setssbsy" ::: "memory" );
++
++        local_irq_enable();
+     }
+ 
+     reset_stack_and_jump(init_done);
