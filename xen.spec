@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 2
+%global hv_rel 3
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -918,7 +918,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
-* Wed May  6 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.21.1-2
+* Thu May 07 2026 Frediano Ziglio <frediano.ziglio@citrix.com> - 4.21.1-3
+- Fix switching PCI card from full pass-through to SR-IOV
+
+* Wed May 06 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.21.1-2
 - Fix for XSA-490 CVE-2025-54518
 - Fix crash on boot when setting up shadow stacks
 - Fix crash on boot when using xAPIC mode on a system with more than 255 CPUs
