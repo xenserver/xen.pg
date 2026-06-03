@@ -1,0 +1,134 @@
+From 4d6e6ed0164672f6d18e5cf827a1abe91ec2f948 Mon Sep 17 00:00:00 2001
+From: Abdelkareem Abdelsaamad <abdelkareem.abdelsaamad@citrix.com>
+Date: Wed, 3 Jun 2026 11:36:55 +0200
+Subject: x86/svm: Support vNMI on capable hardware
+
+Starting with Zen4, AMD CPUs can virtualise NMIs for a guest.  On older
+hardware, determining when an NMI is safe to deliver is a challenge and Xen
+does not handle all corner cases correctly.
+
+With vNMI, there is an enablement bit and two new bits of state in the VMCB; a
+pending bit, and a blocked bit.  These directly map to the CPU state for
+handling NMIs, and are maintained by hardware during the running of the vCPU.
+
+When vNMI is enabled, have svm_{get,set}_interrupt_shadow() work in terms of
+the vnmi_blocking bit rather than the IRET intercept.  This allows an emulated
+IRET instruction to re-enable NMIs.
+
+When injecting a new NMI, simply set the vnmi_pending bit; hardware will
+deliver the NMI to the guest at the next suitable juncture.
+
+One complication is that, when delivering a second NMI before the first has
+completed, the mix between common HVM logic and SVM specific logic will try to
+open an NMI window, malfunctioning as it does so.  When vNMI is enabled, short
+circuit this to not consider NMIs blocked.
+
+Signed-off-by: Abdelkareem Abdelsaamad <abdelkareem.abdelsaamad@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Teddy Astie <teddy.astie@vates.tech>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: 86a203ab8d38f3bae19219980c2a37d091a8f7aa
+master date: 2026-05-21 16:43:01 +0100
+
+diff --git a/xen/arch/x86/hvm/svm/intr.c b/xen/arch/x86/hvm/svm/intr.c
+index 46186a110261..caeeb76a28a5 100644
+--- a/xen/arch/x86/hvm/svm/intr.c
++++ b/xen/arch/x86/hvm/svm/intr.c
+@@ -33,6 +33,12 @@ static void svm_inject_nmi(struct vcpu *v)
+     u32 general1_intercepts = vmcb_get_general1_intercepts(vmcb);
+     intinfo_t event;
+ 
++    if ( vmcb->_vintr.fields.vnmi_enable )
++    {
++        vmcb->_vintr.fields.vnmi_pending = true;
++        return;
++    }
++
+     event.raw = 0;
+     event.v = true;
+     event.type = X86_ET_NMI;
+@@ -142,6 +148,19 @@ void asmlinkage svm_intr_assist(void)
+             return;
+ 
+         intblk = hvm_interrupt_blocked(v, intack);
++
++        /*
++         * When vNMI is active, NMIs can be injected by setting vnmi_pending
++         * and hardware will deliver them at the next appropriate opportunity.
++         * Consider them not blocked, to avoid trying to open an NMI Window.
++         *
++         * Correctness here relies on the fact that all vNMI capable hardware
++         * has vGIF, and vGIF is always activated when appropriate.
++         */
++        if ( intblk == hvm_intblk_nmi_iret &&
++             vmcb->_vintr.fields.vnmi_enable )
++            intblk = hvm_intblk_none;
++
+         if ( intblk == hvm_intblk_svm_gif )
+         {
+             ASSERT(nestedhvm_enabled(v->domain));
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index 90bff726875a..b85686e38788 100644
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -547,7 +547,9 @@ static unsigned cf_check int svm_get_interrupt_shadow(struct vcpu *v)
+     if ( vmcb->int_stat.intr_shadow )
+         intr_shadow |= HVM_INTR_SHADOW_MOV_SS | HVM_INTR_SHADOW_STI;
+ 
+-    if ( vmcb_get_general1_intercepts(vmcb) & GENERAL1_INTERCEPT_IRET )
++    if ( vmcb->_vintr.fields.vnmi_enable
++         ? vmcb->_vintr.fields.vnmi_blocking
++         : (vmcb_get_general1_intercepts(vmcb) & GENERAL1_INTERCEPT_IRET) )
+         intr_shadow |= HVM_INTR_SHADOW_NMI;
+ 
+     return intr_shadow;
+@@ -557,15 +559,23 @@ static void cf_check svm_set_interrupt_shadow(
+     struct vcpu *v, unsigned int intr_shadow)
+ {
+     struct vmcb_struct *vmcb = v->arch.hvm.svm.vmcb;
+-    u32 general1_intercepts = vmcb_get_general1_intercepts(vmcb);
++    bool block_nmi = intr_shadow & HVM_INTR_SHADOW_NMI;
+ 
+     vmcb->int_stat.intr_shadow =
+         !!(intr_shadow & (HVM_INTR_SHADOW_MOV_SS|HVM_INTR_SHADOW_STI));
+ 
+-    general1_intercepts &= ~GENERAL1_INTERCEPT_IRET;
+-    if ( intr_shadow & HVM_INTR_SHADOW_NMI )
+-        general1_intercepts |= GENERAL1_INTERCEPT_IRET;
+-    vmcb_set_general1_intercepts(vmcb, general1_intercepts);
++    if ( vmcb->_vintr.fields.vnmi_enable )
++        vmcb->_vintr.fields.vnmi_blocking = block_nmi;
++    else
++    {
++        uint32_t gen1 = vmcb_get_general1_intercepts(vmcb);
++
++        gen1 &= ~GENERAL1_INTERCEPT_IRET;
++        if ( block_nmi )
++            gen1 |= GENERAL1_INTERCEPT_IRET;
++
++        vmcb_set_general1_intercepts(vmcb, gen1);
++    }
+ }
+ 
+ static int cf_check svm_guest_x86_mode(struct vcpu *v)
+@@ -2534,6 +2544,7 @@ const struct hvm_function_table * __init start_svm(void)
+     P(cpu_has_tsc_ratio, "TSC Rate MSR");
+     P(cpu_has_svm_sss, "NPT Supervisor Shadow Stack");
+     P(cpu_has_svm_spec_ctrl, "MSR_SPEC_CTRL virtualisation");
++    P(cpu_has_svm_vnmi, "Virtual NMI");
+ #undef P
+ 
+     if ( !printed )
+diff --git a/xen/arch/x86/hvm/svm/vmcb.c b/xen/arch/x86/hvm/svm/vmcb.c
+index c57d314a2486..d1227a256c80 100644
+--- a/xen/arch/x86/hvm/svm/vmcb.c
++++ b/xen/arch/x86/hvm/svm/vmcb.c
+@@ -176,6 +176,8 @@ static int construct_vmcb(struct vcpu *v)
+     if ( default_xen_spec_ctrl == SPEC_CTRL_STIBP )
+         v->arch.msrs->spec_ctrl.raw = SPEC_CTRL_STIBP;
+ 
++    vmcb->_vintr.fields.vnmi_enable = cpu_has_svm_vnmi;
++
+     return 0;
+ }
+ 

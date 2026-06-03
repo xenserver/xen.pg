@@ -1,0 +1,76 @@
+From 9a0327bf537bdc1db559504e4a936108a28bd565 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Wed, 3 Jun 2026 11:38:18 +0200
+Subject: x86/pv: Provide better SYSCALL backwards compatibility in FRED mode
+
+In FRED mode, the SYSCALL instruction does not modify %rcx/%r11.  All current
+software using SYSCALL expects the pre-FRED behaviour and spills %rcx/%r11
+around the invocation, which is why FRED not doing this goes largely
+unnoticed.
+
+However, consider the following migration scenario:
+
+ * VM suspends.  Hypercall, so SYSCALL, %rcx/%r11 left unmodified
+ * VM moves to a non-FRED system
+ * Xen resumes the VM with a real SYSRET instruction
+
+Instead of resuming at the instruction following the SYSCALL instruction, the
+VM is resumed at whatever dead value was in %rcx.
+
+In FRED mode, manually adjust %rcx/%r11 when SYSCALL is used and when SYSRET
+would have been used.
+
+Regarding the choice of instructions in eretu_exit_to_guest(), a branch would
+be a context dependent 50/50 split (i.e. increased chance of mispredict), and
+only saves one instruction.  The CMOVs read the same cacheline that ERETU is
+about to process, so are as close to free as we can reasonably get.
+
+Fixes: 76193ef47d91 ("x86/pv: System call handling in FRED mode")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: c5a4b9125bed42d1947a48058119cd335294164b
+master date: 2026-05-28 16:19:16 +0100
+
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index 85d835ab43de..9fdb08ce1aac 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -2409,6 +2409,8 @@ void asmlinkage entry_from_pv(struct cpu_user_regs *regs)
+ 
+             regs->ssx = l ? FLAT_KERNEL_SS   : FLAT_USER_SS32;
+             regs->csx = l ? FLAT_KERNEL_CS64 : FLAT_USER_CS32;
++            regs->rcx = regs->rip;
++            regs->r11 = regs->rflags;
+ 
+             if ( guest_kernel_mode(curr, regs) )
+                 pv_hypercall(regs);
+diff --git a/xen/arch/x86/x86_64/entry-fred.S b/xen/arch/x86/x86_64/entry-fred.S
+index 2fa57beb930c..e9c84423dacd 100644
+--- a/xen/arch/x86/x86_64/entry-fred.S
++++ b/xen/arch/x86/x86_64/entry-fred.S
+@@ -4,6 +4,7 @@
+ 
+ #include <asm/asm_defns.h>
+ #include <asm/page.h>
++#include <asm/processor.h>
+ 
+         .section .text.entry, "ax", @progbits
+ 
+@@ -26,7 +27,16 @@ FUNC(entry_FRED_R3, 4096)
+ END(entry_FRED_R3)
+ 
+ FUNC(eretu_exit_to_guest)
+-        POP_GPRS
++        /*
++         * PV guests aren't aware of FRED.  If Xen in IDT mode would have used
++         * a SYSRET instruction, preserve the legacy behaviour for %rcx/%r11
++         */
++        testb   $TRAP_syscall >> 8, UREGS_entry_vector + 1(%rsp)
++
++        POP_GPRS /* Preserves flags */
++
++        cmovnz  EFRAME_rip(%rsp), %rcx
++        cmovnz  EFRAME_eflags(%rsp), %r11
+ 
+         /*
+          * Exceptions here are handled by redirecting either to
