@@ -1,0 +1,56 @@
+From 188d5305297f4e842511d1374c7121ac8a37c169 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Fri, 29 May 2026 13:03:48 +0200
+Subject: xen/numa: fix setup of non-aligned memory affinity ranges
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The logic to populate memnodemap in populate_memnodemap() assumes that all
+ranges are aligned to the hash shift, this however is only true for the
+first address in a memory affinity node.  Any subsequent ranges belonging
+to the same node might not be aligned to the hash shift value.
+
+Such lack of alignment causes issues to the logic in populate_memnodemap(),
+as then the tail of the range might not be properly accounted for and setup
+in memnodemap.  Fix this by forcing the start address of all regions to
+be aligned to the hash shift; if such alignment causes a region overlap it
+would always be between regions on the same node, and hence will never
+cause setup issues of the memnodemap array.
+
+Fixes: 1666086b0044 ("x86/NUMA: improve memnode_shift calculation for multi node system")
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-Acked-by: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+
+diff --git a/xen/arch/x86/numa.c b/xen/arch/x86/numa.c
+index 322157fab7ca..279d93c2c1b5 100644
+--- a/xen/arch/x86/numa.c
++++ b/xen/arch/x86/numa.c
+@@ -77,6 +77,13 @@ static int __init populate_memnodemap(const struct node *nodes,
+             continue;
+         if ( (epdx >> shift) >= memnodemapsize )
+             return 0;
++
++        /*
++         * Round down start address: if start is not aligned to the memnodemap
++         * chunk size the tail remainder might not be added.  Overlaps created
++         * by rounding will fall into the same NUMA region.
++         */
++        spdx = ROUNDDOWN(spdx, 1UL << shift);
+         do {
+             if ( memnodemap[spdx >> shift] != NUMA_NO_NODE &&
+                  (!nodeids || memnodemap[spdx >> shift] != nodeids[i]) )
+diff --git a/xen/include/xen/lib.h b/xen/include/xen/lib.h
+index a27e995ec045..86abcd021e65 100644
+--- a/xen/include/xen/lib.h
++++ b/xen/include/xen/lib.h
+@@ -2,6 +2,7 @@
+ #define __LIB_H__
+ 
+ #define ROUNDUP(x, a) (((x) + (a) - 1) & ~((a) - 1))
++#define ROUNDDOWN(x, a) ((x) & ~((a) - 1))
+ 
+ #define IS_ALIGNED(val, align) (!((val) & ((align) - 1)))
+ 

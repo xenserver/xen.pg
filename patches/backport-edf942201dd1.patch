@@ -1,0 +1,90 @@
+From edf942201dd112dee6b040f7eb0bf2b8a7608047 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Tue, 9 Jun 2026 10:19:51 +0200
+Subject: xen/pdx: fix off-by-one index in offset mask calculation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adjust the mask calculation in case the last range is merged with the
+previous one, as then the mask must be calculated from the previous range,
+which the current one has been merged into.
+
+Instead of fixing the off-by-one in place, move the calculation of the bit
+change mask to the next loop, after the ranges have been merged.  This
+simplifies the logic by consolidating mask calculation in a single place,
+possibly making it less error prone in the future.
+
+Also add a test case that triggers the bug being fixed by this commit.
+
+Fixes: c5c45bcbd6a1 ("pdx: introduce a new compression algorithm based on region offsets")
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-Acked-by: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+
+diff --git a/tools/tests/pdx/test-pdx.c b/tools/tests/pdx/test-pdx.c
+index d783186577ef..4de8d43d8615 100644
+--- a/tools/tests/pdx/test-pdx.c
++++ b/tools/tests/pdx/test-pdx.c
+@@ -191,6 +191,20 @@ int main(int argc, char **argv)
+             },
+             .compress = false,
+         },
++        /*
++         * Dell R740, dual socket.  Merging of ranges causes mask differences
++         * in PDX offset mode.  Useful for checking mask calculations.
++         */
++        {
++            .ranges = {
++                { .start = 0x0000000UL, .end = 0x0080000UL },
++                { .start = 0x0100000UL, .end = 0x3070000UL },
++                { .start = 0x3070000UL, .end = 0x3870000UL },
++                { .start = 0x3870000UL, .end = 0x6870000UL },
++                { .start = 0x6870000UL, .end = 0x7070000UL },
++            },
++            .compress = false,
++        },
+     };
+     int ret_code = EXIT_SUCCESS;
+ 
+diff --git a/xen/common/pdx.c b/xen/common/pdx.c
+index 7e070ff962e8..e7e16e193e91 100644
+--- a/xen/common/pdx.c
++++ b/xen/common/pdx.c
+@@ -391,10 +391,7 @@ bool __init pfn_pdx_compression_setup(paddr_t base)
+         if ( !i ||
+              ranges[i].base_pfn >=
+              (ranges[i - 1].base_pfn + ranges[i - 1].pages) )
+-        {
+-            mask |= pdx_region_mask(ranges[i].base_pfn, ranges[i].pages);
+             continue;
+-        }
+ 
+         ranges[i - 1].pages = ranges[i].base_pfn + ranges[i].pages -
+                               ranges[i - 1].base_pfn;
+@@ -402,19 +399,21 @@ bool __init pfn_pdx_compression_setup(paddr_t base)
+         if ( i + 1 < nr_ranges )
+             memmove(&ranges[i], &ranges[i + 1],
+                     (nr_ranges - (i + 1)) * sizeof(ranges[0]));
+-        else /* last range */
+-            mask |= pdx_region_mask(ranges[i].base_pfn, ranges[i].pages);
+         nr_ranges--;
+         i--;
+     }
+ 
+     /*
+-     * Populate a mask with the non-equal bits of the different ranges, do this
+-     * to calculate the maximum PFN shift to use as the lookup table index.
++     * Populate two masks: one with the non-equal bits of the different ranges,
++     * another with the bits that change inside ranges.  Do this to calculate
++     * the maximum PFN shift to use as the lookup table index.
+      */
+     for ( i = 0; i < nr_ranges; i++ )
++    {
++        mask |= pdx_region_mask(ranges[i].base_pfn, ranges[i].pages);
+         for ( unsigned int j = i + 1; j < nr_ranges; j++ )
+             idx_mask |= ranges[i].base_pfn ^ ranges[j].base_pfn;
++    }
+     /* Mask out the bits that change inside of ranges. */
+     idx_mask &= ~mask;
+ 

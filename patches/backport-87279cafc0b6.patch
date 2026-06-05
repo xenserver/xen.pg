@@ -1,0 +1,77 @@
+From 87279cafc0b6ba7078576d7f8355caee0cc9598a Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Wed, 3 Jun 2026 14:58:33 +0200
+Subject: x86/mcfg: relax memory map checks on newer firmware
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Per PCI Firmware 3.3 specification, section 4.1.2, ECAM space must be
+reserved by declaring a motherboard resource, but there's no requirement to
+mention it in E820.  The specification additionally states that: the
+resources can optionally be returned in Int15 E820h or EFIGetMemoryMap as
+reserved memory.
+
+Recent Lenovo systems have been found to have the MMCFG region in an
+E820 hole, which looks to be technically spec compliant, but is rejected
+by Xen.
+
+The logic was introduced in Linux in 2006 as 946f2ee5c731 ("[PATCH]
+i386/x86-64: Check that MCFG points to an e820 reserved area").  This was
+picked up by Xen when MCFG support was added in 3b35911d709e ("Enable pci
+mmcfg and ATS for x86_64").  Apply an approach similar to what Linux has
+done in 199f968f1484 ("x86/pci: Skip early E820 check for ECAM region") and
+relax the strict reserved region checking so it's only done for firmware
+manufactured prior to 2016.  For firmware from 2016 and newer allow MCFG
+region to reside in holes on the memory map.  Note Xen is still more strict
+than Linux however, as it will refuse to use MCFG regions that overlap with
+memory map regions different than reserved.
+
+When dom0 boots it can prevent access to misconfigured MCFG regions by
+using the PHYSDEVOP_pci_mmcfg_reserved hypercall.  This brings Xen's early
+usage of MCFG (prior to ACPI AML parsing) more in line with the
+implementation in Linux.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Release-Acked-by: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+
+diff --git a/xen/arch/x86/x86_64/mmconfig-shared.c b/xen/arch/x86/x86_64/mmconfig-shared.c
+index 3e1460dc56cb..b651190d966e 100644
+--- a/xen/arch/x86/x86_64/mmconfig-shared.c
++++ b/xen/arch/x86/x86_64/mmconfig-shared.c
+@@ -13,6 +13,7 @@
+  */
+ 
+ #include <xen/acpi.h>
++#include <xen/dmi.h>
+ #include <xen/init.h>
+ #include <xen/mm.h>
+ #include <xen/param.h>
+@@ -368,12 +369,15 @@ static bool_t __init pci_mmcfg_reject_broken(void)
+     typeof(pci_mmcfg_config[0]) *cfg;
+     int i;
+     bool_t valid = 1;
++    int year;
+ 
+     if ((pci_mmcfg_config_num == 0) ||
+         (pci_mmcfg_config == NULL) ||
+         (pci_mmcfg_config[0].address == 0))
+         return 0;
+ 
++    dmi_get_date(DMI_BIOS_DATE, &year, NULL, NULL);
++
+     for (i = 0; i < pci_mmcfg_config_num; i++) {
+         u64 addr, size;
+ 
+@@ -389,7 +393,9 @@ static bool_t __init pci_mmcfg_reject_broken(void)
+                (unsigned int)cfg->start_bus_number,
+                (unsigned int)cfg->end_bus_number);
+ 
+-        if (!is_mmconf_reserved(addr, size, i, cfg) ||
++        if (((year < 2016 || !is_memory_hole(maddr_to_mfn(addr),
++                                             maddr_to_mfn(addr + size - 1))) &&
++             !is_mmconf_reserved(addr, size, i, cfg)) ||
+             pci_mmcfg_arch_enable(i)) {
+             pci_mmcfg_arch_disable(i);
+             valid = 0;
