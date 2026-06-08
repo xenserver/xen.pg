@@ -79,6 +79,7 @@ BuildRequires: libtool
 # For libxenguest (domain builder)
 BuildRequires: bzip2-devel
 BuildRequires: libzstd-devel
+BuildRequires: lz4-devel
 BuildRequires: lzo-devel
 BuildRequires: xz-devel
 BuildRequires: zlib-devel

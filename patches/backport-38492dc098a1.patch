@@ -1,0 +1,406 @@
+From 38492dc098a19e851a916a9e441008083538bc69 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Tue, 5 May 2026 12:52:03 +0100
+Subject: tools/libs/guest: Use the system liblz4 in the bzimage loader
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Right now lz4, unlike every other compression scheme, unconditionally uses
+Xen's unsafe decompressor.  Make it consistent with all other compression
+schemes by using liblz4.
+
+The unsafe decompression is still required for the MiniOS build, so rename
+xg_dom_decompress_lz4.c to xg_dom_decompress_unsafe_lz4.c and drop the
+non-MiniOS content.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Release-Acked-by: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+
+diff --git a/tools/libs/guest/Makefile.common b/tools/libs/guest/Makefile.common
+index a026a2f662b0..bba8f27f824e 100644
+--- a/tools/libs/guest/Makefile.common
++++ b/tools/libs/guest/Makefile.common
+@@ -43,7 +43,6 @@ OBJS-y                 += xg_dom_core.o
+ OBJS-y                 += xg_dom_boot.o
+ OBJS-y                 += xg_dom_elfloader.o
+ OBJS-$(CONFIG_X86)     += xg_dom_bzimageloader.o
+-OBJS-$(CONFIG_X86)     += xg_dom_decompress_lz4.o
+ OBJS-$(CONFIG_X86)     += xg_dom_hvmloader.o
+ OBJS-$(CONFIG_ARM)     += xg_dom_armzimageloader.o
+ OBJS-y                 += xg_dom_binloader.o
+@@ -56,6 +55,7 @@ OBJS-$(CONFIG_ARM)     += xg_dom_arm.o
+ ifeq ($(CONFIG_LIBXC_MINIOS),y)
+ OBJS-y                 += xg_dom_decompress_unsafe.o
+ OBJS-y                 += xg_dom_decompress_unsafe_bzip2.o
++OBJS-y                 += xg_dom_decompress_unsafe_lz4.o
+ OBJS-y                 += xg_dom_decompress_unsafe_lzma.o
+ OBJS-y                 += xg_dom_decompress_unsafe_lzo1x.o
+ OBJS-y                 += xg_dom_decompress_unsafe_xz.o
+diff --git a/tools/libs/guest/xg_dom_bzimageloader.c b/tools/libs/guest/xg_dom_bzimageloader.c
+index 1fb4e5a1f728..32b3c682a447 100644
+--- a/tools/libs/guest/xg_dom_bzimageloader.c
++++ b/tools/libs/guest/xg_dom_bzimageloader.c
+@@ -32,7 +32,6 @@
+ #include <inttypes.h>
+ 
+ #include "xg_private.h"
+-#include "xg_dom_decompress.h"
+ 
+ #include <xen-tools/common-macros.h>
+ 
+@@ -623,6 +622,133 @@ static int xc_try_zstd_decode(
+ 
+ #endif
+ 
++#if defined(HAVE_LZ4)
++
++#include <lz4.h>
++
++#define ARCHIVE_MAGICNUMBER 0x184C2102
++
++static int xc_try_lz4_decode(struct xc_dom_image *dom, void **blob, size_t *size)
++{
++    size_t outsize, insize;
++    unsigned char *outbuf = NULL, *inp = *blob, *outp;
++    uint32_t chunksize;
++
++    /* Magic, descriptor byte, and trailing size field. */
++    if ( *size <= 8 )
++    {
++        DOMPRINTF("LZ4: insufficient input data");
++        goto err;
++    }
++
++    insize = *size - 4;
++    outsize = get_unaligned_le32(*blob + insize);
++
++    if ( xc_dom_kernel_check_size(dom, outsize) )
++    {
++        DOMPRINTF("LZ4: output too large");
++        goto err;
++    }
++
++    outbuf = malloc(outsize);
++    if ( !outbuf )
++    {
++        DOMPRINTF("LZ4: failed to alloc memory");
++        goto err;
++    }
++    outp = outbuf;
++
++    chunksize = get_unaligned_le32(inp);
++    if ( chunksize == ARCHIVE_MAGICNUMBER )
++    {
++        inp    += 4;
++        insize -= 4;
++    }
++    else
++    {
++        DOMPRINTF("LZ4: invalid header");
++        goto err;
++    }
++
++    for ( ;; )
++    {
++        int dst_len, len;
++
++        if ( insize < 4 )
++        {
++            DOMPRINTF("LZ4: missing data");
++            goto err;
++        }
++
++        chunksize = get_unaligned_le32(inp);
++        inp    += 4;
++        insize -= 4;
++
++        if ( chunksize == ARCHIVE_MAGICNUMBER )
++            continue;
++
++        if ( chunksize > insize )
++        {
++            DOMPRINTF("LZ4: insufficient input data");
++            goto err;
++        }
++
++        dst_len = outsize - (outp - outbuf);
++        len = LZ4_decompress_safe((const void *)inp,
++                                  (void *)outp, chunksize, dst_len);
++
++        if ( len < 0 )
++        {
++            DOMPRINTF("LZ4: decoding failed");
++            goto err;
++        }
++
++        outp   += len;
++        inp    += chunksize;
++        insize -= chunksize;
++
++        if ( insize == 0 )
++            break;
++    }
++
++    if ( (outp - outbuf) != outsize )
++    {
++        DOMPRINTF("LZ4: got 0x%zx bytes instead of 0x%zx",
++                  outp - outbuf, outsize);
++        goto err;
++    }
++
++    if ( xc_dom_register_external(dom, outbuf, outsize) )
++    {
++        DOMPRINTF("LZ4: error registering stream output");
++        goto err;
++    }
++
++    DOMPRINTF("%s: LZ4 decompress OK, 0x%zx -> 0x%zx",
++              __FUNCTION__, insize, outsize);
++
++    *blob = outbuf;
++    *size = outsize;
++
++    return 0;
++
++ err:
++    free(outbuf);
++    return -1;
++}
++
++#else /* !defined(HAVE_LZ4) */
++
++static int xc_try_lz4_decode(struct xc_dom_image *dom, void **blob, size_t *size)
++{
++    xc_dom_panic(dom->xch, XC_INTERNAL_ERROR,
++                 "%s: LZ4 decompress support unavailable\n",
++                 __FUNCTION__);
++    return -1;
++}
++
++#endif
++
+ #endif /* !__MINIOS__ */
+ 
+ struct setup_header {
+diff --git a/tools/libs/guest/xg_dom_decompress.h b/tools/libs/guest/xg_dom_decompress.h
+deleted file mode 100644
+index d7a45f730d67..000000000000
+--- a/tools/libs/guest/xg_dom_decompress.h
++++ /dev/null
+@@ -1,6 +0,0 @@
+-#ifdef __MINIOS__
+-# include "xg_dom_decompress_unsafe.h"
+-#endif
+-
+-int xc_try_lz4_decode(struct xc_dom_image *dom, void **blob, size_t *size);
+-
+diff --git a/tools/libs/guest/xg_dom_decompress_lz4.c b/tools/libs/guest/xg_dom_decompress_lz4.c
+deleted file mode 100644
+index 53ef0bf328ed..000000000000
+--- a/tools/libs/guest/xg_dom_decompress_lz4.c
++++ /dev/null
+@@ -1,143 +0,0 @@
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <inttypes.h>
+-#include <stdint.h>
+-
+-#include INCLUDE_ENDIAN_H
+-
+-#define XG_NEED_UNALIGNED
+-#include "xg_private.h"
+-#include "xg_dom_decompress.h"
+-
+-#define CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+-
+-typedef uint8_t u8;
+-typedef uint16_t u16;
+-typedef uint32_t u32;
+-typedef uint64_t u64;
+-
+-#define likely(a) a
+-#define unlikely(a) a
+-
+-static inline uint16_t le16_to_cpu(uint16_t v)
+-{
+-#if BYTE_ORDER == BIG_ENDIAN
+-    return __builtin_bswap16(v);
+-#else
+-    return v;
+-#endif
+-}
+-
+-#include "../../xen/include/xen/lz4.h"
+-#include "../../xen/common/decompress.h"
+-
+-#ifndef __MINIOS__
+-
+-#include "../../xen/common/lz4/decompress.c"
+-
+-#define ARCHIVE_MAGICNUMBER 0x184C2102
+-
+-int xc_try_lz4_decode(
+-	struct xc_dom_image *dom, void **blob, size_t *psize)
+-{
+-	int ret = -1;
+-	unsigned char *inp = *blob, *output, *outp;
+-	ssize_t size = *psize - 4;
+-	size_t out_len, dest_len, chunksize;
+-	const char *msg;
+-
+-	if (size < 4) {
+-		msg = "input too small";
+-		goto exit_0;
+-	}
+-
+-	out_len = get_unaligned_le32(inp + size);
+-	if (xc_dom_kernel_check_size(dom, out_len)) {
+-		msg = "Decompressed image too large";
+-		goto exit_0;
+-	}
+-
+-	output = malloc(out_len);
+-	if (!output) {
+-		msg = "Could not allocate output buffer";
+-		goto exit_0;
+-	}
+-	outp = output;
+-
+-	chunksize = get_unaligned_le32(inp);
+-	if (chunksize == ARCHIVE_MAGICNUMBER) {
+-		inp += 4;
+-		size -= 4;
+-	} else {
+-		msg = "invalid header";
+-		goto exit_2;
+-	}
+-
+-	for (;;) {
+-		if (size < 4) {
+-			msg = "missing data";
+-			goto exit_2;
+-		}
+-		chunksize = get_unaligned_le32(inp);
+-		if (chunksize == ARCHIVE_MAGICNUMBER) {
+-			inp += 4;
+-			size -= 4;
+-			continue;
+-		}
+-		inp += 4;
+-		size -= 4;
+-		if (chunksize > size) {
+-			msg = "insufficient input data";
+-			goto exit_2;
+-		}
+-
+-		dest_len = out_len - (outp - output);
+-		ret = lz4_decompress_unknownoutputsize(inp, chunksize, outp,
+-				&dest_len);
+-		if (ret < 0) {
+-			msg = "decoding failed";
+-			goto exit_2;
+-		}
+-
+-		ret = -1;
+-		outp += dest_len;
+-		size -= chunksize;
+-
+-		if (size == 0)
+-		{
+-			if ( xc_dom_register_external(dom, output, out_len) )
+-			{
+-				msg = "Error registering stream output";
+-				goto exit_2;
+-			}
+-			*blob = output;
+-			*psize = out_len;
+-			return 0;
+-		}
+-
+-		if (size < 0) {
+-			msg = "data corrupted";
+-			goto exit_2;
+-		}
+-
+-		inp += chunksize;
+-	}
+-
+-exit_2:
+-	free(output);
+-exit_0:
+-	DOMPRINTF("LZ4 decompression error: %s\n", msg);
+-	return ret;
+-}
+-
+-#else /* __MINIOS__ */
+-
+-#include "../../xen/common/unlz4.c"
+-
+-int xc_try_lz4_decode(
+-    struct xc_dom_image *dom, void **blob, size_t *size)
+-{
+-    return xc_dom_decompress_unsafe(unlz4, dom, blob, size);
+-}
+-
+-#endif
+diff --git a/tools/libs/guest/xg_dom_decompress_unsafe.h b/tools/libs/guest/xg_dom_decompress_unsafe.h
+index ac6b94288d5e..5bc222207653 100644
+--- a/tools/libs/guest/xg_dom_decompress_unsafe.h
++++ b/tools/libs/guest/xg_dom_decompress_unsafe.h
+@@ -16,6 +16,8 @@ int xc_dom_decompress_unsafe(
+ 
+ int xc_try_bzip2_decode(struct xc_dom_image *dom, void **blob, size_t *size)
+     __attribute__((visibility("internal")));
++int xc_try_lz4_decode(struct xc_dom_image *dom, void **blob, size_t *size)
++    __attribute__((visibility("internal")));
+ int xc_try_lzma_decode(struct xc_dom_image *dom, void **blob, size_t *size)
+     __attribute__((visibility("internal")));
+ int xc_try_lzo1x_decode(struct xc_dom_image *dom, void **blob, size_t *size)
+diff --git a/tools/libs/guest/xg_dom_decompress_unsafe_lz4.c b/tools/libs/guest/xg_dom_decompress_unsafe_lz4.c
+new file mode 100644
+index 000000000000..405143aa6182
+--- /dev/null
++++ b/tools/libs/guest/xg_dom_decompress_unsafe_lz4.c
+@@ -0,0 +1,39 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <inttypes.h>
++#include <stdint.h>
++
++#include INCLUDE_ENDIAN_H
++
++#define XG_NEED_UNALIGNED
++#include "xg_private.h"
++#include "xg_dom_decompress.h"
++
++#define CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
++
++typedef uint8_t u8;
++typedef uint16_t u16;
++typedef uint32_t u32;
++typedef uint64_t u64;
++
++#define likely(a) a
++#define unlikely(a) a
++
++static inline uint16_t le16_to_cpu(uint16_t v)
++{
++#if BYTE_ORDER == BIG_ENDIAN
++    return __builtin_bswap16(v);
++#else
++    return v;
++#endif
++}
++
++#include "../../xen/include/xen/lz4.h"
++#include "../../xen/common/decompress.h"
++#include "../../xen/common/unlz4.c"
++
++int xc_try_lz4_decode(
++    struct xc_dom_image *dom, void **blob, size_t *size)
++{
++    return xc_dom_decompress_unsafe(unlz4, dom, blob, size);
++}
