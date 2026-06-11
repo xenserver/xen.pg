@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 9
+%global hv_rel 10
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -884,6 +884,12 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Thu Jun 11 2026 Roger Pau Monné <roger.pau@citrix.com> - 4.17.6-10
+- Fix for XSA-491 CVE-2026-42487
+- Fix parsing of NUMA memory affinity information
+- Fix PDX compression setup
+- Don't require MCFG to fall into a memory map reserved region
+
 * Wed May  6 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.6-9
 - Fix for XSA-490 CVE-2025-54518
 - Fix crash on boot when setting up shadow stacks
