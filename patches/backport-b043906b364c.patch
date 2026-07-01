@@ -1,0 +1,220 @@
+From b043906b364c25b3354a2b41ff6cfdd352e9850c Mon Sep 17 00:00:00 2001
+From: Jason Andryuk <jason.andryuk@amd.com>
+Date: Tue, 30 Jun 2026 14:53:03 +0200
+Subject: xen/x86: Change stub page allocation/free
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Today the inline tracking of the stub page is problematic.  0xcc is used to
+indicate unused, but it is also a "clear value."  A !CONFIG_PV build or
+when running with FRED support will not populate the LSTAR/CSTAR stubs at
+CPU bringup.  If a CPU is then offlined, the stubs page will be freed as
+its content will be all 0xcc, regardless of the stubs page still begin
+referenced by other CPUs.
+
+The new approach uses a global, CPU-indexed dynamically allocated array of
+stub addresses.  However, to handle NUMA aware allocations, we cannot
+allocate all the memory in advance because of the NUMA dependency.  Take
+advantage of the fact that Xen will attempt to contiguously pack CPUs on
+the same NUMA node (see normalise_cpu_order()), and on CPU bringup use the
+same stubs page the previous CPU did if suitable.  Note the code would
+still function properly even if CPUs from NUMA nodes are not contiguously
+packed, it just consumes more memory.
+
+Stubs pages are no longer freed.  They remain referenced in the global
+CPU-indexed array and are re-used if the CPU is re-onlined.
+
+The stubs array doesn't have an explicit lock.  During boot it's accessed
+single threaded.  During runtime, &cpu_add_remove_lock serializes access.
+
+Fixes: 7a66ac8d1633 ("x86: move syscall trampolines off the stack")
+Signed-off-by: Jason Andryuk <jason.andryuk@amd.com>
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Tested-by: Jason Andryuk <jason.andryuk@amd.com>
+Reviewed-by: Jason Andryuk <jason.andryuk@amd.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: 4f2c223c59eb25fe8e9e3632a78541a1fddaa921
+master date: 2026-06-12 12:00:12 +0200
+
+diff --git a/xen/arch/x86/include/asm/stubs.h b/xen/arch/x86/include/asm/stubs.h
+index a520928e9a50..6f843a0f4810 100644
+--- a/xen/arch/x86/include/asm/stubs.h
++++ b/xen/arch/x86/include/asm/stubs.h
+@@ -32,6 +32,6 @@ struct stubs {
+ };
+ 
+ DECLARE_PER_CPU(struct stubs, stubs);
+-unsigned long alloc_stub_page(unsigned int cpu, unsigned long *mfn);
++void init_stubs(void);
+ 
+ #endif /* X86_ASM_STUBS_H */
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index f4e06b2ad8d0..8b766592f051 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -2089,9 +2089,7 @@ void asmlinkage __init noreturn __start_xen(void)
+ 
+     init_idle_domain();
+ 
+-    this_cpu(stubs.addr) = alloc_stub_page(smp_processor_id(),
+-                                           &this_cpu(stubs).mfn);
+-    BUG_ON(!this_cpu(stubs.addr));
++    init_stubs();
+ 
+     bsp_traps_reinit(); /* Needs stubs allocated, must be before presmp_initcalls. */
+ 
+diff --git a/xen/arch/x86/smpboot.c b/xen/arch/x86/smpboot.c
+index b37feab3bef4..93b4437a3346 100644
+--- a/xen/arch/x86/smpboot.c
++++ b/xen/arch/x86/smpboot.c
+@@ -20,6 +20,7 @@
+ #include <xen/serial.h>
+ #include <xen/softirq.h>
+ #include <xen/tasklet.h>
++#include <xen/xvmalloc.h>
+ 
+ #include <asm/apic.h>
+ #include <asm/cpuidle.h>
+@@ -641,41 +642,64 @@ static int do_boot_cpu(int apicid, int cpu)
+     return rc;
+ }
+ 
+-#define STUB_BUF_CPU_OFFS(cpu) (((cpu) & (STUBS_PER_PAGE - 1)) * STUB_BUF_SIZE)
++/* Dynamically allocated, indexed by CPU.  Store physical address of stubs. */
++static paddr_t *__ro_after_init stubs;
+ 
+-unsigned long alloc_stub_page(unsigned int cpu, unsigned long *mfn)
++static bool assign_stub_page(unsigned int cpu)
+ {
+     unsigned long stub_va;
+-    struct page_info *pg;
++    paddr_t addr = stubs[cpu];
+ 
+-    BUILD_BUG_ON(STUBS_PER_PAGE & (STUBS_PER_PAGE - 1));
+-
+-    if ( *mfn )
+-        pg = mfn_to_page(_mfn(*mfn));
+-    else
++    if ( addr == INVALID_PADDR )
+     {
+-        nodeid_t node = cpu_to_node(cpu);
+-        unsigned int memflags = node != NUMA_NO_NODE ? MEMF_node(node) : 0;
++        nodeid_t nid = cpu_to_node(cpu);
++
++        /*
++         * Attempt to use the same page as the previous CPU if possible,
++         * otherwise allocate a new one.
++         */
++        if ( cpu && nid == cpu_to_node(cpu - 1) &&
++             stubs[cpu - 1] != INVALID_PADDR &&
++             PAGE_OFFSET(stubs[cpu - 1] + STUB_BUF_SIZE) )
++            addr = stubs[cpu - 1] + STUB_BUF_SIZE;
++        else
++        {
++            struct page_info *pg = alloc_domheap_page(NULL, MEMF_node(nid));
+ 
+-        pg = alloc_domheap_page(NULL, memflags);
+-        if ( !pg )
+-            return 0;
++            if ( !pg )
++                return false;
+ 
+-        unmap_domain_page(memset(__map_domain_page(pg), 0xcc, PAGE_SIZE));
++            unmap_domain_page(memset(__map_domain_page(pg), 0xcc, PAGE_SIZE));
++            addr = page_to_maddr(pg);
++        }
++        stubs[cpu] = addr;
+     }
+ 
+     stub_va = XEN_VIRT_END - FIXADDR_X_SIZE - (cpu + 1) * PAGE_SIZE;
+-    if ( map_pages_to_xen(stub_va, page_to_mfn(pg), 1,
++    if ( map_pages_to_xen(stub_va, maddr_to_mfn(addr), 1,
+                           PAGE_HYPERVISOR_RX | MAP_SMALL_PAGES) )
+-    {
+-        if ( !*mfn )
+-            free_domheap_page(pg);
+-        stub_va = 0;
+-    }
+-    else if ( !*mfn )
+-        *mfn = mfn_x(page_to_mfn(pg));
++        return false;
++
++    per_cpu(stubs.mfn, cpu) = PFN_DOWN(addr);
++    per_cpu(stubs.addr, cpu) = stub_va + PAGE_OFFSET(addr);
++    return true;
++}
++
++void __init init_stubs(void)
++{
++    const unsigned int num_cpus = num_present_cpus();
++    unsigned int i;
++
++    ASSERT(!stubs);
++    stubs = xvmalloc_array(typeof(*stubs), num_cpus);
++    if ( !stubs )
++        panic("Unable to allocate stub array\n");
+ 
+-    return stub_va;
++    for ( i = 0; i < num_cpus; i++ )
++        stubs[i] = INVALID_PADDR;
++
++    if ( !assign_stub_page(0) )
++        panic("Unable to initialize BSP stub region\n");
+ }
+ 
+ void cpu_exit_clear(unsigned int cpu)
+@@ -990,19 +1014,12 @@ static void cpu_smpboot_free(unsigned int cpu, bool remove)
+     {
+         mfn_t mfn = _mfn(per_cpu(stubs.mfn, cpu));
+         unsigned char *stub_page = map_domain_page(mfn);
+-        unsigned int i;
+ 
+-        memset(stub_page + STUB_BUF_CPU_OFFS(cpu), 0xcc, STUB_BUF_SIZE);
+-        for ( i = 0; i < STUBS_PER_PAGE; ++i )
+-            if ( stub_page[i * STUB_BUF_SIZE] != 0xcc )
+-                break;
++        memset(stub_page + PAGE_OFFSET(stubs[cpu]), 0xcc, STUB_BUF_SIZE);
+         unmap_domain_page(stub_page);
+         destroy_xen_mappings(per_cpu(stubs.addr, cpu) & PAGE_MASK,
+                              (per_cpu(stubs.addr, cpu) | ~PAGE_MASK) + 1);
+         per_cpu(stubs.addr, cpu) = 0;
+-        per_cpu(stubs.mfn, cpu) = 0;
+-        if ( i == STUBS_PER_PAGE )
+-            free_domheap_page(mfn_to_page(mfn));
+     }
+ 
+     if ( IS_ENABLED(CONFIG_PV32) )
+@@ -1041,10 +1058,9 @@ void *cpu_alloc_stack(unsigned int cpu)
+ static int cpu_smpboot_alloc(unsigned int cpu)
+ {
+     struct cpu_info *info;
+-    unsigned int i, memflags = 0;
++    unsigned int memflags = 0;
+     nodeid_t node = cpu_to_node(cpu);
+     seg_desc_t *gdt;
+-    unsigned long stub_page;
+     int rc = -ENOMEM;
+ 
+     if ( node != NUMA_NO_NODE )
+@@ -1092,18 +1108,8 @@ static int cpu_smpboot_alloc(unsigned int cpu)
+     memcpy(per_cpu(idt, cpu), bsp_idt, sizeof(bsp_idt));
+     disable_each_ist(per_cpu(idt, cpu));
+ 
+-    for ( stub_page = 0, i = cpu & ~(STUBS_PER_PAGE - 1);
+-          i < nr_cpu_ids && i <= (cpu | (STUBS_PER_PAGE - 1)); ++i )
+-        if ( cpu_online(i) && cpu_to_node(i) == node )
+-        {
+-            per_cpu(stubs.mfn, cpu) = per_cpu(stubs.mfn, i);
+-            break;
+-        }
+-    BUG_ON(i == cpu);
+-    stub_page = alloc_stub_page(cpu, &per_cpu(stubs.mfn, cpu));
+-    if ( !stub_page )
++    if ( !assign_stub_page(cpu) )
+         goto out;
+-    per_cpu(stubs.addr, cpu) = stub_page + STUB_BUF_CPU_OFFS(cpu);
+ 
+     rc = setup_cpu_root_pgt(cpu);
+     if ( rc )

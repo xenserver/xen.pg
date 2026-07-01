@@ -1,0 +1,128 @@
+From 4ef0e85a4abd503354b19e00bdde0a168c49315c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Roger=20Pau=20Monn=C3=A9?= <roger.pau@citrix.com>
+Date: Tue, 30 Jun 2026 14:57:33 +0200
+Subject: char/ns16550: bound execution time of ns16550_interrupt()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The current logic in ns16550_interrupt() will loop until the device sets
+the NOINT in IIR.  At least on the Lenovo ThinkSystem SR630 V4 the flow
+control of the serial-over-lan emulated UART seems to be broken, as it
+doesn't set the NOINT bit consistently.  The Transmitter Holding Register
+Empty in LSR also seems to not be properly signaled, as even with it set
+writes to the transmit register take ~6ms.  This leads to the watchdog
+triggering very easily on such system.
+
+Introduce an upper bound on the execution time of ns16550_interrupt(), this
+is currently set as 4x the polling interval, which is calculated as the
+time to fill RX FIFO and/or empty TX FIFO.  The current maximum timeout is
+either 5ms or the polling interval, whatever is higher.  Once the timeout
+triggers the interrupt is disabled and the uart is switched to polling
+mode.
+
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: d1b72a9aeda57e858b345d46874cd3d07f99be5c
+master date: 2026-06-29 17:14:47 +0200
+
+diff --git a/xen/common/irq.c b/xen/common/irq.c
+index 29729349a6f2..b76bbb614387 100644
+--- a/xen/common/irq.c
++++ b/xen/common/irq.c
+@@ -54,3 +54,15 @@ unsigned int cf_check irq_startup_none(struct irq_desc *desc)
+ {
+     return 0;
+ }
++
++void disable_irq(unsigned int irq)
++{
++    struct irq_desc *desc = irq_to_desc(irq);
++    unsigned long flags;
++
++    spin_lock_irqsave(&desc->lock, flags);
++    if ( desc->handler->disable )
++        desc->handler->disable(desc);
++    desc->status |= IRQ_DISABLED;
++    spin_unlock_irqrestore(&desc->lock, flags);
++}
+diff --git a/xen/drivers/char/ns16550.c b/xen/drivers/char/ns16550.c
+index df554001bcb2..914e9e17e8a6 100644
+--- a/xen/drivers/char/ns16550.c
++++ b/xen/drivers/char/ns16550.c
+@@ -62,6 +62,7 @@ static struct ns16550 {
+ #endif
+     unsigned int timeout_ms;
+     bool intr_works;
++    bool force_polling;
+     bool dw_usr_bsy;
+ #ifdef NS16550_PCI
+     /* PCI card parameters. */
+@@ -190,12 +191,38 @@ static void cf_check ns16550_interrupt(int irq, void *dev_id)
+ {
+     struct serial_port *port = dev_id;
+     struct ns16550 *uart = port->uart;
++    /*
++     * Set quite arbitrarily as 4x the time to drain the TX or fill RX FIFOs,
++     * set the upper bound as 5ms or the timeout_ms value, whatever is higher.
++     */
++    const unsigned int delta = min(uart->timeout_ms * 4,
++                                   max(5u, uart->timeout_ms));
++    const s_time_t timeout = NOW() + MILLISECS(delta);
+ 
++    ASSERT(!uart->force_polling);
+     uart->intr_works = 1;
+ 
+     while ( !(ns_read_reg(uart, UART_IIR) & UART_IIR_NOINT) )
+     {
+         u8 lsr = ns_read_reg(uart, UART_LSR);
++        s_time_t now = NOW();
++
++        /* Break out of the loop if spending too much time. */
++        if ( now > timeout )
++        {
++            /* Disable the interrupt source - it's never shared. */
++            disable_irq(irq);
++
++            /* Disable interrupt generation on the device and arm the timer. */
++            uart->force_polling = true;
++            ns_write_reg(uart, UART_IER, 0);
++            set_timer(&uart->timer, now + MILLISECS(uart->timeout_ms));
++            printk(XENLOG_WARNING
++                   "uart interrupt taking more than %ums, switched to polling\n",
++                   delta);
++
++            return;
++        }
+ 
+         if ( (lsr & uart->lsr_mask) == uart->lsr_mask )
+             serial_tx_interrupt(port);
+@@ -223,7 +250,7 @@ static void cf_check __ns16550_poll(const struct cpu_user_regs *regs)
+     struct ns16550 *uart = port->uart;
+     const struct cpu_user_regs *old_regs;
+ 
+-    if ( uart->intr_works )
++    if ( uart->intr_works && !uart->force_polling )
+         return; /* Interrupts work - no more polling */
+ 
+     /* Mimic interrupt context. */
+@@ -322,6 +349,7 @@ static void ns16550_setup_preirq(struct ns16550 *uart)
+     unsigned int  divisor;
+ 
+     uart->intr_works = 0;
++    uart->force_polling = false;
+ 
+     pci_serial_early_init(uart);
+ 
+diff --git a/xen/include/xen/irq.h b/xen/include/xen/irq.h
+index 95034c0d6bb5..30d58e372b62 100644
+--- a/xen/include/xen/irq.h
++++ b/xen/include/xen/irq.h
+@@ -121,6 +121,7 @@ extern void release_irq(unsigned int irq, const void *dev_id);
+ extern int request_irq(unsigned int irq, unsigned int irqflags,
+                void (*handler)(int irq, void *dev_id),
+                const char *devname, void *dev_id);
++void disable_irq(unsigned int irq);
+ 
+ extern const hw_irq_controller no_irq_type;
+ void cf_check no_action(int cpl, void *dev_id);
