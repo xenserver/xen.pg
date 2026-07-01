@@ -1,0 +1,145 @@
+From 7073cc4de69235623e596e79deb80705e08e4329 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 4 Jun 2026 21:37:32 +0100
+Subject: domctl: handle XEN_DOMCTL_{,un}bind_pt_irq without acquiring domctl
+ lock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With dedicated locking added, the domctl lock isn't required here anymore.
+(It also already isn't used when pt_irq_{create,destroy}_bind() are
+invoked for PVH Dom0.) As the handling is in arch-specific code, no code
+is being moved, but the 2nd (extensible to other sub-ops like the ones
+here) invocation of arch_do_domctl() is being re-used.
+
+This is part of XSA-492.
+
+Fixes: fda49f9b3fbb ("Add build option to allow more hypercalls from stubdoms")
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Acked-by: Daniel P. Smith <dpsmith@apertussolutions.com>
+Acked-by: Julien Grall <julien@xen.org>
+(cherry picked from commit e263eeaf71b961d0d6f987bf7a33c8517be1bae5)
+
+diff --git a/xen/arch/arm/domctl.c b/xen/arch/arm/domctl.c
+index 75c3df602a95..6c9a3f9920fa 100644
+--- a/xen/arch/arm/domctl.c
++++ b/xen/arch/arm/domctl.c
+@@ -104,7 +104,7 @@ long arch_do_domctl(struct xen_domctl *domctl, struct domain *d,
+         if ( rc )
+             return rc;
+ 
+-        rc = xsm_bind_pt_irq(XSM_HOOK, d, bind);
++        rc = xsm_bind_pt_irq(XSM_DM_PRIV, d, bind);
+         if ( rc )
+             return rc;
+ 
+@@ -140,7 +140,7 @@ long arch_do_domctl(struct xen_domctl *domctl, struct domain *d,
+         if ( irq != virq )
+             return -EINVAL;
+ 
+-        rc = xsm_unbind_pt_irq(XSM_HOOK, d, bind);
++        rc = xsm_unbind_pt_irq(XSM_DM_PRIV, d, bind);
+         if ( rc )
+             return rc;
+ 
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index 3fb298912604..9f8e8de5b599 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -575,7 +575,7 @@ long arch_do_domctl(
+         if ( !is_hvm_domain(d) )
+             break;
+ 
+-        ret = xsm_bind_pt_irq(XSM_HOOK, d, bind);
++        ret = xsm_bind_pt_irq(XSM_DM_PRIV, d, bind);
+         if ( ret )
+             break;
+ 
+@@ -613,7 +613,7 @@ long arch_do_domctl(
+         if ( !is_hvm_domain(d) )
+             break;
+ 
+-        ret = xsm_unbind_pt_irq(XSM_HOOK, d, bind);
++        ret = xsm_unbind_pt_irq(XSM_DM_PRIV, d, bind);
+         if ( ret )
+             break;
+ 
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 858e72a05aad..a5359f3814ae 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -437,6 +437,8 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+     }
+ 
+     case XEN_DOMCTL_ioport_mapping:
++    case XEN_DOMCTL_bind_pt_irq:
++    case XEN_DOMCTL_unbind_pt_irq:
+         ret = arch_do_domctl(op, d, u_domctl);
+         goto domctl_out_unlock_domonly;
+ 
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index e4ae29e88ddc..dfff3b52b3c3 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -168,13 +168,11 @@ static XSM_INLINE int cf_check xsm_domctl(
+     switch ( cmd )
+     {
+     case XEN_DOMCTL_bind_pt_irq:
+-    case XEN_DOMCTL_unbind_pt_irq:
+-        return xsm_default_action(XSM_DM_PRIV, current->domain, d);
+-
+     case XEN_DOMCTL_getdomaininfo:
+     case XEN_DOMCTL_get_domain_state:
+     case XEN_DOMCTL_ioport_mapping:
+     case XEN_DOMCTL_memory_mapping:
++    case XEN_DOMCTL_unbind_pt_irq:
+         ASSERT_UNREACHABLE();
+         return -EILSEQ;
+ 
+@@ -541,14 +539,14 @@ static XSM_INLINE int cf_check xsm_unmap_domain_pirq(
+ static XSM_INLINE int cf_check xsm_bind_pt_irq(
+     XSM_DEFAULT_ARG struct domain *d, struct xen_domctl_bind_pt_irq *bind)
+ {
+-    XSM_ASSERT_ACTION(XSM_HOOK);
++    XSM_ASSERT_ACTION(XSM_DM_PRIV);
+     return xsm_default_action(action, current->domain, d);
+ }
+ 
+ static XSM_INLINE int cf_check xsm_unbind_pt_irq(
+     XSM_DEFAULT_ARG struct domain *d, struct xen_domctl_bind_pt_irq *bind)
+ {
+-    XSM_ASSERT_ACTION(XSM_HOOK);
++    XSM_ASSERT_ACTION(XSM_DM_PRIV);
+     return xsm_default_action(action, current->domain, d);
+ }
+ 
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index f094e05640c4..a5280e33343e 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -683,10 +683,12 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
+         return avc_current_has_perm(ssidref, SECCLASS_DOMAIN, DOMAIN__CREATE, NULL);
+ 
+     /* These have individual XSM hooks and don't make it here. */
++    case XEN_DOMCTL_bind_pt_irq:
+     case XEN_DOMCTL_getdomaininfo:
+     case XEN_DOMCTL_get_domain_state:
+     case XEN_DOMCTL_ioport_mapping:
+     case XEN_DOMCTL_memory_mapping:
++    case XEN_DOMCTL_unbind_pt_irq:
+         ASSERT_UNREACHABLE();
+         return -EILSEQ;
+ 
+@@ -697,9 +699,6 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
+     case XEN_DOMCTL_set_target:
+     case XEN_DOMCTL_vm_event_op:
+ 
+-    /* These have individual XSM hooks (arch/../domctl.c) */
+-    case XEN_DOMCTL_bind_pt_irq:
+-    case XEN_DOMCTL_unbind_pt_irq:
+ #ifdef CONFIG_X86
+     /* These have individual XSM hooks (arch/x86/domctl.c) */
+     case XEN_DOMCTL_shadow_op:

@@ -1,0 +1,121 @@
+From 83f644192726c4ee87977d9135840b67f04d56cd Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 4 Jun 2026 21:37:32 +0100
+Subject: domctl/XSM: pass full struct xen_domctl to xsm_domctl()
+
+Subsequently some sub-ops will want to inspect their sub-sub-ops. Plus
+this way we don't need to pass SSIDref separately anymore for
+domain_create.
+
+This is part of XSA-492.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Daniel P. Smith <dpsmith@apertussolutions.com>
+(cherry picked from commit 83f0e11ed16b5ceb42e47dcaab5afd35583ec5d7)
+
+diff --git a/xen/arch/x86/mm/paging.c b/xen/arch/x86/mm/paging.c
+index 65455a686787..3545ddd1d080 100644
+--- a/xen/arch/x86/mm/paging.c
++++ b/xen/arch/x86/mm/paging.c
+@@ -735,7 +735,7 @@ long do_paging_domctl_cont(
+     if ( d == NULL )
+         return -ESRCH;
+ 
+-    ret = xsm_domctl(XSM_OTHER, d, op.cmd, 0 /* SSIDref not applicable */);
++    ret = xsm_domctl(XSM_OTHER, d, &op);
+     if ( !ret )
+     {
+         if ( domctl_lock_acquire() )
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 396874acf2f7..7a450c87ff94 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -526,9 +526,7 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+         break;
+     }
+ 
+-    ret = xsm_domctl(XSM_OTHER, d, op->cmd,
+-                     /* SSIDRef only applicable for cmd == createdomain */
+-                     op->u.createdomain.ssidref);
++    ret = xsm_domctl(XSM_OTHER, d, op);
+     if ( ret )
+         goto domctl_out_unlock_domonly;
+ 
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index f0cba259d79d..c469331ea85c 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -162,10 +162,10 @@ static XSM_INLINE int cf_check xsm_set_target(
+ }
+ 
+ static XSM_INLINE int cf_check xsm_domctl(
+-    XSM_DEFAULT_ARG struct domain *d, unsigned int cmd, uint32_t ssidref)
++    XSM_DEFAULT_ARG struct domain *d, struct xen_domctl *op)
+ {
+     XSM_ASSERT_ACTION(XSM_OTHER);
+-    switch ( cmd )
++    switch ( op->cmd )
+     {
+     case XEN_DOMCTL_bind_pt_irq:
+     case XEN_DOMCTL_getdomaininfo:
+diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
+index c8b07329aeea..4379a6e96b26 100644
+--- a/xen/include/xsm/xsm.h
++++ b/xen/include/xsm/xsm.h
+@@ -61,7 +61,7 @@ struct xsm_ops {
+     int (*sysctl_scheduler_op)(int op);
+ #endif
+     int (*set_target)(struct domain *d, struct domain *e);
+-    int (*domctl)(struct domain *d, unsigned int cmd, uint32_t ssidref);
++    int (*domctl)(struct domain *d, struct xen_domctl *op);
+     int (*sysctl)(int cmd);
+     int (*readconsole)(uint32_t clear);
+ 
+@@ -260,9 +260,9 @@ static inline int xsm_set_target(
+ }
+ 
+ static inline int xsm_domctl(xsm_default_t def, struct domain *d,
+-                             unsigned int cmd, uint32_t ssidref)
++                             struct xen_domctl *op)
+ {
+-    return alternative_call(xsm_ops.domctl, d, cmd, ssidref);
++    return alternative_call(xsm_ops.domctl, d, op);
+ }
+ 
+ static inline int xsm_sysctl(xsm_default_t def, int cmd)
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 1fa0b1a6c7fe..ca4aa9d36718 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -667,10 +667,9 @@ static int cf_check flask_set_target(struct domain *d, struct domain *t)
+     return rc;
+ }
+ 
+-static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
+-                                 uint32_t ssidref)
++static int cf_check flask_domctl(struct domain *d, struct xen_domctl *op)
+ {
+-    switch ( cmd )
++    switch ( op->cmd )
+     {
+     case XEN_DOMCTL_createdomain:
+         /*
+@@ -680,7 +679,8 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
+          * Note that d is NULL because we haven't even allocated memory for it
+          * this early in XEN_DOMCTL_createdomain.
+          */
+-        return avc_current_has_perm(ssidref, SECCLASS_DOMAIN, DOMAIN__CREATE, NULL);
++        return avc_current_has_perm(op->u.createdomain.ssidref, SECCLASS_DOMAIN,
++                                    DOMAIN__CREATE, NULL);
+ 
+     /* These have individual XSM hooks and don't make it here. */
+     case XEN_DOMCTL_bind_pt_irq:
+@@ -855,7 +855,7 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
+         return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__SET_LLC_COLORS);
+ 
+     default:
+-        return avc_unknown_permission("domctl", cmd);
++        return avc_unknown_permission("domctl", op->cmd);
+     }
+ }
+ 

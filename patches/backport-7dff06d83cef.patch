@@ -1,0 +1,94 @@
+From 7dff06d83cef9dba3780771eaac720c3c34f1877 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 4 Jun 2026 21:37:32 +0100
+Subject: domctl: handle XEN_DOMCTL_get_domain_state without acquiring domctl
+ lock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+get_domain_state() uses its own locking. Thus, with caller side locking
+irrelevant, it can as well be called with the domctl lock not held.
+
+Move the handling not only ahead of acquiring the lock, but also ahead
+of the XSM check, leveraging that the sub-op has its own hook.
+
+This is part of XSA-492.
+
+Fixes: 3ad3df1bd0aa ("xen: add new domctl get_domain_state")
+Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Daniel P. Smith <dpsmith@apertussolutions.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+(cherry picked from commit eedff4bcd3d1314f098c2a151d4bb8a90c0f1820)
+
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 9fe097cc71a6..509347822c73 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -339,6 +339,14 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+ 
+         goto domctl_out_unlock_domonly;
+ 
++    case XEN_DOMCTL_get_domain_state:
++        ret = xsm_get_domain_state(XSM_XS_PRIV, d);
++        if ( !ret )
++            ret = get_domain_state(&op->u.get_domain_state, d, &op->domain);
++        if ( !ret )
++            copyback = true;
++        goto domctl_out_unlock_domonly;
++
+     default:
+         /* Everything else handled further down. */
+         break;
+@@ -868,14 +876,6 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+             ret = -EOPNOTSUPP;
+         break;
+ 
+-    case XEN_DOMCTL_get_domain_state:
+-        ret = xsm_get_domain_state(XSM_XS_PRIV, d);
+-        if ( !ret )
+-            ret = get_domain_state(&op->u.get_domain_state, d, &op->domain);
+-        if ( !ret )
+-            copyback = true;
+-        break;
+-
+     default:
+         ret = arch_do_domctl(op, d, u_domctl);
+         break;
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index dcdfa791375a..561b0784194d 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -172,10 +172,9 @@ static XSM_INLINE int cf_check xsm_domctl(
+     case XEN_DOMCTL_bind_pt_irq:
+     case XEN_DOMCTL_unbind_pt_irq:
+         return xsm_default_action(XSM_DM_PRIV, current->domain, d);
+-    case XEN_DOMCTL_get_domain_state:
+-        return xsm_default_action(XSM_XS_PRIV, current->domain, d);
+ 
+     case XEN_DOMCTL_getdomaininfo:
++    case XEN_DOMCTL_get_domain_state:
+         ASSERT_UNREACHABLE();
+         return -EILSEQ;
+ 
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 529de9d7f579..094cb7691f2b 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -684,6 +684,7 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
+ 
+     /* These have individual XSM hooks and don't make it here. */
+     case XEN_DOMCTL_getdomaininfo:
++    case XEN_DOMCTL_get_domain_state:
+         ASSERT_UNREACHABLE();
+         return -EILSEQ;
+ 
+@@ -694,7 +695,6 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
+     case XEN_DOMCTL_memory_mapping:
+     case XEN_DOMCTL_set_target:
+     case XEN_DOMCTL_vm_event_op:
+-    case XEN_DOMCTL_get_domain_state:
+ 
+     /* These have individual XSM hooks (arch/../domctl.c) */
+     case XEN_DOMCTL_bind_pt_irq:

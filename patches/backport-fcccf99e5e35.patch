@@ -1,0 +1,135 @@
+From fcccf99e5e359017ff461588cbe573fbfc6e34ae Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Thu, 4 Jun 2026 21:37:32 +0100
+Subject: domctl: handle XEN_DOMCTL_set_target without acquiring domctl lock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The only locking required here is that between checking d->target and
+setting it. To avoid the need for an explicit lock, use cmpxchgptr() to
+update d->target.
+
+Move the handling not only ahead of acquiring the lock, but also ahead
+of the XSM check, leveraging that the sub-op has its own hook.
+
+This is part of XSA-492.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Daniel P. Smith <dpsmith@apertussolutions.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+(cherry picked from commit 4a93d1fb4f7f1231159688d428f7362d35d32ef6)
+
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 6abe5858fdc5..36ef760c2cec 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -505,6 +505,30 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+     }
+ #endif
+ 
++    case XEN_DOMCTL_set_target:
++    {
++        struct domain *e = get_domain_by_id(op->u.set_target.target);
++
++        ret = -ESRCH;
++        if ( !e )
++            goto domctl_out_unlock_domonly;
++
++        if ( d == e )
++            ret = -EINVAL;
++        else if ( !is_hvm_domain(e) )
++            ret = -EOPNOTSUPP;
++        else
++            ret = xsm_set_target(XSM_PRIV, d, e);
++
++        /* Hold reference on @e until we destroy @d. */
++        if ( !ret && cmpxchgptr(&d->target, NULL, e) )
++            ret = -EINVAL;
++
++        if ( ret )
++            put_domain(e);
++        goto domctl_out_unlock_domonly;
++    }
++
+     case XEN_DOMCTL_vm_event_op:
+         if ( op->u.vm_event_op.op == XEN_VM_EVENT_GET_VERSION )
+         {
+@@ -844,36 +868,6 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+         domain_set_time_offset(d, op->u.settimeoffset.time_offset_seconds);
+         break;
+ 
+-    case XEN_DOMCTL_set_target:
+-    {
+-        struct domain *e;
+-
+-        ret = -ESRCH;
+-        e = get_domain_by_id(op->u.set_target.target);
+-        if ( e == NULL )
+-            break;
+-
+-        ret = -EINVAL;
+-        if ( (d == e) || (d->target != NULL) )
+-        {
+-            put_domain(e);
+-            break;
+-        }
+-
+-        ret = -EOPNOTSUPP;
+-        if ( is_hvm_domain(e) )
+-            ret = xsm_set_target(XSM_HOOK, d, e);
+-        if ( ret )
+-        {
+-            put_domain(e);
+-            break;
+-        }
+-
+-        /* Hold reference on @e until we destroy @d. */
+-        d->target = e;
+-        break;
+-    }
+-
+     case XEN_DOMCTL_subscribe:
+         d->suspend_evtchn = op->u.subscribe.port;
+         break;
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index d06006cb94ea..d45d8b64fcc0 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -150,7 +150,7 @@ static XSM_INLINE int cf_check xsm_sysctl_scheduler_op(XSM_DEFAULT_ARG int cmd)
+ static XSM_INLINE int cf_check xsm_set_target(
+     XSM_DEFAULT_ARG struct domain *d, struct domain *e)
+ {
+-    XSM_ASSERT_ACTION(XSM_HOOK);
++    XSM_ASSERT_ACTION(XSM_PRIV);
+     return xsm_default_action(action, current->domain, NULL);
+ }
+ 
+@@ -170,6 +170,7 @@ static XSM_INLINE int cf_check xsm_domctl(
+     case XEN_DOMCTL_ioport_permission:
+     case XEN_DOMCTL_irq_permission:
+     case XEN_DOMCTL_memory_mapping:
++    case XEN_DOMCTL_set_target:
+     case XEN_DOMCTL_unbind_pt_irq:
+         ASSERT_UNREACHABLE();
+         return -EILSEQ;
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 9ab185ff4167..ae33e324bdf1 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -705,14 +705,11 @@ static int cf_check flask_domctl(struct domain *d, struct xen_domctl *op)
+     case XEN_DOMCTL_ioport_permission:
+     case XEN_DOMCTL_irq_permission:
+     case XEN_DOMCTL_memory_mapping:
++    case XEN_DOMCTL_set_target:
+     case XEN_DOMCTL_unbind_pt_irq:
+         ASSERT_UNREACHABLE();
+         return -EILSEQ;
+ 
+-    /* These have individual XSM hooks (common/domctl.c) */
+-    case XEN_DOMCTL_set_target:
+-        return 0;
+-
+     case XEN_DOMCTL_destroydomain:
+         return current_has_perm(d, SECCLASS_DOMAIN, DOMAIN__DESTROY);
+ 

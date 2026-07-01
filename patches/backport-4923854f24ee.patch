@@ -1,0 +1,89 @@
+From 4923854f24ee782e9e5a725e5f40f167c2a5227b Mon Sep 17 00:00:00 2001
+From: Jan Beulich <jbeulich@suse.com>
+Date: Tue, 30 Jun 2026 14:53:42 +0200
+Subject: domctl: correct return value of XEN_DOMCTL_[gs]etvcpuaffinity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+cpumask_to_xenctl_bitmap() may return errors. Clearing the error indicator
+of an earlier such call by a (successful) later call is misleading the
+caller. For "set", keep setting soft affinity if the hard affinity copy-
+back fails; only accumulate respective errors.
+
+While fiddling with return values, also drop a redundant clearing of
+"ret". This eliminates a Misra C:2012 rule 2.2 ("There shall be no dead
+code") violation.
+
+Fixes: 6e4ecc6d5884 ("sched: DOMCTL_*vcpuaffinity works with hard and soft affinity")
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+master commit: 6a21252a742ec021a814e124b88d273da37065db
+master date: 2026-06-18 10:02:34 +0200
+
+diff --git a/xen/common/sched/core.c b/xen/common/sched/core.c
+index 08175215a0ec..4a4c36c29170 100644
+--- a/xen/common/sched/core.c
++++ b/xen/common/sched/core.c
+@@ -1691,7 +1691,7 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
+ {
+     struct vcpu *v;
+     const struct sched_unit *unit;
+-    int ret = 0;
++    int ret = 0, hret = 0;
+ 
+     if ( vcpuaff->vcpu >= d->max_vcpus )
+         return -EINVAL;
+@@ -1729,19 +1729,17 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
+         if ( vcpuaff->flags & XEN_VCPUAFFINITY_FORCE )
+             vcpu_temporary_affinity(v, NR_CPUS, VCPU_AFFINITY_OVERRIDE);
+ 
+-        ret = 0;
+-
+         /*
+          * We both set a new affinity and report back to the caller what
+          * the scheduler will be effectively using.
+          */
+         if ( vcpuaff->flags & XEN_VCPUAFFINITY_HARD )
+         {
+-            ret = xenctl_bitmap_to_bitmap(cpumask_bits(new_affinity),
+-                                          &vcpuaff->cpumap_hard, nr_cpu_ids);
+-            if ( !ret )
+-                ret = vcpu_set_hard_affinity(v, new_affinity);
+-            if ( ret )
++            hret = xenctl_bitmap_to_bitmap(cpumask_bits(new_affinity),
++                                           &vcpuaff->cpumap_hard, nr_cpu_ids);
++            if ( !hret )
++                hret = vcpu_set_hard_affinity(v, new_affinity);
++            if ( hret )
+                 goto setvcpuaffinity_out;
+ 
+             /*
+@@ -1749,7 +1747,7 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
+              * cpupool's online mask and the new hard affinity.
+              */
+             cpumask_and(new_affinity, online, unit->cpu_hard_affinity);
+-            ret = cpumask_to_xenctl_bitmap(&vcpuaff->cpumap_hard, new_affinity);
++            hret = cpumask_to_xenctl_bitmap(&vcpuaff->cpumap_hard, new_affinity);
+         }
+         if ( vcpuaff->flags & XEN_VCPUAFFINITY_SOFT )
+         {
+@@ -1786,14 +1784,14 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
+     else
+     {
+         if ( vcpuaff->flags & XEN_VCPUAFFINITY_HARD )
+-            ret = cpumask_to_xenctl_bitmap(&vcpuaff->cpumap_hard,
+-                                           unit->cpu_hard_affinity);
++            hret = cpumask_to_xenctl_bitmap(&vcpuaff->cpumap_hard,
++                                            unit->cpu_hard_affinity);
+         if ( vcpuaff->flags & XEN_VCPUAFFINITY_SOFT )
+             ret = cpumask_to_xenctl_bitmap(&vcpuaff->cpumap_soft,
+                                            unit->cpu_soft_affinity);
+     }
+ 
+-    return ret;
++    return hret ?: ret;
+ }
+ 
+ bool alloc_affinity_masks(struct affinity_masks *affinity)
