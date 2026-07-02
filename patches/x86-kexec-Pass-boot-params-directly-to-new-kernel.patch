@@ -1,0 +1,58 @@
+From 50b720adab024a182d097a95b58784b241c9d652 Mon Sep 17 00:00:00 2001
+From: Kevin Lampis <kevin.lampis@citrix.com>
+Date: Mon, 15 Jun 2026 17:47:39 +0100
+Subject: [PATCH v2 6/7] x86/kexec: Pass boot params directly to new kernel
+
+When doing kexec on an EFI image there is no purgatory and kexec_reloc.S
+hands off straight to the new kernel. To facilitate this the Linux
+kernel boot params need to be passed through %rsi.
+
+Signed-off-by: Kevin Lampis <kevin.lampis@citrix.com>
+diff --git a/xen/arch/x86/include/asm/machine_kexec.h b/xen/arch/x86/include/asm/machine_kexec.h
+index d4880818c1d9..bca6dca99154 100644
+--- a/xen/arch/x86/include/asm/machine_kexec.h
++++ b/xen/arch/x86/include/asm/machine_kexec.h
+@@ -7,7 +7,7 @@
+ 
+ extern void kexec_reloc(unsigned long reloc_code, unsigned long reloc_pt,
+                         unsigned long ind_maddr, unsigned long entry_maddr,
+-                        unsigned long flags);
++                        unsigned long flags, unsigned long arg);
+ 
+ extern const char kexec_reloc_end[];
+ 
+diff --git a/xen/arch/x86/machine_kexec.c b/xen/arch/x86/machine_kexec.c
+index 038670922d47..67ca3e09bece 100644
+--- a/xen/arch/x86/machine_kexec.c
++++ b/xen/arch/x86/machine_kexec.c
+@@ -199,7 +199,8 @@ void machine_kexec(struct kexec_image *image)
+ 
+     kexec_reloc(page_to_maddr(image->control_code_page),
+                 page_to_maddr(image->aux_page),
+-                image->head, image->entry_maddr, reloc_flags);
++                image->head, image->entry_maddr, reloc_flags,
++                image->entry_arg);
+ }
+ 
+ int machine_kexec_get(xen_kexec_range_t *range)
+diff --git a/xen/arch/x86/x86_64/kexec_reloc.S b/xen/arch/x86/x86_64/kexec_reloc.S
+index 7f44686ec19a..560d43e23fca 100644
+--- a/xen/arch/x86/x86_64/kexec_reloc.S
++++ b/xen/arch/x86/x86_64/kexec_reloc.S
+@@ -33,6 +33,7 @@ FUNC(kexec_reloc, PAGE_SIZE)
+         /* %rdx - indirection page maddr */
+         /* %rcx - entry maddr (%rbp) */
+         /* %r8 - flags */
++        /* %r9 - entry arg */
+ 
+         movq    %rcx, %rbp
+ 
+@@ -89,6 +90,8 @@ FUNC(kexec_reloc, PAGE_SIZE)
+         movq    %rdx, %rdi
+         call    relocate_pages
+ 
++        movq    %r9, %rsi /* entry arg */
++
+         /* Need to switch to 32-bit mode? */
+         testq   $KEXEC_RELOC_FLAG_COMPAT, %r8
+         jnz     .L_call_32_bit

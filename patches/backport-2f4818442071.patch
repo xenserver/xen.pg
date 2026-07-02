@@ -1,0 +1,383 @@
+From 2f48184420719fca58bdc4c3c4728b93f9faae6c Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 11 Jun 2026 18:02:21 +0100
+Subject: xen/kexec: Drop the obsolete v1 hypercall
+ implementation
+
+The v1 interface was declared obsolete in Xen 4.4 (2013) when kexec in Xen was
+overhauled.
+
+The only known user of the v1 interface was the classic-xen fork of Linux.
+Linux PVOps does not interact with Xen kexec directly, delegating it entirely
+to userspace (i.e. kexec-tools).  Xen support in kexec-tools was part of this
+work, and uses the "new" interface.
+
+As such, there's no way to test changes to the old interface any more.
+
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Acked-by: Oleksii Kurochko <oleksii.kurochko@gmail.com>
+diff --git a/xen/common/kexec.c b/xen/common/kexec.c
+index 227ac4bb56ca..a1b25fd67ef2 100644
+--- a/xen/common/kexec.c
++++ b/xen/common/kexec.c
+@@ -911,206 +911,6 @@ static int kexec_load_slot(struct kexec_image *kimage)
+     return 0;
+ }
+ 
+-static uint16_t kexec_load_v1_arch(void)
+-{
+-#ifdef CONFIG_X86
+-    return is_pv_32bit_domain(hardware_domain) ? EM_386 : EM_X86_64;
+-#else
+-    return EM_NONE;
+-#endif
+-}
+-
+-static int kexec_segments_add_segment(unsigned int *nr_segments,
+-                                      xen_kexec_segment_t *segments,
+-                                      mfn_t mfn)
+-{
+-    paddr_t maddr = mfn_to_maddr(mfn);
+-    unsigned int n = *nr_segments;
+-
+-    /* Need a new segment? */
+-    if ( n == 0
+-         || segments[n-1].dest_maddr + segments[n-1].dest_size != maddr )
+-    {
+-        n++;
+-        if ( n > KEXEC_SEGMENT_MAX )
+-            return -EINVAL;
+-        *nr_segments = n;
+-
+-        set_xen_guest_handle(segments[n-1].buf.h, NULL);
+-        segments[n-1].buf_size = 0;
+-        segments[n-1].dest_maddr = maddr;
+-        segments[n-1].dest_size = 0;
+-    }
+-
+-    return 0;
+-}
+-
+-static int kexec_segments_from_ind_page(mfn_t mfn,
+-                                        unsigned int *nr_segments,
+-                                        xen_kexec_segment_t *segments,
+-                                        bool compat)
+-{
+-    void *page;
+-    kimage_entry_t *entry;
+-    int ret = 0;
+-
+-    page = map_domain_page(mfn);
+-
+-    /*
+-     * Walk the indirection page list, adding destination pages to the
+-     * segments.
+-     */
+-    for ( entry = page; ; )
+-    {
+-        unsigned long ind;
+-
+-        ind = kimage_entry_ind(entry, compat);
+-        mfn = kimage_entry_mfn(entry, compat);
+-
+-        switch ( ind )
+-        {
+-        case IND_DESTINATION:
+-            ret = kexec_segments_add_segment(nr_segments, segments, mfn);
+-            if ( ret < 0 )
+-                goto done;
+-            break;
+-        case IND_INDIRECTION:
+-            unmap_domain_page(page);
+-            entry = page = map_domain_page(mfn);
+-            continue;
+-        case IND_DONE:
+-            goto done;
+-        case IND_SOURCE:
+-            if ( *nr_segments == 0 )
+-            {
+-                ret = -EINVAL;
+-                goto done;
+-            }
+-            segments[*nr_segments-1].dest_size += PAGE_SIZE;
+-            break;
+-        default:
+-            ret = -EINVAL;
+-            goto done;
+-        }
+-        entry = kimage_entry_next(entry, compat);
+-    }
+-done:
+-    unmap_domain_page(page);
+-    return ret;
+-}
+-
+-static int kexec_do_load_v1(xen_kexec_load_v1_t *load, int compat)
+-{
+-    struct kexec_image *kimage = NULL;
+-    xen_kexec_segment_t *segments;
+-    uint16_t arch;
+-    unsigned int nr_segments = 0;
+-    mfn_t ind_mfn = maddr_to_mfn(load->image.indirection_page);
+-    int ret;
+-
+-    arch = kexec_load_v1_arch();
+-    if ( arch == EM_NONE )
+-        return -ENOSYS;
+-
+-    segments = xmalloc_array(xen_kexec_segment_t, KEXEC_SEGMENT_MAX);
+-    if ( segments == NULL )
+-        return -ENOMEM;
+-
+-    /*
+-     * Work out the image segments (destination only) from the
+-     * indirection pages.
+-     *
+-     * This is needed so we don't allocate pages that will overlap
+-     * with the destination when building the new set of indirection
+-     * pages below.
+-     */
+-    ret = kexec_segments_from_ind_page(ind_mfn, &nr_segments, segments, compat);
+-    if ( ret < 0 )
+-        goto error;
+-
+-    ret = kimage_alloc(&kimage, load->type, arch, load->image.start_address,
+-                       nr_segments, segments);
+-    if ( ret < 0 )
+-        goto error;
+-
+-    /*
+-     * Build a new set of indirection pages in the native format.
+-     *
+-     * This walks the guest provided indirection pages a second time.
+-     * The guest could have altered then, invalidating the segment
+-     * information constructed above.  This will only result in the
+-     * resulting image being potentially unrelocatable.
+-     */
+-    ret = kimage_build_ind(kimage, ind_mfn, compat);
+-    if ( ret < 0 )
+-        goto error;
+-
+-    if ( arch == EM_386 || arch == EM_X86_64 )
+-    {
+-        /*
+-         * Ensure 0 - 1 MiB is mapped and accessible by the image.
+-         *
+-         * This allows access to VGA memory and the region purgatory copies
+-         * in the crash case.
+-         */
+-        unsigned long addr;
+-
+-        for ( addr = 0; addr < MB(1); addr += PAGE_SIZE )
+-        {
+-            ret = machine_kexec_add_page(kimage, addr, addr);
+-            if ( ret < 0 )
+-                goto error;
+-        }
+-    }
+-
+-    ret = kexec_load_slot(kimage);
+-    if ( ret < 0 )
+-        goto error;
+-
+-    return 0;
+-
+-error:
+-    if ( !kimage )
+-        xfree(segments);
+-    kimage_free(kimage);
+-    return ret;
+-}
+-
+-static int kexec_load_v1(XEN_GUEST_HANDLE_PARAM(void) uarg)
+-{
+-    xen_kexec_load_v1_t load;
+-
+-    if ( unlikely(copy_from_guest(&load, uarg, 1)) )
+-        return -EFAULT;
+-
+-    return kexec_do_load_v1(&load, 0);
+-}
+-
+-static int kexec_load_v1_compat(XEN_GUEST_HANDLE_PARAM(void) uarg)
+-{
+-#ifdef CONFIG_COMPAT
+-    compat_kexec_load_v1_t compat_load;
+-    xen_kexec_load_v1_t load;
+-
+-    if ( unlikely(copy_from_guest(&compat_load, uarg, 1)) )
+-        return -EFAULT;
+-
+-    /* This is a bit dodgy, load.image is inside load,
+-     * but XLAT_kexec_load (which is automatically generated)
+-     * doesn't translate load.image (correctly)
+-     * Just copy load->type, the only other member, manually instead.
+-     *
+-     * XLAT_kexec_load(&load, &compat_load);
+-     */
+-    load.type = compat_load.type;
+-    XLAT_kexec_image(&load.image, &compat_load.image);
+-
+-    return kexec_do_load_v1(&load, 1);
+-#else
+-    return 0;
+-#endif
+-}
+-
+ static int kexec_load(XEN_GUEST_HANDLE_PARAM(void) uarg)
+ {
+     xen_kexec_load_t load;
+@@ -1170,34 +970,6 @@ static int kexec_do_unload(xen_kexec_unload_t *unload)
+     return 0;
+ }
+ 
+-static int kexec_unload_v1(XEN_GUEST_HANDLE_PARAM(void) uarg)
+-{
+-    xen_kexec_load_v1_t load;
+-    xen_kexec_unload_t unload;
+-
+-    if ( copy_from_guest(&load, uarg, 1) )
+-        return -EFAULT;
+-
+-    unload.type = load.type;
+-    return kexec_do_unload(&unload);
+-}
+-
+-static int kexec_unload_v1_compat(XEN_GUEST_HANDLE_PARAM(void) uarg)
+-{
+-#ifdef CONFIG_COMPAT
+-    compat_kexec_load_v1_t compat_load;
+-    xen_kexec_unload_t unload;
+-
+-    if ( copy_from_guest(&compat_load, uarg, 1) )
+-        return -EFAULT;
+-
+-    unload.type = compat_load.type;
+-    return kexec_do_unload(&unload);
+-#else
+-    return 0;
+-#endif
+-}
+-
+ static int kexec_unload(XEN_GUEST_HANDLE_PARAM(void) uarg)
+ {
+     xen_kexec_unload_t unload;
+@@ -1246,20 +1018,6 @@ static int do_kexec_op_internal(unsigned long op,
+             ret = kexec_get_range(uarg);
+         break;
+ 
+-    case KEXEC_CMD_kexec_load_v1:
+-        if ( compat )
+-            ret = kexec_load_v1_compat(uarg);
+-        else
+-            ret = kexec_load_v1(uarg);
+-        break;
+-
+-    case KEXEC_CMD_kexec_unload_v1:
+-        if ( compat )
+-            ret = kexec_unload_v1_compat(uarg);
+-        else
+-            ret = kexec_unload_v1(uarg);
+-        break;
+-
+     case KEXEC_CMD_kexec:
+         ret = kexec_exec(uarg);
+         break;
+diff --git a/xen/include/public/kexec.h b/xen/include/public/kexec.h
+index 40d79e936b86..abb2a49238f1 100644
+--- a/xen/include/public/kexec.h
++++ b/xen/include/public/kexec.h
+@@ -41,10 +41,6 @@
+ 
+ #include "xen.h"
+ 
+-#if defined(__i386__) || defined(__x86_64__)
+-#define KEXEC_XEN_NO_PAGES 17
+-#endif
+-
+ /*
+  * Prototype for this hypercall is:
+  *  int kexec_op(unsigned long cmd, void *args)
+@@ -66,24 +62,6 @@
+ #define KEXEC_TYPE_DEFAULT 0
+ #define KEXEC_TYPE_CRASH   1
+ 
+-
+-/* The kexec implementation for Xen allows the user to load two
+- * types of kernels, KEXEC_TYPE_DEFAULT and KEXEC_TYPE_CRASH.
+- * All data needed for a kexec reboot is kept in one xen_kexec_image_t
+- * per "instance". The data mainly consists of machine address lists to pages
+- * together with destination addresses. The data in xen_kexec_image_t
+- * is passed to the "code page" which is one page of code that performs
+- * the final relocations before jumping to the new kernel.
+- */
+-
+-typedef struct xen_kexec_image {
+-#if defined(__i386__) || defined(__x86_64__)
+-    unsigned long page_list[KEXEC_XEN_NO_PAGES];
+-#endif
+-    unsigned long indirection_page;
+-    unsigned long start_address;
+-} xen_kexec_image_t;
+-
+ /*
+  * Perform kexec having previously loaded a kexec or kdump kernel
+  * as appropriate.
+@@ -109,16 +87,11 @@ typedef struct xen_kexec_exec {
+ } xen_kexec_exec_t;
+ 
+ /*
+- * Load/Unload kernel image for kexec or kdump.
+- * type  == KEXEC_TYPE_DEFAULT or KEXEC_TYPE_CRASH [in]
+- * image == relocation information for kexec (ignored for unload) [in]
++ * Obsolete since Xen 4.4.  Removed in Xen 4.23
++ *
++#define KEXEC_CMD_kexec_load_v1         1
++#define KEXEC_CMD_kexec_unload_v1       2
+  */
+-#define KEXEC_CMD_kexec_load_v1         1 /* obsolete since 0x00040400 */
+-#define KEXEC_CMD_kexec_unload_v1       2 /* obsolete since 0x00040400 */
+-typedef struct xen_kexec_load_v1 {
+-    int type;
+-    xen_kexec_image_t image;
+-} xen_kexec_load_v1_t;
+ 
+ #define KEXEC_RANGE_MA_CRASH      0 /* machine address and size of crash area */
+ #define KEXEC_RANGE_MA_XEN        1 /* machine address and size of Xen itself */
+@@ -149,7 +122,6 @@ typedef struct xen_kexec_range {
+     unsigned long start;
+ } xen_kexec_range_t;
+ 
+-#if __XEN_INTERFACE_VERSION__ >= 0x00040400
+ /*
+  * A contiguous chunk of a kexec image and it's destination machine
+  * address.
+@@ -224,15 +196,6 @@ typedef struct xen_kexec_status {
+ } xen_kexec_status_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_kexec_status_t);
+ 
+-#else /* __XEN_INTERFACE_VERSION__ < 0x00040400 */
+-
+-#define KEXEC_CMD_kexec_load KEXEC_CMD_kexec_load_v1
+-#define KEXEC_CMD_kexec_unload KEXEC_CMD_kexec_unload_v1
+-#define xen_kexec_load xen_kexec_load_v1
+-#define xen_kexec_load_t xen_kexec_load_v1_t
+-
+-#endif
+-
+ #endif /* _XEN_PUBLIC_KEXEC_H */
+ 
+ /*
+diff --git a/xen/include/xlat.lst b/xen/include/xlat.lst
+index 9d08dcc4bb11..33dc8e2b2a4a 100644
+--- a/xen/include/xlat.lst
++++ b/xen/include/xlat.lst
+@@ -127,7 +127,6 @@
+ ?	hypfs_dirlistentry		hypfs.h
+ 
+ ?	kexec_exec			kexec.h
+-!	kexec_image			kexec.h
+ !	kexec_range			kexec.h
+ 
+ !	add_to_physmap			memory.h

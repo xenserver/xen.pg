@@ -1,0 +1,138 @@
+From 372095ae1fc39280eaa80210ce5b6d99d9772aa5 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Mon, 15 Jun 2026 16:29:51 +0100
+Subject: [PATCH v2 4/7] x86/kexec: Support non-page-aligned kexec segments
+
+With Secure Boot, userspace passes in the entire kernel loaded for
+verification purposes. However, the kernel's startup32 function needs to
+be aligned (e.g. to 16 MiB) and this results in the start of the segment
+not being page-aligned (depending on where the startup32 function lands
+in the kernel binary). Relax this restriction in Xen to support this
+use case.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Kevin Lampis <kevin.lampis@citrix.com>
+diff --git a/xen/common/kimage.c b/xen/common/kimage.c
+index 0e6f9ac4d52a..0809c68392ca 100644
+--- a/xen/common/kimage.c
++++ b/xen/common/kimage.c
+@@ -724,12 +724,14 @@ static int kimage_load_crash_segment(struct kexec_image *image,
+      */
+     paddr_t dest;
+     unsigned long sbytes, dbytes;
++    unsigned int dest_offset;
+     int ret = 0;
+     unsigned long src_offset = 0;
+ 
+     sbytes = segment->buf_size;
+     dbytes = segment->dest_size;
+     dest = segment->dest_maddr;
++    dest_offset = segment->dest_offset;
+ 
+     while ( dbytes )
+     {
+@@ -739,24 +741,26 @@ static int kimage_load_crash_segment(struct kexec_image *image,
+ 
+         dest_mfn = dest >> PAGE_SHIFT;
+ 
+-        dchunk = PAGE_SIZE;
++        dchunk = PAGE_SIZE - dest_offset;
+         schunk = min(dchunk, sbytes);
+ 
+         dest_va = map_domain_page(_mfn(dest_mfn));
+-        if ( !dest_va )
+-            return -EINVAL;
+ 
+-        ret = copy_from_guest_offset(dest_va, segment->h, src_offset, schunk);
+-        memset(dest_va + schunk, 0, dchunk - schunk);
++        if ( dest_offset )
++            memset(dest_va, 0, dest_offset);
++        ret = copy_from_guest_offset(dest_va + dest_offset, segment->h,
++                                     src_offset, schunk);
++        memset(dest_va + dest_offset + schunk, 0, dchunk - schunk);
+ 
+         unmap_domain_page(dest_va);
+         if ( ret )
+             return -EFAULT;
+ 
+-        dbytes -= dchunk;
++        dbytes -= dchunk + dest_offset;
+         sbytes -= schunk;
+-        dest += dchunk;
++        dest += dchunk + dest_offset;
+         src_offset += schunk;
++        dest_offset = 0;
+     }
+ 
+     return 0;
+@@ -797,6 +801,26 @@ int kimage_alloc(struct kexec_image **rimage, uint8_t type, uint16_t arch,
+                  uint32_t nr_segments, struct kimage_segment *segment)
+ {
+     int result;
++    unsigned int i;
++
++    for ( i = 0; i < nr_segments; i++ )
++    {
++        paddr_t mend;
++
++        /*
++         * Stash the destination offset-in-page for use when copying the
++         * buffer later.
++         */
++        segment[i].dest_offset = PAGE_OFFSET(segment[i].dest_maddr);
++
++        /*
++         * Align down the start address to page size and align up the end
++         * address to page size.
++         */
++        mend = segment[i].dest_maddr + segment[i].dest_size;
++        segment[i].dest_maddr &= PAGE_MASK;
++        segment[i].dest_size = ROUNDUP(mend, PAGE_SIZE) - segment[i].dest_maddr;
++    }
+ 
+     switch( type )
+     {
+@@ -823,9 +847,11 @@ static void kimage_calc_one_digest(struct sha2_256_state *ctx,
+ {
+     paddr_t dest;
+     unsigned long sbytes;
++    unsigned int dest_offset;
+ 
+     sbytes = segment->buf_size;
+     dest = segment->dest_maddr;
++    dest_offset = segment->dest_offset;
+ 
+     while ( sbytes )
+     {
+@@ -835,15 +861,16 @@ static void kimage_calc_one_digest(struct sha2_256_state *ctx,
+ 
+         dest_mfn = dest >> PAGE_SHIFT;
+ 
+-        dchunk = PAGE_SIZE;
++        dchunk = PAGE_SIZE - dest_offset;
+         schunk = min(dchunk, sbytes);
+ 
+         dest_va = map_domain_page(_mfn(dest_mfn));
+-        sha2_256_update(ctx, dest_va, schunk);
++        sha2_256_update(ctx, dest_va + dest_offset, schunk);
+         unmap_domain_page(dest_va);
+ 
+         sbytes -= schunk;
+-        dest += dchunk;
++        dest += dchunk + dest_offset;
++        dest_offset = 0;
+     }
+ }
+ 
+diff --git a/xen/include/xen/kimage.h b/xen/include/xen/kimage.h
+index 52953a1e0fdf..d78d95d1ab26 100644
+--- a/xen/include/xen/kimage.h
++++ b/xen/include/xen/kimage.h
+@@ -23,6 +23,7 @@ struct kimage_segment {
+     uint64_t buf_size;
+     uint64_t dest_maddr;
+     uint64_t dest_size;
++    unsigned int dest_offset;
+ };
+ 
+ struct kexec_image {

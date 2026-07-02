@@ -1,0 +1,347 @@
+From 8ecf092e82ad03285aede97b4d75b624a454f565 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Mon, 15 Jun 2026 17:46:41 +0100
+Subject: [PATCH v2 5/7] x86/kexec: Implement new EFI load type
+
+Add new EFI load type for kexec. This load type is suitable for use when
+Secure Boot is enabled.
+
+When this load type is used, the caller should not pass purgatory as one
+of the kexec segments. Instead, Xen will prepare any glue code needed
+internally.
+
+The new load type only works for Linux bzImages using the x86 64-bit
+boot protocol documented at linux/Documentation/arch/x86/boot.rst.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Gerald Elder-Vass <gerald.elder-vass@cloud.com>
+Signed-off-by: Kevin Lampis <kevin.lampis@citrix.com>
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index d9cbd249cc72..b8fbf1a13e3d 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -78,6 +78,7 @@ obj-y += hpet.o
+ obj-y += vm_event.o
+ obj-y += xstate.o
+ obj-y += sbat_data.o
++obj-$(CONFIG_KEXEC) += kexec.o
+ 
+ ifneq ($(CONFIG_PV_SHIM_EXCLUSIVE),y)
+ obj-y += domctl.o
+diff --git a/xen/arch/x86/include/asm/bzimage.h b/xen/arch/x86/include/asm/bzimage.h
+index 8c54b21d0685..e363cc9a4f84 100644
+--- a/xen/arch/x86/include/asm/bzimage.h
++++ b/xen/arch/x86/include/asm/bzimage.h
+@@ -47,4 +47,9 @@ struct __packed bzimage_header {
+         uint32_t        payload_length;
+     };
+ 
++static inline size_t kernel_alignment_offset(void)
++{
++    return offsetof(struct bzimage_header, kernel_alignment);
++}
++
+ #endif /* __X86_BZIMAGE_H__ */
+diff --git a/xen/arch/x86/include/asm/kexec.h b/xen/arch/x86/include/asm/kexec.h
+new file mode 100644
+index 000000000000..04b7eee4c1a9
+--- /dev/null
++++ b/xen/arch/x86/include/asm/kexec.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef ASM_X86_KEXEC_H
++#define ASM_X86_KEXEC_H
++
++struct kexec_image;
++int64_t kimage_find_kernel_entry_maddr(struct kexec_image *image);
++
++#endif /* ASM_X86_KEXEC_H */
+diff --git a/xen/arch/x86/kexec.c b/xen/arch/x86/kexec.c
+new file mode 100644
+index 000000000000..eb31fe2e470b
+--- /dev/null
++++ b/xen/arch/x86/kexec.c
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <xen/kexec.h>
++#include <xen/kimage.h>
++#include <xen/guest_access.h>
++#include <asm/bzimage.h>
++
++/*
++ * Find the entry point to the new kernel, we need to map the crash region into
++ * memory in order to read the kernel header.
++ */
++#define KERNEL_SEGMENT_IDX 0
++int64_t kimage_find_kernel_entry_maddr(struct kexec_image *image)
++{
++    uint64_t dest_maddr;
++    uint32_t alignment, magic;
++    uint16_t version;
++    void *dest_va;
++    const struct bzimage_header *hdr;
++    int setup_sects;
++    size_t kern16_size;
++
++    dest_maddr = image->segments[KERNEL_SEGMENT_IDX].dest_maddr +
++                 image->segments[KERNEL_SEGMENT_IDX].dest_offset;
++
++    dest_va = map_domain_page(maddr_to_mfn(dest_maddr));
++
++    hdr = (const struct bzimage_header *)dest_va;
++    magic = hdr->header;
++    version = hdr->version;
++    alignment = hdr->kernel_alignment;
++    setup_sects = hdr->setup_sects == 0 ? 4 : hdr->setup_sects;
++    kern16_size = (setup_sects + 1 )  * 512;
++
++    unmap_domain_page(dest_va);
++
++    if ( magic != 0x53726448 || version < 0x0202 )
++        return -EINVAL;
++
++    /*
++     * Ensure the kernel alignment is a valid LOAD_PHYSICAL_ADDR,
++     * which ranges from 0x200000 (2MiB) to 0x1000000 (16MiB) on 64-bit systems
++     * as defined in the kernel x86 Kconfig
++     */
++    if ( alignment % 0x200000 != 0 ||
++         alignment < 0x200000 ||
++         alignment > 0x1000000 )
++        return -EINVAL;
++
++    if ( (dest_maddr + kern16_size) % alignment )
++    {
++        printk(XENLOG_WARNING "kernel dest addr 0x%lx is not aligend to 0x%x\n",
++               dest_maddr + kern16_size, alignment);
++        return -EINVAL;
++    }
++
++    return dest_maddr + kern16_size + 0x200;
++}
+diff --git a/xen/common/kexec.c b/xen/common/kexec.c
+index 59d1f5466983..f1cfe69f36d2 100644
+--- a/xen/common/kexec.c
++++ b/xen/common/kexec.c
+@@ -760,6 +760,7 @@ static int kexec_load_get_bits(int type, int *base, int *bit)
+         *bit = KEXEC_FLAG_DEFAULT_POS;
+         break;
+     case KEXEC_TYPE_CRASH:
++    case KEXEC_TYPE_CRASH_EFI:
+         *base = KEXEC_IMAGE_CRASH_BASE;
+         *bit = KEXEC_FLAG_CRASH_POS;
+         break;
+@@ -859,6 +860,7 @@ static int kexec_exec(XEN_GUEST_HANDLE_PARAM(void) uarg)
+         break;
+ 
+     case KEXEC_TYPE_CRASH:
++    case KEXEC_TYPE_CRASH_EFI:
+         kexec_crash(CRASHREASON_KEXECCMD); /* Does not return */
+         break;
+     }
+@@ -960,6 +962,13 @@ static int kexec_load(XEN_GUEST_HANDLE_PARAM(void) uarg)
+ 
+     kimage_calc_digest(kimage, kimage->digest);
+ 
++    if ( load.type == KEXEC_TYPE_CRASH_EFI )
++    {
++        ret = kimage_efi_setup(kimage, load.parameters);
++        if ( ret < 0 )
++            goto error;
++    }
++
+     ret = kexec_load_slot(kimage);
+     if ( ret < 0 )
+         goto error;
+diff --git a/xen/common/kimage.c b/xen/common/kimage.c
+index 0809c68392ca..73357615808f 100644
+--- a/xen/common/kimage.c
++++ b/xen/common/kimage.c
+@@ -19,6 +19,7 @@
+ #include <xen/mm.h>
+ #include <xen/spinlock.h>
+ 
++#include <asm/kexec.h>
+ #include <asm/page.h>
+ 
+ /*
+@@ -104,29 +105,6 @@ static int do_kimage_alloc(struct kexec_image **rimage, paddr_t entry,
+     INIT_PAGE_LIST_HEAD(&image->dest_pages);
+     INIT_PAGE_LIST_HEAD(&image->unusable_pages);
+ 
+-    /*
+-     * Verify we have good destination addresses.  The caller is
+-     * responsible for making certain we don't attempt to load the new
+-     * image into invalid or reserved areas of RAM.  This just
+-     * verifies it is an address we can use.
+-     *
+-     * Since the kernel does everything in page size chunks ensure the
+-     * destination addresses are page aligned.  Too many special cases
+-     * crop of when we don't do this.  The most insidious is getting
+-     * overlapping destination addresses simply because addresses are
+-     * changed to page size granularity.
+-     */
+-    result = -EADDRNOTAVAIL;
+-    for ( i = 0; i < nr_segments; i++ )
+-    {
+-        paddr_t mstart, mend;
+-
+-        mstart = image->segments[i].dest_maddr;
+-        mend   = mstart + image->segments[i].dest_size;
+-        if ( (mstart & ~PAGE_MASK) || (mend & ~PAGE_MASK) )
+-            goto out;
+-    }
+-
+     /*
+      * Verify our destination addresses do not overlap.  If we allowed
+      * overlapping destination addresses through very weird things can
+@@ -212,9 +190,10 @@ static int kimage_normal_alloc(struct kexec_image **rimage, paddr_t entry,
+                            KEXEC_TYPE_DEFAULT);
+ }
+ 
+-static int kimage_crash_alloc(struct kexec_image **rimage, paddr_t entry,
+-                              unsigned long nr_segments,
+-                              struct kimage_segment *segments)
++static int do_kimage_crash_alloc(struct kexec_image **rimage, paddr_t entry,
++                                 unsigned long nr_segments,
++                                 struct kimage_segment *segments,
++                                 uint8_t type)
+ {
+     unsigned long i;
+ 
+@@ -248,8 +227,28 @@ static int kimage_crash_alloc(struct kexec_image **rimage, paddr_t entry,
+     }
+ 
+     /* Allocate and initialize a controlling structure. */
+-    return do_kimage_alloc(rimage, entry, nr_segments, segments,
+-                           KEXEC_TYPE_CRASH);
++    return do_kimage_alloc(rimage, entry, nr_segments, segments, type);
++}
++
++static int kimage_crash_alloc(struct kexec_image **rimage, paddr_t entry,
++                              unsigned long nr_segments,
++                              struct kimage_segment *segments)
++{
++    /* Verify we have a valid entry point */
++    if ( (entry < kexec_crash_area.start)
++         || (entry > kexec_crash_area.start + kexec_crash_area.size))
++        return -EADDRNOTAVAIL;
++
++    return do_kimage_crash_alloc(rimage, entry, nr_segments, segments,
++                                 KEXEC_TYPE_CRASH);
++}
++
++static int kimage_crash_alloc_efi(struct kexec_image **rimage, paddr_t entry,
++                                  unsigned long nr_segments,
++                                  struct kimage_segment *segments)
++{
++    return do_kimage_crash_alloc(rimage, entry, nr_segments, segments,
++                                 KEXEC_TYPE_CRASH_EFI);
+ }
+ 
+ static int kimage_is_destination_range(struct kexec_image *image,
+@@ -421,6 +420,7 @@ struct page_info *kimage_alloc_control_page(struct kexec_image *image,
+         pages = kimage_alloc_normal_control_page(image, memflags);
+         break;
+     case KEXEC_TYPE_CRASH:
++    case KEXEC_TYPE_CRASH_EFI:
+         pages = kimage_alloc_crash_control_page(image);
+         break;
+     }
+@@ -780,6 +780,7 @@ static int kimage_load_segment(struct kexec_image *image,
+             result = kimage_load_normal_segment(image, segment);
+             break;
+         case KEXEC_TYPE_CRASH:
++        case KEXEC_TYPE_CRASH_EFI:
+             result = kimage_load_crash_segment(image, segment);
+             break;
+         }
+@@ -830,6 +831,10 @@ int kimage_alloc(struct kexec_image **rimage, uint8_t type, uint16_t arch,
+     case KEXEC_TYPE_CRASH:
+         result = kimage_crash_alloc(rimage, entry_maddr, nr_segments, segment);
+         break;
++    case KEXEC_TYPE_CRASH_EFI:
++        result = kimage_crash_alloc_efi(rimage, entry_maddr,
++                                        nr_segments, segment);
++        break;
+     default:
+         result = -EINVAL;
+         break;
+@@ -1038,6 +1043,20 @@ done:
+     return ret;
+ }
+ 
++int kimage_efi_setup(struct kexec_image *image, uint64_t parameters)
++{
++    int64_t rip;
++
++    rip = kimage_find_kernel_entry_maddr(image);
++    if ( rip < 0 )
++        return -EINVAL;
++
++    image->entry_arg = parameters;
++    image->entry_maddr = rip;
++
++    return 0;
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/include/public/kexec.h b/xen/include/public/kexec.h
+index abb2a49238f1..5341ddcda289 100644
+--- a/xen/include/public/kexec.h
++++ b/xen/include/public/kexec.h
+@@ -54,13 +54,16 @@
+  * - kexec into a regular kernel, very similar to a standard reboot
+  *   - KEXEC_TYPE_DEFAULT is used to specify this type
+  * - kexec into a special "crash kernel", aka kexec-on-panic
+- *   - KEXEC_TYPE_CRASH is used to specify this type
++ *   - KEXEC_TYPE_CRASH or KEXEC_TYPE_CRASH_EFI are used to specify this type
++ *   - in case of KEXEC_TYPE_CRASH_EFI the first segment will point to the
++ *     full kernel to load and entry point will point to boot params
+  *   - parts of our system may be broken at kexec-on-panic time
+  *     - the code should be kept as simple and self-contained as possible
+  */
+ 
+ #define KEXEC_TYPE_DEFAULT 0
+ #define KEXEC_TYPE_CRASH   1
++#define KEXEC_TYPE_CRASH_EFI 3
+ 
+ /*
+  * Perform kexec having previously loaded a kexec or kdump kernel
+@@ -167,7 +170,11 @@ typedef struct xen_kexec_load {
+         XEN_GUEST_HANDLE(xen_kexec_segment_t) h;
+         uint64_t _pad;
+     } segments;
+-    uint64_t entry_maddr; /* image entry point machine address. */
++    /* image entry point machine address or parameters in case of EFI. */
++    union {
++        uint64_t entry_maddr;
++        uint64_t parameters;
++    };
+ } xen_kexec_load_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_kexec_load_t);
+ 
+diff --git a/xen/include/xen/kimage.h b/xen/include/xen/kimage.h
+index d78d95d1ab26..4324544ea5af 100644
+--- a/xen/include/xen/kimage.h
++++ b/xen/include/xen/kimage.h
+@@ -48,6 +48,7 @@ struct kexec_image {
+     paddr_t next_crash_page;
+ 
+     uint8_t digest[SHA2_256_DIGEST_SIZE];
++    uint64_t entry_arg;
+ };
+ 
+ int kimage_alloc(struct kexec_image **rimage, uint8_t type, uint16_t arch,
+@@ -66,6 +67,7 @@ int kimage_build_ind(struct kexec_image *image, mfn_t ind_mfn,
+ bool kimage_verify_digest(const struct kexec_image *image);
+ void kimage_calc_digest(const struct kexec_image *image,
+                         uint8_t digest[SHA2_256_DIGEST_SIZE]);
++int kimage_efi_setup(struct kexec_image *image, uint64_t parameters);
+ 
+ #endif /* __ASSEMBLY__ */
+ 

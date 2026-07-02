@@ -1,0 +1,157 @@
+From e5cc454c3c8b5b182b06dd59946f80ea703ed970 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Mon, 15 Jun 2026 16:08:28 +0100
+Subject: [PATCH v2 1/7] x86/kexec: add digest checks
+
+To support UEFI Secure Boot we must check that the kexec data has not
+changed between signature verification and actual execution.
+However, this is also a good check to perform generally.
+
+During kexec load, calculate a digest over all the kexec segments. This
+digest is stored and verified again later prior to entering the image.
+
+For now, only kexec crash images are supported.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: Kevin Lampis <kevin.lampis@citrix.com>
+diff --git a/xen/common/kexec.c b/xen/common/kexec.c
+index c3f828881ead..7ca93b718a0a 100644
+--- a/xen/common/kexec.c
++++ b/xen/common/kexec.c
+@@ -389,6 +389,12 @@ void kexec_crash(enum crash_reason reason)
+     if ( !test_bit(KEXEC_IMAGE_CRASH_BASE + pos, &kexec_flags) )
+         return;
+ 
++    if ( !kimage_verify_digest(kexec_image[KEXEC_IMAGE_CRASH_BASE + pos]) )
++    {
++        printk(XENLOG_ERR "kexec digest failed, aborting kexec crash transfer\n");
++        return;
++    }
++
+     kexecing = true;
+ 
+     if ( kexec_common_shutdown() != 0 )
+@@ -943,6 +949,8 @@ static int kexec_load(XEN_GUEST_HANDLE_PARAM(void) uarg)
+     if ( ret < 0 )
+         goto error;
+ 
++    kimage_calc_digest(kimage, kimage->digest);
++
+     ret = kexec_load_slot(kimage);
+     if ( ret < 0 )
+         goto error;
+diff --git a/xen/common/kimage.c b/xen/common/kimage.c
+index 2f8ada5a07a2..f00d226d1723 100644
+--- a/xen/common/kimage.c
++++ b/xen/common/kimage.c
+@@ -817,6 +817,79 @@ int kimage_alloc(struct kexec_image **rimage, uint8_t type, uint16_t arch,
+     return result;
+ }
+ 
++static void kimage_calc_one_digest(struct sha2_256_state *ctx,
++                                   xen_kexec_segment_t *segment)
++{
++    paddr_t dest;
++    unsigned long sbytes;
++
++    sbytes = segment->buf_size;
++    dest = segment->dest_maddr;
++
++    while ( sbytes )
++    {
++        unsigned long dest_mfn;
++        void *dest_va;
++        size_t schunk, dchunk;
++
++        dest_mfn = dest >> PAGE_SHIFT;
++
++        dchunk = PAGE_SIZE;
++        schunk = min(dchunk, sbytes);
++
++        dest_va = map_domain_page(_mfn(dest_mfn));
++        sha2_256_update(ctx, dest_va, schunk);
++        unmap_domain_page(dest_va);
++
++        sbytes -= schunk;
++        dest += dchunk;
++    }
++}
++
++void kimage_calc_digest(const struct kexec_image *image,
++                        uint8_t digest[SHA2_256_DIGEST_SIZE])
++{
++    struct sha2_256_state ctx;
++    unsigned int s;
++
++    if ( image->type == KEXEC_TYPE_DEFAULT )
++    {
++        /* TODO implement digest calculation for normal kexec */
++        return;
++    }
++
++    sha2_256_init(&ctx);
++
++    for ( s = 0; s < image->nr_segments; s++ )
++        kimage_calc_one_digest(&ctx, &image->segments[s]);
++
++    sha2_256_final(&ctx, digest);
++}
++
++bool kimage_verify_digest(const struct kexec_image *image)
++{
++    uint8_t digest[SHA2_256_DIGEST_SIZE];
++
++    if ( image->type == KEXEC_TYPE_DEFAULT )
++    {
++        /* TODO implement digest check for normal kexec */
++        return true;
++    }
++
++    kimage_calc_digest(image, digest);
++
++    if ( memcmp(digest, image->digest, sizeof(digest)) != 0 )
++    {
++        printk(XENLOG_WARNING "kexec digest mismatch:\n"
++               "  expected %" STR(SHA2_256_DIGEST_SIZE) "phN\n"
++               "       got %" STR(SHA2_256_DIGEST_SIZE) "phN\n",
++               image->digest, digest);
++        return false;
++    }
++
++    return true;
++}
++
+ int kimage_load_segments(struct kexec_image *image)
+ {
+     int s;
+diff --git a/xen/include/xen/kimage.h b/xen/include/xen/kimage.h
+index 348f07f5c881..9a87b1d78e1a 100644
+--- a/xen/include/xen/kimage.h
++++ b/xen/include/xen/kimage.h
+@@ -11,6 +11,7 @@
+ 
+ #include <xen/list.h>
+ #include <xen/mm.h>
++#include <xen/sha2.h>
+ #include <public/kexec.h>
+ 
+ #define KEXEC_SEGMENT_MAX 16
+@@ -37,6 +38,8 @@ struct kexec_image {
+ 
+     /* Address of next control page to allocate for crash kernels. */
+     paddr_t next_crash_page;
++
++    uint8_t digest[SHA2_256_DIGEST_SIZE];
+ };
+ 
+ int kimage_alloc(struct kexec_image **rimage, uint8_t type, uint16_t arch,
+@@ -52,6 +55,9 @@ mfn_t kimage_entry_mfn(kimage_entry_t *entry, bool compat);
+ unsigned long kimage_entry_ind(kimage_entry_t *entry, bool compat);
+ int kimage_build_ind(struct kexec_image *image, mfn_t ind_mfn,
+                      bool compat);
++bool kimage_verify_digest(const struct kexec_image *image);
++void kimage_calc_digest(const struct kexec_image *image,
++                        uint8_t digest[SHA2_256_DIGEST_SIZE]);
+ 
+ #endif /* __ASSEMBLY__ */
+ 
