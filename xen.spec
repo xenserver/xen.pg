@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 6
+%global hv_rel 7
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -919,6 +919,11 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Jul 06 2026 Roger Pau Monné <roger.pau@citrix.com> - 4.21.1-7
+- Fix for XSA-491 CVE-2026-42487
+- Fix for XSA-492 CVE-2026-42489 CVE-2026-42490
+- Fix for XSA-494 CVE-2026-42488
+
 * Wed Jun 24 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.21.1-6
 - Fixes to kexec crash transition in FRED mode and with offline CPUs
 - Fix in FRED mode to NMI handling when interrupting userspace
