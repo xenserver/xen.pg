@@ -1,0 +1,131 @@
+From: Jan Beulich <jbeulich@suse.com>
+Subject: vNUMA: close race window in domain cleanup
+
+Calling vnuma_destroy() without any locking can race the handling of both
+XENMEM_get_vnumainfo and XEN_DOMCTL_setvnumainfo. While the latter is,
+without Flask, strictly only exposed to the control domain, the former
+can also be invoked by a stubdom DM or a de-privileged DM running in the
+control domain. Isolate the logic used by XEN_DOMCTL_setvnumainfo into a
+new helper function, which then is also used from domain_kill(). While
+doing so also move the vnuma_destroy() invocation out of the locked
+region.
+
+With d->vnuma properly cleared by domain_kill(), XENMEM_get_vnumainfo now
+really only needs to check for the field being NULL. That check needs
+repeating, though, after re-acquiring the lock.
+
+This is CVE-2026-62429 / XSA-502.
+
+Fixes: 9695014966b5 ("xen: vnuma topology and subop hypercalls")
+Reported-by: Teddy Astie <teddy.astie@vates.tech>
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index 13a1674ce4aa..cd87597f3164 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -955,7 +955,7 @@ int domain_kill(struct domain *d)
+         d->is_dying = DOMDYING_dying;
+         spin_barrier(&d->domain_lock);
+         argo_destroy(d);
+-        vnuma_destroy(d->vnuma);
++        vnuma_replace(d, NULL);
+         domain_set_outstanding_pages(d, 0);
+         /* fallthrough */
+     case DOMDYING_dying:
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 96ca55a421e8..8702ee6c09ad 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -153,7 +153,7 @@ void domctl_lock_release(void)
+     spin_unlock(&current->domain->hypercall_deadlock_mutex);
+ }
+ 
+-void vnuma_destroy(struct vnuma_info *vnuma)
++static void vnuma_destroy(struct vnuma_info *vnuma)
+ {
+     if ( vnuma )
+     {
+@@ -165,6 +165,19 @@ void vnuma_destroy(struct vnuma_info *vnuma)
+     }
+ }
+ 
++/* Overwrite (replace) vnuma topology for a domain. */
++void vnuma_replace(struct domain *d, struct vnuma_info *vnuma)
++{
++    struct vnuma_info *old;
++
++    write_lock(&d->vnuma_rwlock);
++    old = d->vnuma;
++    d->vnuma = vnuma;
++    write_unlock(&d->vnuma_rwlock);
++
++    vnuma_destroy(old);
++}
++
+ /*
+  * Allocates memory for vNUMA, **vnuma should be NULL.
+  * Caller has to make sure that domain has max_pages
+@@ -854,12 +867,7 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+             break;
+         }
+ 
+-        /* overwrite vnuma topology for domain. */
+-        write_lock(&d->vnuma_rwlock);
+-        vnuma_destroy(d->vnuma);
+-        d->vnuma = vnuma;
+-        write_unlock(&d->vnuma_rwlock);
+-
++        vnuma_replace(d, vnuma);
+         break;
+     }
+ 
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index a15e5580f34a..d063f649a120 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -1759,12 +1759,24 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+             goto vnumainfo_out;
+         }
+ 
++        read_lock(&d->vnuma_rwlock);
++
++        /*
++         * Check d->vnuma again after re-acquiring the lock as we can race
++         * with domain destruction.
++         */
++        if ( !d->vnuma )
++        {
++            ASSERT(d->is_dying);
++            read_unlock(&d->vnuma_rwlock);
++            rc = -ESRCH;
++            goto vnumainfo_out;
++        }
++
+         /*
+          * Check if vnuma info has changed and if the allocated arrays
+          * are not big enough.
+          */
+-        read_lock(&d->vnuma_rwlock);
+-
+         if ( dom_vnodes < d->vnuma->nr_vnodes ||
+              dom_vranges < d->vnuma->nr_vmemranges ||
+              dom_vcpus < d->max_vcpus )
+diff --git a/xen/include/xen/domain.h b/xen/include/xen/domain.h
+index 0de9cbc1696d..ed7401e889f6 100644
+--- a/xen/include/xen/domain.h
++++ b/xen/include/xen/domain.h
+@@ -146,9 +146,10 @@ struct vnuma_info {
+ };
+ 
+ #ifndef CONFIG_PV_SHIM_EXCLUSIVE
+-void vnuma_destroy(struct vnuma_info *vnuma);
++void vnuma_replace(struct domain *d, struct vnuma_info *vnuma);
+ #else
+-static inline void vnuma_destroy(struct vnuma_info *vnuma) { ASSERT(!vnuma); }
++static inline void vnuma_replace(struct domain *d, struct vnuma_info *vnuma)
++{ ASSERT(!vnuma); }
+ #endif
+ 
+ extern bool vmtrace_available;
