@@ -1,0 +1,169 @@
+From: Syed Abdul Khaliq <abdul@bugqore.com>
+Subject: libfsimage/iso9660: harden Rock Ridge SUSP parsing against malformed lengths
+
+The directory and Rock Ridge / SUSP walk in iso9660_dir() derives several
+lengths directly from attacker-controlled on-disk fields without validating
+them.  libfsimage is used by pygrub, which parses the filesystem of an
+untrusted guest disk image from dom0, so these are reachable across a trust
+boundary.
+
+Five related problems are addressed:
+
+  * The directory record loop advances by
+
+        idr = (char *)idr + idr->length.l
+
+    and only stops on length.l == 0.  A record whose length is smaller than
+    the fixed part of the on-disk layout cannot hold its own mandatory
+    fields, yet the body still reads name_len/extent/size and computes the
+    System Use area length from it.  Require length to cover at least the
+    fixed record (sizeof(*idr) - sizeof(idr->name)) before entering the body.
+
+    This is CVE-2026-42494.
+
+  * The System Use area length is computed before the inner loop as
+
+        rr_len = idr->length.l - idr->name_len.l
+                 - sizeof(struct iso_directory_record) + sizeof(idr->name);
+
+    in unsigned arithmetic.  If length.l is smaller than name_len.l plus the
+    fixed record size, rr_len underflows to a huge value and the whole SUSP
+    walk runs off the directory buffer.  Guard the subtraction and treat such
+    records as having no System Use area.
+
+    This is CVE-2026-42495.
+
+  * Inside the loop, each entry is consumed with
+
+        rr_len -= rr_ptr.rr->len;
+        rr_ptr.ptr += rr_ptr.rr->len;
+
+    with no lower or upper bound on the entry's own len byte.  A len of 0
+    spins forever; a len greater than the remaining rr_len underflows it and
+    walks past the buffer.  Validate 4 <= len <= rr_len at the top of the
+    loop and stop on violation: a structurally broken entry stream cannot be
+    advanced reliably, so continuing is not meaningful.
+
+    This is CVE-2026-62423.
+
+  * The NM handler subtracted the 5-byte SUSP/NM header from len without a
+    lower-bound check, underflowing name_len (the original report).  The
+    generic check above only guarantees len >= 4; NM has an extra flags byte,
+    so keep an NM-specific len >= 5 check.
+
+    This is CVE-2026-62424.
+
+  * The CE continuation resets rr_ptr/rr_len from ce.offset and ce.size, both
+    image-controlled, into the fixed single-sector RRCONT_BUF with no bounds
+    check.  Reject a window that does not fit in the buffer.
+
+    This is CVE-2026-62425.
+
+This is XSA-497.
+
+Signed-off-by: Syed Abdul Khaliq <abdul@bugqore.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/tools/libfsimage/iso9660/fsys_iso9660.c b/tools/libfsimage/iso9660/fsys_iso9660.c
+index 6e767357bfdc..b1e543afd3ba 100644
+--- a/tools/libfsimage/iso9660/fsys_iso9660.c
++++ b/tools/libfsimage/iso9660/fsys_iso9660.c
+@@ -180,7 +180,15 @@ iso9660_dir (fsi_file_t *ffi, char *dirname)
+ 	  extent++;
+ 
+ 	  idr = (struct iso_directory_record *)DIRREC;
+-	  for (; idr->length.l > 0;
++	  /*
++	   *  length is taken verbatim from the (untrusted) image.  A record
++	   *  shorter than the fixed part of the on-disk layout cannot hold its
++	   *  own mandatory fields (name_len, extent, size, ...), which the loop
++	   *  body reads below; stop the walk rather than dereference past it.
++	   */
++	  for (; idr->length.l >= sizeof(*idr) - sizeof(idr->name)
++		 && idr->length.l
++		    >= sizeof(*idr) - sizeof(idr->name) + idr->name_len.l;
+ 	       idr = (struct iso_directory_record *)((char *)idr + idr->length.l) )
+ 	    {
+ 	      const char *name = (const char *)idr->name;
+@@ -201,21 +209,39 @@ iso9660_dir (fsi_file_t *ffi, char *dirname)
+ 		}
+ 
+ 	      /*
+-	       *  Parse Rock-Ridge extension
++	       *  Parse Rock-Ridge extension.
++	       *
++	       *  length and name_len are taken verbatim from the (untrusted)
++	       *  image.  Reject a record whose name would already overrun the
++	       *  fixed on-disk layout, so that the System Use area length does
++	       *  not underflow to a huge value below.
+ 	       */
+-	      rr_len = (idr->length.l - idr->name_len.l
+-			- sizeof(struct iso_directory_record)
+-			+ sizeof(idr->name));
++	      if (idr->length.l < idr->name_len.l
++		  + sizeof(struct iso_directory_record) - sizeof(idr->name))
++		rr_len = 0;
++	      else
++		rr_len = (idr->length.l - idr->name_len.l
++			  - sizeof(struct iso_directory_record)
++			  + sizeof(idr->name));
+ 	      rr_ptr.ptr = ((char *)idr + idr->name_len.l
+ 			    + sizeof(struct iso_directory_record)
+ 			    - sizeof(idr->name));
+-	      if (rr_ptr.i & 1)
++	      if ((rr_ptr.i & 1) && rr_len)
+ 		rr_ptr.i++, rr_len--;
+ 	      ce_ptr = NULL;
+ 	      rr_flag = RR_FLAG_NM | RR_FLAG_PX /*| RR_FLAG_SL*/;
+ 
+ 	      while (rr_len >= 4)
+ 		{
++		  /*
++		   * A SUSP entry is at least 4 bytes (signature, length,
++		   * version) and must fit in the remaining System Use area.
++		   * A shorter or overlong len is unparseable: stop, rather
++		   * than spin forever (len == 0) or underflow rr_len in the
++		   * advance below (len > rr_len).
++		   */
++		  if (rr_ptr.rr->len < 4 || rr_ptr.rr->len > rr_len)
++		    break;
+ 		  if (rr_ptr.rr->version != 1)
+ 		    {
+ #ifndef STAGE1_5
+@@ -236,9 +262,17 @@ iso9660_dir (fsi_file_t *ffi, char *dirname)
+ 			    rr_flag &= rr_ptr.rr->u.rr.flags.l;
+ 			  break;
+ 			case RRMAGIC('N', 'M'):
+-			  name = (const char *)rr_ptr.rr->u.nm.name;
+-			  name_len = rr_ptr.rr->len - (4+sizeof(struct NM));
+-			  rr_flag &= ~RR_FLAG_NM;
++			  /*
++			   * The generic check above only guarantees len >= 4;
++			   * NM additionally has a flags byte, so len must be at
++			   * least 5 for name_len not to underflow.
++			   */
++			  if (rr_ptr.rr->len >= (4+sizeof(struct NM)))
++			    {
++			      name = (const char *)rr_ptr.rr->u.nm.name;
++			      name_len = rr_ptr.rr->len - (4+sizeof(struct NM));
++			      rr_flag &= ~RR_FLAG_NM;
++			    }
+ 			  break;
+ 			case RRMAGIC('P', 'X'):
+ 			  if (rr_ptr.rr->len >= (4+sizeof(struct PX)))
+@@ -339,6 +373,15 @@ iso9660_dir (fsi_file_t *ffi, char *dirname)
+ 			  memcpy(NAME_BUF, name, name_len);
+ 			  name = (const char *)NAME_BUF;
+ 			}
++		      /*
++		       * offset and size are image-controlled; the loaded
++		       * continuation lives in a single-sector buffer.  Bail
++		       * out if the referenced window does not fit inside it.
++		       */
++		      if (ce_ptr->u.ce.offset.l >= ISO_SECTOR_SIZE
++			  || ce_ptr->u.ce.size.l
++			     > ISO_SECTOR_SIZE - ce_ptr->u.ce.offset.l)
++			break;
+ 		      rr_ptr.ptr = (char *)RRCONT_BUF + ce_ptr->u.ce.offset.l;
+ 		      rr_len = ce_ptr->u.ce.size.l;
+ 		      if (!iso9660_devread(ffi, ce_ptr->u.ce.extent.l, 0, ISO_SECTOR_SIZE, (char *)RRCONT_BUF))
