@@ -1,0 +1,60 @@
+From b3fe7bd3bf6c2ac7324ea0b33ca6afc38d81f159 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Fri, 10 Jul 2026 15:18:12 +0200
+Subject: x86/viridian: ensure count is always set when starting a timer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Otherwise in periodic mode a division by 0 would happen on the second call
+to start_stimer() when using periodic mode.
+
+Note that the HyperV specification states: "Writing the value zero to the
+Count register will stop the counter, thereby disabling the timer,
+independent of the setting of AutoEnable in the configuration register."
+so a timer with a 0 count should never be in the enabled state.
+
+This is XSA-504 / CVE-2026-62431.
+
+Fixes: 26fba3c85571 ("viridian: add implementation of synthetic timers")
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/hvm/viridian/time.c b/xen/arch/x86/hvm/viridian/time.c
+index 9311858d63c0..15f629af0f39 100644
+--- a/xen/arch/x86/hvm/viridian/time.c
++++ b/xen/arch/x86/hvm/viridian/time.c
+@@ -155,6 +155,14 @@ static void start_stimer(struct viridian_stimer *vs)
+         printk(XENLOG_G_INFO "%pv: VIRIDIAN STIMER%u: enabled\n", v,
+                stimerx);
+ 
++    if ( !vs->count )
++    {
++        gprintk(XENLOG_ERR, "VIRIDIAN STIMER started with 0 count\n");
++        ASSERT_UNREACHABLE();
++        domain_crash(v->domain);
++        return;
++    }
++
+     if ( vs->config.periodic )
+     {
+         /*
+@@ -364,7 +372,7 @@ int viridian_time_wrmsr(struct vcpu *v, uint32_t idx, uint64_t val)
+ 
+         vs->config.as_uint64 = val;
+ 
+-        if ( !vs->config.sintx )
++        if ( !vs->config.sintx || !vs->count )
+             vs->config.enable = 0;
+ 
+         if ( vs->config.enable )
+@@ -575,6 +583,9 @@ void viridian_time_load_vcpu_ctxt(
+ 
+         vs->config.as_uint64 = ctxt->stimer_config_msr[i];
+         vs->count = ctxt->stimer_count_msr[i];
++        if ( !vs->config.sintx || !vs->count )
++            /* Reject enabling with a zero sintx or count fields. */
++            vs->config.enable = 0;
+     }
+ }
+ 
