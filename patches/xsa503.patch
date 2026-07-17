@@ -1,0 +1,69 @@
+From 92885076ed6ea3a652b0143ce112582f91932b13 Mon Sep 17 00:00:00 2001
+From: Roger Pau Monne <roger.pau@citrix.com>
+Date: Fri, 10 Jul 2026 15:05:50 +0200
+Subject: x86/vrtc: fix race in CMOS index checking
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Do the checking for a valid CMOS index while holding the spinlock,
+otherwise the value could be changed by the guest after having been
+checked.
+
+This is XSA-503 / CVE-2026-62430.
+
+Fixes: 34bef0e6d5f4 ("hvm: Add locking to platform timers.")
+Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/hvm/rtc.c b/xen/arch/x86/hvm/rtc.c
+index e33a8ec10821..79ca3281e01e 100644
+--- a/xen/arch/x86/hvm/rtc.c
++++ b/xen/arch/x86/hvm/rtc.c
+@@ -647,13 +647,21 @@ static int update_in_progress(RTCState *s)
+     return 0;
+ }
+ 
+-static uint32_t rtc_ioport_read(RTCState *s)
++static bool rtc_ioport_read(RTCState *s, uint32_t *val)
+ {
+     int ret;
+     struct domain *d = vrtc_domain(s);
+ 
++    *val = ~0;
++
+     spin_lock(&s->lock);
+ 
++    if ( s->hw.cmos_index >= RTC_CMOS_SIZE )
++    {
++        spin_unlock(&s->lock);
++        return false;
++    }
++
+     switch ( s->hw.cmos_index )
+     {
+     case RTC_SECONDS:
+@@ -693,7 +701,9 @@ static uint32_t rtc_ioport_read(RTCState *s)
+ 
+     spin_unlock(&s->lock);
+ 
+-    return ret;
++    *val = ret;
++
++    return true;
+ }
+ 
+ static int cf_check handle_rtc_io(
+@@ -718,11 +728,8 @@ static int cf_check handle_rtc_io(
+         *val = 0xff;
+         return X86EMUL_OKAY;
+     }
+-    else if ( vrtc->hw.cmos_index < RTC_CMOS_SIZE )
+-    {
+-        *val = rtc_ioport_read(vrtc);
++    else if ( rtc_ioport_read(vrtc, val) )
+         return X86EMUL_OKAY;
+-    }
+ 
+     return X86EMUL_UNHANDLEABLE;
+ }
