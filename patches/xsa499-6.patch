@@ -1,0 +1,202 @@
+From: Jan Beulich <jbeulich@suse.com>
+Subject: sysctl/XSM: drop .resource_{,un}plug_core() hooks
+
+Integrate the checking with xsm_sysctl(), now that it has the full op
+struct passed. As a positive side effect, permissions are then checked at
+the same early point with and without Flask. Note that these were x86-
+only, i.e. some dead/unreachable code gets eliminated for (in particular)
+Arm.
+
+This is part of CVE-2026-62426 / XSA-499.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-By: Daniel P. Smith <dpsmith@apertussolutions.com>
+
+diff --git a/xen/arch/x86/sysctl.c b/xen/arch/x86/sysctl.c
+index 1b04947516bb..43e00e78ccbc 100644
+--- a/xen/arch/x86/sysctl.c
++++ b/xen/arch/x86/sysctl.c
+@@ -117,20 +117,17 @@ long arch_do_sysctl(
+     {
+         unsigned int cpu = sysctl->u.cpu_hotplug.cpu;
+         unsigned int op  = sysctl->u.cpu_hotplug.op;
+-        bool plug;
+         long (*fn)(void *data);
+         void *hcpu;
+ 
+         switch ( op )
+         {
+         case XEN_SYSCTL_CPU_HOTPLUG_ONLINE:
+-            plug = true;
+             fn = cpu_up_helper;
+             hcpu = _p(cpu);
+             break;
+ 
+         case XEN_SYSCTL_CPU_HOTPLUG_OFFLINE:
+-            plug = false;
+             fn = cpu_down_helper;
+             hcpu = _p(cpu);
+             break;
+@@ -150,9 +147,8 @@ long arch_do_sysctl(
+             if ( CONFIG_NR_CPUS <= 1 )
+                 /* Mimic behavior of smt_up_down_helper(). */
+                 return 0;
+-            plug = op == XEN_SYSCTL_CPU_HOTPLUG_SMT_ENABLE;
+             fn = smt_up_down_helper;
+-            hcpu = _p(plug);
++            hcpu = _p(op == XEN_SYSCTL_CPU_HOTPLUG_SMT_ENABLE);
+             break;
+ 
+         default:
+@@ -160,10 +156,6 @@ long arch_do_sysctl(
+             break;
+         }
+ 
+-        if ( !ret )
+-            ret = plug ? xsm_resource_plug_core(XSM_HOOK)
+-                       : xsm_resource_unplug_core(XSM_HOOK);
+-
+         if ( !ret )
+             ret = continue_hypercall_on_cpu(0, fn, hcpu);
+     }
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index 7bf1f85a8719..005e50ae3a6f 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -397,18 +397,6 @@ static XSM_INLINE int cf_check xsm_get_device_group(
+ }
+ #endif /* HAS_PASSTHROUGH && HAS_PCI */
+ 
+-static XSM_INLINE int cf_check xsm_resource_plug_core(XSM_DEFAULT_VOID)
+-{
+-    XSM_ASSERT_ACTION(XSM_HOOK);
+-    return xsm_default_action(action, current->domain, NULL);
+-}
+-
+-static XSM_INLINE int cf_check xsm_resource_unplug_core(XSM_DEFAULT_VOID)
+-{
+-    XSM_ASSERT_ACTION(XSM_HOOK);
+-    return xsm_default_action(action, current->domain, NULL);
+-}
+-
+ static XSM_INLINE int cf_check xsm_resource_plug_pci(
+     XSM_DEFAULT_ARG uint32_t machine_bdf)
+ {
+diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
+index f175acfb382d..80f6a917718b 100644
+--- a/xen/include/xsm/xsm.h
++++ b/xen/include/xsm/xsm.h
+@@ -124,8 +124,6 @@ struct xsm_ops {
+     int (*get_device_group)(uint32_t machine_bdf);
+ #endif
+ 
+-    int (*resource_plug_core)(void);
+-    int (*resource_unplug_core)(void);
+     int (*resource_plug_pci)(uint32_t machine_bdf);
+     int (*resource_unplug_pci)(uint32_t machine_bdf);
+     int (*resource_setup_pci)(uint32_t machine_bdf);
+@@ -519,16 +517,6 @@ static inline int xsm_resource_unplug_pci(
+     return alternative_call(xsm_ops.resource_unplug_pci, machine_bdf);
+ }
+ 
+-static inline int xsm_resource_plug_core(xsm_default_t def)
+-{
+-    return alternative_call(xsm_ops.resource_plug_core);
+-}
+-
+-static inline int xsm_resource_unplug_core(xsm_default_t def)
+-{
+-    return alternative_call(xsm_ops.resource_unplug_core);
+-}
+-
+ static inline int xsm_resource_setup_pci(
+     xsm_default_t def, uint32_t machine_bdf)
+ {
+diff --git a/xen/xsm/dummy.c b/xen/xsm/dummy.c
+index bade92f43b17..c8faf6da50e3 100644
+--- a/xen/xsm/dummy.c
++++ b/xen/xsm/dummy.c
+@@ -79,8 +79,6 @@ static const struct xsm_ops __initconst_cf_clobber dummy_ops = {
+     .get_device_group              = xsm_get_device_group,
+ #endif
+ 
+-    .resource_plug_core            = xsm_resource_plug_core,
+-    .resource_unplug_core          = xsm_resource_unplug_core,
+     .resource_plug_pci             = xsm_resource_plug_pci,
+     .resource_unplug_pci           = xsm_resource_unplug_pci,
+     .resource_setup_pci            = xsm_resource_setup_pci,
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 6e8ded5e4161..7ada71143f42 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -56,6 +56,11 @@ static int flask_deassign_dtdevice(struct domain *d, const char *dtpath);
+ #endif
+ #endif /* CONFIG_HAS_PASSTHROUGH */
+ 
++#if defined(CONFIG_SYSCTL) || defined(CONFIG_X86)
++static int flask_resource_plug_core(void);
++static int flask_resource_unplug_core(void);
++#endif
++
+ static uint32_t domain_sid(const struct domain *dom)
+ {
+     struct domain_security_struct *dsec = dom->ssid;
+@@ -911,9 +916,6 @@ static int cf_check flask_sysctl(const struct xen_sysctl *op)
+     {
+     /* These have individual XSM hooks */
+     case XEN_SYSCTL_page_offline_op:
+-#ifdef CONFIG_X86
+-    case XEN_SYSCTL_cpu_hotplug:
+-#endif
+         return 0;
+ 
+     case XEN_SYSCTL_readconsole:
+@@ -965,6 +967,23 @@ static int cf_check flask_sysctl(const struct xen_sysctl *op)
+     case XEN_SYSCTL_getdomaininfolist:
+         return flask_getdomaininfo(dom_xen);
+ 
++#ifdef CONFIG_X86
++    case XEN_SYSCTL_cpu_hotplug:
++        switch ( op->u.cpu_hotplug.op )
++        {
++        case XEN_SYSCTL_CPU_HOTPLUG_ONLINE:
++        case XEN_SYSCTL_CPU_HOTPLUG_SMT_ENABLE:
++            return flask_resource_plug_core();
++
++        case XEN_SYSCTL_CPU_HOTPLUG_OFFLINE:
++        case XEN_SYSCTL_CPU_HOTPLUG_SMT_DISABLE:
++            return flask_resource_unplug_core();
++
++        default:
++            return avc_unknown_permission("cpu_hotplug", op->u.cpu_hotplug.op);
++        }
++#endif
++
+     case XEN_SYSCTL_psr_cmt_op:
+         return avc_current_has_perm(SECINITSID_XEN, SECCLASS_XEN2,
+                                     XEN2__PSR_CMT_OP, NULL);
+@@ -1244,12 +1263,12 @@ static int cf_check flask_pci_config_permission(
+ }
+ 
+ #if defined(CONFIG_SYSCTL) || defined(CONFIG_X86)
+-static int cf_check flask_resource_plug_core(void)
++static int flask_resource_plug_core(void)
+ {
+     return avc_current_has_perm(SECINITSID_DOMXEN, SECCLASS_RESOURCE, RESOURCE__PLUG, NULL);
+ }
+ 
+-static int cf_check flask_resource_unplug_core(void)
++static int flask_resource_unplug_core(void)
+ {
+     return avc_current_has_perm(SECINITSID_DOMXEN, SECCLASS_RESOURCE, RESOURCE__UNPLUG, NULL);
+ }
+@@ -1987,8 +2006,6 @@ static const struct xsm_ops __initconst_cf_clobber flask_ops = {
+     .iomem_mapping_vpci = flask_iomem_mapping,
+     .pci_config_permission = flask_pci_config_permission,
+ 
+-    .resource_plug_core = flask_resource_plug_core,
+-    .resource_unplug_core = flask_resource_unplug_core,
+     .resource_plug_pci = flask_resource_plug_pci,
+     .resource_unplug_pci = flask_resource_unplug_pci,
+     .resource_setup_pci = flask_resource_setup_pci,

@@ -1,0 +1,99 @@
+From: Jan Beulich <jbeulich@suse.com>
+Subject: platform-op/XSM: move resource-{,un}plug-core checks
+
+Integrate the checking with flask_platform_op(); there never really was a
+need to defer these checks, as the sub-op has always been known to the
+function. As a positive side effect, permissions are then checked at the
+same early point with and without Flask.
+
+This is CVE-2026-62427 / part of XSA-499.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-By: Daniel P. Smith <dpsmith@apertussolutions.com>
+
+diff --git a/xen/arch/x86/platform_hypercall.c b/xen/arch/x86/platform_hypercall.c
+index 79bb99e0b602..40783a8d535b 100644
+--- a/xen/arch/x86/platform_hypercall.c
++++ b/xen/arch/x86/platform_hypercall.c
+@@ -706,10 +706,6 @@ ret_t do_platform_op(
+     {
+         int cpu = op->u.cpu_ol.cpuid;
+ 
+-        ret = xsm_resource_plug_core(XSM_HOOK);
+-        if ( ret )
+-            break;
+-
+         if ( cpu >= nr_cpu_ids || !cpu_present(cpu) ||
+              clocksource_is_tsc() )
+         {
+@@ -732,10 +728,6 @@ ret_t do_platform_op(
+     {
+         int cpu = op->u.cpu_ol.cpuid;
+ 
+-        ret = xsm_resource_unplug_core(XSM_HOOK);
+-        if ( ret )
+-            break;
+-
+         if ( cpu == 0 )
+         {
+             ret = -EOPNOTSUPP;
+@@ -760,20 +752,12 @@ ret_t do_platform_op(
+     }
+ 
+     case XENPF_cpu_hotadd:
+-        ret = xsm_resource_plug_core(XSM_HOOK);
+-        if ( ret )
+-            break;
+-
+         ret = cpu_add(op->u.cpu_add.apic_id,
+                       op->u.cpu_add.acpi_id,
+                       op->u.cpu_add.pxm);
+         break;
+ 
+     case XENPF_mem_hotadd:
+-        ret = xsm_resource_plug_core(XSM_HOOK);
+-        if ( ret )
+-            break;
+-
+         ret = memory_add(op->u.mem_add.spfn,
+                       op->u.mem_add.epfn,
+                       op->u.mem_add.pxm);
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index ae33e324bdf1..953297c959b6 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -1244,6 +1244,7 @@ static int cf_check flask_pci_config_permission(
+ 
+ }
+ 
++#if defined(CONFIG_SYSCTL) || defined(CONFIG_X86)
+ static int cf_check flask_resource_plug_core(void)
+ {
+     return avc_current_has_perm(SECINITSID_DOMXEN, SECCLASS_RESOURCE, RESOURCE__PLUG, NULL);
+@@ -1253,6 +1254,7 @@ static int cf_check flask_resource_unplug_core(void)
+ {
+     return avc_current_has_perm(SECINITSID_DOMXEN, SECCLASS_RESOURCE, RESOURCE__UNPLUG, NULL);
+ }
++#endif /* CONFIG_SYSCTL || CONFIG_X86 */
+ 
+ #ifdef CONFIG_SYSCTL
+ static int flask_resource_use_core(void)
+@@ -1573,12 +1575,13 @@ static int cf_check flask_platform_op(uint32_t op)
+     switch ( op )
+     {
+ #ifdef CONFIG_X86
+-    /* These operations have their own XSM hooks */
+     case XENPF_cpu_online:
+-    case XENPF_cpu_offline:
+     case XENPF_cpu_hotadd:
+     case XENPF_mem_hotadd:
+-        return 0;
++        return flask_resource_plug_core();
++
++    case XENPF_cpu_offline:
++        return flask_resource_unplug_core();
+ #endif
+ 
+     case XENPF_settime32:

@@ -1,0 +1,128 @@
+From: Jan Beulich <jbeulich@suse.com>
+Subject: sysctl/XSM: drop .scheduler_op() hook
+
+Integrate the checking with xsm_sysctl(), now that it has the full op
+struct passed. As a positive side effect, permissions are then checked at
+the same early point with and without Flask.
+
+This is part of CVE-2026-62426 / XSA-499.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Acked-By: Daniel P. Smith <dpsmith@apertussolutions.com>
+
+diff --git a/xen/common/sched/core.c b/xen/common/sched/core.c
+index 4a4c36c29170..2488243c747c 100644
+--- a/xen/common/sched/core.c
++++ b/xen/common/sched/core.c
+@@ -2104,10 +2104,6 @@ long sched_adjust_global(struct xen_sysctl_scheduler_op *op)
+     struct cpupool *pool;
+     int rc;
+ 
+-    rc = xsm_sysctl_scheduler_op(XSM_HOOK, op->cmd);
+-    if ( rc )
+-        return rc;
+-
+     if ( (op->cmd != XEN_SYSCTL_SCHEDOP_putinfo) &&
+          (op->cmd != XEN_SYSCTL_SCHEDOP_getinfo) )
+         return -EINVAL;
+diff --git a/xen/include/xsm/dummy.h b/xen/include/xsm/dummy.h
+index c00453be5661..dc6f0c7ee375 100644
+--- a/xen/include/xsm/dummy.h
++++ b/xen/include/xsm/dummy.h
+@@ -141,12 +141,6 @@ static XSM_INLINE int cf_check xsm_getdomaininfo(
+     return xsm_default_action(action, current->domain, d);
+ }
+ 
+-static XSM_INLINE int cf_check xsm_sysctl_scheduler_op(XSM_DEFAULT_ARG int cmd)
+-{
+-    XSM_ASSERT_ACTION(XSM_HOOK);
+-    return xsm_default_action(action, current->domain, NULL);
+-}
+-
+ static XSM_INLINE int cf_check xsm_set_target(
+     XSM_DEFAULT_ARG struct domain *d, struct domain *e)
+ {
+diff --git a/xen/include/xsm/xsm.h b/xen/include/xsm/xsm.h
+index 555e68bd55b5..ff4cb8065c55 100644
+--- a/xen/include/xsm/xsm.h
++++ b/xen/include/xsm/xsm.h
+@@ -56,9 +56,6 @@ struct xsm_ops {
+                                 struct xen_domctl_getdomaininfo *info);
+     int (*domain_create)(struct domain *d, uint32_t ssidref);
+     int (*getdomaininfo)(struct domain *d);
+-#ifdef CONFIG_SYSCTL
+-    int (*sysctl_scheduler_op)(int op);
+-#endif
+     int (*set_target)(struct domain *d, struct domain *e);
+     int (*domctl)(struct domain *d, struct xen_domctl *op);
+ #ifdef CONFIG_SYSCTL
+@@ -233,13 +230,6 @@ static inline int xsm_get_domain_state(xsm_default_t def, struct domain *d)
+     return alternative_call(xsm_ops.get_domain_state, d);
+ }
+ 
+-#ifdef CONFIG_SYSCTL
+-static inline int xsm_sysctl_scheduler_op(xsm_default_t def, int cmd)
+-{
+-    return alternative_call(xsm_ops.sysctl_scheduler_op, cmd);
+-}
+-#endif
+-
+ static inline int xsm_set_target(
+     xsm_default_t def, struct domain *d, struct domain *e)
+ {
+diff --git a/xen/xsm/dummy.c b/xen/xsm/dummy.c
+index 860233e4beed..fa7c40655346 100644
+--- a/xen/xsm/dummy.c
++++ b/xen/xsm/dummy.c
+@@ -18,9 +18,6 @@ static const struct xsm_ops __initconst_cf_clobber dummy_ops = {
+     .security_domaininfo           = xsm_security_domaininfo,
+     .domain_create                 = xsm_domain_create,
+     .getdomaininfo                 = xsm_getdomaininfo,
+-#ifdef CONFIG_SYSCTL
+-    .sysctl_scheduler_op           = xsm_sysctl_scheduler_op,
+-#endif
+     .set_target                    = xsm_set_target,
+     .domctl                        = xsm_domctl,
+ #ifdef CONFIG_SYSCTL
+diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
+index 9014c1e82e96..de214f948bfd 100644
+--- a/xen/xsm/flask/hooks.c
++++ b/xen/xsm/flask/hooks.c
+@@ -639,7 +639,7 @@ static int flask_domctl_scheduler_op(struct domain *d, int op)
+ }
+ 
+ #ifdef CONFIG_SYSCTL
+-static int cf_check flask_sysctl_scheduler_op(int op)
++static int flask_sysctl_scheduler_op(unsigned int op)
+ {
+     switch ( op )
+     {
+@@ -913,7 +913,6 @@ static int cf_check flask_sysctl(const struct xen_sysctl *op)
+     case XEN_SYSCTL_readconsole:
+     case XEN_SYSCTL_getdomaininfolist:
+     case XEN_SYSCTL_page_offline_op:
+-    case XEN_SYSCTL_scheduler_op:
+ #ifdef CONFIG_X86
+     case XEN_SYSCTL_cpu_hotplug:
+ #endif
+@@ -949,6 +948,9 @@ static int cf_check flask_sysctl(const struct xen_sysctl *op)
+     case XEN_SYSCTL_cpupool_op:
+         return domain_has_xen(current->domain, XEN__CPUPOOL_OP);
+ 
++    case XEN_SYSCTL_scheduler_op:
++        return flask_sysctl_scheduler_op(op->u.scheduler_op.cmd);
++
+     case XEN_SYSCTL_physinfo:
+     case XEN_SYSCTL_cputopoinfo:
+     case XEN_SYSCTL_numainfo:
+@@ -1932,9 +1934,6 @@ static const struct xsm_ops __initconst_cf_clobber flask_ops = {
+     .security_domaininfo = flask_security_domaininfo,
+     .domain_create = flask_domain_create,
+     .getdomaininfo = flask_getdomaininfo,
+-#ifdef CONFIG_SYSCTL
+-    .sysctl_scheduler_op = flask_sysctl_scheduler_op,
+-#endif
+     .set_target = flask_set_target,
+     .domctl = flask_domctl,
+ #ifdef CONFIG_SYSCTL
