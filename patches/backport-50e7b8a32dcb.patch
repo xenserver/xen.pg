@@ -1,0 +1,87 @@
+From 50e7b8a32dcb1360dbe9e0fa8b81a3ad02d0b670 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 20 Jul 2026 10:12:13 +0100
+Subject: x86/domctl: Reorder user_regs accesses for efficiency
+
+The current order is derived from expanding XLAT_cpu_user_regs() which used
+the x86_32 cpu_user_regs order.  This is correct for one the blocks, but not
+the others.
+
+In order to work with the prefetcher, rather than against it, loads want to be
+in field order.  Make this so for the three paths reading an x86_64
+cpu_user_regs.
+
+No functional change.
+
+Reported-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Frediano Ziglio <frediano.ziglio@citrix.com>
+Reviewed-by: Teddy Astie <teddy.astie@vates.tech>
+
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 893ebaa13a6f..c7fa0a46fda0 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -1284,17 +1284,17 @@ int arch_set_info_guest(
+         v->arch.user_regs.r14               = c.nat->user_regs.r14;
+         v->arch.user_regs.r13               = c.nat->user_regs.r13;
+         v->arch.user_regs.r12               = c.nat->user_regs.r12;
++        v->arch.user_regs.rbp               = c.nat->user_regs.rbp;
++        v->arch.user_regs.rbx               = c.nat->user_regs.rbx;
+         v->arch.user_regs.r11               = c.nat->user_regs.r11;
+         v->arch.user_regs.r10               = c.nat->user_regs.r10;
+         v->arch.user_regs.r9                = c.nat->user_regs.r9;
+         v->arch.user_regs.r8                = c.nat->user_regs.r8;
+-        v->arch.user_regs.rbx               = c.nat->user_regs.rbx;
++        v->arch.user_regs.rax               = c.nat->user_regs.rax;
+         v->arch.user_regs.rcx               = c.nat->user_regs.rcx;
+         v->arch.user_regs.rdx               = c.nat->user_regs.rdx;
+         v->arch.user_regs.rsi               = c.nat->user_regs.rsi;
+         v->arch.user_regs.rdi               = c.nat->user_regs.rdi;
+-        v->arch.user_regs.rbp               = c.nat->user_regs.rbp;
+-        v->arch.user_regs.rax               = c.nat->user_regs.rax;
+         v->arch.user_regs.rip               = c.nat->user_regs.rip;
+         v->arch.user_regs.cs                = c.nat->user_regs.cs;
+         v->arch.user_regs.rflags            = (c.nat->user_regs.rflags & X86_EFLAGS_ALL) | X86_EFLAGS_MBS;
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index dc2b0dc02299..71ecb358085e 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -1448,17 +1448,17 @@ void arch_get_info_guest(struct vcpu *v, vcpu_guest_context_u c)
+         c.nat->user_regs.r14               = v->arch.user_regs.r14;
+         c.nat->user_regs.r13               = v->arch.user_regs.r13;
+         c.nat->user_regs.r12               = v->arch.user_regs.r12;
++        c.nat->user_regs.rbp               = v->arch.user_regs.rbp;
++        c.nat->user_regs.rbx               = v->arch.user_regs.rbx;
+         c.nat->user_regs.r11               = v->arch.user_regs.r11;
+         c.nat->user_regs.r10               = v->arch.user_regs.r10;
+         c.nat->user_regs.r9                = v->arch.user_regs.r9;
+         c.nat->user_regs.r8                = v->arch.user_regs.r8;
+-        c.nat->user_regs.rbx               = v->arch.user_regs.rbx;
++        c.nat->user_regs.rax               = v->arch.user_regs.rax;
+         c.nat->user_regs.rcx               = v->arch.user_regs.rcx;
+         c.nat->user_regs.rdx               = v->arch.user_regs.rdx;
+         c.nat->user_regs.rsi               = v->arch.user_regs.rsi;
+         c.nat->user_regs.rdi               = v->arch.user_regs.rdi;
+-        c.nat->user_regs.rbp               = v->arch.user_regs.rbp;
+-        c.nat->user_regs.rax               = v->arch.user_regs.rax;
+         c.nat->user_regs.rip               = v->arch.user_regs.rip;
+         c.nat->user_regs.cs                = v->arch.user_regs.cs;
+         c.nat->user_regs.rflags            = v->arch.user_regs.rflags;
+@@ -1477,13 +1477,13 @@ void arch_get_info_guest(struct vcpu *v, vcpu_guest_context_u c)
+     else
+     {
+         /* Backing memory is pre-zeroed. */
++        c.cmp->user_regs.ebp               = v->arch.user_regs.ebp;
+         c.cmp->user_regs.ebx               = v->arch.user_regs.ebx;
++        c.cmp->user_regs.eax               = v->arch.user_regs.eax;
+         c.cmp->user_regs.ecx               = v->arch.user_regs.ecx;
+         c.cmp->user_regs.edx               = v->arch.user_regs.edx;
+         c.cmp->user_regs.esi               = v->arch.user_regs.esi;
+         c.cmp->user_regs.edi               = v->arch.user_regs.edi;
+-        c.cmp->user_regs.ebp               = v->arch.user_regs.ebp;
+-        c.cmp->user_regs.eax               = v->arch.user_regs.eax;
+         c.cmp->user_regs.eip               = v->arch.user_regs.eip;
+         c.cmp->user_regs.cs                = v->arch.user_regs.cs;
+         c.cmp->user_regs.eflags            = v->arch.user_regs.eflags;
