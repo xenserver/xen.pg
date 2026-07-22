@@ -16,9 +16,13 @@ This is CVE-2026-62436.
 
 Reported-by: Mark Esler <mark@hexproof.dev>
 
-During a v1 -> v2 change, the number of shared table entries also
-reduces, meaning that previously validated grant references may now be
-out of bounds.
+During a v1 -> v2 change, the number of shared table entries reduces,
+meaning that previously validated grant references may now be out of
+bounds. Because of the checking of pin counts in gnttab_set_version()
+(with the grant table lock held for writing), for now-out-of-bounds gref-s
+neither active mappings can exist, nor can there be in-progress copy
+operations. Nevertheless bounds checks are added there, just to be on the
+safe side.
 
 For gnttab_transfer(), to cover the gap between the lock being dropped by
 gnttab_prepare_for_transfer() and it being re-acquired, have the helper
@@ -35,10 +39,10 @@ Everything together is XSA-501.
 Fixes: a98dc13703e0 ("Introduce a grant_entry_v2 structure")
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
 Tested-by: Mark Esler <mark@hexproof.dev>
-Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
 
 diff --git a/xen/common/grant_table.c b/xen/common/grant_table.c
-index 5577b321d2e3..6f0721816c3a 100644
+index 5577b321d2e3..75433f260eec 100644
 --- a/xen/common/grant_table.c
 +++ b/xen/common/grant_table.c
 @@ -71,6 +71,10 @@ struct grant_table {
@@ -52,7 +56,17 @@ index 5577b321d2e3..6f0721816c3a 100644
      /*
       * Number of available maptrack entries.  For cleanup purposes it is
       * important to realize that this field and @maptrack further down will
-@@ -1343,11 +1347,28 @@ map_grant_ref(
+@@ -933,6 +937,9 @@ static void reduce_status_for_pin(struct domain *rd,
+ {
+     unsigned int clear_flags = act->pin ? 0 : GTF_reading;
+ 
++    if ( unlikely(!status) )
++        return;
++
+     if ( !readonly && !(act->pin & (GNTPIN_hstw_mask | GNTPIN_devw_mask)) )
+         clear_flags |= GTF_writing;
+ 
+@@ -1343,6 +1350,22 @@ map_grant_ref(
  
      grant_read_lock(rgt);
  
@@ -75,22 +89,18 @@ index 5577b321d2e3..6f0721816c3a 100644
      act = active_entry_acquire(rgt, op->ref);
      act->pin -= pin_incr;
  
-  unlock_out_clear:
--    reduce_status_for_pin(rd, act, status, op->flags & GNTMAP_readonly);
-+    if ( likely(status) )
-+        reduce_status_for_pin(rd, act, status, op->flags & GNTMAP_readonly);
- 
-  act_release_out:
-     active_entry_release(act);
-@@ -1586,7 +1607,6 @@ unmap_common_complete(struct gnttab_unmap_common *op)
+@@ -1586,9 +1609,8 @@ unmap_common_complete(struct gnttab_unmap_common *op)
      struct domain *ld, *rd = op->rd;
      struct grant_table *rgt;
      struct active_grant_entry *act;
 -    grant_entry_header_t *sha;
      struct page_info *pg;
-     uint16_t *status;
+-    uint16_t *status;
++    uint16_t *status = NULL;
  
-@@ -1604,10 +1624,9 @@ unmap_common_complete(struct gnttab_unmap_common *op)
+     if ( evaluate_nospec(!op->done) )
+     {
+@@ -1604,11 +1626,10 @@ unmap_common_complete(struct gnttab_unmap_common *op)
      grant_read_lock(rgt);
  
      act = active_entry_acquire(rgt, op->ref);
@@ -98,11 +108,13 @@ index 5577b321d2e3..6f0721816c3a 100644
  
      if ( evaluate_nospec(rgt->gt_version == 1) )
 -        status = &sha->flags;
+-    else
 +        status = &shared_entry_v1(rgt, op->ref).flags;
-     else
++    else if ( evaluate_nospec(op->ref < nr_grant_entries(rgt)) )
          status = &status_entry(rgt, op->ref);
  
-@@ -2197,14 +2216,14 @@ gnttab_query_size(
+     pg = !is_iomem_page(act->mfn) ? mfn_to_page(op->mfn) : NULL;
+@@ -2197,14 +2218,14 @@ gnttab_query_size(
   * Check that the given grant reference (rd,ref) allows 'ld' to transfer
   * ownership of a page frame. If so, lock down the grant entry.
   */
@@ -119,7 +131,7 @@ index 5577b321d2e3..6f0721816c3a 100644
  
      grant_read_lock(rgt);
  
-@@ -2249,8 +2268,11 @@ gnttab_prepare_for_transfer(
+@@ -2249,8 +2270,11 @@ gnttab_prepare_for_transfer(
          scombo = prev;
      }
  
@@ -132,7 +144,7 @@ index 5577b321d2e3..6f0721816c3a 100644
  
   fail:
      grant_read_unlock(rgt);
-@@ -2275,7 +2297,7 @@ gnttab_transfer(
+@@ -2275,7 +2299,7 @@ gnttab_transfer(
  
      for ( i = 0; i < count; i++ )
      {
@@ -141,7 +153,7 @@ index 5577b321d2e3..6f0721816c3a 100644
          int rc;
  
          if ( i && hypercall_preempt_check() )
-@@ -2415,14 +2437,14 @@ gnttab_transfer(
+@@ -2415,14 +2439,14 @@ gnttab_transfer(
           * pagelist.
           */
          nrspin_unlock(&e->page_alloc_lock);
@@ -159,7 +171,7 @@ index 5577b321d2e3..6f0721816c3a 100644
          {
              bool drop_dom_ref;
  
-@@ -2434,7 +2456,7 @@ gnttab_transfer(
+@@ -2434,7 +2458,7 @@ gnttab_transfer(
              drop_dom_ref = !domain_adjust_tot_pages(e, -1);
              nrspin_unlock(&e->page_alloc_lock);
  
@@ -168,7 +180,7 @@ index 5577b321d2e3..6f0721816c3a 100644
                  gdprintk(XENLOG_INFO, "Transferee d%d is now dying\n",
                           e->domain_id);
  
-@@ -2454,7 +2476,13 @@ gnttab_transfer(
+@@ -2454,7 +2478,13 @@ gnttab_transfer(
          grant_read_lock(e->grant_table);
          act = active_entry_acquire(e->grant_table, gop.ref);
  
@@ -183,7 +195,7 @@ index 5577b321d2e3..6f0721816c3a 100644
          {
              grant_entry_v1_t *sha = &shared_entry_v1(e->grant_table, gop.ref);
  
-@@ -2474,6 +2502,7 @@ gnttab_transfer(
+@@ -2474,6 +2504,7 @@ gnttab_transfer(
          shared_entry_header(e->grant_table, gop.ref)->flags |=
              GTF_transfer_completed;
  
@@ -191,15 +203,18 @@ index 5577b321d2e3..6f0721816c3a 100644
          active_entry_release(act);
          grant_read_unlock(e->grant_table);
  
-@@ -2502,7 +2531,6 @@ release_grant_for_copy(
+@@ -2502,28 +2533,27 @@ release_grant_for_copy(
      struct domain *rd, grant_ref_t gref, bool readonly)
  {
      struct grant_table *rgt = rd->grant_table;
 -    grant_entry_header_t *sha;
      struct active_grant_entry *act;
      mfn_t mfn;
-     uint16_t *status;
-@@ -2512,12 +2540,11 @@ release_grant_for_copy(
+-    uint16_t *status;
++    uint16_t *status = NULL;
+     grant_ref_t trans_gref;
+     struct domain *td;
+ 
      grant_read_lock(rgt);
  
      act = active_entry_acquire(rgt, gref);
@@ -213,7 +228,15 @@ index 5577b321d2e3..6f0721816c3a 100644
          td = rd;
          trans_gref = gref;
      }
-@@ -2542,6 +2569,9 @@ release_grant_for_copy(
+     else
+     {
+-        status = &status_entry(rgt, gref);
++        if ( evaluate_nospec(gref < nr_grant_entries(rgt)) )
++            status = &status_entry(rgt, gref);
+         td = (act->src_domid == rd->domain_id)
+              ? rd : knownalive_domain_from_domid(act->src_domid);
+         trans_gref = act->trans_gref;
+@@ -2542,6 +2572,9 @@ release_grant_for_copy(
  
      reduce_status_for_pin(rd, act, status, readonly);
  
@@ -223,7 +246,7 @@ index 5577b321d2e3..6f0721816c3a 100644
      active_entry_release(act);
      grant_read_unlock(rgt);
  
-@@ -2673,8 +2703,10 @@ acquire_grant_for_copy(
+@@ -2673,8 +2706,10 @@ acquire_grant_for_copy(
  
          /*
           * acquire_grant_for_copy() will take the lock on the remote table,
@@ -235,7 +258,7 @@ index 5577b321d2e3..6f0721816c3a 100644
          active_entry_release(act);
          grant_read_unlock(rgt);
  
-@@ -2688,6 +2720,7 @@ acquire_grant_for_copy(
+@@ -2688,6 +2723,7 @@ acquire_grant_for_copy(
  
          if ( rc != GNTST_okay )
          {
@@ -243,7 +266,7 @@ index 5577b321d2e3..6f0721816c3a 100644
              rcu_unlock_domain(td);
              reduce_status_for_pin(rd, act, status, readonly);
              active_entry_release(act);
-@@ -2724,6 +2757,8 @@ acquire_grant_for_copy(
+@@ -2724,6 +2760,8 @@ acquire_grant_for_copy(
              rcu_unlock_domain(td);
  
              grant_read_lock(rgt);
@@ -252,7 +275,7 @@ index 5577b321d2e3..6f0721816c3a 100644
              act = active_entry_acquire(rgt, gref);
              reduce_status_for_pin(rd, act, status, readonly);
              active_entry_release(act);
-@@ -2750,6 +2785,8 @@ acquire_grant_for_copy(
+@@ -2750,6 +2788,8 @@ acquire_grant_for_copy(
               */
              act->is_sub_page = true;
          }
@@ -261,7 +284,7 @@ index 5577b321d2e3..6f0721816c3a 100644
      }
      else if ( !old_pin ||
                (!readonly && !(old_pin & (GNTPIN_devw_mask|GNTPIN_hstw_mask))) )
-@@ -2804,6 +2841,9 @@ acquire_grant_for_copy(
+@@ -2804,6 +2844,9 @@ acquire_grant_for_copy(
              act->src_domid = td->domain_id;
              act->trans_gref = trans_gref;
              act->mfn = grant_mfn;
@@ -271,7 +294,7 @@ index 5577b321d2e3..6f0721816c3a 100644
          }
          else if ( !mfn_eq(act->mfn, grant_mfn) ||
                    act->src_domid != td->domain_id ||
-@@ -3233,7 +3273,17 @@ gnttab_set_version(XEN_GUEST_HANDLE_PARAM(gnttab_set_version_t) uop)
+@@ -3233,7 +3276,17 @@ gnttab_set_version(XEN_GUEST_HANDLE_PARAM(gnttab_set_version_t) uop)
          if ( res < 0)
              goto out_unlock;
          break;
