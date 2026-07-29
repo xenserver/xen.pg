@@ -919,6 +919,9 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Wed Jul 29 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.21.2-1
+- Update to Xen 4.21.2
+
 * Wed Jul 22 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.21.1-9
 - Update fix for XSA-501 CVE-2026-62435 CVE-2026-62436
 
