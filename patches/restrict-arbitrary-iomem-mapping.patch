@@ -73,7 +73,7 @@ index 3d1c8a606be1..9a28802a1e0c 100644
      }
  
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index e051d18fcbf2..3b613527c80d 100644
+index e051d18fcbf2..c07d14a09bf6 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
 @@ -413,7 +413,8 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
@@ -82,12 +82,12 @@ index e051d18fcbf2..3b613527c80d 100644
          if ( !iomem_access_permitted(current->domain,
 -                                     mfn, mfn + nr_mfns - 1) )
 +                                     mfn, mfn + nr_mfns - 1) ||
-+             check_iomem_access(d, mfn, mfn + nr_mfns - 1) )
++             check_iomem_vs_pci_bars(d, mfn, mfn + nr_mfns - 1) )
              ret = -EPERM;
          else if ( allow )
              ret = iomem_permit_access(d, mfn, mfn + nr_mfns - 1);
 diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
-index 3132b13529b2..ef2d8f25f64a 100644
+index 07ffc7567142..b8c504d13414 100644
 --- a/xen/drivers/passthrough/pci.c
 +++ b/xen/drivers/passthrough/pci.c
 @@ -348,6 +348,9 @@ static struct pci_dev *alloc_pdev(struct pci_seg *pseg, u8 bus, u8 devfn)
@@ -237,17 +237,17 @@ index 3132b13529b2..ef2d8f25f64a 100644
  static bool cache_pdev(struct pci_dev *pdev)
  {
      unsigned i;
-@@ -655,6 +781,77 @@ static bool cache_pdev(struct pci_dev *pdev)
+@@ -655,6 +781,84 @@ static bool cache_pdev(struct pci_dev *pdev)
      return true;
  }
  
-+static int check_iomem_access_vgpu(const struct domain *d, xen_pfn_t mfn_start,
-+                                   xen_pfn_t mfn_end, bool vgpu)
++static int check_iomem_access_vgpu(
++    struct domain *d, xen_pfn_t mfn_start, xen_pfn_t mfn_end, bool vgpu)
 +{
 +    struct pci_dev *pdev;
 +    int rc = 0;
 +
-+    pcidevs_lock();
++    read_lock(&d->pci_lock);
 +    list_for_each_entry ( pdev, &d->pdev_list, domain_list )
 +    {
 +        /* filter out no vGPU if vGPU is required */
@@ -291,12 +291,19 @@ index 3132b13529b2..ef2d8f25f64a 100644
 +    rc = -ENOENT;
 +
 +out:
-+    pcidevs_unlock();
++    read_unlock(&d->pci_lock);
 +    return rc;
 +}
 +
-+int check_iomem_access(const struct domain *d, xen_pfn_t mfn_start,
-+                       xen_pfn_t mfn_end)
++/*
++ * When Lockdown mode is active, we further restrict MMIO mappings to being
++ * part of an BAR of an assigned device.
++ *
++ * For pre-SRIOV Nvidia graphics sharing, the GPU is owned by dom0.  Allow
++ * mappings of such devices too.
++ */
++int check_iomem_vs_pci_bars(
++    struct domain *d, xen_pfn_t mfn_start, xen_pfn_t mfn_end)
 +{
 +    int rc;
 +
@@ -312,10 +319,10 @@ index 3132b13529b2..ef2d8f25f64a 100644
 +    return check_iomem_access_vgpu(current->domain, mfn_start, mfn_end, true);
 +}
 +
- int check_ioport_access(const struct domain *d, unsigned int port_start,
-                         unsigned int port_end)
- {
-@@ -848,8 +1045,7 @@ int pci_add_device(u16 seg, u8 bus, u8 devfn,
+ /*
+  * When Lockdown mode is active, we further restrict IO Ports to being part of
+  * an IO BAR of an assigned device.
+@@ -852,8 +1056,7 @@ int pci_add_device(u16 seg, u8 bus, u8 devfn,
  
      if ( !pdev->info.is_virtfn && !pdev->physfn.vf_rlen[0] )
      {
@@ -326,7 +333,7 @@ index 3132b13529b2..ef2d8f25f64a 100644
  
          if ( !pos )
 diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
-index d7dee528f7fa..61018eccf869 100644
+index 24ac1a314119..9f098f5a0b47 100644
 --- a/xen/include/xen/pci.h
 +++ b/xen/include/xen/pci.h
 @@ -124,6 +124,8 @@ struct pci_dev {
@@ -338,13 +345,12 @@ index d7dee528f7fa..61018eccf869 100644
      nodeid_t node; /* NUMA node */
  
      /* Device to be quarantined, don't automatically re-assign to dom0 */
-@@ -287,6 +289,9 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
- int check_ioport_access(const struct domain *d, unsigned int port_start,
-                         unsigned int port_end);
+@@ -286,6 +288,8 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
  
-+int check_iomem_access(const struct domain *d, xen_pfn_t mfn_start,
-+                       xen_pfn_t mfn_end);
-+
+ int check_ioports_vs_pci_bars(
+     struct domain *d, unsigned int port_start, unsigned int port_end);
++int check_iomem_vs_pci_bars(
++    struct domain *d, xen_pfn_t mfn_start, xen_pfn_t mfn_end);
+ 
  #define PCI_BAR_VF      (1u << 0)
  #define PCI_BAR_LAST    (1u << 1)
- #define PCI_BAR_ROM     (1u << 2)
