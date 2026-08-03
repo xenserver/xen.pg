@@ -1,0 +1,61 @@
+From 48054287a840011bce4c07f3db47ea1a4c669155 Mon Sep 17 00:00:00 2001
+From: Bernhard Kaindl <bernhard.kaindl@citrix.com>
+Date: Tue, 5 May 2026 08:29:45 +0200
+Subject: xen/mm: normalize page count types to unsigned long
+
+The current use of long for total_avail_pages and outstanding_claims
+creates an unnecessary mix of signed and unsigned types during page
+allocation calculations. This necessitates awkward constructs
+like '+ 0UL' to satisfy type matching in macros such as min().
+
+Address this by normalizing `total_avail_pages` and `outstanding_claims`
+from `long` to `unsigned long`.
+
+As a direct consequence of making `total_avail_pages` unsigned, the
+post-decrement assertions checking for `>= 0` are no longer logically
+sound. Adjust those assertions to pre-decrement checks.
+
+No functional change intended.
+
+Suggested-by: Jan Beulich <jbeulich@suse.com>
+Signed-off-by: Bernhard Kaindl <bernhard.kaindl@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
+index cf95b2d40786..c458a30c8bd1 100644
+--- a/xen/common/page_alloc.c
++++ b/xen/common/page_alloc.c
+@@ -484,10 +484,11 @@ static heap_by_zone_and_order_t *_heap[MAX_NUMNODES];
+ static unsigned long node_need_scrub[MAX_NUMNODES];
+ 
+ static unsigned long *avail[MAX_NUMNODES];
+-static long total_avail_pages;
++static unsigned long total_avail_pages;
+ 
+ static DEFINE_SPINLOCK(heap_lock);
+-static long outstanding_claims; /* total outstanding claims by all domains */
++/* Total outstanding claims by all domains */
++static unsigned long outstanding_claims;
+ 
+ static unsigned long avail_heap_pages(
+     unsigned int zone_lo, unsigned int zone_hi, unsigned int node)
+@@ -1047,8 +1048,8 @@ static struct page_info *alloc_heap_pages(
+ 
+     ASSERT(avail[node][zone] >= request);
+     avail[node][zone] -= request;
++    ASSERT(total_avail_pages >= request);
+     total_avail_pages -= request;
+-    ASSERT(total_avail_pages >= 0);
+ 
+     if ( d && d->outstanding_pages && !(memflags & MEMF_no_refcount) )
+     {
+@@ -1247,8 +1248,8 @@ static int reserve_offlined_page(struct page_info *head)
+             continue;
+ 
+         avail[node][zone]--;
++        ASSERT(total_avail_pages > 0);
+         total_avail_pages--;
+-        ASSERT(total_avail_pages >= 0);
+ 
+         page_list_add_tail(cur_head,
+                            test_bit(_PGC_broken, &cur_head->count_info) ?

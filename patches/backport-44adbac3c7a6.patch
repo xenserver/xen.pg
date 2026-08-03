@@ -1,0 +1,65 @@
+From 44adbac3c7a6a6993e5c435a968e6556fb18452e Mon Sep 17 00:00:00 2001
+From: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Date: Mon, 3 Aug 2026 09:40:05 +0200
+Subject: xen/mm: Introduce per-node free page counter
+
+Add node_avail_pages[], updated under heap_lock in sync with
+avail[node][zone] to cache the per-node sum of free pages.
+
+Use it in avail_node_heap_pages() to avoid summing all zones on each
+call. Guard it with nodeid < MAX_NUMNODES and node_online(nodeid).
+
+Signed-off-by: Alejandro Vallejo <alejandro.vallejo@cloud.com>
+Signed-off-by: Bernhard Kaindl <bernhard.kaindl@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/common/page_alloc.c b/xen/common/page_alloc.c
+index c458a30c8bd1..1da7c72d56ca 100644
+--- a/xen/common/page_alloc.c
++++ b/xen/common/page_alloc.c
+@@ -485,6 +485,7 @@ static unsigned long node_need_scrub[MAX_NUMNODES];
+ 
+ static unsigned long *avail[MAX_NUMNODES];
+ static unsigned long total_avail_pages;
++static unsigned long node_avail_pages[MAX_NUMNODES];
+ 
+ static DEFINE_SPINLOCK(heap_lock);
+ /* Total outstanding claims by all domains */
+@@ -1050,6 +1051,8 @@ static struct page_info *alloc_heap_pages(
+     avail[node][zone] -= request;
+     ASSERT(total_avail_pages >= request);
+     total_avail_pages -= request;
++    ASSERT(node_avail_pages[node] >= request);
++    node_avail_pages[node] -= request;
+ 
+     if ( d && d->outstanding_pages && !(memflags & MEMF_no_refcount) )
+     {
+@@ -1250,6 +1253,8 @@ static int reserve_offlined_page(struct page_info *head)
+         avail[node][zone]--;
+         ASSERT(total_avail_pages > 0);
+         total_avail_pages--;
++        ASSERT(node_avail_pages[node] > 0);
++        node_avail_pages[node]--;
+ 
+         page_list_add_tail(cur_head,
+                            test_bit(_PGC_broken, &cur_head->count_info) ?
+@@ -1573,6 +1578,7 @@ static void free_heap_pages(
+ 
+     avail[node][zone] += 1 << order;
+     total_avail_pages += 1 << order;
++    node_avail_pages[node] += 1 << order;
+     if ( need_scrub )
+     {
+         node_need_scrub[node] += 1 << order;
+@@ -2838,7 +2844,10 @@ unsigned long avail_domheap_pages_region(
+ 
+ unsigned long avail_node_heap_pages(unsigned int nodeid)
+ {
+-    return avail_heap_pages(MEMZONE_XEN, NR_ZONES -1, nodeid);
++    if ( nodeid < MAX_NUMNODES && node_online(nodeid) )
++        return node_avail_pages[nodeid];
++
++    return 0;
+ }
+ 
+ 
