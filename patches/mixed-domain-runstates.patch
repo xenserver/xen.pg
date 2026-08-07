@@ -273,22 +273,22 @@ index 18a17883d6bc..266323a82657 100644
                                          value cpu)
  {
 diff --git a/xen/common/domain.c b/xen/common/domain.c
-index 22e43e2dc8a5..a99d65e5937d 100644
+index 632e2f1240e2..8e6eb568c9a5 100644
 --- a/xen/common/domain.c
 +++ b/xen/common/domain.c
-@@ -618,6 +618,7 @@ struct domain *domain_create(domid_t domid,
+@@ -623,6 +623,7 @@ struct domain *domain_create(domid_t domid,
      spin_lock_init_prof(d, domain_lock);
      spin_lock_init_prof(d, page_alloc_lock);
      spin_lock_init(&d->hypercall_deadlock_mutex);
 +    spin_lock_init(&d->runstate_lock);
+     rwlock_init(&d->caps_lock);
      INIT_PAGE_LIST_HEAD(&d->page_list);
      INIT_PAGE_LIST_HEAD(&d->extra_page_list);
-     INIT_PAGE_LIST_HEAD(&d->xenpage_list);
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index 6cf78d4975bd..bda8548348ec 100644
+index 33118070cbf5..1bd7bf692fd8 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -860,6 +860,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+@@ -966,6 +966,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
                  __HYPERVISOR_domctl, "h", u_domctl);
          break;
  
@@ -301,7 +301,7 @@ index 6cf78d4975bd..bda8548348ec 100644
          ret = arch_do_domctl(op, d, u_domctl);
          break;
 diff --git a/xen/common/sched/core.c b/xen/common/sched/core.c
-index 320a6166a2be..63ba4916645c 100644
+index 9361ec714c1e..5feb1f87eb70 100644
 --- a/xen/common/sched/core.c
 +++ b/xen/common/sched/core.c
 @@ -276,6 +276,7 @@ static inline bool is_running_nonaffine(const struct vcpu *v,
@@ -312,10 +312,10 @@ index 320a6166a2be..63ba4916645c 100644
      s_time_t delta;
      struct sched_unit *unit = v->sched_unit;
  
-@@ -305,6 +306,65 @@ static inline void vcpu_runstate_change(
-     }
+@@ -310,6 +311,65 @@ static inline void vcpu_runstate_change(
  
-     v->runstate.state = new_state;
+         v->runstate.state = new_state;
+     }
 +
 +    /* Update domain runstate */
 +    if ( spin_trylock(&d->runstate_lock) )
@@ -378,8 +378,8 @@ index 320a6166a2be..63ba4916645c 100644
  }
  
  void sched_guest_idle(void (*idle) (void), unsigned int cpu)
-@@ -372,6 +432,37 @@ struct vcpu_runstate_extra vcpu_runstate_get(
-     return ret;
+@@ -386,6 +446,37 @@ uint64_t vcpu_runstate_get_running(const struct vcpu *v)
+     return running;
  }
  
 +void domain_runstate_get(struct domain *d, domain_runstate_info_t *info)
@@ -415,12 +415,12 @@ index 320a6166a2be..63ba4916645c 100644
 +
  uint64_t get_cpu_idle_time(unsigned int cpu)
  {
-     struct vcpu_runstate_info state = { 0 };
+     if ( cpu_online(cpu) && get_sched_res(cpu) )
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index 7ba3a565209e..eb1d3f7f8134 100644
+index 1af7b3d41ad4..e9022dd329ab 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -1189,6 +1189,50 @@ struct xen_domctl_vmtrace_op {
+@@ -1192,6 +1192,50 @@ struct xen_domctl_vmtrace_op {
  typedef struct xen_domctl_vmtrace_op xen_domctl_vmtrace_op_t;
  DEFINE_XEN_GUEST_HANDLE(xen_domctl_vmtrace_op_t);
  
@@ -471,7 +471,7 @@ index 7ba3a565209e..eb1d3f7f8134 100644
  struct xen_domctl {
      uint32_t cmd;
  #define XEN_DOMCTL_createdomain                   1
-@@ -1276,6 +1320,7 @@ struct xen_domctl {
+@@ -1279,6 +1323,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_vmtrace_op                    84
  #define XEN_DOMCTL_get_paging_mempool_size       85
  #define XEN_DOMCTL_set_paging_mempool_size       86
@@ -479,7 +479,7 @@ index 7ba3a565209e..eb1d3f7f8134 100644
  #define XEN_DOMCTL_gdbsx_guestmemio            1000
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
  #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
-@@ -1326,6 +1371,7 @@ struct xen_domctl {
+@@ -1329,6 +1374,7 @@ struct xen_domctl {
          struct xen_domctl_set_access_required access_required;
          struct xen_domctl_audit_p2m         audit_p2m;
          struct xen_domctl_set_virq_handler  set_virq_handler;
@@ -488,10 +488,10 @@ index 7ba3a565209e..eb1d3f7f8134 100644
          struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
          struct xen_domctl_cacheflush        cacheflush;
 diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
-index 809c648c99b8..79ac24f5cbb3 100644
+index ff145c1bc568..aee6f0b3a66b 100644
 --- a/xen/include/xen/sched.h
 +++ b/xen/include/xen/sched.h
-@@ -376,6 +376,8 @@ struct evtchn_port_ops;
+@@ -381,6 +381,8 @@ struct evtchn_port_ops;
  
  #define MAX_NR_IOREQ_SERVERS 8
  
@@ -500,7 +500,7 @@ index 809c648c99b8..79ac24f5cbb3 100644
  struct domain
  {
      domid_t          domain_id;
-@@ -622,6 +624,11 @@ struct domain
+@@ -628,6 +630,11 @@ struct domain
      struct page_info *pending_scrub;
      unsigned int pending_scrub_order;
      unsigned int pending_scrub_index;
@@ -512,19 +512,19 @@ index 809c648c99b8..79ac24f5cbb3 100644
  } __aligned(PAGE_SIZE);
  
  static inline struct page_list_head *page_to_list(
-@@ -1053,6 +1060,7 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
+@@ -1059,6 +1066,7 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
  
  struct vcpu_runstate_extra vcpu_runstate_get(
      const struct vcpu *v, struct vcpu_runstate_info *runstate);
 +void domain_runstate_get(struct domain *d, domain_runstate_info_t *info);
- 
+ uint64_t vcpu_runstate_get_running(const struct vcpu *v);
  uint64_t get_cpu_idle_time(unsigned int cpu);
  void sched_guest_idle(void (*idle) (void), unsigned int cpu);
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
-index 42857c212223..2737c4f2cc4a 100644
+index 2df93b01b482..33fedd46b847 100644
 --- a/xen/xsm/flask/hooks.c
 +++ b/xen/xsm/flask/hooks.c
-@@ -838,6 +838,9 @@ static int cf_check flask_domctl(struct domain *d, unsigned int cmd,
+@@ -884,6 +884,9 @@ static int cf_check flask_domctl(struct domain *d, struct xen_domctl *op)
      case XEN_DOMCTL_set_paging_mempool_size:
          return current_has_perm(d, SECCLASS_DOMAIN, DOMAIN__SETPAGINGMEMPOOL);
  
@@ -532,7 +532,7 @@ index 42857c212223..2737c4f2cc4a 100644
 +        return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__GET_RUNSTATE_INFO);
 +
      default:
-         return avc_unknown_permission("domctl", cmd);
+         return avc_unknown_permission("domctl", op->cmd);
      }
 diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
 index 4e6710a63e1b..48bc5502b9e8 100644
