@@ -884,6 +884,10 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Mon Aug 03 2026 Kevin Lampis <kevin.lampis@citrix.com> - 4.17.7-1
+- Update to Xen 4.17.7
+- Fix for XSA-492 CA-428525
+
 * Wed Jul 22 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.17.6-12
 - Update fix for XSA-501 CVE-2026-62435 CVE-2026-62436
 
