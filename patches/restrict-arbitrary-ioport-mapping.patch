@@ -8,10 +8,10 @@ dom0 kernel space.
 
 Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
 diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
-index 25e9b37da65e..983a5f2ef19c 100644
+index 24245bc57029..5f40883976f0 100644
 --- a/xen/arch/x86/domctl.c
 +++ b/xen/arch/x86/domctl.c
-@@ -243,7 +243,8 @@ long arch_do_domctl(
+@@ -362,7 +362,8 @@ long arch_do_domctl(
  
          iocaps_double_lock(d, true);
  
@@ -21,7 +21,7 @@ index 25e9b37da65e..983a5f2ef19c 100644
              ret = -EPERM;
          else if ( allow )
              ret = ioports_permit_access(d, fp, fp + np - 1);
-@@ -713,6 +714,8 @@ long arch_do_domctl(
+@@ -832,6 +833,8 @@ long arch_do_domctl(
                  list_add_tail(&g2m_ioport->list, &hvm->g2m_ioport_list);
              }
              write_unlock(&hvm->g2m_ioport_lock);
@@ -31,19 +31,20 @@ index 25e9b37da65e..983a5f2ef19c 100644
                  ret = ioports_permit_access(d, fmp, fmp + np - 1);
              if ( ret && !found && g2m_ioport )
 diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
-index 990acd1626cb..1f6dc2491690 100644
+index 82b066961250..20c536f3abbc 100644
 --- a/xen/drivers/passthrough/pci.c
 +++ b/xen/drivers/passthrough/pci.c
-@@ -33,6 +33,7 @@
- #include <xen/tasklet.h>
- #include <xen/vpci.h>
- #include <xen/msi.h>
-+#include <xen/lockdown.h>
- #include <xsm/xsm.h>
- #include "ats.h"
+@@ -588,7 +588,7 @@ static bool need_cache(const struct pci_dev *pdev, unsigned num_bars)
+     return false;
+ }
  
-@@ -571,6 +572,62 @@ struct pci_dev *pci_get_pdev(const struct domain *d, pci_sbdf_t sbdf)
-     return NULL;
+-static bool __maybe_unused cache_pdev(struct pci_dev *pdev)
++static bool cache_pdev(struct pci_dev *pdev)
+ {
+     unsigned i;
+ 
+@@ -655,6 +655,46 @@ static bool __maybe_unused cache_pdev(struct pci_dev *pdev)
+     return true;
  }
  
 +int check_ioport_access(const struct domain *d, unsigned int port_start,
@@ -58,40 +59,24 @@ index 990acd1626cb..1f6dc2491690 100644
 +    pcidevs_lock();
 +    list_for_each_entry ( pdev, &d->pdev_list, domain_list )
 +    {
-+        unsigned int i;
-+
 +        if ( pdev->info.is_virtfn )
 +            continue;
 +
-+        if ( (pci_conf_read8(pdev->sbdf, PCI_HEADER_TYPE) & 0x7f) !=
-+                PCI_HEADER_TYPE_NORMAL )
++        if ( !cache_pdev(pdev) )
 +            continue;
 +
-+        for ( i = 0; i < PCI_HEADER_NORMAL_NR_BARS; i++ )
++        for ( unsigned i = 0; i < PCI_HEADER_NORMAL_NR_BARS; i++ )
 +        {
-+            uint32_t size;
-+            unsigned int idx = PCI_BASE_ADDRESS_0 + i * 4;
-+            uint32_t bar = pci_conf_read32(pdev->sbdf, idx);
++            uint32_t size, addr;
 +
-+            if ( (bar & PCI_BASE_ADDRESS_SPACE) == PCI_BASE_ADDRESS_SPACE_MEMORY )
-+            {
-+                if ( (bar & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
-+                        PCI_BASE_ADDRESS_MEM_TYPE_64 )
-+                    i++;
++            if ( pdev->bar[i].type != PCI_BAR_TYPE_IO )
 +                continue;
-+            }
 +
-+            pci_conf_write32(pdev->sbdf, idx, ~0);
-+            size = pci_conf_read32(pdev->sbdf, idx) & PCI_BASE_ADDRESS_IO_MASK;
-+            size = ~size + 1;
-+            pci_conf_write32(pdev->sbdf, idx, bar);
++            addr = (uint32_t)pdev->bar[i].addr;
++            size = (uint32_t)pdev->bar[i].size;
 +
-+            if ( port_start >= (bar & PCI_BASE_ADDRESS_IO_MASK) &&
-+                 port_end <= ((bar & PCI_BASE_ADDRESS_IO_MASK) + size - 1) )
-+            {
-+                rc = 0;
++            if ( port_start >= addr && port_end <= (addr + size - 1) )
 +                goto out;
-+            }
 +        }
 +    }
 +
@@ -106,10 +91,10 @@ index 990acd1626cb..1f6dc2491690 100644
   * pci_enable_acs - enable ACS if hardware support it
   * @dev: the PCI device
 diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
-index 130c2a8c1a65..0be5c50991c5 100644
+index b978e0438c85..d7dee528f7fa 100644
 --- a/xen/include/xen/pci.h
 +++ b/xen/include/xen/pci.h
-@@ -269,6 +269,9 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
+@@ -284,6 +284,9 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
                            unsigned int *bus_p, unsigned int *dev_p,
                            unsigned int *func_p, bool *def_seg);
  

@@ -36,39 +36,22 @@ Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
 Signed-off-by: Frediano Ziglio <frediano.ziglio@citrix.com>
 Signed-off-by: Kevin Lampis <kevin.lampis@cloud.com>
 diff --git a/xen/arch/x86/pci.c b/xen/arch/x86/pci.c
-index fd0715fb6a1b..9a28802a1e0c 100644
+index 3d1c8a606be1..9a28802a1e0c 100644
 --- a/xen/arch/x86/pci.c
 +++ b/xen/arch/x86/pci.c
-@@ -77,6 +77,7 @@ int pci_conf_write_intercept(unsigned int seg, unsigned int bdf,
-                              uint32_t *data)
- {
-     struct pci_dev *pdev;
-+    bool bar_change;
-     int rc = xsm_pci_config_permission(XSM_HOOK, current->domain, bdf,
-                                        reg, reg + size - 1, 1);
- 
-@@ -84,18 +85,40 @@ int pci_conf_write_intercept(unsigned int seg, unsigned int bdf,
-         return rc;
-     ASSERT(!rc);
- 
-+    bar_change =
-+        (reg + size > PCI_BASE_ADDRESS_0 && reg < PCI_BASE_ADDRESS_5 + 4) ||
-+        (reg + size > PCI_ROM_ADDRESS && reg < PCI_ROM_ADDRESS + 4);
-+
-     /*
+@@ -93,7 +93,7 @@ int pci_conf_write_intercept(unsigned int seg, unsigned int bdf,
       * Avoid expensive operations when no hook is going to do anything
       * for the access anyway.
       */
--    if ( reg < 64 || reg >= 256 )
+-    if ( !bar_change && (reg < 64 || reg >= 256) )
 +    if ( !bar_change && reg < 64 )
          return 0;
  
      pcidevs_lock();
- 
+@@ -101,9 +101,22 @@ int pci_conf_write_intercept(unsigned int seg, unsigned int bdf,
      pdev = pci_get_pdev(NULL, PCI_SBDF(seg, bdf));
      if ( pdev )
--        rc = pci_msi_conf_write_intercept(pdev, reg, size, data);
-+    {
+     {
 +        /* Invalidate all VFs cache if BARs are changed for PF */
 +        if ( !pdev->info.is_virtfn && pdev->sriov_pos != 0 )
 +        {
@@ -82,19 +65,18 @@ index fd0715fb6a1b..9a28802a1e0c 100644
 +                    pdev_invalidate_cache(vf_pdev);
 +            }
 +        }
-+        if ( bar_change )
-+            pdev_invalidate_cache(pdev);
+         if ( bar_change )
+             pdev_invalidate_cache(pdev);
+-        else
 +        else if ( reg >= 64 && reg < 256 )
-+            rc = pci_msi_conf_write_intercept(pdev, reg, size, data);
-+    }
- 
-     pcidevs_unlock();
+             rc = pci_msi_conf_write_intercept(pdev, reg, size, data);
+     }
  
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index d12362850320..a567d4b80a8b 100644
+index e051d18fcbf2..3b613527c80d 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
-@@ -400,7 +400,8 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+@@ -413,7 +413,8 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
          iocaps_double_lock(d, true);
  
          if ( !iomem_access_permitted(current->domain,
@@ -105,7 +87,7 @@ index d12362850320..a567d4b80a8b 100644
          else if ( allow )
              ret = iomem_permit_access(d, mfn, mfn + nr_mfns - 1);
 diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
-index 64e499ab894a..fc54b7fc7223 100644
+index 3132b13529b2..ef2d8f25f64a 100644
 --- a/xen/drivers/passthrough/pci.c
 +++ b/xen/drivers/passthrough/pci.c
 @@ -348,6 +348,9 @@ static struct pci_dev *alloc_pdev(struct pci_seg *pseg, u8 bus, u8 devfn)
@@ -118,7 +100,7 @@ index 64e499ab894a..fc54b7fc7223 100644
      list_add(&pdev->alldevs_list, &pseg->alldevs_list);
  
      /* update bus2bridge */
-@@ -579,6 +582,276 @@ struct pci_dev *pci_get_pdev(const struct domain *d, pci_sbdf_t sbdf)
+@@ -579,6 +582,34 @@ struct pci_dev *pci_get_pdev(const struct domain *d, pci_sbdf_t sbdf)
      return NULL;
  }
  
@@ -150,15 +132,13 @@ index 64e499ab894a..fc54b7fc7223 100644
 +    return false;
 +}
 +
-+static bool need_cache(const struct pci_dev *pdev, unsigned num_bars)
-+{
-+    for ( unsigned i = 0; i < num_bars; i++ )
-+        if ( pdev->bar[i].type == PCI_BAR_TYPE_EMPTY )
-+            return true;
-+
-+    return false;
-+}
-+
+ static bool need_cache(const struct pci_dev *pdev, unsigned int num_bars)
+ {
+     for ( unsigned int i = 0; i < num_bars; i++ )
+@@ -588,6 +619,101 @@ static bool need_cache(const struct pci_dev *pdev, unsigned int num_bars)
+     return false;
+ }
+ 
 +static bool cache_virtfn(struct pci_dev *pdev)
 +{
 +    int vf;
@@ -254,73 +234,13 @@ index 64e499ab894a..fc54b7fc7223 100644
 +    return true;
 +}
 +
-+static bool cache_pdev(struct pci_dev *pdev)
-+{
-+    unsigned i;
-+
-+    if ( !need_cache(pdev, PCI_HEADER_NORMAL_NR_BARS) )
-+        return true;
-+
-+    if ( (pci_conf_read8(pdev->sbdf, PCI_HEADER_TYPE) & 0x7f) !=
-+         PCI_HEADER_TYPE_NORMAL )
-+        return false;
-+
-+    for ( i = 0; i < PCI_HEADER_NORMAL_NR_BARS; ++i )
-+    {
-+        unsigned int idx = PCI_BASE_ADDRESS_0 + i * 4;
-+        int rc;
-+        uint32_t bar;
-+
-+        if ( pdev->bar[i].type != PCI_BAR_TYPE_EMPTY )
-+            continue;
-+
-+        bar = pci_conf_read32(pdev->sbdf, idx);
-+
-+        if ( (bar & PCI_BASE_ADDRESS_SPACE) != PCI_BASE_ADDRESS_SPACE_MEMORY )
-+        {
-+            uint32_t size;
-+
-+            pci_conf_write32(pdev->sbdf, idx, ~0);
-+            size = pci_conf_read32(pdev->sbdf, idx) & PCI_BASE_ADDRESS_IO_MASK;
-+            size = ~size + 1;
-+            pci_conf_write32(pdev->sbdf, idx, bar);
-+
-+            pdev->bar[i].addr = bar & PCI_BASE_ADDRESS_IO_MASK;
-+            pdev->bar[i].size = size;
-+            pdev->bar[i].type = PCI_BAR_TYPE_IO;
-+            continue;
-+        }
-+
-+        rc = pci_size_mem_bar(pdev->sbdf, idx,
-+                              &pdev->bar[i].addr, &pdev->bar[i].size,
-+                              (i == PCI_HEADER_NORMAL_NR_BARS - 1) ?
-+                                  PCI_BAR_LAST : 0);
-+        if ( rc == 2 )
-+        {
-+            pdev->bar[i].type = PCI_BAR_TYPE_MEM64_LO;
-+            ++i;
-+            pdev->bar[i].type = PCI_BAR_TYPE_MEM64_HI;
-+            pdev->bar[i].addr = 0;
-+            pdev->bar[i].size = 0;
-+        }
-+        else
-+        {
-+            pdev->bar[i].type = PCI_BAR_TYPE_MEM32;
-+        }
-+    }
-+
-+    /* Handle the ROM BAR */
-+    i = PCI_HEADER_NORMAL_NR_BARS;
-+    pdev->bar[i].type = PCI_BAR_TYPE_ROM;
-+    pdev->bar[i].size = 0;
-+    pdev->bar[i].addr = 0;
-+    pci_size_mem_bar(pdev->sbdf, PCI_ROM_ADDRESS,
-+                     &pdev->bar[i].addr, &pdev->bar[i].size,
-+                     PCI_BAR_ROM);
-+
-+    return true;
-+}
-+
+ static bool cache_pdev(struct pci_dev *pdev)
+ {
+     unsigned i;
+@@ -655,6 +781,77 @@ static bool cache_pdev(struct pci_dev *pdev)
+     return true;
+ }
+ 
 +static int check_iomem_access_vgpu(const struct domain *d, xen_pfn_t mfn_start,
 +                                   xen_pfn_t mfn_end, bool vgpu)
 +{
@@ -395,55 +315,7 @@ index 64e499ab894a..fc54b7fc7223 100644
  int check_ioport_access(const struct domain *d, unsigned int port_start,
                          unsigned int port_end)
  {
-@@ -591,40 +864,24 @@ int check_ioport_access(const struct domain *d, unsigned int port_start,
-     pcidevs_lock();
-     list_for_each_entry ( pdev, &d->pdev_list, domain_list )
-     {
--        unsigned int i;
--
-         if ( pdev->info.is_virtfn )
-             continue;
- 
--        if ( (pci_conf_read8(pdev->sbdf, PCI_HEADER_TYPE) & 0x7f) !=
--                PCI_HEADER_TYPE_NORMAL )
-+        if ( !cache_pdev(pdev) )
-             continue;
- 
--        for ( i = 0; i < PCI_HEADER_NORMAL_NR_BARS; i++ )
-+        for ( unsigned i = 0; i < PCI_HEADER_NORMAL_NR_BARS; i++ )
-         {
--            uint32_t size;
--            unsigned int idx = PCI_BASE_ADDRESS_0 + i * 4;
--            uint32_t bar = pci_conf_read32(pdev->sbdf, idx);
-+            uint32_t size, addr;
- 
--            if ( (bar & PCI_BASE_ADDRESS_SPACE) == PCI_BASE_ADDRESS_SPACE_MEMORY )
--            {
--                if ( (bar & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
--                        PCI_BASE_ADDRESS_MEM_TYPE_64 )
--                    i++;
-+            if ( pdev->bar[i].type != PCI_BAR_TYPE_IO )
-                 continue;
--            }
- 
--            pci_conf_write32(pdev->sbdf, idx, ~0);
--            size = pci_conf_read32(pdev->sbdf, idx) & PCI_BASE_ADDRESS_IO_MASK;
--            size = ~size + 1;
--            pci_conf_write32(pdev->sbdf, idx, bar);
-+            addr = (uint32_t)pdev->bar[i].addr;
-+            size = (uint32_t)pdev->bar[i].size;
- 
--            if ( port_start >= (bar & PCI_BASE_ADDRESS_IO_MASK) &&
--                 port_end <= ((bar & PCI_BASE_ADDRESS_IO_MASK) + size - 1) )
--            {
--                rc = 0;
-+            if ( port_start >= addr && port_end <= (addr + size - 1) )
-                 goto out;
--            }
-         }
-     }
- 
-@@ -788,8 +1045,7 @@ int pci_add_device(u16 seg, u8 bus, u8 devfn,
+@@ -848,8 +1045,7 @@ int pci_add_device(u16 seg, u8 bus, u8 devfn,
  
      if ( !pdev->info.is_virtfn && !pdev->physfn.vf_rlen[0] )
      {
@@ -453,33 +325,8 @@ index 64e499ab894a..fc54b7fc7223 100644
          uint16_t ctrl = pci_conf_read16(pdev->sbdf, pos + PCI_SRIOV_CTRL);
  
          if ( !pos )
-diff --git a/xen/drivers/pci/physdev.c b/xen/drivers/pci/physdev.c
-index d46501b88428..66fa27187739 100644
---- a/xen/drivers/pci/physdev.c
-+++ b/xen/drivers/pci/physdev.c
-@@ -103,17 +103,19 @@ ret_t pci_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
-         }
- 
-         write_lock(&pdev->domain->pci_lock);
--        pcidevs_unlock();
-         switch ( dev_reset.flags & PCI_DEVICE_RESET_MASK )
-         {
-         case PCI_DEVICE_RESET_COLD:
-         case PCI_DEVICE_RESET_WARM:
-         case PCI_DEVICE_RESET_HOT:
-         case PCI_DEVICE_RESET_FLR:
-+            pdev_invalidate_cache(pdev);
-+            pcidevs_unlock();
-             ret = vpci_reset_device(pdev);
-             break;
- 
-         default:
-+            pcidevs_unlock();
-             ret = -EINVAL;
-             break;
-         }
 diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
-index a168678ac5a9..61018eccf869 100644
+index d7dee528f7fa..61018eccf869 100644
 --- a/xen/include/xen/pci.h
 +++ b/xen/include/xen/pci.h
 @@ -124,6 +124,8 @@ struct pci_dev {
@@ -491,27 +338,7 @@ index a168678ac5a9..61018eccf869 100644
      nodeid_t node; /* NUMA node */
  
      /* Device to be quarantined, don't automatically re-assign to dom0 */
-@@ -177,6 +179,19 @@ struct pci_dev {
-     struct vpci *vpci;
- 
-     struct rangeset *config_writable;
-+
-+    struct bar {
-+        uint64_t addr;
-+        uint64_t size;
-+        enum {
-+            PCI_BAR_TYPE_EMPTY,
-+            PCI_BAR_TYPE_IO,
-+            PCI_BAR_TYPE_MEM32,
-+            PCI_BAR_TYPE_MEM64_LO,
-+            PCI_BAR_TYPE_MEM64_HI,
-+            PCI_BAR_TYPE_ROM,
-+        } type;
-+    } bar[PCI_HEADER_NORMAL_NR_BARS + 1];
- };
- 
- #define for_each_pdev(domain, pdev) \
-@@ -274,6 +289,9 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
+@@ -287,6 +289,9 @@ const char *parse_pci_seg(const char *s, unsigned int *seg_p,
  int check_ioport_access(const struct domain *d, unsigned int port_start,
                          unsigned int port_end);
  
@@ -521,13 +348,3 @@ index a168678ac5a9..61018eccf869 100644
  #define PCI_BAR_VF      (1u << 0)
  #define PCI_BAR_LAST    (1u << 1)
  #define PCI_BAR_ROM     (1u << 2)
-@@ -300,5 +318,9 @@ static inline int arch_pci_clean_pirqs(struct domain *d)
- 
- bool pdev_has_write_access(const struct pci_dev *pdev,
-                            uint32_t pos, uint8_t size);
-+static inline void pdev_invalidate_cache(struct pci_dev *pdev)
-+{
-+    memset(pdev->bar, 0, sizeof(pdev->bar));
-+}
- 
- #endif /* __XEN_PCI_H__ */

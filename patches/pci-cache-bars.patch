@@ -1,0 +1,188 @@
+diff --git a/xen/arch/x86/pci.c b/xen/arch/x86/pci.c
+index fd0715fb6a1b..3d1c8a606be1 100644
+--- a/xen/arch/x86/pci.c
++++ b/xen/arch/x86/pci.c
+@@ -77,6 +77,7 @@ int pci_conf_write_intercept(unsigned int seg, unsigned int bdf,
+                              uint32_t *data)
+ {
+     struct pci_dev *pdev;
++    bool bar_change;
+     int rc = xsm_pci_config_permission(XSM_HOOK, current->domain, bdf,
+                                        reg, reg + size - 1, 1);
+ 
+@@ -84,18 +85,27 @@ int pci_conf_write_intercept(unsigned int seg, unsigned int bdf,
+         return rc;
+     ASSERT(!rc);
+ 
++    bar_change =
++        (reg + size > PCI_BASE_ADDRESS_0 && reg < PCI_BASE_ADDRESS_5 + 4) ||
++        (reg + size > PCI_ROM_ADDRESS && reg < PCI_ROM_ADDRESS + 4);
++
+     /*
+      * Avoid expensive operations when no hook is going to do anything
+      * for the access anyway.
+      */
+-    if ( reg < 64 || reg >= 256 )
++    if ( !bar_change && (reg < 64 || reg >= 256) )
+         return 0;
+ 
+     pcidevs_lock();
+ 
+     pdev = pci_get_pdev(NULL, PCI_SBDF(seg, bdf));
+     if ( pdev )
+-        rc = pci_msi_conf_write_intercept(pdev, reg, size, data);
++    {
++        if ( bar_change )
++            pdev_invalidate_cache(pdev);
++        else
++            rc = pci_msi_conf_write_intercept(pdev, reg, size, data);
++    }
+ 
+     pcidevs_unlock();
+ 
+diff --git a/xen/drivers/passthrough/pci.c b/xen/drivers/passthrough/pci.c
+index 1ee4dc8d8c0e..498abce55b37 100644
+--- a/xen/drivers/passthrough/pci.c
++++ b/xen/drivers/passthrough/pci.c
+@@ -579,6 +579,82 @@ struct pci_dev *pci_get_pdev(const struct domain *d, pci_sbdf_t sbdf)
+     return NULL;
+ }
+ 
++static bool need_cache(const struct pci_dev *pdev, unsigned int num_bars)
++{
++    for ( unsigned int i = 0; i < num_bars; i++ )
++        if ( pdev->bar[i].type == PCI_BAR_TYPE_EMPTY )
++            return true;
++
++    return false;
++}
++
++static bool __maybe_unused cache_pdev(struct pci_dev *pdev)
++{
++    unsigned i;
++
++    if ( !need_cache(pdev, PCI_HEADER_NORMAL_NR_BARS) )
++        return true;
++
++    if ( (pci_conf_read8(pdev->sbdf, PCI_HEADER_TYPE) & 0x7f) !=
++         PCI_HEADER_TYPE_NORMAL )
++        return false;
++
++    for ( i = 0; i < PCI_HEADER_NORMAL_NR_BARS; ++i )
++    {
++        unsigned int idx = PCI_BASE_ADDRESS_0 + i * 4;
++        int rc;
++        uint32_t bar;
++
++        if ( pdev->bar[i].type != PCI_BAR_TYPE_EMPTY )
++            continue;
++
++        bar = pci_conf_read32(pdev->sbdf, idx);
++
++        if ( (bar & PCI_BASE_ADDRESS_SPACE) != PCI_BASE_ADDRESS_SPACE_MEMORY )
++        {
++            uint32_t size;
++
++            pci_conf_write32(pdev->sbdf, idx, ~0);
++            size = pci_conf_read32(pdev->sbdf, idx) & PCI_BASE_ADDRESS_IO_MASK;
++            size = ~size + 1;
++            pci_conf_write32(pdev->sbdf, idx, bar);
++
++            pdev->bar[i].addr = bar & PCI_BASE_ADDRESS_IO_MASK;
++            pdev->bar[i].size = size;
++            pdev->bar[i].type = PCI_BAR_TYPE_IO;
++            continue;
++        }
++
++        rc = pci_size_mem_bar(pdev->sbdf, idx,
++                              &pdev->bar[i].addr, &pdev->bar[i].size,
++                              (i == PCI_HEADER_NORMAL_NR_BARS - 1) ?
++                                  PCI_BAR_LAST : 0);
++        if ( rc == 2 )
++        {
++            pdev->bar[i].type = PCI_BAR_TYPE_MEM64_LO;
++            ++i;
++            pdev->bar[i].type = PCI_BAR_TYPE_MEM64_HI;
++            pdev->bar[i].addr = 0;
++            pdev->bar[i].size = 0;
++        }
++        else
++        {
++            pdev->bar[i].type = PCI_BAR_TYPE_MEM32;
++        }
++    }
++
++    /* Handle the ROM BAR */
++    i = PCI_HEADER_NORMAL_NR_BARS;
++    pdev->bar[i].type = PCI_BAR_TYPE_ROM;
++    pdev->bar[i].size = 0;
++    pdev->bar[i].addr = 0;
++    pci_size_mem_bar(pdev->sbdf, PCI_ROM_ADDRESS,
++                     &pdev->bar[i].addr, &pdev->bar[i].size,
++                     PCI_BAR_ROM);
++
++    return true;
++}
++
+ /**
+  * pci_enable_acs - enable ACS if hardware support it
+  * @dev: the PCI device
+diff --git a/xen/drivers/pci/physdev.c b/xen/drivers/pci/physdev.c
+index d46501b88428..66fa27187739 100644
+--- a/xen/drivers/pci/physdev.c
++++ b/xen/drivers/pci/physdev.c
+@@ -103,17 +103,19 @@ ret_t pci_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+         }
+ 
+         write_lock(&pdev->domain->pci_lock);
+-        pcidevs_unlock();
+         switch ( dev_reset.flags & PCI_DEVICE_RESET_MASK )
+         {
+         case PCI_DEVICE_RESET_COLD:
+         case PCI_DEVICE_RESET_WARM:
+         case PCI_DEVICE_RESET_HOT:
+         case PCI_DEVICE_RESET_FLR:
++            pdev_invalidate_cache(pdev);
++            pcidevs_unlock();
+             ret = vpci_reset_device(pdev);
+             break;
+ 
+         default:
++            pcidevs_unlock();
+             ret = -EINVAL;
+             break;
+         }
+diff --git a/xen/include/xen/pci.h b/xen/include/xen/pci.h
+index 2a08a6f22394..b978e0438c85 100644
+--- a/xen/include/xen/pci.h
++++ b/xen/include/xen/pci.h
+@@ -177,6 +177,19 @@ struct pci_dev {
+     struct vpci *vpci;
+ 
+     struct rangeset *config_writable;
++
++    struct bar {
++        uint64_t addr;
++        uint64_t size;
++        enum {
++            PCI_BAR_TYPE_EMPTY,
++            PCI_BAR_TYPE_IO,
++            PCI_BAR_TYPE_MEM32,
++            PCI_BAR_TYPE_MEM64_LO,
++            PCI_BAR_TYPE_MEM64_HI,
++            PCI_BAR_TYPE_ROM,
++        } type;
++    } bar[PCI_HEADER_NORMAL_NR_BARS + 1];
+ };
+ 
+ #define for_each_pdev(domain, pdev) \
+@@ -297,5 +310,9 @@ static inline int arch_pci_clean_pirqs(struct domain *d)
+ 
+ bool pdev_has_write_access(const struct pci_dev *pdev,
+                            uint32_t pos, uint8_t size);
++static inline void pdev_invalidate_cache(struct pci_dev *pdev)
++{
++    memset(pdev->bar, 0, sizeof(pdev->bar));
++}
+ 
+ #endif /* __XEN_PCI_H__ */
