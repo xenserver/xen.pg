@@ -1,0 +1,71 @@
+From 1cefa774195b99032c7d086437634304bfd13dd5 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Mon, 24 Aug 2026 11:52:15 +0200
+Subject: x86/nmi: Check MSR_MISC_ENABLE for all Intel platforms
+
+Right now it's only checked in setup_p4_watchdog(), and not in
+setup_p6_watchdog().
+
+Perform the check in the common Intel path in setup_apic_nmi_watchdog(), and
+pass misc_enable as a parameter into setup_p4_watchdog() to avoid reading it
+twice.
+
+Fixes: 0dfba864fbff ("NMI watchdog support in Xen.")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+master commit: dfb428cb1142a5a468531410e0461fb2a9f2a4ea
+master date: 2026-08-18 12:51:08 +0100
+
+diff --git a/xen/arch/x86/nmi.c b/xen/arch/x86/nmi.c
+index e3e653d34555..12bea11e8baf 100644
+--- a/xen/arch/x86/nmi.c
++++ b/xen/arch/x86/nmi.c
+@@ -345,14 +345,8 @@ static void setup_p6_watchdog(unsigned counter)
+     wrmsrns(MSR_P6_EVNTSEL(0), evntsel);
+ }
+ 
+-static void setup_p4_watchdog(void)
++static void setup_p4_watchdog(uint64_t misc_enable)
+ {
+-    uint64_t misc_enable;
+-
+-    rdmsrl(MSR_IA32_MISC_ENABLE, misc_enable);
+-    if (!(misc_enable & MSR_IA32_MISC_ENABLE_PERF_AVAIL))
+-        return;
+-
+     nmi_perfctr_msr = MSR_P4_IQ_PERFCTR0;
+     nmi_p4_cccr_val = P4_NMI_IQ_CCCR0;
+     if ( boot_cpu_data.x86_num_siblings == 2 )
+@@ -384,6 +378,8 @@ static void setup_p4_watchdog(void)
+ 
+ void setup_apic_nmi_watchdog(void)
+ {
++    uint64_t misc;
++
+     if ( nmi_watchdog == NMI_NONE )
+         return;
+ 
+@@ -394,6 +390,14 @@ void setup_apic_nmi_watchdog(void)
+         break;
+ 
+     case X86_VENDOR_INTEL:
++        misc = rdmsr(MSR_IA32_MISC_ENABLE);
++
++        if ( !(misc & MSR_IA32_MISC_ENABLE_PERF_AVAIL) )
++        {
++            printk(XENLOG_WARNING "Intel Perfmon unavailable\n");
++            break;
++        }
++
+         switch (boot_cpu_data.x86) {
+         case 6:
+             setup_p6_watchdog((boot_cpu_data.x86_model < 14) 
+@@ -401,7 +405,7 @@ void setup_apic_nmi_watchdog(void)
+                               : CORE_EVENT_CPU_CLOCKS_NOT_HALTED);
+             break;
+         case 15:
+-            setup_p4_watchdog();
++            setup_p4_watchdog(misc);
+             break;
+         }
+         break;

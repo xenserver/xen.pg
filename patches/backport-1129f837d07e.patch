@@ -1,0 +1,38 @@
+From 1129f837d07e5443b98f33aa5ab05b97cf8f1963 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Mon, 24 Aug 2026 11:50:56 +0200
+Subject: xen/credit: fix race with schedule_cpu_rm() in csched_timer()
+
+When removing a CPU from a cpupool running the credit scheduler, a
+race might happen between schedule_cpu_rm() and csched_timer(),
+resulting in a NULL dereference.
+
+The timer associated with csched_timer() is killed only in
+csched_deinit_pdata(), which is called by schedule_cpu_rm() after
+setting the scheduler's per-cpu data to NULL AND after enabling
+interrupts again. This can result in the timer firing before being
+killed, so csched_timer() needs to test the per-cpu data being set
+before accessing it.
+
+Fixes: 78be3dbbfefa ("cpupools [1/6]: hypervisor changes")
+Reported-by: Dietmar Hahn <dietmar.hahn@fujitsu.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Acked-by: Andrew Cooper <andrew.cooper3@citrix.com>
+master commit: ea1d785a5f660ec52ec70454a0410c2f7fb2930a
+master date: 2026-07-29 14:41:22 +0100
+
+diff --git a/xen/common/sched/credit.c b/xen/common/sched/credit.c
+index 6dcf6b2c8b0a..485e52bd7c31 100644
+--- a/xen/common/sched/credit.c
++++ b/xen/common/sched/credit.c
+@@ -1589,6 +1589,10 @@ static void cf_check csched_tick(void *_cpu)
+     struct csched_pcpu *spc = CSCHED_PCPU(cpu);
+     struct csched_private *prv = CSCHED_PRIV(sr->scheduler);
+ 
++    /* Handle race of timer disabling vs. firing when switching scheduler. */
++    if ( !spc )
++        return;
++
+     spc->tick++;
+ 
+     /*

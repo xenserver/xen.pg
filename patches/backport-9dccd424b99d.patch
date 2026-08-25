@@ -1,0 +1,95 @@
+From 9dccd424b99dd09b457e0d739a26d4d699227b99 Mon Sep 17 00:00:00 2001
+From: Oleksii Moisieiev <oleksii_moisieiev@epam.com>
+Date: Mon, 24 Aug 2026 11:50:32 +0200
+Subject: xen/sched: rt: fix NULL cpupool dereference in move_repl_timer()
+
+schedule_cpu_rm() clears the cpupool pointer of the scheduling
+resource before calling sched_deinit_pdata():
+
+    sr->cpupool = NULL;
+    ...
+    sched_deinit_pdata(data->old_ops, data->ppriv_old, cpu);
+
+For RTDS, rt_deinit_pdata() calls move_repl_timer() when the
+replenishment timer lives on the cpu being removed, and
+move_repl_timer() dereferences get_sched_res(old_cpu)->cpupool
+without checking it for NULL. Removing a pCPU owning the timer from
+an RTDS cpupool therefore dereferences NULL + 0x10 (the res_valid
+member) and panics:
+
+    (XEN) Data Abort Trap. Syndrome=0x1c28005
+    (XEN) Walking Hypervisor VA 0x10 on CPU0 via TTBR ...
+    (XEN) Xen call trace:
+    (XEN)    [<...>] find_next_bit+0x74/0xa8 (PC)
+    (XEN)    [<...>] rt.c#move_repl_timer+0xb8/0xec (LR)
+    (XEN)
+    (XEN) Panic on CPU 0:
+    (XEN) CPU0: Unexpected Trap: Data Abort
+
+Reproducer, on any host with at least 2 pCPUs and RTDS compiled in
+(observed on arm64, but the path is common code):
+
+    xl cpupool-create name="test" sched="rtds"
+    xl cpupool-cpu-remove Pool-0 1
+    xl cpupool-cpu-add test 1
+    xl cpupool-cpu-remove test 1
+
+The last command moves the RTDS replenishment timer to cpu1 (first
+and only cpu of the pool) and then removes cpu1, hitting the NULL
+dereference in the sched_deinit_pdata() callback.
+
+Use the cpupool back-pointer of the scheduler instead of the one of
+the scheduling resource. It is set by cpupool_create() before any
+pCPU can be assigned to the pool and stays valid for the whole
+lifetime of the scheduler, so it is still available when
+rt_deinit_pdata() runs. Other schedulers already rely on it the same
+way, e.g. credit2 in cpu_add_to_runqueue().
+
+Fixes: b6f5334aeaca ("sched: fix cpu offlining with core scheduling")
+Signed-off-by: Oleksii Moisieiev <oleksii_moisieiev@epam.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+master commit: f294e3abe40cda37618d9fbad8cde86bbae0d1c6
+master date: 2026-07-21 09:47:36 +0200
+
+diff --git a/xen/common/sched/rt.c b/xen/common/sched/rt.c
+index 5c9c41e63b67..a9141d22b4c5 100644
+--- a/xen/common/sched/rt.c
++++ b/xen/common/sched/rt.c
+@@ -750,10 +750,16 @@ rt_switch_sched(struct scheduler *new_ops, unsigned int cpu,
+     return &prv->lock;
+ }
+ 
+-static void move_repl_timer(struct rt_private *prv, unsigned int old_cpu)
++static void move_repl_timer(const struct scheduler *ops, unsigned int old_cpu)
+ {
+-    cpumask_t *online = get_sched_res(old_cpu)->cpupool->res_valid;
+-    unsigned int new_cpu = cpumask_cycle(old_cpu, online);
++    struct rt_private *prv = rt_priv(ops);
++    /*
++     * Use the cpupool of the scheduler: the one of the scheduling resource
++     * is already cleared when this is called from rt_deinit_pdata().
++     */
++    const struct cpupool *c = ops->cpupool;
++    unsigned int new_cpu = c ? cpumask_cycle(old_cpu, c->res_valid)
++                             : nr_cpu_ids;
+ 
+     /*
+      * Make sure the timer run on one of the cpus that are still available
+@@ -780,7 +786,7 @@ rt_deinit_pdata(const struct scheduler *ops, void *pcpu, int cpu)
+     spin_lock_irqsave(&prv->lock, flags);
+ 
+     if ( prv->repl_timer.cpu == cpu )
+-        move_repl_timer(prv, cpu);
++        move_repl_timer(ops, cpu);
+ 
+     spin_unlock_irqrestore(&prv->lock, flags);
+ }
+@@ -798,7 +804,7 @@ rt_move_timers(const struct scheduler *ops, struct sched_resource *sr)
+     if ( prv->repl_timer.status != TIMER_STATUS_invalid &&
+          prv->repl_timer.status != TIMER_STATUS_killed &&
+          !cpumask_test_cpu(old_cpu, sr->cpupool->res_valid) )
+-        move_repl_timer(prv, old_cpu);
++        move_repl_timer(ops, old_cpu);
+ 
+     spin_unlock_irqrestore(&prv->lock, flags);
+ }
