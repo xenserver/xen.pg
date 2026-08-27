@@ -5,7 +5,7 @@
 
 # Hypervisor release.  Should match the tag in the repository and would be in
 # the Release field if it weren't for the %%{xsrel} automagic.
-%global hv_rel 2
+%global hv_rel 3
 
 # Full hash from the HEAD commit of this repo during processing, usually
 # provided by the environment.  Default to ??? if not set.
@@ -919,6 +919,13 @@ fi
 %{?_cov_results_package}
 
 %changelog
+* Thu Aug 27 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.21.2-3
+- Fixes for:
+  - XSA-509 CVE-2026-62437
+  - XSA-510 CVE-2026-79602
+  - XSA-511 CVE-2026-79603
+  - XSA-512 CVE-2026-79604
+
 * Thu Aug 20 2026 Andrew Cooper <andrew.cooper3@citrix.com> - 4.21.2-2
 - Fix crash caused by watchdog NMIs being mis-classified and treated as fatal
 - Fix crash late loading microcode on Granite Rapids systems
