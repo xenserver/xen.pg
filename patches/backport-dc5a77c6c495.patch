@@ -1,0 +1,57 @@
+From dc5a77c6c4951e8ad75c884b3b6b87a1ba46c488 Mon Sep 17 00:00:00 2001
+From: Andrew Cooper <andrew.cooper3@citrix.com>
+Date: Thu, 13 Aug 2026 16:18:59 +0100
+Subject: x86/nmi: Fix mis-classification of watchdog NMIs
+
+It used to be the case that cpu_data[] inherited the BSP's cpuid_level until
+the AP had calculated it itself.  Following the rework, cpuid_level has a
+placeholder 1 until it is calculated properly.
+
+setup_apic_nmi_watchdog() happens to be called on the BSP after SMP bring-up,
+meaning that the first call is on CPU1.  It is also positioned in the window
+where cpu_data[] is wrong.
+
+As a result, setup_p6_watchdog()'s one-time calculation of the performance
+counter width falls back into Pentium compatibility mode assuming 32bit
+counters.  This causes a watchdog NMI which is delayed a little (e.g. from an
+SMI), to appear as if it hadn't overflowed, and therefore be considered as not
+a watchdog NMI.  On systems where unknown NMIs are treated as fatal, this
+results in a spurious crash.
+
+Switch setup_p6_watchdog() to use boot_cpu_data.cpuid_level, which is how this
+is checked almost everywhere else.
+
+core2_vpmu_init() used the same pattern to look at leaf 0xa.  Despite being
+init code and only running on the BSP, {boot,current}_cpu_data are different
+objects, so switch it over to checking boot_cpu_data.cpuid_level too.
+
+Fixes: 7126b7f806d5 ("x86/CPU: re-work populating of cpu_data[]")
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Jan Beulich <jbeulich@suse.com>
+
+diff --git a/xen/arch/x86/cpu/vpmu_intel.c b/xen/arch/x86/cpu/vpmu_intel.c
+index b91d818be0b6..7b83257c4720 100644
+--- a/xen/arch/x86/cpu/vpmu_intel.c
++++ b/xen/arch/x86/cpu/vpmu_intel.c
+@@ -918,7 +918,7 @@ const struct arch_vpmu_ops *__init core2_vpmu_init(void)
+     unsigned int version = 0;
+     unsigned int i;
+ 
+-    if ( current_cpu_data.cpuid_level >= 0xa )
++    if ( boot_cpu_data.cpuid_level >= 0xa )
+         version = MASK_EXTR(cpuid_eax(0xa), PMU_VERSION_MASK);
+ 
+     switch ( version )
+diff --git a/xen/arch/x86/nmi.c b/xen/arch/x86/nmi.c
+index c7c51614a619..d436c6939048 100644
+--- a/xen/arch/x86/nmi.c
++++ b/xen/arch/x86/nmi.c
+@@ -318,7 +318,7 @@ static void setup_p6_watchdog(unsigned counter)
+ {
+     unsigned int evntsel;
+ 
+-    if ( !nmi_p6_event_width && current_cpu_data.cpuid_level >= 0xa )
++    if ( !nmi_p6_event_width && boot_cpu_data.cpuid_level >= 0xa )
+         nmi_p6_event_width = MASK_EXTR(cpuid_eax(0xa), P6_EVENT_WIDTH_MASK);
+     if ( !nmi_p6_event_width )
+         nmi_p6_event_width = P6_EVENT_WIDTH_MIN;
