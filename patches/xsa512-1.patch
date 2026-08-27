@@ -1,0 +1,80 @@
+From 5332a2c46db4f96e5d5a57100c55076fe5610beb Mon Sep 17 00:00:00 2001
+From: Andrii Sultanov <andriy.sultanov@vates.tech>
+Date: Thu, 20 Aug 2026 16:00:02 +0100
+Subject: oxenstored: Factor out Process.do_reconnect()
+
+The logic flow here is complicated.  In preparation to fix a bug, factor out
+reconnecting a xenbus connection, and fold History.reconnect into it's single
+caller.
+
+No functional change.
+
+This is part of XSA-512 / CVE-2026-79604.
+
+Signed-off-by: Andrii Sultanov <andriy.sultanov@vates.tech>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Andrii Sultanov <andriy.sultanov@vates.tech>
+
+diff --git a/tools/ocaml/xenstored/history.ml b/tools/ocaml/xenstored/history.ml
+index f03fb1832923..3474a62da230 100644
+--- a/tools/ocaml/xenstored/history.ml
++++ b/tools/ocaml/xenstored/history.ml
+@@ -39,10 +39,6 @@ let end_transaction txn con tid commit =
+   trim ~txn ();
+   success
+ 
+-let reconnect con =
+-  trim ();
+-  Connection.do_reconnect con
+-
+ let push (x: history_record) =
+   let dom = x.con.Connection.dom in
+   match dom with
+diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
+index 0c9c460a9915..bc68c54c9aba 100644
+--- a/tools/ocaml/xenstored/process.ml
++++ b/tools/ocaml/xenstored/process.ml
+@@ -350,6 +350,13 @@ let do_reset_watches con _t _domains cons _data =
+   Connections.del_watches cons con;
+   Connection.del_transactions con
+ 
++let do_reconnect cons con =
++  let domstr = Connection.get_domstr con in
++  info "%s requests a reconnect" domstr;
++  History.trim ();
++  Connection.do_reconnect con;
++  info "%s reconnection complete" domstr
++
+ (* only in >= xen3.3                                                                                    *)
+ let do_set_target con _t _domains cons data =
+   if not (Connection.is_dom0 con)
+@@ -735,9 +742,7 @@ let do_input store cons doms con =
+       if Connection.can_input con then Connection.do_input con
+       else None
+     with Xenbus.Xb.Reconnect ->
+-      info "%s requests a reconnect" (Connection.get_domstr con);
+-      History.reconnect con;
+-      info "%s reconnection complete" (Connection.get_domstr con);
++      do_reconnect cons con;
+       None
+        | Invalid_argument exp | Failure exp ->
+          error "caught exception %s" exp;
+@@ -760,7 +765,7 @@ let do_input store cons doms con =
+     write_access_log ~ty ~tid ~con:(Connection.get_domstr con) ~data;
+     Connection.incr_ops con
+ 
+-let do_output _store _cons _doms con =
++let do_output _store cons _doms con =
+   Connection.source_flush_watchevents con;
+   if Connection.has_output con then (
+     if Connection.has_new_output con then (
+@@ -775,8 +780,6 @@ let do_output _store _cons _doms con =
+     try
+       ignore (Connection.do_output con)
+     with Xenbus.Xb.Reconnect ->
+-      info "%s requests a reconnect" (Connection.get_domstr con);
+-      History.reconnect con;
+-      info "%s reconnection complete" (Connection.get_domstr con)
++      do_reconnect cons con
+   )
+ 

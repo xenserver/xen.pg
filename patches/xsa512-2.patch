@@ -1,0 +1,78 @@
+From 8dc4ca50e62f2587a0213b078fc908fdfb54828b Mon Sep 17 00:00:00 2001
+From: Andrii Sultanov <andriy.sultanov@vates.tech>
+Date: Thu, 20 Aug 2026 15:00:02 +0000
+Subject: oxenstored: Reset the watches trie on domain reconnect
+
+oxenstored maintains two datastructures about watches; one global trie, and
+one hashtable tracked per domain.  Both need keeping in sync, and right now
+the global trie is not emptied when a xenbus reconnect is requested.
+
+This is basically the same bug as XSA-330, commit 491a077ed4c5
+("tools/ocaml/xenstored: delete watch from trie too when resetting watches"),
+just tickled via another path.
+
+Arrange for both Process.do_reset_watches() and Process.do_reconnect() to
+share a common codepath for the resetting of watches and transactions.
+Notably, this means that the latter now calls Connections.del_watches() which
+clears the global trie too.
+
+Connections.del_watches() already calls Connection.del_watches() so remove the
+re-clearing of the state from Connection.do_reconnect().
+
+Move History.trim() into reset_watches_and_transactions() so it's on the
+common path, and place it after removing the transactions rather than before.
+
+This is part of XSA-512 / CVE-2026-79604.
+
+Reported-by: David Korczynski <David@Adalogics.com>
+Fixes: 674ad2be409d ("xenstore: extend the xenstore ring with a 'closing' signal")
+Signed-off-by: Andrii Sultanov <andriy.sultanov@vates.tech>
+Signed-off-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Reviewed-by: Andrii Sultanov <andriy.sultanov@vates.tech>
+
+diff --git a/tools/ocaml/xenstored/connection.ml b/tools/ocaml/xenstored/connection.ml
+index d11011e16439..37eb2444b936 100644
+--- a/tools/ocaml/xenstored/connection.ml
++++ b/tools/ocaml/xenstored/connection.ml
+@@ -148,13 +148,11 @@ let mark_as_bad con =
+ let initial_next_tid = 1
+ 
+ let do_reconnect con =
++  (* transactions and watches handled by caller *)
+   Xenbus.Xb.reconnect con.xb;
+   (* dom is the same *)
+-  Hashtbl.clear con.transactions;
+   con.next_tid <- initial_next_tid;
+-  Hashtbl.clear con.watches;
+   (* anonid is the same *)
+-  con.nb_watches <- 0;
+   con.stat_nb_ops <- 0;
+   (* perm is the same *)
+   ()
+diff --git a/tools/ocaml/xenstored/process.ml b/tools/ocaml/xenstored/process.ml
+index bc68c54c9aba..fc2558ac3d9b 100644
+--- a/tools/ocaml/xenstored/process.ml
++++ b/tools/ocaml/xenstored/process.ml
+@@ -345,15 +345,18 @@ let do_isintroduced con _t domains _cons data =
+   in
+   if domid = Define.domid_self || Domains.exist domains domid then "T\000" else "F\000"
+ 
+-(* only in xen >= 4.2 *)
+-let do_reset_watches con _t _domains cons _data =
++let reset_watches_and_transactions cons con =
+   Connections.del_watches cons con;
+-  Connection.del_transactions con
++  Connection.del_transactions con;
++  History.trim ()
++
++let do_reset_watches con _t _domains cons _data =
++  reset_watches_and_transactions cons con
+ 
+ let do_reconnect cons con =
+   let domstr = Connection.get_domstr con in
+   info "%s requests a reconnect" domstr;
+-  History.trim ();
++  reset_watches_and_transactions cons con;
+   Connection.do_reconnect con;
+   info "%s reconnection complete" domstr
+ 
